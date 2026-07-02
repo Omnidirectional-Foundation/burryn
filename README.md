@@ -11,7 +11,7 @@ The name: a **burrow** is where a gopher (Go) lives, and it puns on Rust's
 *borrow* checker; a **burr** is what forging leaves on metal; and *burrin*
 reads like **burin** — the engraver's tool for precise, quiet work.
 
-```
+```sh
 bur run examples/sieve.bur
 ```
 
@@ -100,7 +100,7 @@ for _i in range(0, 5) { sum = sum + <-ch }
 
 ## Architecture
 
-```
+```markdown
 source ──lexer──▶ tokens ──parser──▶ AST ──compiler──▶ bytecode ──▶ BurrynVM
  (lexer.go)        (auto-semicolons)  (parser.go)      (compiler.go)   (vm.go)
                                                                         │
@@ -122,7 +122,7 @@ source ──lexer──▶ tokens ──parser──▶ AST ──compiler─�
 
 ## Commands
 
-```
+```sh
 bur run <file.bur>    run
 bur <file.bur>        same
 bur dis <file.bur>    disassemble the compiled bytecode
