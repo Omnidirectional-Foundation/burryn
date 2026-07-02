@@ -1,0 +1,34 @@
+// The classic CSP prime sieve — one fiber per prime, chained by channels.
+// A direct homage to the famous Go demo, running on Burryn's own scheduler.
+
+fn generate(ch) {
+    let mut i = 2
+    while true {
+        ch <- i          // blocks until someone downstream is ready
+        i = i + 1
+    }
+}
+
+fn filter(in_ch, out_ch, prime) {
+    while true {
+        let n = <-in_ch
+        if n % prime != 0 {
+            out_ch <- n
+        }
+    }
+}
+
+let mut ch = chan()      // unbuffered: pure rendezvous
+spawn generate(ch)
+
+let mut found = []
+while len(found) < 15 {
+    let prime = <-ch
+    push(found, prime)
+    let next = chan()
+    spawn filter(ch, next, prime)   // this prime now guards the stream
+    ch = next
+}
+
+println("first 15 primes:", found)
+println("(computed by", len(found) + 1, "fibers talking through channels)")
