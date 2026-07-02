@@ -1,0 +1,1137 @@
+package main
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// ---- type representation ----
+
+type Ty interface{ tyNode() }
+
+// TCon: type constructor. Prims: int float bool str unit; "list"/"chan" take
+// one arg; enum names take their declared parameters.
+type TCon struct {
+	Name string
+	Args []Ty
+}
+
+type TFunc struct {
+	Params []Ty
+	Ret    Ty
+}
+
+// TV: type variable with Rémy-style levels for efficient generalization and
+// an optional overloading constraint ("num" = int|float, "addord" = int|float|str).
+type TV struct {
+	id    int
+	level int
+	con   string
+	link  Ty // non-nil once bound
+}
+
+func (*TCon) tyNode()  {}
+func (*TFunc) tyNode() {}
+func (*TV) tyNode()    {}
+
+var conSets = map[string][]string{
+	"num":    {"int", "float"},
+	"addord": {"int", "float", "str"},
+}
+
+func resolve(t Ty) Ty {
+	for {
+		tv, ok := t.(*TV)
+		if !ok || tv.link == nil {
+			return t
+		}
+		t = tv.link
+	}
+}
+
+type Scheme struct {
+	vars []*TV // quantified
+	t    Ty
+}
+
+// ---- checker ----
+
+type binding struct {
+	scheme  *Scheme
+	mut     bool
+	used    bool
+	isFn    bool
+	special string // "chan", "printf" for irregular natives
+	line    int
+	col     int
+	kind    string // "local", "param", "global", "native"
+}
+
+type VariantSig struct {
+	Name   string
+	Fields []TypeExpr
+}
+
+type EnumSig struct {
+	Name     string
+	Params   []string
+	Variants []VariantSig
+}
+
+type Checker struct {
+	diags   []Diag
+	scopes  []map[string]*binding
+	enums   map[string]*EnumSig
+	nextID  int
+	level   int
+	retTys  []Ty // stack of enclosing function return types
+	loop    int
+}
+
+func typecheck(stmts []Stmt) []Diag {
+	c := &Checker{enums: map[string]*EnumSig{}}
+	c.pushScope()
+	c.declareBuiltins()
+
+	// pass 1: register enums, pre-declare every top-level name (monomorphic)
+	for _, s := range stmts {
+		switch st := s.(type) {
+		case *EnumDecl:
+			c.registerEnum(st)
+		}
+	}
+	pre := map[string]*TV{}
+	for _, s := range stmts {
+		switch st := s.(type) {
+		case *FnDecl:
+			tv := c.fresh("")
+			pre[st.Name] = tv
+			c.declare(st.Name, &Scheme{t: tv}, false, "global", st.Line, st.Col)
+			c.scopes[len(c.scopes)-1][st.Name].isFn = true
+		case *LetStmt:
+			tv := c.fresh("")
+			pre[st.Name] = tv
+			c.declare(st.Name, &Scheme{t: tv}, st.Mut, "global", st.Line, st.Col)
+		}
+	}
+
+	// pass 2: infer in order
+	for _, s := range stmts {
+		switch st := s.(type) {
+		case *FnDecl:
+			c.level++
+			ft := c.inferExpr(st.Fn)
+			c.level--
+			// generalize BEFORE linking the level-0 placeholder: unify would
+			// pin every inner var to level 0 and kill polymorphism. Vars
+			// already pinned by earlier (mutual-recursive) uses resolve to
+			// their concrete types during instantiation, which stays sound.
+			b := c.lookup(st.Name)
+			b.scheme = c.generalize(ft)
+			c.unifyAt(pre[st.Name], ft, st.Line, st.Col, "in this function")
+		case *LetStmt:
+			t := c.inferLetInit(st)
+			c.unifyAt(pre[st.Name], t, st.Line, st.Col, "in this binding")
+		case *EnumDecl:
+			// already registered
+		default:
+			c.inferStmt(s)
+		}
+	}
+
+	// lint unused top-level bindings (skip _-prefixed)
+	for name, b := range c.scopes[0] {
+		if b.kind == "global" && !b.used && !strings.HasPrefix(name, "_") {
+			what := "variable"
+			if b.isFn {
+				what = "function"
+			}
+			c.warnf(b.line, b.col, "unused_variable",
+				fmt.Sprintf("if this is intentional, prefix it with an underscore: `_%s`", name),
+				"unused %s: `%s`", what, name)
+		}
+	}
+
+	sort.SliceStable(c.diags, func(i, j int) bool {
+		if c.diags[i].Line != c.diags[j].Line {
+			return c.diags[i].Line < c.diags[j].Line
+		}
+		return c.diags[i].Col < c.diags[j].Col
+	})
+	return c.diags
+}
+
+func (c *Checker) errorf(line, col int, code, help, format string, args ...any) {
+	c.diags = append(c.diags, Diag{
+		IsErr: true, Code: code, Line: line, Col: col,
+		Msg: fmt.Sprintf(format, args...), Help: help,
+	})
+}
+
+func (c *Checker) warnf(line, col int, code, help, format string, args ...any) {
+	c.diags = append(c.diags, Diag{
+		IsErr: false, Code: code, Line: line, Col: col,
+		Msg: fmt.Sprintf(format, args...), Help: help,
+	})
+}
+
+// ---- scopes ----
+
+func (c *Checker) pushScope() { c.scopes = append(c.scopes, map[string]*binding{}) }
+
+func (c *Checker) popScope() {
+	top := c.scopes[len(c.scopes)-1]
+	for name, b := range top {
+		if !b.used && !strings.HasPrefix(name, "_") && (b.kind == "local" || b.kind == "param") {
+			what := "variable"
+			if b.kind == "param" {
+				what = "parameter"
+			}
+			c.warnf(b.line, b.col, "unused_variable",
+				fmt.Sprintf("if this is intentional, prefix it with an underscore: `_%s`", name),
+				"unused %s: `%s`", what, name)
+		}
+	}
+	c.scopes = c.scopes[:len(c.scopes)-1]
+}
+
+func (c *Checker) declare(name string, s *Scheme, mut bool, kind string, line, col int) {
+	c.scopes[len(c.scopes)-1][name] = &binding{scheme: s, mut: mut, kind: kind, line: line, col: col}
+}
+
+func (c *Checker) lookup(name string) *binding {
+	for i := len(c.scopes) - 1; i >= 0; i-- {
+		if b, ok := c.scopes[i][name]; ok {
+			return b
+		}
+	}
+	return nil
+}
+
+// ---- type variable machinery ----
+
+func (c *Checker) fresh(con string) *TV {
+	c.nextID++
+	return &TV{id: c.nextID, level: c.level, con: con}
+}
+
+func adjustLevel(t Ty, level int) {
+	switch x := resolve(t).(type) {
+	case *TV:
+		if x.level > level {
+			x.level = level
+		}
+	case *TCon:
+		for _, a := range x.Args {
+			adjustLevel(a, level)
+		}
+	case *TFunc:
+		for _, p := range x.Params {
+			adjustLevel(p, level)
+		}
+		adjustLevel(x.Ret, level)
+	}
+}
+
+func occurs(v *TV, t Ty) bool {
+	switch x := resolve(t).(type) {
+	case *TV:
+		return x == v
+	case *TCon:
+		for _, a := range x.Args {
+			if occurs(v, a) {
+				return true
+			}
+		}
+	case *TFunc:
+		for _, p := range x.Params {
+			if occurs(v, p) {
+				return true
+			}
+		}
+		return occurs(v, x.Ret)
+	}
+	return false
+}
+
+func conAllows(con, name string) bool {
+	if con == "" {
+		return true
+	}
+	for _, n := range conSets[con] {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeCon(a, b string) (string, bool) {
+	if a == "" {
+		return b, true
+	}
+	if b == "" || a == b {
+		return a, true
+	}
+	// num ∩ addord = num
+	return "num", true
+}
+
+func (c *Checker) unify(a, b Ty) error {
+	a, b = resolve(a), resolve(b)
+	if a == b {
+		return nil
+	}
+	if av, ok := a.(*TV); ok {
+		if occurs(av, b) {
+			return fmt.Errorf("recursive type detected")
+		}
+		if bc, ok := b.(*TCon); ok && len(bc.Args) == 0 {
+			if !conAllows(av.con, bc.Name) {
+				return fmt.Errorf("`%s` is not valid here: this operator needs %s", bc.Name, strings.Join(conSets[av.con], " or "))
+			}
+		}
+		if bc, ok := b.(*TCon); ok && len(bc.Args) > 0 && av.con != "" {
+			return fmt.Errorf("`%s` is not valid here: this operator needs %s", pretty(bc), strings.Join(conSets[av.con], " or "))
+		}
+		if _, ok := b.(*TFunc); ok && av.con != "" {
+			return fmt.Errorf("a function is not valid here: this operator needs %s", strings.Join(conSets[av.con], " or "))
+		}
+		if bv, ok := b.(*TV); ok {
+			merged, _ := mergeCon(av.con, bv.con)
+			bv.con = merged
+		}
+		adjustLevel(b, av.level)
+		av.link = b
+		return nil
+	}
+	if _, ok := b.(*TV); ok {
+		return c.unify(b, a)
+	}
+	ac, aok := a.(*TCon)
+	bc, bok := b.(*TCon)
+	if aok && bok {
+		if ac.Name != bc.Name || len(ac.Args) != len(bc.Args) {
+			return fmt.Errorf("expected `%s`, found `%s`", pretty(a), pretty(b))
+		}
+		for i := range ac.Args {
+			if err := c.unify(ac.Args[i], bc.Args[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	af, aok2 := a.(*TFunc)
+	bf, bok2 := b.(*TFunc)
+	if aok2 && bok2 {
+		if len(af.Params) != len(bf.Params) {
+			return fmt.Errorf("expected a function with %d parameter(s), found one with %d", len(af.Params), len(bf.Params))
+		}
+		for i := range af.Params {
+			if err := c.unify(af.Params[i], bf.Params[i]); err != nil {
+				return err
+			}
+		}
+		return c.unify(af.Ret, bf.Ret)
+	}
+	return fmt.Errorf("expected `%s`, found `%s`", pretty(a), pretty(b))
+}
+
+func (c *Checker) unifyAt(a, b Ty, line, col int, context string) {
+	if err := c.unify(a, b); err != nil {
+		c.errorf(line, col, "E0308", "", "mismatched types %s: %s", context, err.Error())
+	}
+}
+
+func (c *Checker) generalize(t Ty) *Scheme {
+	var vars []*TV
+	seen := map[*TV]bool{}
+	var walk func(Ty)
+	walk = func(t Ty) {
+		switch x := resolve(t).(type) {
+		case *TV:
+			if x.level > c.level && !seen[x] {
+				seen[x] = true
+				vars = append(vars, x)
+			}
+		case *TCon:
+			for _, a := range x.Args {
+				walk(a)
+			}
+		case *TFunc:
+			for _, p := range x.Params {
+				walk(p)
+			}
+			walk(x.Ret)
+		}
+	}
+	walk(t)
+	return &Scheme{vars: vars, t: t}
+}
+
+func (c *Checker) instantiate(s *Scheme) Ty {
+	if len(s.vars) == 0 {
+		return s.t
+	}
+	subst := map[*TV]Ty{}
+	for _, v := range s.vars {
+		subst[v] = c.fresh(v.con)
+	}
+	var cp func(Ty) Ty
+	cp = func(t Ty) Ty {
+		switch x := resolve(t).(type) {
+		case *TV:
+			if n, ok := subst[x]; ok {
+				return n
+			}
+			return x
+		case *TCon:
+			args := make([]Ty, len(x.Args))
+			for i, a := range x.Args {
+				args[i] = cp(a)
+			}
+			return &TCon{Name: x.Name, Args: args}
+		case *TFunc:
+			ps := make([]Ty, len(x.Params))
+			for i, p := range x.Params {
+				ps[i] = cp(p)
+			}
+			return &TFunc{Params: ps, Ret: cp(x.Ret)}
+		}
+		return t
+	}
+	return cp(s.t)
+}
+
+// ---- enums ----
+
+func (c *Checker) registerEnum(st *EnumDecl) {
+	if _, exists := c.enums[st.Name]; exists {
+		c.errorf(st.Line, st.Col, "E0428", "", "enum `%s` is declared more than once", st.Name)
+		return
+	}
+	sig := &EnumSig{Name: st.Name, Params: st.Params}
+	for _, v := range st.Variants {
+		sig.Variants = append(sig.Variants, VariantSig{Name: v.Name, Fields: v.Types})
+	}
+	c.enums[st.Name] = sig
+	// validate field type expressions
+	pm := map[string]bool{}
+	for _, p := range st.Params {
+		pm[p] = true
+	}
+	for _, v := range st.Variants {
+		for _, te := range v.Types {
+			c.validateTypeExpr(te, pm)
+		}
+	}
+}
+
+func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
+	switch x := te.(type) {
+	case *TEName:
+		switch x.Name {
+		case "int", "float", "bool", "str", "unit":
+			if len(x.Args) > 0 {
+				c.errorf(x.Line, x.Col, "E0109", "", "`%s` takes no type arguments", x.Name)
+			}
+		case "chan":
+			if len(x.Args) != 1 {
+				c.errorf(x.Line, x.Col, "E0107", "", "`chan` takes exactly one type argument, e.g. chan(int)")
+			}
+		default:
+			if params[x.Name] {
+				if len(x.Args) > 0 {
+					c.errorf(x.Line, x.Col, "E0109", "", "type parameter `%s` takes no arguments", x.Name)
+				}
+			} else if sig, ok := c.enums[x.Name]; ok {
+				if len(x.Args) != len(sig.Params) {
+					c.errorf(x.Line, x.Col, "E0107", "",
+						"enum `%s` takes %d type argument(s), %d given", x.Name, len(sig.Params), len(x.Args))
+				}
+			} else {
+				c.errorf(x.Line, x.Col, "E0412", "", "cannot find type `%s`", x.Name)
+			}
+		}
+		for _, a := range x.Args {
+			c.validateTypeExpr(a, params)
+		}
+	case *TEList:
+		c.validateTypeExpr(x.Elem, params)
+	case *TEFn:
+		for _, p := range x.Params {
+			c.validateTypeExpr(p, params)
+		}
+		c.validateTypeExpr(x.Ret, params)
+	}
+}
+
+func (c *Checker) convertTypeExpr(te TypeExpr, subst map[string]Ty) Ty {
+	switch x := te.(type) {
+	case *TEName:
+		if t, ok := subst[x.Name]; ok {
+			return t
+		}
+		args := make([]Ty, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = c.convertTypeExpr(a, subst)
+		}
+		switch x.Name {
+		case "chan":
+			return &TCon{Name: "chan", Args: args}
+		default:
+			return &TCon{Name: x.Name, Args: args}
+		}
+	case *TEList:
+		return &TCon{Name: "list", Args: []Ty{c.convertTypeExpr(x.Elem, subst)}}
+	case *TEFn:
+		ps := make([]Ty, len(x.Params))
+		for i, p := range x.Params {
+			ps[i] = c.convertTypeExpr(p, subst)
+		}
+		return &TFunc{Params: ps, Ret: c.convertTypeExpr(x.Ret, subst)}
+	}
+	return &TCon{Name: "unit"}
+}
+
+// instantiateEnum returns the enum type with fresh parameters and a substitution
+// for converting variant field types.
+func (c *Checker) instantiateEnum(sig *EnumSig) (Ty, map[string]Ty) {
+	subst := map[string]Ty{}
+	args := make([]Ty, len(sig.Params))
+	for i, p := range sig.Params {
+		v := c.fresh("")
+		subst[p] = v
+		args[i] = v
+	}
+	return &TCon{Name: sig.Name, Args: args}, subst
+}
+
+func (c *Checker) findVariantSig(name string) (*EnumSig, int, bool) {
+	var found *EnumSig
+	idx := -1
+	for _, sig := range c.enums {
+		for i, v := range sig.Variants {
+			if v.Name == name {
+				if idx >= 0 {
+					return nil, -1, true // ambiguous
+				}
+				found, idx = sig, i
+			}
+		}
+	}
+	return found, idx, false
+}
+
+// ---- statements ----
+
+func (c *Checker) inferLetInit(st *LetStmt) Ty {
+	if fl, ok := st.Init.(*FnLit); ok {
+		c.level++
+		t := c.inferExpr(fl)
+		c.level--
+		return t
+	}
+	return c.inferExpr(st.Init)
+}
+
+func (c *Checker) inferStmt(s Stmt) {
+	switch st := s.(type) {
+	case *LetStmt:
+		t := c.inferLetInit(st)
+		var sch *Scheme
+		if _, isFn := st.Init.(*FnLit); isFn {
+			sch = c.generalize(t)
+		} else {
+			sch = &Scheme{t: t}
+		}
+		c.declare(st.Name, sch, st.Mut, "local", st.Line, st.Col)
+	case *FnDecl:
+		tv := c.fresh("")
+		c.declare(st.Name, &Scheme{t: tv}, false, "local", st.Line, st.Col)
+		b := c.lookup(st.Name)
+		b.isFn = true
+		b.used = true // don't lint named helper fns
+		c.level++
+		ft := c.inferExpr(st.Fn)
+		c.level--
+		b.scheme = c.generalize(ft) // before unify: see top-level FnDecl note
+		c.unifyAt(tv, ft, st.Line, st.Col, "in this function")
+	case *EnumDecl:
+		c.errorf(st.Line, st.Col, "E0637", "", "enum declarations are only allowed at top level")
+	case *ExprStmt:
+		t := c.inferExpr(st.E)
+		switch r := resolve(t).(type) {
+		case *TCon:
+			if r.Name == "Result" || r.Name == "Option" {
+				c.errorf(st.Line, st.Col, "unused_must_use",
+					"handle it with `match`/`?`, or discard explicitly with `let _ = ...`",
+					"unused `%s` value must be handled", r.Name)
+			}
+		}
+	case *AssignStmt:
+		switch tgt := st.Target.(type) {
+		case *Ident:
+			b := c.lookup(tgt.Name)
+			if b == nil {
+				c.errorf(tgt.Line, tgt.Col, "E0425", "declare it first: `let mut "+tgt.Name+" = ...`",
+					"cannot assign to undeclared variable `%s`", tgt.Name)
+				c.inferExpr(st.Val)
+				return
+			}
+			if !b.mut {
+				c.errorf(tgt.Line, tgt.Col, "E0384",
+					fmt.Sprintf("make this binding mutable: `let mut %s`", tgt.Name),
+					"cannot assign twice to immutable variable `%s`", tgt.Name)
+			}
+			vt := c.inferExpr(st.Val)
+			c.unifyAt(c.instantiate(b.scheme), vt, st.Line, st.Col, "in this assignment")
+		case *Index:
+			el := c.fresh("")
+			tt := c.inferExpr(tgt.Target)
+			c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, tgt.Line, tgt.Col, "when indexing")
+			it := c.inferExpr(tgt.Idx)
+			c.unifyAt(it, tInt, tgt.Line, tgt.Col, "in this index")
+			vt := c.inferExpr(st.Val)
+			c.unifyAt(el, vt, st.Line, st.Col, "in this assignment")
+		}
+	case *WhileStmt:
+		ct := c.inferExpr(st.Cond)
+		c.unifyAt(ct, tBool, st.Line, st.Col, "in this `while` condition")
+		c.loop++
+		c.pushScope()
+		c.inferBlockStmts(st.Body)
+		c.popScope()
+		c.loop--
+	case *ForStmt:
+		el := c.fresh("")
+		it := c.inferExpr(st.Iter)
+		c.unifyAt(it, &TCon{Name: "list", Args: []Ty{el}}, st.Line, st.Col, "in this `for` loop (iterate over a list)")
+		c.loop++
+		c.pushScope()
+		c.declare(st.Var, &Scheme{t: el}, false, "local", st.Line, st.Col)
+		c.inferBlockStmts(st.Body)
+		c.popScope()
+		c.loop--
+	case *ReturnStmt:
+		var t Ty = tUnit
+		if st.Val != nil {
+			t = c.inferExpr(st.Val)
+		}
+		if len(c.retTys) == 0 {
+			c.errorf(st.Line, st.Col, "E0572", "", "`return` outside of a function")
+			return
+		}
+		c.unifyAt(c.retTys[len(c.retTys)-1], t, st.Line, st.Col, "in this `return`")
+	case *SpawnStmt:
+		c.inferExpr(st.CallE)
+	case *SendStmt:
+		el := c.fresh("")
+		ct := c.inferExpr(st.Chan)
+		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, st.Line, st.Col, "on the left of `<-` (need a channel)")
+		vt := c.inferExpr(st.Val)
+		c.unifyAt(el, vt, st.Line, st.Col, "in this send")
+	case *BreakStmt, *ContinueStmt:
+		// loop nesting validated by the compiler
+	}
+}
+
+func (c *Checker) inferBlockStmts(b *Block) {
+	for _, s := range b.Stmts {
+		c.inferStmt(s)
+	}
+}
+
+// ---- expressions ----
+
+var (
+	tInt   = &TCon{Name: "int"}
+	tFloat = &TCon{Name: "float"}
+	tBool  = &TCon{Name: "bool"}
+	tStr   = &TCon{Name: "str"}
+	tUnit  = &TCon{Name: "unit"}
+)
+
+func (c *Checker) inferExpr(e Expr) Ty {
+	switch ex := e.(type) {
+	case *IntLit:
+		return tInt
+	case *FloatLit:
+		return tFloat
+	case *StrLit:
+		return tStr
+	case *BoolLit:
+		return tBool
+	case *Ident:
+		if b := c.lookup(ex.Name); b != nil {
+			b.used = true
+			return c.instantiate(b.scheme)
+		}
+		// bare enum variant
+		if sig, idx, amb := c.findVariantSig(ex.Name); amb {
+			c.errorf(ex.Line, ex.Col, "E0659",
+				fmt.Sprintf("qualify it, e.g. `SomeEnum.%s`", ex.Name),
+				"`%s` is a variant of several enums", ex.Name)
+			return c.fresh("")
+		} else if idx >= 0 {
+			return c.variantType(sig, idx)
+		}
+		c.errorf(ex.Line, ex.Col, "E0425", "", "cannot find `%s` in this scope", ex.Name)
+		return c.fresh("")
+	case *VariantAccess:
+		sig, ok := c.enums[ex.EnumName]
+		if !ok {
+			c.errorf(ex.Line, ex.Col, "E0412", "", "cannot find enum `%s`", ex.EnumName)
+			return c.fresh("")
+		}
+		for i, v := range sig.Variants {
+			if v.Name == ex.Variant {
+				return c.variantType(sig, i)
+			}
+		}
+		c.errorf(ex.Line, ex.Col, "E0599", "", "enum `%s` has no variant `%s`", ex.EnumName, ex.Variant)
+		return c.fresh("")
+	case *Unary:
+		t := c.inferExpr(ex.Rhs)
+		if ex.Op == TMinus {
+			c.unifyAt(t, c.fresh("num"), ex.Line, ex.Col, "with unary `-`")
+			return t
+		}
+		c.unifyAt(t, tBool, ex.Line, ex.Col, "with `!`")
+		return tBool
+	case *Binary:
+		lt := c.inferExpr(ex.Lhs)
+		rt := c.inferExpr(ex.Rhs)
+		switch ex.Op {
+		case TPlus:
+			c.unifyAt(lt, rt, ex.Line, ex.Col, "with `+` (no implicit conversions: use to_float()/trunc())")
+			c.unifyAt(lt, c.fresh("addord"), ex.Line, ex.Col, "with `+`")
+			return lt
+		case TMinus, TStar, TSlash:
+			c.unifyAt(lt, rt, ex.Line, ex.Col, "with this operator (no implicit conversions: use to_float()/trunc())")
+			c.unifyAt(lt, c.fresh("num"), ex.Line, ex.Col, "with this arithmetic operator")
+			return lt
+		case TPercent:
+			c.unifyAt(lt, tInt, ex.Line, ex.Col, "with `%` (int only)")
+			c.unifyAt(rt, tInt, ex.Line, ex.Col, "with `%` (int only)")
+			return tInt
+		case TLt, TLtEq, TGt, TGtEq:
+			c.unifyAt(lt, rt, ex.Line, ex.Col, "in this comparison (no implicit conversions)")
+			c.unifyAt(lt, c.fresh("addord"), ex.Line, ex.Col, "in this comparison")
+			return tBool
+		case TEqEq, TBangEq:
+			c.unifyAt(lt, rt, ex.Line, ex.Col, "in this equality (both sides must be the same type)")
+			return tBool
+		}
+		return c.fresh("")
+	case *Logical:
+		lt := c.inferExpr(ex.Lhs)
+		rt := c.inferExpr(ex.Rhs)
+		c.unifyAt(lt, tBool, ex.Line, ex.Col, "with `&&`/`||`")
+		c.unifyAt(rt, tBool, ex.Line, ex.Col, "with `&&`/`||`")
+		return tBool
+	case *Call:
+		return c.inferCall(ex)
+	case *Index:
+		el := c.fresh("")
+		tt := c.inferExpr(ex.Target)
+		c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, ex.Line, ex.Col,
+			"when indexing (only lists; for strings use char_at())")
+		it := c.inferExpr(ex.Idx)
+		c.unifyAt(it, tInt, ex.Line, ex.Col, "in this index")
+		return el
+	case *ListLit:
+		el := c.fresh("")
+		for _, e := range ex.Elems {
+			t := c.inferExpr(e)
+			c.unifyAt(el, t, ex.Line, ex.Col, "in this list (all elements must share one type)")
+		}
+		return &TCon{Name: "list", Args: []Ty{el}}
+	case *FnLit:
+		c.pushScope()
+		params := make([]Ty, len(ex.Params))
+		for i, p := range ex.Params {
+			params[i] = c.fresh("")
+			c.declare(p, &Scheme{t: params[i]}, false, "param", ex.Line, ex.Col)
+		}
+		ret := c.fresh("")
+		c.retTys = append(c.retTys, ret)
+		bt := c.inferBlockExpr(ex.Body)
+		c.unifyAt(ret, bt, ex.Line, ex.Col, "as this function's result")
+		c.retTys = c.retTys[:len(c.retTys)-1]
+		c.popScope()
+		return &TFunc{Params: params, Ret: ret}
+	case *Block:
+		c.pushScope()
+		t := c.inferBlockExprNoScope(ex)
+		c.popScope()
+		return t
+	case *IfExpr:
+		ct := c.inferExpr(ex.Cond)
+		c.unifyAt(ct, tBool, ex.Line, ex.Col, "in this `if` condition")
+		tt := c.inferExpr(ex.Then)
+		if ex.Else == nil {
+			c.unifyAt(tt, tUnit, ex.Line, ex.Col,
+				"in this `if` (without an `else`, the branch must be unit)")
+			return tUnit
+		}
+		et := c.inferExpr(ex.Else)
+		c.unifyAt(tt, et, ex.Line, ex.Col, "between `if` and `else` branches")
+		return tt
+	case *MatchExpr:
+		return c.inferMatch(ex)
+	case *TryExpr:
+		return c.inferTry(ex)
+	case *RecvExpr:
+		el := c.fresh("")
+		ct := c.inferExpr(ex.Chan)
+		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, ex.Line, ex.Col, "with `<-` (need a channel)")
+		return el
+	}
+	return c.fresh("")
+}
+
+func (c *Checker) inferBlockExpr(b *Block) Ty {
+	c.pushScope()
+	t := c.inferBlockExprNoScope(b)
+	c.popScope()
+	return t
+}
+
+func (c *Checker) inferBlockExprNoScope(b *Block) Ty {
+	n := len(b.Stmts)
+	for i, s := range b.Stmts {
+		if i == n-1 {
+			if es, ok := s.(*ExprStmt); ok {
+				return c.inferExpr(es.E)
+			}
+		}
+		c.inferStmt(s)
+	}
+	return tUnit
+}
+
+func (c *Checker) variantType(sig *EnumSig, idx int) Ty {
+	enumTy, subst := c.instantiateEnum(sig)
+	v := sig.Variants[idx]
+	if len(v.Fields) == 0 {
+		return enumTy
+	}
+	fields := make([]Ty, len(v.Fields))
+	for i, f := range v.Fields {
+		fields[i] = c.convertTypeExpr(f, subst)
+	}
+	return &TFunc{Params: fields, Ret: enumTy}
+}
+
+func (c *Checker) inferCall(ex *Call) Ty {
+	// special-cased natives
+	if id, ok := ex.Callee.(*Ident); ok {
+		if b := c.lookup(id.Name); b != nil && b.special != "" {
+			b.used = true
+			switch b.special {
+			case "printf": // print/println: variadic, any types
+				for _, a := range ex.Args {
+					c.inferExpr(a)
+				}
+				return tUnit
+			case "chan":
+				if len(ex.Args) > 1 {
+					c.errorf(ex.Line, ex.Col, "E0061", "", "chan() takes at most one argument (the capacity)")
+				}
+				for _, a := range ex.Args {
+					at := c.inferExpr(a)
+					c.unifyAt(at, tInt, ex.Line, ex.Col, "as the channel capacity")
+				}
+				return &TCon{Name: "chan", Args: []Ty{c.fresh("")}}
+			}
+		}
+	}
+	ct := c.inferExpr(ex.Callee)
+	args := make([]Ty, len(ex.Args))
+	for i, a := range ex.Args {
+		args[i] = c.inferExpr(a)
+	}
+	// better arity errors when the callee type is already concrete
+	if f, ok := resolve(ct).(*TFunc); ok && len(f.Params) != len(args) {
+		c.errorf(ex.Line, ex.Col, "E0061", "",
+			"this call takes %d argument(s) but %d were supplied", len(f.Params), len(args))
+		return f.Ret
+	}
+	ret := c.fresh("")
+	c.unifyAt(ct, &TFunc{Params: args, Ret: ret}, ex.Line, ex.Col, "in this call")
+	return ret
+}
+
+func (c *Checker) inferTry(ex *TryExpr) Ty {
+	t := c.inferExpr(ex.Inner)
+	if len(c.retTys) == 0 {
+		c.errorf(ex.Line, ex.Col, "E0277", "", "`?` can only be used inside a function")
+		return c.fresh("")
+	}
+	ret := c.retTys[len(c.retTys)-1]
+	switch r := resolve(t).(type) {
+	case *TCon:
+		switch r.Name {
+		case "Result":
+			e := c.fresh("")
+			ok := c.fresh("")
+			c.unifyAt(t, &TCon{Name: "Result", Args: []Ty{ok, e}}, ex.Line, ex.Col, "with `?`")
+			b := c.fresh("")
+			c.unifyAt(ret, &TCon{Name: "Result", Args: []Ty{b, e}}, ex.Line, ex.Col,
+				"with `?` (the enclosing function must return a Result with the same error type)")
+			return ok
+		case "Option":
+			v := c.fresh("")
+			c.unifyAt(t, &TCon{Name: "Option", Args: []Ty{v}}, ex.Line, ex.Col, "with `?`")
+			b := c.fresh("")
+			c.unifyAt(ret, &TCon{Name: "Option", Args: []Ty{b}}, ex.Line, ex.Col,
+				"with `?` (the enclosing function must return an Option)")
+			return v
+		}
+	}
+	c.errorf(ex.Line, ex.Col, "E0277", "", "`?` needs an `Option` or `Result`, found `%s`", pretty(t))
+	return c.fresh("")
+}
+
+// ---- match & exhaustiveness ----
+
+func (c *Checker) inferMatch(m *MatchExpr) Ty {
+	scrutT := c.inferExpr(m.Scrut)
+	resT := c.fresh("")
+
+	covered := map[string]bool{} // variant names / "true"/"false"
+	hasCatchAll := false
+
+	for _, arm := range m.Arms {
+		c.pushScope()
+		switch pat := arm.Pat.(type) {
+		case *PatWildcard:
+			hasCatchAll = true
+		case *PatLiteral:
+			var lt Ty
+			switch pat.Val.(type) {
+			case *IntLit:
+				lt = tInt
+			case *FloatLit:
+				lt = tFloat
+			case *StrLit:
+				lt = tStr
+			case *BoolLit:
+				lt = tBool
+				if b, ok := pat.Val.(*BoolLit); ok {
+					covered[fmt.Sprintf("%v", b.Val)] = true
+				}
+			}
+			c.unifyAt(scrutT, lt, pat.Line, pat.Col, "between this pattern and the matched value")
+		case *PatBinding:
+			if sig, idx, amb := c.findVariantSig(pat.Name); amb {
+				c.errorf(pat.Line, pat.Col, "E0659",
+					fmt.Sprintf("qualify it, e.g. `SomeEnum.%s`", pat.Name),
+					"`%s` is a variant of several enums", pat.Name)
+			} else if idx >= 0 && len(sig.Variants[idx].Fields) == 0 {
+				enumTy, _ := c.instantiateEnum(sig)
+				c.unifyAt(scrutT, enumTy, pat.Line, pat.Col, "between this pattern and the matched value")
+				covered[pat.Name] = true
+			} else if idx >= 0 {
+				c.errorf(pat.Line, pat.Col, "E0532", "",
+					"variant `%s` has %d field(s); bind them: `%s(...)`", pat.Name, len(sig.Variants[idx].Fields), pat.Name)
+			} else {
+				hasCatchAll = true
+				c.declare(pat.Name, &Scheme{t: scrutT}, false, "local", pat.Line, pat.Col)
+			}
+		case *PatVariant:
+			var sig *EnumSig
+			idx := -1
+			if pat.EnumName != "" {
+				s, ok := c.enums[pat.EnumName]
+				if !ok {
+					c.errorf(pat.Line, pat.Col, "E0412", "", "cannot find enum `%s`", pat.EnumName)
+				} else {
+					sig = s
+					for i, v := range sig.Variants {
+						if v.Name == pat.Variant {
+							idx = i
+							break
+						}
+					}
+					if idx < 0 {
+						c.errorf(pat.Line, pat.Col, "E0599", "", "enum `%s` has no variant `%s`", pat.EnumName, pat.Variant)
+						sig = nil
+					}
+				}
+			} else {
+				s, i, amb := c.findVariantSig(pat.Variant)
+				if amb {
+					c.errorf(pat.Line, pat.Col, "E0659",
+						fmt.Sprintf("qualify it, e.g. `SomeEnum.%s`", pat.Variant),
+						"`%s` is a variant of several enums", pat.Variant)
+				} else if i < 0 {
+					c.errorf(pat.Line, pat.Col, "E0425", "", "cannot find variant `%s`", pat.Variant)
+				} else {
+					sig, idx = s, i
+				}
+			}
+			if sig != nil && idx >= 0 {
+				enumTy, subst := c.instantiateEnum(sig)
+				c.unifyAt(scrutT, enumTy, pat.Line, pat.Col, "between this pattern and the matched value")
+				fields := sig.Variants[idx].Fields
+				if len(pat.Binds) != len(fields) {
+					c.errorf(pat.Line, pat.Col, "E0023", "",
+						"variant `%s` has %d field(s), pattern binds %d", pat.Variant, len(fields), len(pat.Binds))
+				} else {
+					for i, sub := range pat.Binds {
+						ft := c.convertTypeExpr(fields[i], subst)
+						if b, ok := sub.(*PatBinding); ok {
+							c.declare(b.Name, &Scheme{t: ft}, false, "local", b.Line, b.Col)
+						}
+					}
+				}
+				covered[pat.Variant] = true
+			}
+		}
+		bt := c.inferExpr(arm.Body)
+		c.unifyAt(resT, bt, arm.Line, arm.Col, "between the arms of this `match` (all arms must produce one type)")
+		c.popScope()
+	}
+
+	// exhaustiveness
+	if !hasCatchAll {
+		switch s := resolve(scrutT).(type) {
+		case *TCon:
+			if sig, ok := c.enums[s.Name]; ok {
+				var missing []string
+				for _, v := range sig.Variants {
+					if !covered[v.Name] {
+						missing = append(missing, "`"+v.Name+"`")
+					}
+				}
+				if len(missing) > 0 {
+					c.errorf(m.Line, m.Col, "E0004",
+						"add the missing arms, or a `_ => ...` catch-all",
+						"non-exhaustive `match`: variant(s) %s not covered", strings.Join(missing, ", "))
+				}
+			} else if s.Name == "bool" {
+				if !covered["true"] || !covered["false"] {
+					c.errorf(m.Line, m.Col, "E0004",
+						"cover both `true` and `false`, or add `_ => ...`",
+						"non-exhaustive `match` on bool")
+				}
+			} else {
+				c.errorf(m.Line, m.Col, "E0004",
+					"add a final binding or `_ => ...` arm",
+					"non-exhaustive `match`: `%s` cannot be enumerated", pretty(scrutT))
+			}
+		default:
+			c.errorf(m.Line, m.Col, "E0004",
+				"add a final binding or `_ => ...` arm",
+				"non-exhaustive `match`")
+		}
+	}
+	return resT
+}
+
+// ---- builtins ----
+
+func (c *Checker) declareBuiltins() {
+	c.enums["Option"] = &EnumSig{
+		Name: "Option", Params: []string{"a"},
+		Variants: []VariantSig{
+			{Name: "Some", Fields: []TypeExpr{&TEName{Name: "a"}}},
+			{Name: "None"},
+		},
+	}
+	c.enums["Result"] = &EnumSig{
+		Name: "Result", Params: []string{"a", "e"},
+		Variants: []VariantSig{
+			{Name: "Ok", Fields: []TypeExpr{&TEName{Name: "a"}}},
+			{Name: "Err", Fields: []TypeExpr{&TEName{Name: "e"}}},
+		},
+	}
+
+	mono := func(t Ty) *Scheme { return &Scheme{t: t} }
+	fn := func(ret Ty, ps ...Ty) *TFunc { return &TFunc{Params: ps, Ret: ret} }
+	list := func(t Ty) Ty { return &TCon{Name: "list", Args: []Ty{t}} }
+
+	poly1 := func(mk func(a *TV) *TFunc) *Scheme {
+		a := &TV{id: -1, level: 1}
+		return &Scheme{vars: []*TV{a}, t: mk(a)}
+	}
+
+	decl := func(name string, s *Scheme) {
+		c.declare(name, s, false, "native", 0, 0)
+	}
+
+	decl("len", poly1(func(a *TV) *TFunc { return fn(tInt, list(a)) }))
+	decl("push", poly1(func(a *TV) *TFunc { return fn(tUnit, list(a), a) }))
+	decl("pop", poly1(func(a *TV) *TFunc { return fn(a, list(a)) }))
+	decl("str", poly1(func(a *TV) *TFunc { return fn(tStr, a) }))
+	decl("type_of", poly1(func(a *TV) *TFunc { return fn(tStr, a) }))
+	decl("str_len", mono(fn(tInt, tStr)))
+	decl("char_at", mono(fn(tStr, tStr, tInt)))
+	decl("trunc", mono(fn(tInt, tFloat)))
+	decl("to_float", mono(fn(tFloat, tInt)))
+	decl("parse_int", mono(fn(&TCon{Name: "Option", Args: []Ty{tInt}}, tStr)))
+	decl("parse_float", mono(fn(&TCon{Name: "Option", Args: []Ty{tFloat}}, tStr)))
+	decl("range", mono(fn(list(tInt), tInt, tInt)))
+	decl("clock", mono(fn(tFloat)))
+	decl("assert", mono(fn(tUnit, tBool, tStr)))
+	decl("gc", mono(fn(tInt)))
+	decl("heap_objects", mono(fn(tInt)))
+	decl("gc_cycles", mono(fn(tInt)))
+	decl("chr", mono(fn(tStr, tInt)))
+	decl("ord", mono(fn(tInt, tStr)))
+	decl("yield", mono(fn(tUnit)))
+
+	decl("print", mono(fn(tUnit)))
+	c.scopes[0]["print"].special = "printf"
+	decl("println", mono(fn(tUnit)))
+	c.scopes[0]["println"].special = "printf"
+	decl("chan", mono(fn(&TCon{Name: "chan", Args: []Ty{tUnit}})))
+	c.scopes[0]["chan"].special = "chan"
+}
+
+// ---- pretty-printing ----
+
+func pretty(t Ty) string {
+	names := map[*TV]string{}
+	return prettyWith(t, names)
+}
+
+func prettyWith(t Ty, names map[*TV]string) string {
+	switch x := resolve(t).(type) {
+	case *TV:
+		n, ok := names[x]
+		if !ok {
+			n = "'" + string(rune('a'+len(names)%26))
+			names[x] = n
+		}
+		if x.con != "" {
+			return n + ":" + x.con
+		}
+		return n
+	case *TCon:
+		switch x.Name {
+		case "list":
+			return "[" + prettyWith(x.Args[0], names) + "]"
+		case "chan":
+			return "chan(" + prettyWith(x.Args[0], names) + ")"
+		}
+		if len(x.Args) == 0 {
+			return x.Name
+		}
+		parts := make([]string, len(x.Args))
+		for i, a := range x.Args {
+			parts[i] = prettyWith(a, names)
+		}
+		return x.Name + "(" + strings.Join(parts, ", ") + ")"
+	case *TFunc:
+		parts := make([]string, len(x.Params))
+		for i, p := range x.Params {
+			parts[i] = prettyWith(p, names)
+		}
+		return "fn(" + strings.Join(parts, ", ") + ") -> " + prettyWith(x.Ret, names)
+	}
+	return "?"
+}
