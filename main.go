@@ -59,14 +59,19 @@ func usage() {
 	fmt.Println(`Burryn ` + version + ` — a small language forged from Go and Rust
 
 usage:
-  bur run <file.bur>     typecheck and run a program
-  bur <file.bur>         same as run
-  bur check <file.bur>   typecheck only (rustc-style diagnostics)
-  bur dis <file.bur>     disassemble compiled bytecode
+  bur run <file.bur>     typecheck and run a script
+  bur run <dir>          run a module package (needs bur.mod, fn main)
+  bur <file.bur|dir>     same as run
+  bur check <file|dir>   typecheck only (rustc-style diagnostics)
+  bur dis <file|dir>     disassemble compiled bytecode
   bur version`)
 }
 
 func runFile(path string, mode int) {
+	if st, err := os.Stat(path); err == nil && st.IsDir() {
+		runModule(path, mode)
+		return
+	}
 	srcBytes, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -114,13 +119,63 @@ func runFile(path string, mode int) {
 		os.Exit(exitStatic)
 	}
 	if mode == modeDis {
-		disasmAll(fn, shared.lines)
+		disasmAll(fn, shared)
 		return
 	}
 	vm := newVM(gc, shared)
 	if err := vm.run(fn); err != nil {
 		if re, ok := err.(*runtimeErr); ok {
 			render([]Diag{{IsErr: true, Msg: re.msg, Span: re.span}})
+		} else {
+			fmt.Fprintln(os.Stderr, err) // deadlock etc.: whole-program, no span
+		}
+		os.Exit(exitRuntime)
+	}
+}
+
+// runModule drives the module pipeline for a package directory argument.
+func runModule(dir string, mode int) {
+	m, loadDiags := loadModule(dir)
+	loadErrs, loadWarns := renderDiags(os.Stderr, loadDiags, m.Srcs)
+	if loadErrs > 0 {
+		if m.Path == "" { // no usable bur.mod: an input problem, not a compile error
+			os.Exit(exitNoInput)
+		}
+		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", loadErrs)
+		os.Exit(exitStatic)
+	}
+
+	diags := typecheckModule(m)
+	errs, warns := renderDiags(os.Stderr, diags, m.Srcs)
+	warns += loadWarns
+	if mode == modeCheck {
+		if errs > 0 {
+			fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s); %d warning(s)\n", errs, warns)
+			os.Exit(exitStatic)
+		}
+		fmt.Fprintf(os.Stderr, "ok: 0 errors, %d warning(s)\n", warns)
+		return
+	}
+	if errs > 0 {
+		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
+		os.Exit(exitStatic)
+	}
+
+	gc := newGC()
+	fn, shared, compDiags := compileModule(gc, m)
+	if len(compDiags) > 0 {
+		errs, _ := renderDiags(os.Stderr, compDiags, m.Srcs)
+		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
+		os.Exit(exitStatic)
+	}
+	if mode == modeDis {
+		disasmAll(fn, shared)
+		return
+	}
+	vm := newVM(gc, shared)
+	if err := vm.run(fn); err != nil {
+		if re, ok := err.(*runtimeErr); ok {
+			renderDiags(os.Stderr, []Diag{{IsErr: true, Msg: re.msg, File: re.file, Span: re.span}}, m.Srcs)
 		} else {
 			fmt.Fprintln(os.Stderr, err) // deadlock etc.: whole-program, no span
 		}

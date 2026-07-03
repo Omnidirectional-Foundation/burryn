@@ -69,6 +69,7 @@ type VM struct {
 
 type runtimeErr struct {
 	msg  string
+	file string // source file the span refers to; "" in scripts
 	span Span
 }
 
@@ -133,6 +134,10 @@ func (vm *VM) run(mainFn *OFunc) error {
 		done, err := vm.exec(f)
 		vm.current = nil
 		if err != nil {
+			// the erroring frame is still on top: attribute the span's file
+			if re, ok := err.(*runtimeErr); ok && re.file == "" && len(f.frames) > 0 {
+				re.file = f.frames[len(f.frames)-1].closure.Fn.File
+			}
 			return err
 		}
 		if done && f == vm.main {

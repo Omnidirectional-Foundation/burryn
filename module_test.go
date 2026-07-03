@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -437,4 +439,131 @@ fn main() {
 }
 `,
 	}, "E0004")
+}
+
+// runTree drives the full module pipeline (load, check, compile, run) and
+// returns the program's stdout plus any runtime error.
+func runTree(t *testing.T, files map[string]string, entry string) (string, error) {
+	t.Helper()
+	m, diags := loadTree(t, files, entry)
+	for _, d := range diags {
+		if d.IsErr {
+			t.Fatalf("load error: [%s] %s", d.Code, d.Msg)
+		}
+	}
+	for _, d := range typecheckModule(m) {
+		if d.IsErr {
+			t.Fatalf("type error: [%s] %s", d.Code, d.Msg)
+		}
+	}
+	gc := newGC()
+	fn, shared, compDiags := compileModule(gc, m)
+	if len(compDiags) > 0 {
+		t.Fatalf("compile error: [%s] %s", compDiags[0].Code, compDiags[0].Msg)
+	}
+	var buf bytes.Buffer
+	vm := newVM(gc, shared)
+	vm.out = &buf
+	err := vm.run(fn)
+	return buf.String(), err
+}
+
+func expectModuleOut(t *testing.T, files map[string]string, want string) {
+	t.Helper()
+	out, err := runTree(t, files, ".")
+	if err != nil {
+		t.Fatalf("runtime error: %v\noutput so far:\n%s", err, out)
+	}
+	if out != want {
+		t.Fatalf("wrong output\n--- got ---\n%s\n--- want ---\n%s", out, want)
+	}
+}
+
+func TestModuleRunCrossPackage(t *testing.T) {
+	expectModuleOut(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur": `import "example.com/m/geo"
+
+fn main() {
+    let s = geo.Shape.Rect(3, 4)
+    println(geo.area(s))
+    match s {
+        geo.Shape.Circle(r) => println("circle", r),
+        geo.Shape.Rect(w, h) => println("rect", w, h),
+    }
+    println(geo.inc(41))
+}
+`,
+	}, "12.0\nrect 3 4\n42\n")
+}
+
+func TestModuleRunMultiFilePackage(t *testing.T) {
+	expectModuleOut(t, map[string]string{
+		"bur.mod": modHeader,
+		"a.bur":   "fn main() {\n    println(greet(\"bur\"))\n}\n",
+		"b.bur":   "fn greet(name) { \"hello \" + name }\n",
+	}, "hello bur\n")
+}
+
+func TestModuleRunPackageLevelLets(t *testing.T) {
+	expectModuleOut(t, map[string]string{
+		"bur.mod":   modHeader,
+		"cfg/c.bur": "pub let limit = 2 * 21\npub let mut hits = [1]\n",
+		"main.bur": `import "example.com/m/cfg"
+
+fn main() {
+    println(cfg.limit)
+    push(cfg.hits, 2)
+    println(cfg.hits)
+}
+`,
+	}, "42\n[1, 2]\n")
+}
+
+func TestModuleRunSameNameInTwoPackages(t *testing.T) {
+	expectModuleOut(t, map[string]string{
+		"bur.mod":  modHeader,
+		"a/a.bur":  "pub fn tag() { \"a\" }\n",
+		"b/b.bur":  "pub fn tag() { \"b\" }\n",
+		"main.bur": "import \"example.com/m/a\"\nimport \"example.com/m/b\"\n\nfn main() {\n    println(a.tag(), b.tag())\n}\n",
+	}, "a b\n")
+}
+
+func TestModuleRunBuiltinsInsidePackages(t *testing.T) {
+	expectModuleOut(t, map[string]string{
+		"bur.mod":    modHeader,
+		"util/u.bur": "pub fn half(n) {\n    if n % 2 == 0 { Some(n / 2) } else { None }\n}\n",
+		"main.bur": `import "example.com/m/util"
+
+fn main() {
+    match util.half(10) {
+        Some(h) => println(h),
+        None => println("odd"),
+    }
+}
+`,
+	}, "5\n")
+}
+
+func TestModuleRuntimeErrorCarriesFile(t *testing.T) {
+	_, err := runTree(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": "pub fn boom() {\n    let xs = [1]\n    xs[9]\n}\n",
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    println(geo.boom())\n}\n",
+	}, ".")
+	re, ok := err.(*runtimeErr)
+	if !ok {
+		t.Fatalf("expected *runtimeErr, got %v", err)
+	}
+	if !strings.HasSuffix(re.file, "g.bur") {
+		t.Fatalf("runtime error attributed to %q, want the geo file", re.file)
+	}
+}
+
+func TestModuleRunMainReturnValueIgnored(t *testing.T) {
+	expectModuleOut(t, map[string]string{
+		"bur.mod":  modHeader,
+		"main.bur": "fn main() {\n    println(\"done\")\n    42\n}\n",
+	}, "done\n")
 }
