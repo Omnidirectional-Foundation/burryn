@@ -54,18 +54,18 @@ const (
 
 type Chunk struct {
 	Code   []byte
-	Lines  []int // parallel to Code
+	Spans  []Span // parallel to Code: source span of each instruction byte
 	Consts []Value
 }
 
-func (c *Chunk) write(b byte, line int) {
+func (c *Chunk) write(b byte, sp Span) {
 	c.Code = append(c.Code, b)
-	c.Lines = append(c.Lines, line)
+	c.Spans = append(c.Spans, sp)
 }
 
-func (c *Chunk) writeU16(v uint16, line int) {
-	c.write(byte(v>>8), line)
-	c.write(byte(v&0xff), line)
+func (c *Chunk) writeU16(v uint16, sp Span) {
+	c.write(byte(v>>8), sp)
+	c.write(byte(v&0xff), sp)
 }
 
 func (c *Chunk) addConst(v Value) uint16 {

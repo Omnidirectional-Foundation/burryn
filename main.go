@@ -109,12 +109,16 @@ func runFile(path string, mode int) {
 		os.Exit(exitStatic)
 	}
 	if mode == modeDis {
-		disasmAll(fn)
+		disasmAll(fn, shared.lines)
 		return
 	}
 	vm := newVM(gc, shared)
 	if err := vm.run(fn); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		if re, ok := err.(*runtimeErr); ok {
+			renderDiags(os.Stderr, []Diag{{IsErr: true, Msg: re.msg, Span: re.span}}, path, src)
+		} else {
+			fmt.Fprintln(os.Stderr, err) // deadlock etc.: whole-program, no span
+		}
 		os.Exit(exitRuntime)
 	}
 }

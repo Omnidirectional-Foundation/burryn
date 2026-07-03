@@ -12,7 +12,7 @@ import (
 func badFn(arity int, code ...byte) *OFunc {
 	fn := &OFunc{Name: "bad", Arity: arity}
 	for _, b := range code {
-		fn.Chunk.write(b, 1)
+		fn.Chunk.write(b, Span{})
 	}
 	return fn
 }

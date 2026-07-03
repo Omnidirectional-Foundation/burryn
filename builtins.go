@@ -23,7 +23,7 @@ var nativeDefs = []nativeDef{
 		return Unit, nil
 	}},
 	{"len", 1, func(vm *VM, args []Value) (Value, error) {
-		n, err := lengthOf(args[0], 0)
+		n, err := lengthOf(args[0], Span{})
 		if err != nil {
 			return Unit, fmt.Errorf("len() needs a list or string, got %s", typeOf(args[0]))
 		}
