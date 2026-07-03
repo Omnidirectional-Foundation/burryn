@@ -79,9 +79,10 @@ func runFile(path string, mode int) {
 		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
-	stmts, err := parse(src, toks)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	stmts, parseDiags := parse(toks)
+	if len(parseDiags) > 0 {
+		errs, _ := renderDiags(os.Stderr, parseDiags, path, src)
+		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
 

@@ -6,35 +6,78 @@ import (
 )
 
 type Parser struct {
-	toks  []Token
-	pos   int
-	lines lineIndex // for line numbers in parse-error messages
+	toks []Token
+	pos  int
 }
 
-func parse(src string, toks []Token) (stmts []Stmt, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			if pe, ok := r.(parseErr); ok {
-				err = fmt.Errorf("%s", string(pe))
-				return
-			}
-			panic(r)
-		}
-	}()
-	p := &Parser{toks: toks, lines: newLineIndex(src)}
+// maxParseDiags stops error recovery once a source is hopelessly broken.
+const maxParseDiags = 20
+
+// parse builds statements from toks, collecting parse errors as diagnostics.
+// After an error it synchronizes to the next statement boundary and keeps
+// parsing, so several errors can be reported in one pass.
+func parse(toks []Token) (stmts []Stmt, diags []Diag) {
+	p := &Parser{toks: toks}
 	p.skipSemis()
-	for !p.check(TEOF) {
-		stmts = append(stmts, p.statement())
+	for !p.check(TEOF) && len(diags) < maxParseDiags {
+		if s, d := p.statementRecover(); d != nil {
+			diags = append(diags, *d)
+			p.synchronize()
+		} else {
+			stmts = append(stmts, s)
+		}
 		p.skipSemis()
 	}
-	return stmts, nil
+	return stmts, diags
 }
 
-type parseErr string
+// statementRecover parses one statement, catching a parse failure anywhere
+// inside it and returning it as a diagnostic.
+func (p *Parser) statementRecover() (s Stmt, d *Diag) {
+	defer func() {
+		if r := recover(); r != nil {
+			pe, ok := r.(parseErr)
+			if !ok {
+				panic(r)
+			}
+			dd := Diag(pe)
+			d = &dd
+		}
+	}()
+	return p.statement(), nil
+}
 
-func (p *Parser) fail(sp Span, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	panic(parseErr(fmt.Sprintf("parse error at line %d: %s", p.lines.line(sp.Start), msg)))
+// synchronize skips tokens until the next statement boundary: a semicolon at
+// the current brace depth (closers of blocks we bailed out of are swallowed
+// as residue) or a token that starts a statement.
+func (p *Parser) synchronize() {
+	depth := 0
+	for !p.check(TEOF) {
+		switch p.advance().Type {
+		case TLBrace:
+			depth++
+		case TRBrace:
+			if depth > 0 {
+				depth--
+			}
+		case TSemi:
+			if depth == 0 && !p.check(TRBrace) {
+				return
+			}
+		}
+		if depth == 0 {
+			switch p.peek().Type {
+			case TLet, TFn, TEnum, TWhile, TFor, TReturn, TSpawn, TBreak, TContinue:
+				return
+			}
+		}
+	}
+}
+
+type parseErr Diag
+
+func (p *Parser) fail(sp Span, code, help, format string, args ...any) {
+	panic(parseErr(Diag{IsErr: true, Code: code, Msg: fmt.Sprintf(format, args...), Help: help, Span: sp}))
 }
 
 func (p *Parser) peek() Token          { return p.toks[p.pos] }
@@ -64,7 +107,7 @@ func (p *Parser) expect(t TokType, what string) Token {
 		return p.advance()
 	}
 	tok := p.peek()
-	p.fail(tok.Span, "expected %s, got %q", what, tok.Lex)
+	p.fail(tok.Span, "E1101", "", "expected %s, got %q", what, tok.Lex)
 	return Token{}
 }
 
@@ -84,7 +127,7 @@ func (p *Parser) endStmt() {
 		return
 	}
 	tok := p.peek()
-	p.fail(tok.Span, "expected end of statement, got %q", tok.Lex)
+	p.fail(tok.Span, "E1102", "separate statements with a newline or ';'", "expected end of statement, got %q", tok.Lex)
 }
 
 // ---- statements ----
@@ -129,7 +172,7 @@ func (p *Parser) statement() Stmt {
 		switch e.(type) {
 		case *Ident, *Index:
 		default:
-			p.fail(e.span(), "invalid assignment target")
+			p.fail(e.span(), "E1103", "only a variable or an index expression can be assigned to", "invalid assignment target")
 		}
 		p.endStmt()
 		return &AssignStmt{Target: e, Val: val, Span: e.span().union(val.span())}
@@ -214,7 +257,7 @@ func (p *Parser) enumDecl() Stmt {
 		}
 		variants = append(variants, v)
 		if !p.match(TComma) && !p.check(TSemi) && !p.check(TRBrace) {
-			p.fail(p.peek().Span, "expected ',' or newline between enum variants")
+			p.fail(p.peek().Span, "E1104", "", "expected ',' or newline between enum variants")
 		}
 		p.skipSemis()
 	}
@@ -261,7 +304,7 @@ func (p *Parser) typeExpr() TypeExpr {
 		}
 		return te
 	}
-	p.fail(tok.Span, "expected a type, got %q", tok.Lex)
+	p.fail(tok.Span, "E1105", "", "expected a type, got %q", tok.Lex)
 	return nil
 }
 
@@ -287,7 +330,7 @@ func (p *Parser) spawnStmt() Stmt {
 	e := p.expression()
 	call, ok := e.(*Call)
 	if !ok {
-		p.fail(tok.Span, "spawn expects a function call, e.g. `spawn worker(ch)`")
+		p.fail(tok.Span, "E1106", "", "spawn expects a function call, e.g. `spawn worker(ch)`")
 	}
 	p.endStmt()
 	return &SpawnStmt{CallE: call, Span: tok.Span.union(call.Span)}
@@ -414,7 +457,7 @@ func (p *Parser) postfix() Expr {
 			d := p.advance()
 			id, ok := e.(*Ident)
 			if !ok {
-				p.fail(d.Span, "'.' is only used for enum variants (Enum.Variant)")
+				p.fail(d.Span, "E1107", "", "'.' is only used for enum variants (Enum.Variant)")
 			}
 			v := p.expect(TIdent, "variant name after '.'")
 			e = &VariantAccess{EnumName: id.Name, Variant: v.Lex, Span: id.Span.union(v.Span)}
@@ -431,14 +474,14 @@ func (p *Parser) primary() Expr {
 		p.advance()
 		n, err := strconv.ParseInt(tok.Lex, 10, 64)
 		if err != nil {
-			p.fail(tok.Span, "bad integer literal %q", tok.Lex)
+			p.fail(tok.Span, "E1108", "i64 holds -9223372036854775808..9223372036854775807", "bad integer literal %q", tok.Lex)
 		}
 		return &IntLit{Val: n, Span: tok.Span}
 	case TFloat:
 		p.advance()
 		f, err := strconv.ParseFloat(tok.Lex, 64)
 		if err != nil {
-			p.fail(tok.Span, "bad float literal %q", tok.Lex)
+			p.fail(tok.Span, "E1108", "", "bad float literal %q", tok.Lex)
 		}
 		return &FloatLit{Val: f, Span: tok.Span}
 	case TString:
@@ -482,7 +525,7 @@ func (p *Parser) primary() Expr {
 	case TLBrace:
 		return p.block()
 	}
-	p.fail(tok.Span, "unexpected token %q", tok.Lex)
+	p.fail(tok.Span, "E1109", "", "unexpected token %q", tok.Lex)
 	return nil
 }
 
@@ -516,14 +559,14 @@ func (p *Parser) matchExpr() Expr {
 		body := p.expression()
 		m.Arms = append(m.Arms, MatchArm{Pat: pat, Body: body, Span: pat.span().union(body.span())})
 		if !p.match(TComma) && !p.check(TSemi) && !p.check(TRBrace) {
-			p.fail(p.peek().Span, "expected ',' or newline between match arms")
+			p.fail(p.peek().Span, "E1104", "", "expected ',' or newline between match arms")
 		}
 		p.skipSemis()
 	}
 	rb := p.expect(TRBrace, "'}' after match arms")
 	m.Span = m.Span.union(rb.Span)
 	if len(m.Arms) == 0 {
-		p.fail(m.Span, "match must have at least one arm")
+		p.fail(m.Span, "E1110", "", "match must have at least one arm")
 	}
 	return m
 }
@@ -543,7 +586,7 @@ func (p *Parser) pattern() Pattern {
 		case *FloatLit:
 			l.Val = -l.Val
 		default:
-			p.fail(tok.Span, "'-' in pattern must precede a number")
+			p.fail(tok.Span, "E1111", "", "'-' in pattern must precede a number")
 		}
 		return &PatLiteral{Val: lit, Span: tok.Span.union(lit.span())}
 	case TIdent:
@@ -566,7 +609,7 @@ func (p *Parser) pattern() Pattern {
 				switch sub.(type) {
 				case *PatBinding, *PatWildcard:
 				default:
-					p.fail(sub.span(), "variant fields may only bind names or use '_'")
+					p.fail(sub.span(), "E1112", "", "variant fields may only bind names or use '_'")
 				}
 				pv.Binds = append(pv.Binds, sub)
 				if !p.match(TComma) {
@@ -583,6 +626,6 @@ func (p *Parser) pattern() Pattern {
 		// bare name: binding, or a nullary variant like None ??compiler decides
 		return &PatBinding{Name: variant, Span: sp}
 	}
-	p.fail(tok.Span, "invalid pattern %q", tok.Lex)
+	p.fail(tok.Span, "E1113", "", "invalid pattern %q", tok.Lex)
 	return nil
 }

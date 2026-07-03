@@ -17,8 +17,8 @@ func interpretMode(src string, skipCheck bool) (out string, compileError error, 
 	if err := diagsToErr(lexDiags); err != nil {
 		return "", err, nil
 	}
-	stmts, err := parse(src, toks)
-	if err != nil {
+	stmts, parseDiags := parse(toks)
+	if err := diagsToErr(parseDiags); err != nil {
 		return "", err, nil
 	}
 	if !skipCheck {
@@ -76,8 +76,8 @@ func checkDiags(t *testing.T, src string) []Diag {
 	if err := diagsToErr(lexDiags); err != nil {
 		t.Fatalf("lex error: %v", err)
 	}
-	stmts, err := parse(src, toks)
-	if err != nil {
+	stmts, parseDiags := parse(toks)
+	if err := diagsToErr(parseDiags); err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
 	return typecheck(stmts)
@@ -175,6 +175,53 @@ func TestLexUnterminatedString(t *testing.T) {
 	_, diags := lex("let s = \"oops")
 	if len(diags) != 1 || diags[0].Code != "E1002" {
 		t.Fatalf("expected one E1002 diag, got %v", diags)
+	}
+}
+
+// ---- parser diagnostics ----
+
+func parseSrc(t *testing.T, src string) ([]Stmt, []Diag) {
+	t.Helper()
+	toks, lexDiags := lex(src)
+	if err := diagsToErr(lexDiags); err != nil {
+		t.Fatalf("lex error: %v", err)
+	}
+	return parse(toks)
+}
+
+func TestParseErrorRecoveryCollectsSeveral(t *testing.T) {
+	stmts, diags := parseSrc(t, "let = 1\nlet b = )\nlet c = 3")
+	want := []string{"E1101", "E1109"}
+	if len(diags) != len(want) {
+		t.Fatalf("expected %d parse diags, got %d: %v", len(want), len(diags), diags)
+	}
+	for i, d := range diags {
+		if d.Code != want[i] {
+			t.Errorf("diag %d: expected code %s, got %s (%s)", i, want[i], d.Code, d.Msg)
+		}
+		if !d.IsErr || d.Span.End <= d.Span.Start {
+			t.Errorf("diag %d: bad IsErr/span: %+v", i, d)
+		}
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected the healthy trailing statement to survive, got %d stmts", len(stmts))
+	}
+}
+
+func TestParseErrorRecoveryInsideBlock(t *testing.T) {
+	stmts, diags := parseSrc(t, "fn f() {\n    let = 3\n}\nlet ok = 1")
+	if len(diags) != 1 {
+		t.Fatalf("expected one parse diag (no cascade from the block closer), got %d: %v", len(diags), diags)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected the statement after the broken fn to survive, got %d stmts", len(stmts))
+	}
+}
+
+func TestParseErrorCap(t *testing.T) {
+	_, diags := parseSrc(t, strings.Repeat("let = 1\n", maxParseDiags+10))
+	if len(diags) != maxParseDiags {
+		t.Fatalf("expected recovery to stop at %d diags, got %d", maxParseDiags, len(diags))
 	}
 }
 
