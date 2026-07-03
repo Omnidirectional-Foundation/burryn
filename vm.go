@@ -27,10 +27,10 @@ type Frame struct {
 }
 
 type Fiber struct {
-	id         int
-	stack      []Value
-	top        int
-	frames     []Frame
+	id          int
+	stack       []Value
+	top         int
+	frames      []Frame
 	status      FiberStatus
 	sendVal     Value       // pending value while blocked on send
 	selectChans []*OChannel // channels this fiber waits on while blocked in select
@@ -65,6 +65,7 @@ type VM struct {
 	start     time.Time
 	optEnum   *OEnumType
 	resEnum   *OEnumType
+	outEnum   *OEnumType
 	yieldFlag bool
 	parkRecv  *OChannel // set by the recv() native to ask OpCall to park & retry
 	out       io.Writer
@@ -87,11 +88,13 @@ func newVM(gc *GC, shared *Shared) *VM {
 		start:   time.Now(),
 		optEnum: shared.enums["Option"].runtime,
 		resEnum: shared.enums["Result"].runtime,
+		outEnum: shared.enums["Output"].runtime,
 		out:     os.Stdout,
 	}
 	gc.vm = vm
 	vm.globals["Option"] = ObjV(vm.optEnum)
 	vm.globals["Result"] = ObjV(vm.resEnum)
+	vm.globals["Output"] = ObjV(vm.outEnum)
 	registerNatives(vm)
 	return vm
 }

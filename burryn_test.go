@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -319,6 +320,33 @@ func TestReadDirSortedNames(t *testing.T) {
   Ok(names) => println(names)
   Err(e) => println("err:", e)
 }`, "[\"a.txt\", \"b.txt\"]\n")
+}
+
+func TestExecCapturesStdout(t *testing.T) {
+	if _, err := exec.LookPath("echo"); err != nil {
+		t.Skip("echo not on PATH")
+	}
+	expectOut(t, `match exec("echo", ["hello"]) {
+  Ok(o) => match o { Output(code, out, _) => println(code, trim(out)) }
+  Err(e) => println("spawn failed:", e)
+}`, "0 hello\n")
+}
+
+func TestExecNonzeroExitAndStderr(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not on PATH")
+	}
+	expectOut(t, `match exec("sh", ["-c", "echo oops 1>&2; exit 3"]) {
+  Ok(o) => match o { Output(code, _, err) => println(code, trim(err)) }
+  Err(e) => println("spawn failed:", e)
+}`, "3 oops\n")
+}
+
+func TestExecSpawnFailureIsErr(t *testing.T) {
+	expectOut(t, `match exec("no_such_command_burryn_xyz", []) {
+  Ok(_) => println("unexpected")
+  Err(_) => println("spawn failed")
+}`, "spawn failed\n")
 }
 
 func TestIntegerOverflowTraps(t *testing.T) {
