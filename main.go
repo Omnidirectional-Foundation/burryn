@@ -21,23 +21,23 @@ func main() {
 			usage()
 			os.Exit(exitUsage)
 		}
-		runFile(args[1], modeRun)
+		runFile(args[1], modeRun, args[2:])
 	case "check":
 		if len(args) < 2 {
 			usage()
 			os.Exit(exitUsage)
 		}
-		runFile(args[1], modeCheck)
+		runFile(args[1], modeCheck, nil)
 	case "dis":
 		if len(args) < 2 {
 			usage()
 			os.Exit(exitUsage)
 		}
-		runFile(args[1], modeDis)
+		runFile(args[1], modeDis, nil)
 	case "help", "-h", "--help":
 		usage()
 	default:
-		runFile(args[0], modeRun)
+		runFile(args[0], modeRun, args[1:])
 	}
 }
 
@@ -67,9 +67,9 @@ usage:
   bur version`)
 }
 
-func runFile(path string, mode int) {
+func runFile(path string, mode int, argv []string) {
 	if st, err := os.Stat(path); err == nil && st.IsDir() {
-		runModule(path, mode)
+		runModule(path, mode, argv)
 		return
 	}
 	srcBytes, err := os.ReadFile(path)
@@ -123,7 +123,11 @@ func runFile(path string, mode int) {
 		return
 	}
 	vm := newVM(gc, shared)
+	vm.args = argv
 	if err := vm.run(fn); err != nil {
+		if er, ok := err.(*exitRequest); ok {
+			os.Exit(er.code)
+		}
 		if re, ok := err.(*runtimeErr); ok {
 			render([]Diag{{IsErr: true, Msg: re.msg, Span: re.span}})
 		} else {
@@ -134,7 +138,7 @@ func runFile(path string, mode int) {
 }
 
 // runModule drives the module pipeline for a package directory argument.
-func runModule(dir string, mode int) {
+func runModule(dir string, mode int, argv []string) {
 	m, loadDiags := loadModule(dir)
 	loadErrs, loadWarns := renderDiags(os.Stderr, loadDiags, m.Srcs)
 	if loadErrs > 0 {
@@ -173,7 +177,11 @@ func runModule(dir string, mode int) {
 		return
 	}
 	vm := newVM(gc, shared)
+	vm.args = argv
 	if err := vm.run(fn); err != nil {
+		if er, ok := err.(*exitRequest); ok {
+			os.Exit(er.code)
+		}
 		if re, ok := err.(*runtimeErr); ok {
 			renderDiags(os.Stderr, []Diag{{IsErr: true, Msg: re.msg, File: re.file, Span: re.span}}, m.Srcs)
 		} else {

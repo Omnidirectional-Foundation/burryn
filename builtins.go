@@ -356,6 +356,23 @@ var nativeDefs = []nativeDef{
 		}
 		return vm.output(code, stdout.String(), stderr.String()), nil
 	}},
+	{"args", 0, func(vm *VM, args []Value) (Value, error) {
+		// root the list first, then grow it with fresh argument strings
+		lst := vm.gc.newList(make([]Value, 0, len(vm.args)))
+		f := vm.current
+		f.push(ObjV(lst))
+		for _, a := range vm.args {
+			lst.Elems = append(lst.Elems, ObjV(vm.gc.newString(a)))
+		}
+		f.pop()
+		return ObjV(lst), nil
+	}},
+	{"exit", 1, func(vm *VM, args []Value) (Value, error) {
+		if args[0].T != VInt {
+			return Unit, fmt.Errorf("exit() needs an int, got %s", typeOf(args[0]))
+		}
+		return Unit, &exitRequest{code: int(args[0].I)}
+	}},
 	{"chan", -1, func(vm *VM, args []Value) (Value, error) {
 		capacity := 0
 		if len(args) > 1 {
