@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -327,6 +329,33 @@ var nativeDefs = []nativeDef{
 		f.pop()
 		return res, nil
 	}},
+	{"exec", 2, func(vm *VM, args []Value) (Value, error) {
+		cmd, ok := asString(args[0])
+		argList, ok2 := asList(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("exec() needs (str, [str])")
+		}
+		cmdArgs := make([]string, len(argList.Elems))
+		for i, e := range argList.Elems {
+			s, ok := asString(e)
+			if !ok {
+				return Unit, fmt.Errorf("exec() args must be str, got %s", typeOf(e))
+			}
+			cmdArgs[i] = s
+		}
+		c := exec.Command(cmd, cmdArgs...)
+		var stdout, stderr bytes.Buffer
+		c.Stdout, c.Stderr = &stdout, &stderr
+		code := 0
+		if runErr := c.Run(); runErr != nil {
+			ee, ok := runErr.(*exec.ExitError)
+			if !ok { // spawn failure: command not found, not executable, ...
+				return vm.errStr(runErr.Error()), nil
+			}
+			code = ee.ExitCode()
+		}
+		return vm.output(code, stdout.String(), stderr.String()), nil
+	}},
 	{"chan", -1, func(vm *VM, args []Value) (Value, error) {
 		capacity := 0
 		if len(args) > 1 {
@@ -514,6 +543,22 @@ func (vm *VM) errStr(msg string) Value {
 	f := vm.current
 	f.push(ObjV(vm.gc.newString(msg)))
 	res := vm.err(f.peek(0))
+	f.pop()
+	return res
+}
+
+// output builds Ok(Output(code, stdout, stderr)), keeping each fresh string
+// and the enum instance rooted on the fiber stack across every allocation.
+func (vm *VM) output(code int, stdout, stderr string) Value {
+	f := vm.current
+	f.push(ObjV(vm.gc.newString(stdout))) // rooted at peek(1)
+	f.push(ObjV(vm.gc.newString(stderr))) // rooted at peek(0)
+	out := &OEnumInst{Enum: vm.outEnum, Variant: 0,
+		Fields: []Value{IntV(int64(code)), f.peek(1), f.peek(0)}}
+	vm.gc.alloc(out)
+	f.pop()                      // drop stderr; still reachable via out
+	f.stack[f.top-1] = ObjV(out) // replace stdout root with the Output root
+	res := vm.ok(f.peek(0))
 	f.pop()
 	return res
 }

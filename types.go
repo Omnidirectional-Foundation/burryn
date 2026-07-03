@@ -1460,6 +1460,15 @@ func (c *Checker) declareBuiltins() {
 			{Name: "Err", Fields: []TypeExpr{&TEName{Name: "e"}}},
 		},
 	}
+	// Output(code, stdout, stderr): the single-variant result of exec()
+	c.enums["Output"] = &EnumSig{
+		Name: "Output", Qual: "Output", Pub: true,
+		Variants: []VariantSig{
+			{Name: "Output", Fields: []TypeExpr{
+				&TEName{Name: "int"}, &TEName{Name: "str"}, &TEName{Name: "str"},
+			}},
+		},
+	}
 
 	mono := func(t Ty) *Scheme { return &Scheme{t: t} }
 	fn := func(ret Ty, ps ...Ty) *TFunc { return &TFunc{Params: ps, Ret: ret} }
@@ -1513,6 +1522,7 @@ func (c *Checker) declareBuiltins() {
 	decl("write_file", mono(fn(res(tUnit, tStr), tStr, tStr)))
 	decl("file_exists", mono(fn(tBool, tStr)))
 	decl("read_dir", mono(fn(res(list(tStr), tStr), tStr)))
+	decl("exec", mono(fn(res(&TCon{Name: "Output"}, tStr), tStr, list(tStr))))
 	decl("clock", mono(fn(tFloat)))
 	decl("assert", mono(fn(tUnit, tBool, tStr)))
 	decl("gc", mono(fn(tInt)))

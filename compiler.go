@@ -32,6 +32,7 @@ func newShared(gc *GC, srcs map[string]string) *Shared {
 	}
 	s.declareEnum("Option", "", []VariantInfo{{"Some", 1}, {"None", 0}})
 	s.declareEnum("Result", "", []VariantInfo{{"Ok", 1}, {"Err", 1}})
+	s.declareEnum("Output", "", []VariantInfo{{"Output", 3}})
 	for _, n := range nativeNames() {
 		s.globalMut[n] = false
 	}
