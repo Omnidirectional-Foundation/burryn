@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -276,6 +277,56 @@ var nativeDefs = []nativeDef{
 		}
 		return BoolV(false), nil
 	}},
+	{"read_file", 1, func(vm *VM, args []Value) (Value, error) {
+		path, ok := asString(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("read_file() needs a str, got %s", typeOf(args[0]))
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return vm.errStr(err.Error()), nil
+		}
+		return vm.okStr(string(data)), nil
+	}},
+	{"write_file", 2, func(vm *VM, args []Value) (Value, error) {
+		path, ok := asString(args[0])
+		contents, ok2 := asString(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("write_file() needs (str, str)")
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			return vm.errStr(err.Error()), nil
+		}
+		return vm.ok(Unit), nil
+	}},
+	{"file_exists", 1, func(vm *VM, args []Value) (Value, error) {
+		path, ok := asString(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("file_exists() needs a str, got %s", typeOf(args[0]))
+		}
+		_, err := os.Stat(path)
+		return BoolV(err == nil), nil
+	}},
+	{"read_dir", 1, func(vm *VM, args []Value) (Value, error) {
+		path, ok := asString(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("read_dir() needs a str, got %s", typeOf(args[0]))
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return vm.errStr(err.Error()), nil
+		}
+		// root the list first, then grow it with fresh name strings
+		lst := vm.gc.newList(make([]Value, 0, len(entries)))
+		f := vm.current
+		f.push(ObjV(lst))
+		for _, e := range entries {
+			lst.Elems = append(lst.Elems, ObjV(vm.gc.newString(e.Name())))
+		}
+		res := vm.ok(f.peek(0))
+		f.pop()
+		return res, nil
+	}},
 	{"chan", -1, func(vm *VM, args []Value) (Value, error) {
 		capacity := 0
 		if len(args) > 1 {
@@ -435,4 +486,34 @@ func (vm *VM) none() Value {
 	inst := &OEnumInst{Enum: vm.optEnum, Variant: 1}
 	vm.gc.alloc(inst)
 	return ObjV(inst)
+}
+
+func (vm *VM) ok(v Value) Value {
+	inst := &OEnumInst{Enum: vm.resEnum, Variant: 0, Fields: []Value{v}}
+	vm.gc.alloc(inst)
+	return ObjV(inst)
+}
+
+func (vm *VM) err(v Value) Value {
+	inst := &OEnumInst{Enum: vm.resEnum, Variant: 1, Fields: []Value{v}}
+	vm.gc.alloc(inst)
+	return ObjV(inst)
+}
+
+// okStr builds Ok(s) and errStr builds Err(msg), each rooting the fresh
+// string on the fiber stack across the enum allocation.
+func (vm *VM) okStr(s string) Value {
+	f := vm.current
+	f.push(ObjV(vm.gc.newString(s)))
+	res := vm.ok(f.peek(0))
+	f.pop()
+	return res
+}
+
+func (vm *VM) errStr(msg string) Value {
+	f := vm.current
+	f.push(ObjV(vm.gc.newString(msg)))
+	res := vm.err(f.peek(0))
+	f.pop()
+	return res
 }
