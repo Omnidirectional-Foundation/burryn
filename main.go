@@ -102,9 +102,10 @@ func runFile(path string, mode int) {
 	}
 
 	gc := newGC()
-	fn, shared, err := compileProgram(gc, src, stmts)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	fn, shared, compDiags := compileProgram(gc, src, stmts)
+	if len(compDiags) > 0 {
+		errs, _ := renderDiags(os.Stderr, compDiags, path, src)
+		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
 	if mode == modeDis {

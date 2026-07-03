@@ -90,16 +90,21 @@ type Compiler struct {
 	loops      []loopCtx
 }
 
-type compileErr string
+type compileErr Diag
 
-func compileProgram(gc *GC, src string, stmts []Stmt) (fn *OFunc, shared *Shared, err error) {
+// compileProgram compiles stmts, reporting compile errors as diagnostics.
+// Compilation stops at the first error (the checker has already caught
+// anything a user is likely to write; these are backstops and limits).
+// A bytecode verifier failure is a compiler bug and panics.
+func compileProgram(gc *GC, src string, stmts []Stmt) (fn *OFunc, shared *Shared, diags []Diag) {
 	defer func() {
 		if r := recover(); r != nil {
-			if ce, ok := r.(compileErr); ok {
-				err = fmt.Errorf("%s", string(ce))
-				return
+			ce, ok := r.(compileErr)
+			if !ok {
+				panic(r)
 			}
-			panic(r)
+			fn, shared = nil, nil
+			diags = []Diag{Diag(ce)}
 		}
 	}()
 	shared = newShared(gc, src)
@@ -112,14 +117,13 @@ func compileProgram(gc *GC, src string, stmts []Stmt) (fn *OFunc, shared *Shared
 	c.emit(OpUnit, Span{})
 	c.emit(OpReturn, Span{})
 	if err := verifyAll(c.fn); err != nil {
-		return nil, nil, err
+		panic(fmt.Sprintf("internal error: bytecode verifier: %v", err))
 	}
 	return c.fn, shared, nil
 }
 
-func (c *Compiler) fail(sp Span, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	panic(compileErr(fmt.Sprintf("compile error at line %d: %s", c.line(sp), msg)))
+func (c *Compiler) fail(sp Span, code, help, format string, args ...any) {
+	panic(compileErr(Diag{IsErr: true, Code: code, Msg: fmt.Sprintf(format, args...), Help: help, Span: sp}))
 }
 
 func (c *Compiler) chunk() *Chunk { return &c.fn.Chunk }
@@ -150,7 +154,7 @@ func (c *Compiler) emitJump(op Op, sp Span) int {
 func (c *Compiler) patchJump(at int) {
 	dist := len(c.chunk().Code) - (at + 2)
 	if dist > 0xffff {
-		c.fail(Span{}, "jump too large")
+		c.fail(Span{}, "E2001", "", "jump too large")
 	}
 	c.chunk().Code[at] = byte(dist >> 8)
 	c.chunk().Code[at+1] = byte(dist & 0xff)
@@ -160,7 +164,7 @@ func (c *Compiler) emitLoop(to int, sp Span) {
 	c.emit(OpLoop, sp)
 	dist := len(c.chunk().Code) + 2 - to
 	if dist > 0xffff {
-		c.fail(sp, "loop body too large")
+		c.fail(sp, "E2002", "", "loop body too large")
 	}
 	c.emitU16(uint16(dist), sp)
 }
@@ -182,7 +186,7 @@ func (c *Compiler) nextSlot() int {
 func (c *Compiler) declareLocal(name string, mut bool, sp Span) {
 	slot := c.nextSlot()
 	if slot > 0xfffe {
-		c.fail(sp, "too many locals")
+		c.fail(sp, "E2003", "", "too many locals")
 	}
 	c.locals = append(c.locals, LocalVar{
 		name: name, depth: c.scopeDepth, slot: slot, mut: mut, tempsBelow: c.temps,
@@ -215,7 +219,7 @@ func (c *Compiler) endScopeExpr(sp Span) {
 	}
 	if n > 0 {
 		if n > 255 {
-			c.fail(sp, "too many locals in block")
+			c.fail(sp, "E2003", "", "too many locals in block")
 		}
 		c.emit(OpEndBlock, sp)
 		c.emit(byte(n), sp)
@@ -238,7 +242,7 @@ func (c *Compiler) addUpvalue(index uint16, isLocal, mut bool, sp Span) int {
 		}
 	}
 	if len(c.upvals) >= 255 {
-		c.fail(sp, "too many captured variables")
+		c.fail(sp, "E2004", "", "too many captured variables")
 	}
 	c.upvals = append(c.upvals, UpvalMeta{index: index, isLocal: isLocal, mut: mut})
 	c.fn.NumUpvals = len(c.upvals)
@@ -317,7 +321,7 @@ func (c *Compiler) stmt(s Stmt) {
 		}
 		c.temps -= len(st.CallE.Args) + 1
 		if len(st.CallE.Args) > 255 {
-			c.fail(st.Span, "too many arguments")
+			c.fail(st.Span, "E2005", "", "too many arguments")
 		}
 		c.emit(OpSpawn, st.Span)
 		c.emit(byte(len(st.CallE.Args)), st.Span)
@@ -335,7 +339,7 @@ func (c *Compiler) stmt(s Stmt) {
 func (c *Compiler) defineGlobal(name string, mut bool, sp Span) {
 	if _, exists := c.shared.globalMut[name]; exists {
 		if _, isEnum := c.shared.enums[name]; isEnum {
-			c.fail(sp, "cannot redeclare enum %q", name)
+			c.fail(sp, "E2007", "", "cannot redeclare enum %q", name)
 		}
 	}
 	c.shared.globalMut[name] = mut
@@ -351,25 +355,25 @@ func (c *Compiler) assign(st *AssignStmt) {
 		if li := c.resolveLocal(t.Name); li >= 0 {
 			l := c.locals[li]
 			if !l.mut {
-				c.fail(st.Span, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
+				c.fail(st.Span, "E2010", "declare it with `let mut`", "cannot assign to immutable variable %q", t.Name)
 			}
 			c.emit(OpSetLocal, st.Span)
 			c.emitU16(uint16(l.slot), st.Span)
 		} else if ui := c.resolveUpvalue(t.Name, st.Span); ui >= 0 {
 			if !c.upvals[ui].mut {
-				c.fail(st.Span, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
+				c.fail(st.Span, "E2010", "declare it with `let mut`", "cannot assign to immutable variable %q", t.Name)
 			}
 			c.emit(OpSetUpval, st.Span)
 			c.emitU16(uint16(ui), st.Span)
 		} else if mut, ok := c.shared.globalMut[t.Name]; ok {
 			if !mut {
-				c.fail(st.Span, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
+				c.fail(st.Span, "E2010", "declare it with `let mut`", "cannot assign to immutable variable %q", t.Name)
 			}
 			idx := c.chunk().addConst(ObjV(c.shared.gc.newString(t.Name)))
 			c.emit(OpSetGlobal, st.Span)
 			c.emitU16(idx, st.Span)
 		} else {
-			c.fail(st.Span, "cannot assign to undeclared variable %q", t.Name)
+			c.fail(st.Span, "E2011", "", "cannot assign to undeclared variable %q", t.Name)
 		}
 		c.emit(OpPop, st.Span)
 	case *Index:
@@ -381,7 +385,7 @@ func (c *Compiler) assign(st *AssignStmt) {
 		c.temps -= 2
 		c.emit(OpIndexSet, st.Span)
 	default:
-		c.fail(st.Span, "invalid assignment target")
+		c.fail(st.Span, "E2012", "", "invalid assignment target")
 	}
 }
 
@@ -460,7 +464,7 @@ func (c *Compiler) forStmt(st *ForStmt) {
 // compiler bookkeeping (execution continues past the jump for other paths)
 func (c *Compiler) unwindToLoop(sp Span) *loopCtx {
 	if len(c.loops) == 0 {
-		c.fail(sp, "break/continue outside of a loop")
+		c.fail(sp, "E2013", "", "break/continue outside of a loop")
 	}
 	lp := &c.loops[len(c.loops)-1]
 	for i := len(c.locals) - 1; i >= 0 && c.locals[i].slot >= lp.baseSlot; i-- {
@@ -489,16 +493,16 @@ func (c *Compiler) continueStmt(sp Span) {
 
 func (c *Compiler) enumDecl(st *EnumDecl) {
 	if c.scopeDepth > 0 {
-		c.fail(st.Span, "enum declarations are only allowed at top level")
+		c.fail(st.Span, "E2008", "", "enum declarations are only allowed at top level")
 	}
 	if _, exists := c.shared.enums[st.Name]; exists {
-		c.fail(st.Span, "enum %q is already declared", st.Name)
+		c.fail(st.Span, "E2007", "", "enum %q is already declared", st.Name)
 	}
 	seen := map[string]bool{}
 	var variants []VariantInfo
 	for _, v := range st.Variants {
 		if seen[v.Name] {
-			c.fail(st.Span, "duplicate variant %q in enum %q", v.Name, st.Name)
+			c.fail(st.Span, "E2009", "", "duplicate variant %q in enum %q", v.Name, st.Name)
 		}
 		seen[v.Name] = true
 		variants = append(variants, VariantInfo{Name: v.Name, Arity: v.Arity})
@@ -584,7 +588,7 @@ func (c *Compiler) expr(e Expr) {
 		}
 		c.temps -= len(ex.Args) + 1
 		if len(ex.Args) > 255 {
-			c.fail(ex.Span, "too many arguments")
+			c.fail(ex.Span, "E2005", "", "too many arguments")
 		}
 		c.emit(OpCall, ex.Span)
 		c.emit(byte(len(ex.Args)), ex.Span)
@@ -601,7 +605,7 @@ func (c *Compiler) expr(e Expr) {
 		}
 		c.temps -= len(ex.Elems)
 		if len(ex.Elems) > 0xffff {
-			c.fail(ex.Span, "list literal too large")
+			c.fail(ex.Span, "E2006", "", "list literal too large")
 		}
 		c.emit(OpList, ex.Span)
 		c.emitU16(uint16(len(ex.Elems)), ex.Span)
@@ -640,7 +644,7 @@ func (c *Compiler) identExpr(ex *Ident) {
 	if _, declared := c.shared.globalMut[ex.Name]; !declared {
 		// bare enum variant like Some / None / Ok / Err
 		if info, idx, amb := c.shared.findVariant(ex.Name); amb {
-			c.fail(ex.Span, "variant %q exists in several enums; qualify it as Enum.%s", ex.Name, ex.Name)
+			c.fail(ex.Span, "E2014", fmt.Sprintf("qualify it as Enum.%s", ex.Name), "variant %q exists in several enums", ex.Name)
 		} else if idx >= 0 {
 			c.emitVariant(info, idx, ex.Span)
 			return
@@ -655,7 +659,7 @@ func (c *Compiler) identExpr(ex *Ident) {
 func (c *Compiler) variantAccess(enumName, variant string, sp Span) {
 	info, ok := c.shared.enums[enumName]
 	if !ok {
-		c.fail(sp, "unknown enum %q", enumName)
+		c.fail(sp, "E2015", "", "unknown enum %q", enumName)
 	}
 	for i, v := range info.Variants {
 		if v.Name == variant {
@@ -663,7 +667,7 @@ func (c *Compiler) variantAccess(enumName, variant string, sp Span) {
 			return
 		}
 	}
-	c.fail(sp, "enum %q has no variant %q", enumName, variant)
+	c.fail(sp, "E2016", "", "enum %q has no variant %q", enumName, variant)
 }
 
 // nullary variants become singleton instance constants; variants with fields
@@ -700,12 +704,12 @@ func (c *Compiler) function(lit *FnLit) {
 	}
 	sub.locals = append(sub.locals, LocalVar{name: selfName, depth: sub.scopeDepth, slot: 0})
 	if len(lit.Params) > 255 {
-		sub.fail(lit.Span, "too many parameters")
+		sub.fail(lit.Span, "E2019", "", "too many parameters")
 	}
 	seen := map[string]bool{}
 	for _, p := range lit.Params {
 		if seen[p] {
-			sub.fail(lit.Span, "duplicate parameter %q", p)
+			sub.fail(lit.Span, "E2020", "", "duplicate parameter %q", p)
 		}
 		seen[p] = true
 		sub.locals = append(sub.locals, LocalVar{
@@ -772,7 +776,7 @@ func (c *Compiler) ifExpr(ex *IfExpr) {
 	case *IfExpr:
 		c.ifExpr(els)
 	default:
-		c.fail(ex.Span, "invalid else branch")
+		c.fail(ex.Span, "E2018", "", "invalid else branch")
 	}
 	c.patchJump(endJ)
 }
@@ -804,11 +808,11 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 			// a bare name is a nullary-variant test if such a variant exists,
 			// otherwise a catch-all binding
 			if info, idx, amb := c.shared.findVariant(pat.Name); amb {
-				c.fail(arm.Span, "variant %q exists in several enums; qualify it as Enum.%s", pat.Name, pat.Name)
+				c.fail(arm.Span, "E2014", fmt.Sprintf("qualify it as Enum.%s", pat.Name), "variant %q exists in several enums", pat.Name)
 			} else if idx >= 0 && info.Variants[idx].Arity == 0 {
 				failJ = c.emitVariantTest(info, idx, scrutSlot, arm.Span)
 			} else if idx >= 0 {
-				c.fail(arm.Span, "variant %q has %d field(s); bind them: %s(...)", pat.Name, info.Variants[idx].Arity, pat.Name)
+				c.fail(arm.Span, "E2017", fmt.Sprintf("bind them: %s(...)", pat.Name), "variant %q has %d field(s)", pat.Name, info.Variants[idx].Arity)
 			} else {
 				c.emit(OpGetLocal, arm.Span)
 				c.emitU16(uint16(scrutSlot), arm.Span)
@@ -822,7 +826,7 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 				var ok bool
 				info, ok = c.shared.enums[pat.EnumName]
 				if !ok {
-					c.fail(arm.Span, "unknown enum %q", pat.EnumName)
+					c.fail(arm.Span, "E2015", "", "unknown enum %q", pat.EnumName)
 				}
 				idx = -1
 				for i, v := range info.Variants {
@@ -832,21 +836,21 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 					}
 				}
 				if idx < 0 {
-					c.fail(arm.Span, "enum %q has no variant %q", pat.EnumName, pat.Variant)
+					c.fail(arm.Span, "E2016", "", "enum %q has no variant %q", pat.EnumName, pat.Variant)
 				}
 			} else {
 				var amb bool
 				info, idx, amb = c.shared.findVariant(pat.Variant)
 				if amb {
-					c.fail(arm.Span, "variant %q exists in several enums; qualify it as Enum.%s", pat.Variant, pat.Variant)
+					c.fail(arm.Span, "E2014", fmt.Sprintf("qualify it as Enum.%s", pat.Variant), "variant %q exists in several enums", pat.Variant)
 				}
 				if idx < 0 {
-					c.fail(arm.Span, "unknown variant %q", pat.Variant)
+					c.fail(arm.Span, "E2016", "", "unknown variant %q", pat.Variant)
 				}
 			}
 			arity := info.Variants[idx].Arity
 			if len(pat.Binds) != arity {
-				c.fail(arm.Span, "variant %s has %d field(s), pattern binds %d", pat.Variant, arity, len(pat.Binds))
+				c.fail(arm.Span, "E2017", "", "variant %s has %d field(s), pattern binds %d", pat.Variant, arity, len(pat.Binds))
 			}
 			failJ = c.emitVariantTest(info, idx, scrutSlot, arm.Span)
 			for i, sub := range pat.Binds {
