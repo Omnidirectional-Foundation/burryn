@@ -69,6 +69,7 @@ type VM struct {
 	yieldFlag bool
 	parkRecv  *OChannel // set by the recv() native to ask OpCall to park & retry
 	out       io.Writer
+	args      []string // user command-line arguments, exposed via args()
 }
 
 type runtimeErr struct {
@@ -80,6 +81,13 @@ type runtimeErr struct {
 func (e *runtimeErr) Error() string {
 	return "runtime error: " + e.msg
 }
+
+// exitRequest is raised by the exit() native and unwinds the fiber loop
+// unwrapped, so main can translate it into a process exit code rather than
+// reporting it as a runtime trap.
+type exitRequest struct{ code int }
+
+func (e *exitRequest) Error() string { return "exit" }
 
 func newVM(gc *GC, shared *Shared) *VM {
 	vm := &VM{
@@ -737,6 +745,9 @@ func (vm *VM) callValue(f *Fiber, argc int, sp Span) error {
 		args := f.stack[f.top-argc : f.top]
 		res, err := o.Fn(vm, args)
 		if err != nil {
+			if _, ok := err.(*exitRequest); ok {
+				return err // exit(): propagate unwrapped for main to os.Exit
+			}
 			return &runtimeErr{msg: err.Error(), span: sp}
 		}
 		if vm.parkRecv != nil {

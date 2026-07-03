@@ -349,6 +349,60 @@ func TestExecSpawnFailureIsErr(t *testing.T) {
 }`, "spawn failed\n")
 }
 
+func TestExitPropagatesCodeAndStops(t *testing.T) {
+	out, cerr, rerr := interpret("println(\"before\")\nexit(5)\nprintln(\"after\")")
+	if cerr != nil {
+		t.Fatalf("unexpected compile error: %v", cerr)
+	}
+	er, ok := rerr.(*exitRequest)
+	if !ok {
+		t.Fatalf("expected *exitRequest, got %v", rerr)
+	}
+	if er.code != 5 {
+		t.Fatalf("expected exit code 5, got %d", er.code)
+	}
+	if out != "before\n" {
+		t.Fatalf("expected only pre-exit output, got %q", out)
+	}
+}
+
+func TestExitIsDivergentInMatchArm(t *testing.T) {
+	// exit "returns" whatever the other arm needs: here it unifies with int
+	expectOut(t, `let n = match parse_int("42") {
+  Some(v) => v,
+  None => exit(1),
+}
+println(n)`, "42\n")
+}
+
+func TestArgsEmptyByDefault(t *testing.T) {
+	expectOut(t, `println(args(), len(args()))`, "[] 0\n")
+}
+
+func TestArgsExposesUserArgv(t *testing.T) {
+	src := "println(args())\nprintln(len(args()))"
+	toks, _ := lex(src)
+	stmts, _ := parse(toks)
+	if diags := typecheck(stmts); len(diags) > 0 {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+	gc := newGC()
+	fn, shared, compDiags := compileProgram(gc, src, stmts)
+	if len(compDiags) > 0 {
+		t.Fatalf("compile error: %v", compDiags)
+	}
+	var buf bytes.Buffer
+	vm := newVM(gc, shared)
+	vm.out = &buf
+	vm.args = []string{"build", "src/"}
+	if err := vm.run(fn); err != nil {
+		t.Fatalf("runtime error: %v", err)
+	}
+	if want := "[\"build\", \"src/\"]\n2\n"; buf.String() != want {
+		t.Fatalf("wrong argv output\n got: %q\nwant: %q", buf.String(), want)
+	}
+}
+
 func TestIntegerOverflowTraps(t *testing.T) {
 	// overflow always traps — never wraps silently
 	max := "9223372036854775807"

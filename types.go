@@ -1523,6 +1523,9 @@ func (c *Checker) declareBuiltins() {
 	decl("file_exists", mono(fn(tBool, tStr)))
 	decl("read_dir", mono(fn(res(list(tStr), tStr), tStr)))
 	decl("exec", mono(fn(res(&TCon{Name: "Output"}, tStr), tStr, list(tStr))))
+	decl("args", mono(fn(list(tStr))))
+	// exit never returns, so it unifies with any expected type
+	decl("exit", poly1(func(a *TV) *TFunc { return fn(a, tInt) }))
 	decl("clock", mono(fn(tFloat)))
 	decl("assert", mono(fn(tUnit, tBool, tStr)))
 	decl("gc", mono(fn(tInt)))
