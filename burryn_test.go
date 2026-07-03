@@ -8,9 +8,11 @@ import (
 )
 
 // interpretMode runs a Burryn source string and returns its stdout.
-// With dyn=false the static checker runs first; its errors come back as
-// compileError. Warnings never fail a run.
-func interpretMode(src string, dyn bool) (out string, compileError error, runtimeError error) {
+// With skipCheck=false the static checker runs first; its errors come back
+// as compileError. Warnings never fail a run. skipCheck=true is white-box
+// only — it bypasses the checker to exercise the VM's defensive runtime
+// traps (the language itself has no dynamic mode).
+func interpretMode(src string, skipCheck bool) (out string, compileError error, runtimeError error) {
 	toks, err := lex(src)
 	if err != nil {
 		return "", err, nil
@@ -19,7 +21,7 @@ func interpretMode(src string, dyn bool) (out string, compileError error, runtim
 	if err != nil {
 		return "", err, nil
 	}
-	if !dyn {
+	if !skipCheck {
 		diags := typecheck(stmts)
 		var msgs []string
 		for _, d := range diags {
@@ -75,14 +77,14 @@ func expectOut(t *testing.T, src, want string) {
 	}
 }
 
-func expectOutDyn(t *testing.T, src, want string) {
+func expectOutUnchecked(t *testing.T, src, want string) {
 	t.Helper()
 	out, cerr, rerr := interpretMode(src, true)
 	if cerr != nil || rerr != nil {
-		t.Fatalf("error (dyn): %v %v\nsource:\n%s", cerr, rerr, src)
+		t.Fatalf("error (unchecked): %v %v\nsource:\n%s", cerr, rerr, src)
 	}
 	if out != want {
-		t.Fatalf("wrong output (dyn)\n--- got ---\n%s\n--- want ---\n%s", out, want)
+		t.Fatalf("wrong output (unchecked)\n--- got ---\n%s\n--- want ---\n%s", out, want)
 	}
 }
 
@@ -436,9 +438,9 @@ println(D.Q(5), type_of(D.Q(5)))`, "Q(5) D\n")
 	expectTypeError(t, `enum F { W(nosuchtype) }`, "E0412")
 }
 
-func TestMatchEnumIdentityNotJustIndexDyn(t *testing.T) {
-	// dynamic-mode regression test: variant tests check enum identity, not tag
-	expectOutDyn(t, `enum A { X(v) }
+func TestVMMatchEnumIdentityNotJustIndex(t *testing.T) {
+	// VM defense regression test: variant tests check enum identity, not tag
+	expectOutUnchecked(t, `enum A { X(v) }
 enum B { Y(v) }
 fn what(e) {
     match e {
@@ -450,10 +452,10 @@ fn what(e) {
 println(what(A.X(1)), what(B.Y(1)), what(42))`, "A.X B.Y ?\n")
 }
 
-func TestMatchNoMatchDyn(t *testing.T) {
+func TestVMMatchNoMatchTrap(t *testing.T) {
 	_, _, rerr := interpretMode(`match 42 { 1 => "one" }`, true)
 	if rerr == nil || !strings.Contains(rerr.Error(), "no pattern matched") {
-		t.Fatalf("expected dyn no-match runtime error, got %v", rerr)
+		t.Fatalf("expected VM no-match trap, got %v", rerr)
 	}
 }
 
@@ -562,10 +564,10 @@ while len(primes) < 5 {
 println(primes)`, "[2, 3, 5, 7, 11]\n")
 }
 
-func TestSpawnNeedsFunctionDyn(t *testing.T) {
+func TestVMSpawnNeedsFunctionTrap(t *testing.T) {
 	_, _, rerr := interpretMode(`spawn println("x")()`, true)
 	if rerr == nil || !strings.Contains(rerr.Error(), "spawn needs a function") {
-		t.Fatalf("expected dyn spawn runtime error, got %v", rerr)
+		t.Fatalf("expected VM spawn trap, got %v", rerr)
 	}
 }
 
