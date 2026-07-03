@@ -63,11 +63,26 @@ const (
 	TEOF
 )
 
+// Span is a half-open byte range [Start, End) into the source.
+type Span struct {
+	Start, End int
+}
+
+// union returns the smallest span covering both s and o.
+func (s Span) union(o Span) Span {
+	if o.Start < s.Start {
+		s.Start = o.Start
+	}
+	if o.End > s.End {
+		s.End = o.End
+	}
+	return s
+}
+
 type Token struct {
 	Type TokType
 	Lex  string
-	Line int
-	Col  int
+	Span Span
 }
 
 var keywords = map[string]TokType{

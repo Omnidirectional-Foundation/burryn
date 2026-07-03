@@ -8,25 +8,24 @@ import (
 // Lexer with Go-style automatic semicolon insertion: a newline terminates a
 // statement when the previous token could legally end one.
 type Lexer struct {
-	src       string
-	start     int
-	pos       int
-	line      int
-	lineStart int // offset of the current line, for column tracking
-	last      TokType // last token type emitted (for semicolon insertion)
-	begun     bool    // whether any token was emitted yet
-	toks      []Token
-	err       error
+	src   string
+	start int
+	pos   int
+	last  TokType // last token type emitted (for semicolon insertion)
+	begun bool    // whether any token was emitted yet
+	toks  []Token
+	err   error
 }
 
 func lex(src string) ([]Token, error) {
 	src = strings.TrimPrefix(src, string(rune(0xFEFF))) // tolerate a UTF-8 BOM
-	l := &Lexer{src: src, line: 1}
+	l := &Lexer{src: src}
 	for l.err == nil && !l.atEnd() {
 		l.start = l.pos
 		l.scan()
 	}
-	l.maybeSemi() // final newline may be missing
+	l.start = l.pos // spans of the synthetic trailing tokens sit at EOF
+	l.maybeSemi()   // final newline may be missing
 	l.emit(TEOF, "")
 	return l.toks, l.err
 }
@@ -62,13 +61,15 @@ func (l *Lexer) match(c byte) bool {
 }
 
 func (l *Lexer) emit(t TokType, lexeme string) {
-	col := l.start - l.lineStart + 1
-	if col < 1 {
-		col = 1
-	}
-	l.toks = append(l.toks, Token{Type: t, Lex: lexeme, Line: l.line, Col: col})
+	l.toks = append(l.toks, Token{Type: t, Lex: lexeme, Span: Span{Start: l.start, End: l.pos}})
 	l.last = t
 	l.begun = true
+}
+
+// lineAt computes the 1-based line of a byte offset; only used on the rare
+// error paths, so counting is fine.
+func (l *Lexer) lineAt(off int) int {
+	return 1 + strings.Count(l.src[:min(off, len(l.src))], "\n")
 }
 
 // statement-ending token types trigger semicolon insertion at newline
@@ -93,8 +94,6 @@ func (l *Lexer) scan() {
 	case ' ', '\t', '\r':
 	case '\n':
 		l.maybeSemi()
-		l.line++
-		l.lineStart = l.pos
 	case '/':
 		if l.match('/') {
 			for !l.atEnd() && l.peek() != '\n' {
@@ -169,13 +168,13 @@ func (l *Lexer) scan() {
 		if l.match('&') {
 			l.emit(TAndAnd, "&&")
 		} else {
-			l.err = fmt.Errorf("line %d: unexpected '&'", l.line)
+			l.err = fmt.Errorf("line %d: unexpected '&'", l.lineAt(l.start))
 		}
 	case '|':
 		if l.match('|') {
 			l.emit(TOrOr, "||")
 		} else {
-			l.err = fmt.Errorf("line %d: unexpected '|'", l.line)
+			l.err = fmt.Errorf("line %d: unexpected '|'", l.lineAt(l.start))
 		}
 	case '"':
 		l.scanString()
@@ -185,7 +184,7 @@ func (l *Lexer) scan() {
 		} else if isAlpha(c) {
 			l.scanIdent()
 		} else {
-			l.err = fmt.Errorf("line %d: unexpected character %q", l.line, string(c))
+			l.err = fmt.Errorf("line %d: unexpected character %q", l.lineAt(l.start), string(c))
 		}
 	}
 }
@@ -194,9 +193,6 @@ func (l *Lexer) scanString() {
 	var buf []byte
 	for !l.atEnd() && l.peek() != '"' {
 		c := l.advance()
-		if c == '\n' {
-			l.line++
-		}
 		if c == '\\' && !l.atEnd() {
 			e := l.advance()
 			switch e {
@@ -209,7 +205,7 @@ func (l *Lexer) scanString() {
 			case '\\':
 				buf = append(buf, '\\')
 			default:
-				l.err = fmt.Errorf("line %d: bad escape \\%s", l.line, string(e))
+				l.err = fmt.Errorf("line %d: bad escape \\%s", l.lineAt(l.pos-1), string(e))
 				return
 			}
 		} else {
@@ -217,7 +213,7 @@ func (l *Lexer) scanString() {
 		}
 	}
 	if l.atEnd() {
-		l.err = fmt.Errorf("line %d: unterminated string", l.line)
+		l.err = fmt.Errorf("line %d: unterminated string", l.lineAt(l.start))
 		return
 	}
 	l.pos++ // closing quote
