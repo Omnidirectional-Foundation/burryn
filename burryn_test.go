@@ -253,6 +253,30 @@ println(char_at(s, 0) + char_at(s, 3))`, "rg\n")
 	expectOut(t, `println("tab\tquote\"done")`, "tab\tquote\"done\n")
 }
 
+func TestStringGapFills(t *testing.T) {
+	expectOut(t, `println(split("a,b,c", ","))`, "[\"a\", \"b\", \"c\"]\n")
+	expectOut(t, `println(join(["a", "b", "c"], "-"))`, "a-b-c\n")
+	expectOut(t, `println(substr("burryn", 2, 3))`, "rry\n")
+	expectOut(t, `println(str_contains("burryn", "rry"), str_contains("burryn", "xyz"))`, "true false\n")
+	expectOut(t, `println(str_index_of("burryn", "rry"), str_index_of("burryn", "z"))`,
+		"Some(2) None\n")
+	expectOut(t, `println(trim("  hi \n"))`, "hi\n")
+	expectRuntimeError(t, `println(substr("abc", 1, 5))`, "out of bounds")
+}
+
+func TestListGapFills(t *testing.T) {
+	expectOut(t, `println(slice([1, 2, 3, 4], 1, 3))`, "[2, 3]\n")
+	expectOut(t, `println(concat([1, 2], [3, 4]))`, "[1, 2, 3, 4]\n")
+	expectOut(t, `println(contains([1, 2, 3], 2), contains([1, 2, 3], 9))`, "true false\n")
+	expectOut(t, `println(contains(["a", "b"], "b"))`, "true\n")
+	// slice copies: mutating the result must not touch the source
+	expectOut(t, `let xs = [1, 2, 3]
+let mut ys = slice(xs, 0, 2)
+push(ys, 9)
+println(xs, ys)`, "[1, 2, 3] [1, 2, 9]\n")
+	expectRuntimeError(t, `println(slice([1, 2], 0, 5))`, "out of bounds")
+}
+
 func TestIntegerOverflowTraps(t *testing.T) {
 	// overflow always traps — never wraps silently
 	max := "9223372036854775807"

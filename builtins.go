@@ -169,6 +169,108 @@ var nativeDefs = []nativeDef{
 		}
 		return ObjV(vm.gc.newList(elems)), nil
 	}},
+	{"split", 2, func(vm *VM, args []Value) (Value, error) {
+		s, ok := asString(args[0])
+		sep, ok2 := asString(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("split() needs (str, str)")
+		}
+		parts := strings.Split(s, sep)
+		elems := make([]Value, len(parts))
+		for i, p := range parts {
+			elems[i] = ObjV(vm.gc.newString(p))
+		}
+		return ObjV(vm.gc.newList(elems)), nil
+	}},
+	{"join", 2, func(vm *VM, args []Value) (Value, error) {
+		lst, ok := asList(args[0])
+		sep, ok2 := asString(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("join() needs ([str], str)")
+		}
+		parts := make([]string, len(lst.Elems))
+		for i, e := range lst.Elems {
+			p, ok := asString(e)
+			if !ok {
+				return Unit, fmt.Errorf("join() needs a list of str, got %s element", typeOf(e))
+			}
+			parts[i] = p
+		}
+		return ObjV(vm.gc.newString(strings.Join(parts, sep))), nil
+	}},
+	{"substr", 3, func(vm *VM, args []Value) (Value, error) {
+		s, ok := asString(args[0])
+		if !ok || args[1].T != VInt || args[2].T != VInt {
+			return Unit, fmt.Errorf("substr() needs (str, int, int)")
+		}
+		start, n := args[1].I, args[2].I
+		if start < 0 || n < 0 || start+n > int64(len(s)) {
+			return Unit, fmt.Errorf("substr(%d, %d) out of bounds (len %d)", start, n, len(s))
+		}
+		return ObjV(vm.gc.newString(s[start : start+n])), nil
+	}},
+	{"str_contains", 2, func(vm *VM, args []Value) (Value, error) {
+		s, ok := asString(args[0])
+		sub, ok2 := asString(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("str_contains() needs (str, str)")
+		}
+		return BoolV(strings.Contains(s, sub)), nil
+	}},
+	{"str_index_of", 2, func(vm *VM, args []Value) (Value, error) {
+		s, ok := asString(args[0])
+		sub, ok2 := asString(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("str_index_of() needs (str, str)")
+		}
+		if i := strings.Index(s, sub); i >= 0 {
+			return vm.some(IntV(int64(i))), nil
+		}
+		return vm.none(), nil
+	}},
+	{"trim", 1, func(vm *VM, args []Value) (Value, error) {
+		s, ok := asString(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("trim() needs a str, got %s", typeOf(args[0]))
+		}
+		return ObjV(vm.gc.newString(strings.TrimSpace(s))), nil
+	}},
+	{"slice", 3, func(vm *VM, args []Value) (Value, error) {
+		lst, ok := asList(args[0])
+		if !ok || args[1].T != VInt || args[2].T != VInt {
+			return Unit, fmt.Errorf("slice() needs ([a], int, int)")
+		}
+		start, end := args[1].I, args[2].I
+		if start < 0 || end < start || end > int64(len(lst.Elems)) {
+			return Unit, fmt.Errorf("slice(%d, %d) out of bounds (len %d)", start, end, len(lst.Elems))
+		}
+		elems := make([]Value, end-start)
+		copy(elems, lst.Elems[start:end])
+		return ObjV(vm.gc.newList(elems)), nil
+	}},
+	{"concat", 2, func(vm *VM, args []Value) (Value, error) {
+		xs, ok := asList(args[0])
+		ys, ok2 := asList(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("concat() needs ([a], [a])")
+		}
+		elems := make([]Value, 0, len(xs.Elems)+len(ys.Elems))
+		elems = append(elems, xs.Elems...)
+		elems = append(elems, ys.Elems...)
+		return ObjV(vm.gc.newList(elems)), nil
+	}},
+	{"contains", 2, func(vm *VM, args []Value) (Value, error) {
+		lst, ok := asList(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("contains() needs a list, got %s", typeOf(args[0]))
+		}
+		for _, e := range lst.Elems {
+			if valuesEqual(e, args[1]) {
+				return BoolV(true), nil
+			}
+		}
+		return BoolV(false), nil
+	}},
 	{"chan", -1, func(vm *VM, args []Value) (Value, error) {
 		capacity := 0
 		if len(args) > 1 {
