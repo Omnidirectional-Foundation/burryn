@@ -1,0 +1,38 @@
+// Stream results over a channel and close it when done. The consumer uses
+// `for v in ch`, which ends cleanly once the channel is closed and drained —
+// no sentinel value, no manual count.
+
+fn squares(ch, upto) {
+    for i in range(1, upto) {
+        ch <- i * i
+    }
+    close(ch)                      // signal end-of-stream
+}
+
+fn main_loop() {
+    let ch = chan(4)
+    spawn squares(ch, 8)
+
+    let mut total = 0
+    let mut count = 0
+    for v in ch {
+        total = total + v
+        count = count + 1
+    }
+    println("received", count, "squares, sum =", total)
+
+    // recv() exposes the same close as an Option: None means closed-and-drained
+    let done = chan(0)
+    spawn squares(done, 4)
+    let mut fold = 0
+    let mut open = true
+    while open {
+        match recv(done) {
+            Some(v) => { fold = fold + v },
+            None => { open = false },
+        }
+    }
+    println("recv fold of 1..3 squares =", fold)
+}
+
+main_loop()

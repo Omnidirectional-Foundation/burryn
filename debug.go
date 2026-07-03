@@ -166,6 +166,8 @@ func disasmInst(ch *Chunk, lines lineIndex, ip int) int {
 		return simple("SEND")
 	case OpRecv:
 		return simple("RECV")
+	case OpChanNext:
+		return jump("CHAN_NEXT", 1)
 	}
 	fmt.Printf("UNKNOWN %d\n", op)
 	return ip + 1

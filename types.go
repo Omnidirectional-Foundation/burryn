@@ -891,7 +891,15 @@ func (c *Checker) inferStmt(s Stmt) {
 	case *ForStmt:
 		el := c.fresh("")
 		it := c.inferExpr(st.Iter)
-		c.unifyAt(it, &TCon{Name: "list", Args: []Ty{el}}, st.Iter.span(), "in this `for` loop (iterate over a list)")
+		// a channel iterable receives until closed; anything else must be a
+		// list. The channel type must be statically evident here (same
+		// limitation as elsewhere: unannotated params default to list).
+		if ch, ok := resolve(it).(*TCon); ok && ch.Name == "chan" {
+			c.unifyAt(el, ch.Args[0], st.Iter.span(), "in this `for` loop (receive from a channel)")
+			st.IterIsChan = true
+		} else {
+			c.unifyAt(it, &TCon{Name: "list", Args: []Ty{el}}, st.Iter.span(), "in this `for` loop (iterate over a list or channel)")
+		}
 		c.loop++
 		c.pushScope()
 		c.declare(st.Var, &Scheme{t: el}, false, "local", st.VarSpan)
@@ -1476,6 +1484,8 @@ func (c *Checker) declareBuiltins() {
 	decl("chr", mono(fn(tStr, tInt)))
 	decl("ord", mono(fn(tInt, tStr)))
 	decl("yield", mono(fn(tUnit)))
+	decl("close", poly1(func(a *TV) *TFunc { return fn(tUnit, &TCon{Name: "chan", Args: []Ty{a}}) }))
+	decl("recv", poly1(func(a *TV) *TFunc { return fn(opt(a), &TCon{Name: "chan", Args: []Ty{a}}) }))
 
 	decl("print", mono(fn(tUnit)))
 	c.scopes[0]["print"].special = "printf"

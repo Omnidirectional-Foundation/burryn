@@ -184,6 +184,41 @@ var nativeDefs = []nativeDef{
 		vm.gc.alloc(ch)
 		return ObjV(ch), nil
 	}},
+	{"close", 1, func(vm *VM, args []Value) (Value, error) {
+		ch, ok := asChannelV(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("close() needs a channel, got %s", typeOf(args[0]))
+		}
+		if ch.closed {
+			return Unit, fmt.Errorf("close of closed channel")
+		}
+		ch.closed = true
+		// wake every blocked receiver: each re-runs its receive, drains any
+		// buffered values, then observes closure
+		for _, r := range ch.recvq {
+			vm.schedule(r)
+		}
+		ch.recvq = nil
+		return Unit, nil
+	}},
+	{"recv", 1, func(vm *VM, args []Value) (Value, error) {
+		ch, ok := asChannelV(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("recv() needs a channel, got %s", typeOf(args[0]))
+		}
+		if v, ready := vm.chanTryRecv(ch); ready {
+			f := vm.current
+			f.push(v) // root v across the Some allocation
+			opt := vm.some(f.peek(0))
+			f.pop()
+			return opt, nil
+		}
+		if ch.closed {
+			return vm.none(), nil
+		}
+		vm.parkRecv = ch // OpCall parks this fiber and retries once woken
+		return Unit, nil
+	}},
 	{"chr", 1, func(vm *VM, args []Value) (Value, error) {
 		if args[0].T != VInt || args[0].I < 0 || args[0].I > 0x10ffff {
 			return Unit, fmt.Errorf("chr() needs an int code point")
