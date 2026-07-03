@@ -18,7 +18,9 @@ bur run examples/sieve.bur
 ## What it takes from Rust
 
 - **Immutable by default.** `let x = 1` cannot be reassigned — enforced at
-  *compile time*. Mutation requires `let mut`.
+  *compile time*. Mutation requires `let mut`, and it runs deep: a plain
+  `let` freezes list contents too — `push`, `pop` and `l[i] = v` all demand
+  a `mut` binding.
 - **No null.** Absence is `Option` (`Some(v)` / `None`), failure is `Result`
   (`Ok(v)` / `Err(e)`). Both are built-in enums.
 - **The `?` operator.** Unwraps `Ok`/`Some`, or returns the `Err`/`None` to
@@ -54,7 +56,7 @@ enum Shape { Circle(r), Rect(w, h) }
 fn area(s) {
     match s {
         Circle(r) => 3.14159 * r * r,
-        Rect(w, h) => float(w * h),
+        Rect(w, h) => to_float(w * h),
     }
 }
 
@@ -123,18 +125,20 @@ source ──lexer──▶ tokens ──parser──▶ AST ──compiler─�
 ## Commands
 
 ```sh
-bur run <file.bur>    run
+bur run <file.bur>    typecheck and run
 bur <file.bur>        same
+bur check <file.bur>  typecheck only (rustc-style diagnostics)
 bur dis <file.bur>    disassemble the compiled bytecode
 bur version
 ```
 
-Build: `go build -o bur.exe .` &nbsp;•&nbsp; Test: `go test .` (48 tests)
+Build: `go build -o bur.exe .` &nbsp;•&nbsp; Test: `go test .` (includes a
+golden test for every example)
 
-## Honest limitations (v1)
+## Honest limitations (v2)
 
-Dynamically typed — the type system is the price paid for fitting in a day.
-The v2 plan is Hindley-Milner type inference (full static checking with zero
-annotations), which also unlocks `match` exhaustiveness checking. No maps,
-no string interpolation, no modules yet. `mut` governs rebinding; list
-contents are freely mutable through any reference.
+No maps, no string interpolation, no modules yet — those are the v3
+milestone, together with a C backend on the road to self-hosting. Deep
+`mut` is a binding-level discipline, not a borrow checker: two `mut`
+bindings may still alias the same list. Function parameters are immutable,
+so a helper cannot mutate a list passed to it.
