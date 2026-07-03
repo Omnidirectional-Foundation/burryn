@@ -176,11 +176,16 @@ var nativeDefs = []nativeDef{
 			return Unit, fmt.Errorf("split() needs (str, str)")
 		}
 		parts := strings.Split(s, sep)
-		elems := make([]Value, len(parts))
-		for i, p := range parts {
-			elems[i] = ObjV(vm.gc.newString(p))
+		// root the list first, then grow it: each newString may trigger a
+		// collection, and only the list keeps the earlier strings reachable
+		lst := vm.gc.newList(make([]Value, 0, len(parts)))
+		f := vm.current
+		f.push(ObjV(lst))
+		for _, p := range parts {
+			lst.Elems = append(lst.Elems, ObjV(vm.gc.newString(p)))
 		}
-		return ObjV(vm.gc.newList(elems)), nil
+		f.pop()
+		return ObjV(lst), nil
 	}},
 	{"join", 2, func(vm *VM, args []Value) (Value, error) {
 		lst, ok := asList(args[0])
