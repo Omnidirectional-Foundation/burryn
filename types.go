@@ -1466,6 +1466,7 @@ func (c *Checker) declareBuiltins() {
 	list := func(t Ty) Ty { return &TCon{Name: "list", Args: []Ty{t}} }
 	mapt := func(k, v Ty) Ty { return &TCon{Name: "map", Args: []Ty{k, v}} }
 	opt := func(t Ty) Ty { return &TCon{Name: "Option", Args: []Ty{t}} }
+	res := func(a, e Ty) Ty { return &TCon{Name: "Result", Args: []Ty{a, e}} }
 
 	poly1 := func(mk func(a *TV) *TFunc) *Scheme {
 		a := &TV{id: -1, level: 1}
@@ -1508,6 +1509,10 @@ func (c *Checker) declareBuiltins() {
 	decl("slice", poly1(func(a *TV) *TFunc { return fn(list(a), list(a), tInt, tInt) }))
 	decl("concat", poly1(func(a *TV) *TFunc { return fn(list(a), list(a), list(a)) }))
 	decl("contains", poly1(func(a *TV) *TFunc { return fn(tBool, list(a), a) }))
+	decl("read_file", mono(fn(res(tStr, tStr), tStr)))
+	decl("write_file", mono(fn(res(tUnit, tStr), tStr, tStr)))
+	decl("file_exists", mono(fn(tBool, tStr)))
+	decl("read_dir", mono(fn(res(list(tStr), tStr), tStr)))
 	decl("clock", mono(fn(tFloat)))
 	decl("assert", mono(fn(tUnit, tBool, tStr)))
 	decl("gc", mono(fn(tInt)))

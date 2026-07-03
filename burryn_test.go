@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -275,6 +277,48 @@ let mut ys = slice(xs, 0, 2)
 push(ys, 9)
 println(xs, ys)`, "[1, 2, 3] [1, 2, 9]\n")
 	expectRuntimeError(t, `println(slice([1, 2], 0, 5))`, "out of bounds")
+}
+
+func TestFsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hello.txt")
+	expectOut(t, `match write_file("`+path+`", "hi there\n") {
+  Ok(_) => {}
+  Err(e) => println("write failed:", e)
+}
+match read_file("`+path+`") {
+  Ok(s) => print(s)
+  Err(e) => println("read failed:", e)
+}`, "hi there\n")
+}
+
+func TestReadFileMissingIsErr(t *testing.T) {
+	expectOut(t, `match read_file("/no/such/burryn/file/here") {
+  Ok(_) => println("unexpected")
+  Err(_) => println("missing")
+}`, "missing\n")
+}
+
+func TestFileExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "there.txt")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	expectOut(t, `println(file_exists("`+path+`"), file_exists("`+dir+`/nope"))`,
+		"true false\n")
+}
+
+func TestReadDirSortedNames(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"b.txt", "a.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectOut(t, `match read_dir("`+dir+`") {
+  Ok(names) => println(names)
+  Err(e) => println("err:", e)
+}`, "[\"a.txt\", \"b.txt\"]\n")
 }
 
 func TestIntegerOverflowTraps(t *testing.T) {
