@@ -25,9 +25,63 @@ var nativeDefs = []nativeDef{
 	{"len", 1, func(vm *VM, args []Value) (Value, error) {
 		n, err := lengthOf(args[0], Span{})
 		if err != nil {
-			return Unit, fmt.Errorf("len() needs a list or string, got %s", typeOf(args[0]))
+			return Unit, fmt.Errorf("len() needs a list, string, or map, got %s", typeOf(args[0]))
 		}
 		return IntV(n), nil
+	}},
+	{"map", 0, func(vm *VM, args []Value) (Value, error) {
+		m := &OMap{index: map[mapKey]int{}}
+		vm.gc.alloc(m)
+		return ObjV(m), nil
+	}},
+	{"get", 2, func(vm *VM, args []Value) (Value, error) {
+		m, ok := asMap(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("get() needs a map, got %s", typeOf(args[0]))
+		}
+		k, ok := toMapKey(args[1])
+		if !ok {
+			return Unit, fmt.Errorf("map keys must be int or str, got %s", typeOf(args[1]))
+		}
+		if v, found := m.get(k); found {
+			return vm.some(v), nil
+		}
+		return vm.none(), nil
+	}},
+	{"put", 3, func(vm *VM, args []Value) (Value, error) {
+		m, ok := asMap(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("put() needs a map, got %s", typeOf(args[0]))
+		}
+		k, ok := toMapKey(args[1])
+		if !ok {
+			return Unit, fmt.Errorf("map keys must be int or str, got %s", typeOf(args[1]))
+		}
+		m.set(k, args[1], args[2])
+		return Unit, nil
+	}},
+	{"delete", 2, func(vm *VM, args []Value) (Value, error) {
+		m, ok := asMap(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("delete() needs a map, got %s", typeOf(args[0]))
+		}
+		k, ok := toMapKey(args[1])
+		if !ok {
+			return Unit, fmt.Errorf("map keys must be int or str, got %s", typeOf(args[1]))
+		}
+		m.del(k)
+		return Unit, nil
+	}},
+	{"keys", 1, func(vm *VM, args []Value) (Value, error) {
+		m, ok := asMap(args[0])
+		if !ok {
+			return Unit, fmt.Errorf("keys() needs a map, got %s", typeOf(args[0]))
+		}
+		elems := make([]Value, len(m.entries))
+		for i, e := range m.entries {
+			elems[i] = e.key
+		}
+		return ObjV(vm.gc.newList(elems)), nil
 	}},
 	{"push", 2, func(vm *VM, args []Value) (Value, error) {
 		lst, ok := asList(args[0])
@@ -206,6 +260,14 @@ func asList(v Value) (*OList, bool) {
 	if v.T == VObj {
 		l, ok := v.O.(*OList)
 		return l, ok
+	}
+	return nil, false
+}
+
+func asMap(v Value) (*OMap, bool) {
+	if v.T == VObj {
+		m, ok := v.O.(*OMap)
+		return m, ok
 	}
 	return nil, false
 }

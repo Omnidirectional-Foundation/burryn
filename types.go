@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -38,6 +39,13 @@ func (*TV) tyNode()    {}
 var conSets = map[string][]string{
 	"num":    {"int", "float"},
 	"addord": {"int", "float", "str"},
+	"key":    {"int", "str"},
+	// singletons name the intersections that merging can produce (e.g.
+	// num ∩ key = {int}); a variable pinned to one of these can only be
+	// that type.
+	"int":   {"int"},
+	"float": {"float"},
+	"str":   {"str"},
 }
 
 func resolve(t Ty) Ty {
@@ -440,6 +448,9 @@ func conAllows(con, name string) bool {
 	return false
 }
 
+// mergeCon intersects two overloading constraints, returning the name of the
+// set equal to their intersection; ok is false when the intersection is empty
+// (the two constraints are incompatible).
 func mergeCon(a, b string) (string, bool) {
 	if a == "" {
 		return b, true
@@ -447,8 +458,33 @@ func mergeCon(a, b string) (string, bool) {
 	if b == "" || a == b {
 		return a, true
 	}
-	// num ∩ addord = num
-	return "num", true
+	var inter []string
+	for _, x := range conSets[a] {
+		for _, y := range conSets[b] {
+			if x == y {
+				inter = append(inter, x)
+				break
+			}
+		}
+	}
+	if len(inter) == 0 {
+		return "", false
+	}
+	for name, set := range conSets {
+		if len(set) == len(inter) {
+			same := true
+			for _, x := range inter {
+				if !slices.Contains(set, x) {
+					same = false
+					break
+				}
+			}
+			if same {
+				return name, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (c *Checker) unify(a, b Ty) error {
@@ -472,7 +508,11 @@ func (c *Checker) unify(a, b Ty) error {
 			return fmt.Errorf("a function is not valid here: this operator needs %s", strings.Join(conSets[av.con], " or "))
 		}
 		if bv, ok := b.(*TV); ok {
-			merged, _ := mergeCon(av.con, bv.con)
+			merged, ok := mergeCon(av.con, bv.con)
+			if !ok {
+				return fmt.Errorf("no type satisfies both %s and %s",
+					strings.Join(conSets[av.con], "|"), strings.Join(conSets[bv.con], "|"))
+			}
 			bv.con = merged
 		}
 		adjustLevel(b, av.level)
@@ -626,6 +666,10 @@ func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
 			if len(x.Args) != 1 {
 				c.errorf(x.Span, "E0107", "", "`chan` takes exactly one type argument, e.g. chan(int)")
 			}
+		case "map":
+			if len(x.Args) != 2 {
+				c.errorf(x.Span, "E0107", "", "`map` takes two type arguments, e.g. map(str, int)")
+			}
 		default:
 			if params[x.Name] {
 				if len(x.Args) > 0 {
@@ -672,7 +716,7 @@ func (c *Checker) convertTypeExpr(te TypeExpr, subst map[string]Ty, prefix strin
 		case x.Pkg != "":
 			return &TCon{Name: x.Pkg + "." + x.Name, Args: args}
 		case x.Name == "int" || x.Name == "float" || x.Name == "bool" ||
-			x.Name == "str" || x.Name == "unit" || x.Name == "chan":
+			x.Name == "str" || x.Name == "unit" || x.Name == "chan" || x.Name == "map":
 			return &TCon{Name: x.Name, Args: args}
 		default:
 			name := x.Name
@@ -1011,7 +1055,7 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		el := c.fresh("")
 		tt := c.inferExpr(ex.Target)
 		c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, ex.Target.span(),
-			"when indexing (only lists; for strings use char_at())")
+			"when indexing (only lists; for strings use char_at(), for maps use get())")
 		it := c.inferExpr(ex.Idx)
 		c.unifyAt(it, tInt, ex.Idx.span(), "in this index")
 		return el
@@ -1102,7 +1146,7 @@ func (c *Checker) variantType(sig *EnumSig, idx int) Ty {
 // mutatingNatives are builtins that mutate their first argument in place.
 // Calling them on a place rooted in an immutable binding is an error:
 // `mut` is deep (GOALS: default immutability must mean what it says).
-var mutatingNatives = map[string]bool{"push": true, "pop": true}
+var mutatingNatives = map[string]bool{"push": true, "pop": true, "put": true, "delete": true}
 
 // requireMutRoot walks an index chain (`xs`, `xs[i]`, `xs[i][j]`, ...) back
 // to its root binding — a local, a global, or an imported package member —
@@ -1389,10 +1433,18 @@ func (c *Checker) declareBuiltins() {
 	mono := func(t Ty) *Scheme { return &Scheme{t: t} }
 	fn := func(ret Ty, ps ...Ty) *TFunc { return &TFunc{Params: ps, Ret: ret} }
 	list := func(t Ty) Ty { return &TCon{Name: "list", Args: []Ty{t}} }
+	mapt := func(k, v Ty) Ty { return &TCon{Name: "map", Args: []Ty{k, v}} }
+	opt := func(t Ty) Ty { return &TCon{Name: "Option", Args: []Ty{t}} }
 
 	poly1 := func(mk func(a *TV) *TFunc) *Scheme {
 		a := &TV{id: -1, level: 1}
 		return &Scheme{vars: []*TV{a}, t: mk(a)}
+	}
+	// poly2map quantifies a key-constrained K and an unconstrained V.
+	poly2map := func(mk func(k, v *TV) *TFunc) *Scheme {
+		k := &TV{id: -1, level: 1, con: "key"}
+		v := &TV{id: -1, level: 1}
+		return &Scheme{vars: []*TV{k, v}, t: mk(k, v)}
 	}
 
 	decl := func(name string, s *Scheme) {
@@ -1402,6 +1454,11 @@ func (c *Checker) declareBuiltins() {
 	decl("len", poly1(func(a *TV) *TFunc { return fn(tInt, list(a)) }))
 	decl("push", poly1(func(a *TV) *TFunc { return fn(tUnit, list(a), a) }))
 	decl("pop", poly1(func(a *TV) *TFunc { return fn(a, list(a)) }))
+	decl("map", poly2map(func(k, v *TV) *TFunc { return fn(mapt(k, v)) }))
+	decl("get", poly2map(func(k, v *TV) *TFunc { return fn(opt(v), mapt(k, v), k) }))
+	decl("put", poly2map(func(k, v *TV) *TFunc { return fn(tUnit, mapt(k, v), k, v) }))
+	decl("delete", poly2map(func(k, v *TV) *TFunc { return fn(tUnit, mapt(k, v), k) }))
+	decl("keys", poly2map(func(k, v *TV) *TFunc { return fn(list(k), mapt(k, v)) }))
 	decl("str", poly1(func(a *TV) *TFunc { return fn(tStr, a) }))
 	decl("type_of", poly1(func(a *TV) *TFunc { return fn(tStr, a) }))
 	decl("str_len", mono(fn(tInt, tStr)))
