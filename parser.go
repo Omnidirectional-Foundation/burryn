@@ -67,7 +67,7 @@ func (p *Parser) synchronize() {
 		}
 		if depth == 0 {
 			switch p.peek().Type {
-			case TLet, TFn, TEnum, TWhile, TFor, TReturn, TSpawn, TBreak, TContinue:
+			case TLet, TFn, TEnum, TWhile, TFor, TReturn, TSpawn, TBreak, TContinue, TPub, TImport:
 				return
 			}
 		}
@@ -140,6 +140,10 @@ func (p *Parser) statement() Stmt {
 		return p.fnDecl()
 	case p.check(TEnum):
 		return p.enumDecl()
+	case p.check(TPub):
+		return p.pubDecl()
+	case p.check(TImport):
+		return p.importDecl()
 	case p.check(TWhile):
 		return p.whileStmt()
 	case p.check(TFor):
@@ -195,6 +199,46 @@ func (p *Parser) letStmt() Stmt {
 	p.endStmt()
 	return &LetStmt{Name: name.Lex, NameSpan: name.Span, Mut: mut, Init: init,
 		Span: tok.Span.union(init.span())}
+}
+
+// pubDecl parses `pub` followed by an exportable declaration.
+func (p *Parser) pubDecl() Stmt {
+	tok := p.advance() // pub
+	switch {
+	case p.check(TLet):
+		s := p.letStmt().(*LetStmt)
+		s.Pub = true
+		s.Span = tok.Span.union(s.Span)
+		return s
+	case p.check(TFn) && p.toks[p.pos+1].Type == TIdent:
+		s := p.fnDecl().(*FnDecl)
+		s.Pub = true
+		s.Span = tok.Span.union(s.Span)
+		return s
+	case p.check(TEnum):
+		s := p.enumDecl().(*EnumDecl)
+		s.Pub = true
+		s.Span = tok.Span.union(s.Span)
+		return s
+	}
+	p.fail(tok.Span, "E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, or `pub let`",
+		"expected `fn`, `enum`, or `let` after `pub`, got %q", p.peek().Lex)
+	return nil
+}
+
+// importDecl parses `import ["alias"] "path"`.
+func (p *Parser) importDecl() Stmt {
+	tok := p.advance() // import
+	d := &ImportDecl{Span: tok.Span}
+	if p.check(TIdent) {
+		a := p.advance()
+		d.Alias, d.AliasSpan = a.Lex, a.Span
+	}
+	pathTok := p.expect(TString, "an import path string")
+	d.Path, d.PathSpan = pathTok.Lex, pathTok.Span
+	d.Span = tok.Span.union(pathTok.Span)
+	p.endStmt()
+	return d
 }
 
 func (p *Parser) fnDecl() Stmt {
@@ -292,6 +336,11 @@ func (p *Parser) typeExpr() TypeExpr {
 	case TIdent:
 		p.advance()
 		te := &TEName{Name: tok.Lex, Span: tok.Span}
+		if p.match(TDot) { // qualified type: pkg.Name
+			n := p.expect(TIdent, "a type name after '.'")
+			te.Pkg, te.Name = tok.Lex, n.Lex
+			te.Span = te.Span.union(n.Span)
+		}
 		if p.match(TLParen) {
 			for !p.check(TRParen) {
 				te.Args = append(te.Args, p.typeExpr())
@@ -455,12 +504,17 @@ func (p *Parser) postfix() Expr {
 			e = &TryExpr{Inner: e, Span: e.span().union(q.Span)}
 		case p.check(TDot):
 			d := p.advance()
-			id, ok := e.(*Ident)
-			if !ok {
-				p.fail(d.Span, "E1107", "", "'.' is only used for enum variants (Enum.Variant)")
+			switch head := e.(type) {
+			case *Ident:
+				v := p.expect(TIdent, "a name after '.'")
+				e = &VariantAccess{EnumName: head.Name, Variant: v.Lex, Span: head.Span.union(v.Span)}
+			case *VariantAccess: // third segment: pkg.Enum.Variant
+				v := p.expect(TIdent, "a name after '.'")
+				e = &QualVariantAccess{Pkg: head.EnumName, Enum: head.Variant, Variant: v.Lex,
+					Span: head.Span.union(v.Span)}
+			default:
+				p.fail(d.Span, "E1107", "", "'.' is only used for enum variants (Enum.Variant) and package members (pkg.name)")
 			}
-			v := p.expect(TIdent, "variant name after '.'")
-			e = &VariantAccess{EnumName: id.Name, Variant: v.Lex, Span: id.Span.union(v.Span)}
 		default:
 			return e
 		}
@@ -594,16 +648,22 @@ func (p *Parser) pattern() Pattern {
 		if tok.Lex == "_" {
 			return &PatWildcard{Span: tok.Span}
 		}
-		enumName, variant := "", tok.Lex
+		pkg, enumName, variant := "", "", tok.Lex
 		sp := tok.Span
 		if p.match(TDot) {
 			enumName = tok.Lex
 			vtok := p.expect(TIdent, "variant name after '.'")
 			variant = vtok.Lex
 			sp = sp.union(vtok.Span)
+			if p.match(TDot) { // third segment: pkg.Enum.Variant
+				pkg, enumName = enumName, variant
+				vtok = p.expect(TIdent, "variant name after '.'")
+				variant = vtok.Lex
+				sp = sp.union(vtok.Span)
+			}
 		}
 		if p.match(TLParen) {
-			pv := &PatVariant{EnumName: enumName, Variant: variant}
+			pv := &PatVariant{Pkg: pkg, EnumName: enumName, Variant: variant}
 			for !p.check(TRParen) {
 				sub := p.pattern()
 				switch sub.(type) {
@@ -621,7 +681,7 @@ func (p *Parser) pattern() Pattern {
 			return pv
 		}
 		if enumName != "" {
-			return &PatVariant{EnumName: enumName, Variant: variant, Span: sp}
+			return &PatVariant{Pkg: pkg, EnumName: enumName, Variant: variant, Span: sp}
 		}
 		// bare name: binding, or a nullary variant like None ??compiler decides
 		return &PatBinding{Name: variant, Span: sp}

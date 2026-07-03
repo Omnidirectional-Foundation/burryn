@@ -827,3 +827,32 @@ func TestGlobalDefinedLaterVisibleInFn(t *testing.T) {
 let later = 21
 println(use_it())`, "42\n")
 }
+
+func TestPubRejectedInScript(t *testing.T) {
+	expectTypeError(t, "pub fn f() { 1 }\nprintln(f())", "E0449")
+	expectTypeError(t, "pub let x = 1\nprintln(x)", "E0449")
+	expectTypeError(t, "pub enum E { A }\nprintln(1)", "E0449")
+	expectTypeError(t, "fn g() {\n    pub let x = 1\n    println(x)\n}\ng()", "E0449")
+}
+
+func TestPubRequiresDeclaration(t *testing.T) {
+	expectCompileError(t, "pub while true { }", "E1114")
+}
+
+func TestImportRejectedInScript(t *testing.T) {
+	expectTypeError(t, "import \"example.com/x\"\nprintln(1)", "E0432")
+	expectTypeError(t, "import m \"example.com/x\"\nprintln(1)", "E0432")
+}
+
+func TestQualifiedPathsUnresolvedInScript(t *testing.T) {
+	// three-segment expression path
+	expectTypeError(t, "let _ = geo.Shape.Circle(1.0)", "E0433")
+	// pkg-qualified variant pattern
+	expectTypeError(t, "enum E { A }\nlet x = A\nmatch x {\n    geo.Shape.Circle(r) => println(r),\n    _ => println(0),\n}", "E0433")
+	// pkg-qualified type in an enum field
+	expectTypeError(t, "enum E { A(geo.Shape) }\nprintln(1)", "E0433")
+}
+
+func TestDotChainTooDeep(t *testing.T) {
+	expectCompileError(t, "let _ = a.b.c.d", "E1107")
+}

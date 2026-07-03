@@ -6,7 +6,7 @@ type EnumInfo struct {
 	Name       string
 	Variants   []VariantInfo
 	runtime    *OEnumType
-	singletons []*OEnumInst   // cached nullary instances
+	singletons []*OEnumInst    // cached nullary instances
 	ctors      []*OVariantCtor // cached constructors
 }
 

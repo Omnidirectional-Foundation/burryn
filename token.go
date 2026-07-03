@@ -59,6 +59,8 @@ const (
 	TSpawn
 	TBreak
 	TContinue
+	TPub
+	TImport
 
 	TEOF
 )
@@ -102,4 +104,6 @@ var keywords = map[string]TokType{
 	"spawn":    TSpawn,
 	"break":    TBreak,
 	"continue": TContinue,
+	"pub":      TPub,
+	"import":   TImport,
 }
