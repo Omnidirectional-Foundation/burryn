@@ -168,6 +168,26 @@ func disasmInst(ch *Chunk, lines lineIndex, ip int) int {
 		return simple("RECV")
 	case OpChanNext:
 		return jump("CHAN_NEXT", 1)
+	case OpSelect:
+		nArms := int(ch.Code[ip+1])
+		hasDefault := ch.Code[ip+2] != 0
+		p := ip + 3
+		fmt.Printf("%-16s arms=%d default=%v\n", "SELECT", nArms, hasDefault)
+		for i := 0; i < nArms; i++ {
+			kind := "recv"
+			if ch.Code[p] == 1 {
+				kind = "send"
+			}
+			target := p + 3 + int(readU16(ch.Code, p+1))
+			fmt.Printf("%04d    |    arm %d %s -> %04d\n", p, i, kind, target)
+			p += 3
+		}
+		if hasDefault {
+			target := p + 2 + int(readU16(ch.Code, p))
+			fmt.Printf("%04d    |    default -> %04d\n", p, target)
+			p += 2
+		}
+		return p
 	}
 	fmt.Printf("UNKNOWN %d\n", op)
 	return ip + 1

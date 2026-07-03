@@ -51,6 +51,7 @@ const (
 	OpSend        // pops val, chan (may park fiber)
 	OpRecv        // pops chan, push received (may park fiber); traps on closed
 	OpChanNext    // u16 fwd: pops chan; push next value, or jump when closed+drained
+	OpSelect      // u8 nArms, u8 flags, per-arm{u8 kind,u16 bodyJump}, [u16 defaultJump]
 )
 
 type Chunk struct {

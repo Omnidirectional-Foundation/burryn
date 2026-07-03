@@ -463,6 +463,8 @@ func (c *Compiler) stmt(s Stmt) {
 		c.expr(st.Val)
 		c.temps--
 		c.emit(OpSend, st.Span)
+	case *SelectStmt:
+		c.selectStmt(st)
 	default:
 		panic(fmt.Sprintf("unhandled stmt %T", s))
 	}
@@ -659,6 +661,80 @@ func (c *Compiler) continueStmt(sp Span) {
 		c.emitLoop(lp.continueTo, sp)
 	} else {
 		lp.continueJumps = append(lp.continueJumps, c.emitJump(OpJump, sp))
+	}
+}
+
+// selectStmt compiles a `select`: it evaluates every arm's channel (and send
+// value) onto the stack, then OpSelect chooses a ready arm (or default, or
+// parks) and transfers to that arm's body. A received value is left on the
+// stack for a binding arm to consume.
+func (c *Compiler) selectStmt(st *SelectStmt) {
+	baseTemps := c.temps
+	for _, arm := range st.Arms {
+		c.expr(arm.Chan)
+		c.temps++
+		if arm.IsSend {
+			c.expr(arm.Val)
+			c.temps++
+		}
+	}
+	c.temps = baseTemps // OpSelect consumes all the operands
+
+	if len(st.Arms) > 255 {
+		c.fail(st.Span, "E2021", "", "too many select arms")
+	}
+	c.emit(OpSelect, st.Span)
+	c.emit(byte(len(st.Arms)), st.Span)
+	var flags byte
+	if st.HasDefault {
+		flags = 1
+	}
+	c.emit(flags, st.Span)
+	armSlots := make([]int, len(st.Arms))
+	for i, arm := range st.Arms {
+		var kind byte
+		if arm.IsSend {
+			kind = 1
+		}
+		c.emit(kind, st.Span)
+		c.emitU16(0xffff, st.Span)
+		armSlots[i] = len(c.chunk().Code) - 2
+	}
+	defSlot := -1
+	if st.HasDefault {
+		c.emitU16(0xffff, st.Span)
+		defSlot = len(c.chunk().Code) - 2
+	}
+
+	var endJumps []int
+	for i, arm := range st.Arms {
+		c.patchJump(armSlots[i])
+		c.beginScope()
+		if arm.IsSend {
+			c.expr(arm.Body)
+			c.emit(OpPop, arm.Span)
+		} else if arm.Bind != "" && arm.Bind != "_" {
+			c.declareLocal(arm.Bind, false, arm.Span) // received value on the stack
+			c.expr(arm.Body)
+			c.emit(OpPop, arm.Span)
+		} else {
+			c.emit(OpPop, arm.Span) // discard the received value
+			c.expr(arm.Body)
+			c.emit(OpPop, arm.Span)
+		}
+		c.endScope(arm.Span)
+		endJumps = append(endJumps, c.emitJump(OpJump, arm.Span))
+	}
+	if st.HasDefault {
+		c.patchJump(defSlot)
+		c.beginScope()
+		c.expr(st.Default)
+		c.emit(OpPop, st.DefaultSpan)
+		c.endScope(st.DefaultSpan)
+		endJumps = append(endJumps, c.emitJump(OpJump, st.DefaultSpan))
+	}
+	for _, j := range endJumps {
+		c.patchJump(j)
 	}
 }
 

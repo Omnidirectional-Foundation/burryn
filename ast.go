@@ -289,6 +289,27 @@ type SpawnStmt struct {
 	CallE *Call
 	Span  Span
 }
+
+// SelectArm is one communication clause of a `select`.
+type SelectArm struct {
+	IsSend bool // true: `ch <- v`; false: receive
+	Bind   string // recv only: name bound to the received value ("" or "_" = discard)
+	BindSpan Span
+	Chan   Expr
+	Val    Expr // send only
+	Body   Expr
+	Span   Span
+}
+
+// SelectStmt waits on several channels, running the first ready arm in
+// declaration order; an optional `default` arm runs when none are ready.
+type SelectStmt struct {
+	Arms       []SelectArm
+	HasDefault bool
+	Default    Expr
+	DefaultSpan Span
+	Span       Span
+}
 type SendStmt struct { // ch <- v
 	Chan Expr
 	Val  Expr
@@ -307,6 +328,7 @@ func (*FnDecl) stmtNode()       {}
 func (*EnumDecl) stmtNode()     {}
 func (*ImportDecl) stmtNode()   {}
 func (*SpawnStmt) stmtNode()    {}
+func (*SelectStmt) stmtNode()   {}
 func (*SendStmt) stmtNode()     {}
 func (*BreakStmt) stmtNode()    {}
 func (*ContinueStmt) stmtNode() {}
@@ -321,6 +343,7 @@ func (s *FnDecl) span() Span       { return s.Span }
 func (s *EnumDecl) span() Span     { return s.Span }
 func (s *ImportDecl) span() Span   { return s.Span }
 func (s *SpawnStmt) span() Span    { return s.Span }
+func (s *SelectStmt) span() Span   { return s.Span }
 func (s *SendStmt) span() Span     { return s.Span }
 func (s *BreakStmt) span() Span    { return s.Span }
 func (s *ContinueStmt) span() Span { return s.Span }

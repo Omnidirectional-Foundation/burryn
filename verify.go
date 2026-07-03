@@ -175,6 +175,47 @@ func verifyStack(fn *OFunc) error {
 				}
 				work = append(work, state{ip + 3 + u16(), depth - 1})
 				next = ip + 3 // fall-through depth unchanged: -1 chan, +1 value
+			case OpSelect:
+				// operands (channels/values) sit on the stack; OpSelect pops
+				// them all and transfers to one arm body (a received value is
+				// pushed for receive arms). It never falls through.
+				nArms := int(code[ip+1])
+				hasDefault := code[ip+2] != 0
+				p := ip + 3
+				slots := 0
+				type armT struct {
+					recv   bool
+					target int
+				}
+				armv := make([]armT, nArms)
+				for i := 0; i < nArms; i++ {
+					kind := code[p]
+					p++
+					target := p + 2 + int(readU16(code, p))
+					p += 2
+					armv[i] = armT{recv: kind == 0, target: target}
+					if kind == 1 {
+						slots += 2
+					} else {
+						slots++
+					}
+				}
+				base := depth - slots
+				if base < floor {
+					return errf(ip, "select pops %d operand(s) into the frame slots (depth %d, floor %d)", slots, depth, floor)
+				}
+				for _, a := range armv {
+					d := base
+					if a.recv {
+						d = base + 1 // received value is bound in the arm body
+					}
+					work = append(work, state{a.target, d})
+				}
+				if hasDefault {
+					target := p + 2 + int(readU16(code, p))
+					work = append(work, state{target, base})
+				}
+				break path // OpSelect always transfers to an arm
 			default:
 				return errf(ip, "unknown opcode %d", op)
 			}
