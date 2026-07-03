@@ -3,7 +3,8 @@ package main
 import "fmt"
 
 type EnumInfo struct {
-	Name       string
+	Name       string // qualified name: <pkg>.<Name>, or Name outside packages
+	Prefix     string // import path of the defining package; "" for scripts and builtins
 	Variants   []VariantInfo
 	runtime    *OEnumType
 	singletons []*OEnumInst    // cached nullary instances
@@ -13,38 +14,69 @@ type EnumInfo struct {
 // Shared holds cross-function compile state.
 type Shared struct {
 	gc        *GC
-	enums     map[string]*EnumInfo
-	globalMut map[string]bool // declared globals -> is mutable
-	lines     lineIndex       // maps AST spans to source lines for chunk.Lines
+	enums     map[string]*EnumInfo // keyed by qualified name
+	globalMut map[string]bool      // declared globals (qualified names) -> is mutable
+	lines     map[string]lineIndex // per source file, for disassembly
+	curPkg    string               // import path of the package being compiled; "" for scripts
+	curFile   string               // stamped onto compile diagnostics and functions
+	pkgDecls  map[string]bool      // top-level names of the current package
 }
 
-func newShared(gc *GC, src string) *Shared {
-	s := &Shared{gc: gc, enums: map[string]*EnumInfo{}, globalMut: map[string]bool{}, lines: newLineIndex(src)}
-	s.declareEnum("Option", []VariantInfo{{"Some", 1}, {"None", 0}})
-	s.declareEnum("Result", []VariantInfo{{"Ok", 1}, {"Err", 1}})
+// newShared builds compile state over the program's sources (file -> text);
+// scripts pass their single source under the "" key.
+func newShared(gc *GC, srcs map[string]string) *Shared {
+	s := &Shared{gc: gc, enums: map[string]*EnumInfo{}, globalMut: map[string]bool{},
+		lines: map[string]lineIndex{}}
+	for file, src := range srcs {
+		s.lines[file] = newLineIndex(src)
+	}
+	s.declareEnum("Option", "", []VariantInfo{{"Some", 1}, {"None", 0}})
+	s.declareEnum("Result", "", []VariantInfo{{"Ok", 1}, {"Err", 1}})
 	for _, n := range nativeNames() {
 		s.globalMut[n] = false
 	}
 	return s
 }
 
-func (s *Shared) declareEnum(name string, variants []VariantInfo) *EnumInfo {
-	rt := &OEnumType{Name: name, Variants: variants}
+// qualify maps a top-level name of the current package to its globally
+// unique global-table name.
+func (s *Shared) qualify(name string) string {
+	if s.curPkg == "" {
+		return name
+	}
+	return s.curPkg + "." + name
+}
+
+// mangleIfDecl qualifies name when it is a top-level declaration of the
+// current package; natives and script globals pass through unchanged.
+func (s *Shared) mangleIfDecl(name string) string {
+	if s.pkgDecls[name] {
+		return s.qualify(name)
+	}
+	return name
+}
+
+func (s *Shared) declareEnum(qual, prefix string, variants []VariantInfo) *EnumInfo {
+	rt := &OEnumType{Name: qual, Variants: variants}
 	s.gc.alloc(rt)
 	info := &EnumInfo{
-		Name: name, Variants: variants, runtime: rt,
+		Name: qual, Prefix: prefix, Variants: variants, runtime: rt,
 		singletons: make([]*OEnumInst, len(variants)),
 		ctors:      make([]*OVariantCtor, len(variants)),
 	}
-	s.enums[name] = info
-	s.globalMut[name] = false
+	s.enums[qual] = info
+	s.globalMut[qual] = false
 	return info
 }
 
-// find a variant by bare name across all enums; ambiguous if several match
+// find a variant by bare name across the enums visible without a qualifier
+// (the current package's and the builtins); ambiguous if several match
 func (s *Shared) findVariant(name string) (info *EnumInfo, idx int, ambiguous bool) {
 	idx = -1
 	for _, e := range s.enums {
+		if e.Prefix != s.curPkg && e.Prefix != "" {
+			continue
+		}
 		for i, v := range e.Variants {
 			if v.Name == name {
 				if idx >= 0 {
@@ -55,6 +87,16 @@ func (s *Shared) findVariant(name string) (info *EnumInfo, idx int, ambiguous bo
 		}
 	}
 	return info, idx, false
+}
+
+// localEnum resolves a bare enum name written in the current package; the
+// package's own enums shadow the builtins.
+func (s *Shared) localEnum(name string) (*EnumInfo, bool) {
+	if info, ok := s.enums[s.qualify(name)]; ok {
+		return info, true
+	}
+	info, ok := s.enums[name]
+	return info, ok && info.Prefix == ""
 }
 
 type LocalVar struct {
@@ -107,7 +149,7 @@ func compileProgram(gc *GC, src string, stmts []Stmt) (fn *OFunc, shared *Shared
 			diags = []Diag{Diag(ce)}
 		}
 	}()
-	shared = newShared(gc, src)
+	shared = newShared(gc, map[string]string{"": src})
 	c := &Compiler{shared: shared, fn: &OFunc{Name: "<script>"}}
 	gc.alloc(c.fn)
 	c.locals = append(c.locals, LocalVar{name: "", depth: 0, slot: 0}) // slot 0: script itself
@@ -122,8 +164,107 @@ func compileProgram(gc *GC, src string, stmts []Stmt) (fn *OFunc, shared *Shared
 	return c.fn, shared, nil
 }
 
+// compileModule compiles every package of a loaded module into one program:
+// per-file init functions define each package's globals in dependency order,
+// then the entry package's main runs.
+func compileModule(gc *GC, m *Module) (fn *OFunc, shared *Shared, diags []Diag) {
+	defer func() {
+		if r := recover(); r != nil {
+			ce, ok := r.(compileErr)
+			if !ok {
+				panic(r)
+			}
+			fn, shared = nil, nil
+			diags = []Diag{Diag(ce)}
+		}
+	}()
+	shared = newShared(gc, m.Srcs)
+	c := &Compiler{shared: shared, fn: &OFunc{Name: "<module>"}}
+	gc.alloc(c.fn)
+	c.locals = append(c.locals, LocalVar{name: "", depth: 0, slot: 0}) // slot 0: the program itself
+	for _, pkg := range m.Packages {
+		shared.curPkg = pkg.ImportPath
+		shared.pkgDecls = pkgDeclNames(pkg)
+		// register every enum of the package before compiling any body, so
+		// variant references resolve across files regardless of order
+		for _, f := range pkg.Files {
+			shared.curFile = f.Path
+			for _, s := range f.Stmts {
+				if st, ok := s.(*EnumDecl); ok {
+					c.registerEnumDecl(st)
+				}
+			}
+		}
+		for _, f := range pkg.Files {
+			shared.curFile = f.Path
+			c.fileInit(f)
+		}
+	}
+	shared.curPkg, shared.curFile, shared.pkgDecls = "", "", nil
+
+	mainName := m.Entry.ImportPath + ".main"
+	idx := c.chunk().addConst(ObjV(gc.newString(mainName)))
+	c.emit(OpGetGlobal, Span{})
+	c.emitU16(idx, Span{})
+	c.emit(OpCall, Span{})
+	c.emit(0, Span{})
+	c.emit(OpPop, Span{})
+	c.emit(OpUnit, Span{})
+	c.emit(OpReturn, Span{})
+	if err := verifyAll(c.fn); err != nil {
+		panic(fmt.Sprintf("internal error: bytecode verifier: %v", err))
+	}
+	return c.fn, shared, nil
+}
+
+// pkgDeclNames collects the package's top-level names; references to them
+// compile to qualified globals.
+func pkgDeclNames(pkg *Package) map[string]bool {
+	names := map[string]bool{}
+	for _, f := range pkg.Files {
+		for _, s := range f.Stmts {
+			switch st := s.(type) {
+			case *FnDecl:
+				names[st.Name] = true
+			case *EnumDecl:
+				names[st.Name] = true
+			case *LetStmt:
+				names[st.Name] = true
+			}
+		}
+	}
+	return names
+}
+
+// fileInit compiles one package file's declarations into an init function
+// and emits a call to it, so runtime errors during initialization attribute
+// to the right file.
+func (c *Compiler) fileInit(f *SourceFile) {
+	sub := &Compiler{
+		shared: c.shared,
+		fn:     &OFunc{Name: "<init>", File: f.Path},
+	}
+	c.shared.gc.alloc(sub.fn)
+	sub.locals = append(sub.locals, LocalVar{name: "", depth: 0, slot: 0})
+	for _, s := range f.Stmts {
+		sub.stmt(s)
+	}
+	sub.emit(OpUnit, Span{})
+	sub.emit(OpReturn, Span{})
+	if len(sub.upvals) > 0 {
+		panic("internal error: package file init captured variables")
+	}
+	idx := c.chunk().addConst(ObjV(sub.fn))
+	c.emit(OpClosure, Span{})
+	c.emitU16(idx, Span{})
+	c.emit(OpCall, Span{})
+	c.emit(0, Span{})
+	c.emit(OpPop, Span{})
+}
+
 func (c *Compiler) fail(sp Span, code, help, format string, args ...any) {
-	panic(compileErr(Diag{IsErr: true, Code: code, Msg: fmt.Sprintf(format, args...), Help: help, Span: sp}))
+	panic(compileErr(Diag{IsErr: true, Code: code, Msg: fmt.Sprintf(format, args...),
+		Help: help, File: c.shared.curFile, Span: sp}))
 }
 
 func (c *Compiler) chunk() *Chunk { return &c.fn.Chunk }
@@ -328,13 +469,14 @@ func (c *Compiler) stmt(s Stmt) {
 }
 
 func (c *Compiler) defineGlobal(name string, mut bool, sp Span) {
-	if _, exists := c.shared.globalMut[name]; exists {
-		if _, isEnum := c.shared.enums[name]; isEnum {
+	qual := c.shared.qualify(name)
+	if _, exists := c.shared.globalMut[qual]; exists {
+		if _, isEnum := c.shared.enums[qual]; isEnum {
 			c.fail(sp, "E2007", "", "cannot redeclare enum %q", name)
 		}
 	}
-	c.shared.globalMut[name] = mut
-	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(name)))
+	c.shared.globalMut[qual] = mut
+	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(qual)))
 	c.emit(OpDefGlobal, sp)
 	c.emitU16(idx, sp)
 }
@@ -356,11 +498,11 @@ func (c *Compiler) assign(st *AssignStmt) {
 			}
 			c.emit(OpSetUpval, st.Span)
 			c.emitU16(uint16(ui), st.Span)
-		} else if mut, ok := c.shared.globalMut[t.Name]; ok {
+		} else if mut, ok := c.shared.globalMut[c.shared.mangleIfDecl(t.Name)]; ok {
 			if !mut {
 				c.fail(st.Span, "E2010", "declare it with `let mut`", "cannot assign to immutable variable %q", t.Name)
 			}
-			idx := c.chunk().addConst(ObjV(c.shared.gc.newString(t.Name)))
+			idx := c.chunk().addConst(ObjV(c.shared.gc.newString(c.shared.mangleIfDecl(t.Name))))
 			c.emit(OpSetGlobal, st.Span)
 			c.emitU16(idx, st.Span)
 		} else {
@@ -486,7 +628,27 @@ func (c *Compiler) enumDecl(st *EnumDecl) {
 	if c.scopeDepth > 0 {
 		c.fail(st.Span, "E2008", "", "enum declarations are only allowed at top level")
 	}
-	if _, exists := c.shared.enums[st.Name]; exists {
+	qual := c.shared.qualify(st.Name)
+	info, registered := c.shared.enums[qual]
+	if !registered {
+		info = c.registerEnumDecl(st)
+	} else if c.shared.curPkg == "" {
+		// module builds pre-register every enum; in a script an existing
+		// entry is a redeclaration
+		c.fail(st.Span, "E2007", "", "enum %q is already declared", st.Name)
+	}
+	c.emitConst(ObjV(info.runtime), st.Span)
+	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(qual)))
+	c.emit(OpDefGlobal, st.Span)
+	c.emitU16(idx, st.Span)
+}
+
+// registerEnumDecl records an enum's compile-time info without emitting
+// code; module builds run it over every file before compiling bodies so
+// cross-file variant references resolve regardless of order.
+func (c *Compiler) registerEnumDecl(st *EnumDecl) *EnumInfo {
+	qual := c.shared.qualify(st.Name)
+	if _, exists := c.shared.enums[qual]; exists {
 		c.fail(st.Span, "E2007", "", "enum %q is already declared", st.Name)
 	}
 	seen := map[string]bool{}
@@ -498,11 +660,7 @@ func (c *Compiler) enumDecl(st *EnumDecl) {
 		seen[v.Name] = true
 		variants = append(variants, VariantInfo{Name: v.Name, Arity: v.Arity})
 	}
-	info := c.shared.declareEnum(st.Name, variants)
-	c.emitConst(ObjV(info.runtime), st.Span)
-	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(st.Name)))
-	c.emit(OpDefGlobal, st.Span)
-	c.emitU16(idx, st.Span)
+	return c.shared.declareEnum(qual, c.shared.curPkg, variants)
 }
 
 // ---- expressions ----
@@ -610,6 +768,16 @@ func (c *Compiler) expr(e Expr) {
 		c.matchExpr(ex)
 	case *VariantAccess:
 		c.variantAccess(ex.EnumName, ex.Variant, ex.Span)
+	case *PkgAccess:
+		idx := c.chunk().addConst(ObjV(c.shared.gc.newString(ex.Pkg + "." + ex.Name)))
+		c.emit(OpGetGlobal, ex.Span)
+		c.emitU16(idx, ex.Span)
+	case *QualVariantAccess:
+		info, ok := c.shared.enums[ex.Pkg+"."+ex.Enum]
+		if !ok {
+			c.fail(ex.Span, "E2015", "", "unknown enum %q", ex.Pkg+"."+ex.Enum)
+		}
+		c.emitVariantOf(info, ex.Variant, ex.Span)
 	case *TryExpr:
 		c.expr(ex.Inner)
 		c.emit(OpTry, ex.Span)
@@ -632,7 +800,8 @@ func (c *Compiler) identExpr(ex *Ident) {
 		c.emitU16(uint16(ui), ex.Span)
 		return
 	}
-	if _, declared := c.shared.globalMut[ex.Name]; !declared {
+	name := c.shared.mangleIfDecl(ex.Name)
+	if _, declared := c.shared.globalMut[name]; !declared {
 		// bare enum variant like Some / None / Ok / Err
 		if info, idx, amb := c.shared.findVariant(ex.Name); amb {
 			c.fail(ex.Span, "E2014", fmt.Sprintf("qualify it as Enum.%s", ex.Name), "variant %q exists in several enums", ex.Name)
@@ -642,23 +811,28 @@ func (c *Compiler) identExpr(ex *Ident) {
 		}
 	}
 	// global (possibly defined later in the script)
-	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(ex.Name)))
+	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(name)))
 	c.emit(OpGetGlobal, ex.Span)
 	c.emitU16(idx, ex.Span)
 }
 
 func (c *Compiler) variantAccess(enumName, variant string, sp Span) {
-	info, ok := c.shared.enums[enumName]
+	info, ok := c.shared.localEnum(enumName)
 	if !ok {
 		c.fail(sp, "E2015", "", "unknown enum %q", enumName)
 	}
+	c.emitVariantOf(info, variant, sp)
+}
+
+// emitVariantOf emits the constructor or singleton for a named variant.
+func (c *Compiler) emitVariantOf(info *EnumInfo, variant string, sp Span) {
 	for i, v := range info.Variants {
 		if v.Name == variant {
 			c.emitVariant(info, i, sp)
 			return
 		}
 	}
-	c.fail(sp, "E2016", "", "enum %q has no variant %q", enumName, variant)
+	c.fail(sp, "E2016", "", "enum %q has no variant %q", info.Name, variant)
 }
 
 // nullary variants become singleton instance constants; variants with fields
@@ -685,7 +859,7 @@ func (c *Compiler) function(lit *FnLit) {
 	sub := &Compiler{
 		enclosing: c,
 		shared:    c.shared,
-		fn:        &OFunc{Name: lit.Name, Arity: len(lit.Params)},
+		fn:        &OFunc{Name: lit.Name, File: c.shared.curFile, Arity: len(lit.Params)},
 	}
 	c.shared.gc.alloc(sub.fn)
 	sub.beginScope()
@@ -813,9 +987,25 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 		case *PatVariant:
 			var info *EnumInfo
 			var idx int
-			if pat.EnumName != "" {
+			if pat.Pkg != "" {
 				var ok bool
-				info, ok = c.shared.enums[pat.EnumName]
+				info, ok = c.shared.enums[pat.Pkg+"."+pat.EnumName]
+				if !ok {
+					c.fail(arm.Span, "E2015", "", "unknown enum %q", pat.Pkg+"."+pat.EnumName)
+				}
+				idx = -1
+				for i, v := range info.Variants {
+					if v.Name == pat.Variant {
+						idx = i
+						break
+					}
+				}
+				if idx < 0 {
+					c.fail(arm.Span, "E2016", "", "enum %q has no variant %q", pat.EnumName, pat.Variant)
+				}
+			} else if pat.EnumName != "" {
+				var ok bool
+				info, ok = c.shared.localEnum(pat.EnumName)
 				if !ok {
 					c.fail(arm.Span, "E2015", "", "unknown enum %q", pat.EnumName)
 				}

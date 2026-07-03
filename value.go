@@ -57,6 +57,7 @@ type OList struct {
 type OFunc struct {
 	GCHeader
 	Name      string
+	File      string // source file the function was compiled from; "" in scripts
 	Arity     int
 	NumUpvals int
 	Chunk     Chunk

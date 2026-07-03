@@ -4,13 +4,13 @@ import "fmt"
 
 // disasmAll prints the bytecode of a function and, recursively, of every
 // function found in its constant table.
-func disasmAll(fn *OFunc, lines lineIndex) {
-	disasm(fn, lines)
+func disasmAll(fn *OFunc, shared *Shared) {
+	disasm(fn, shared.lines[fn.File])
 	for _, c := range fn.Chunk.Consts {
 		if c.T == VObj {
 			if sub, ok := c.O.(*OFunc); ok {
 				fmt.Println()
-				disasmAll(sub, lines)
+				disasmAll(sub, shared)
 			}
 		}
 	}
