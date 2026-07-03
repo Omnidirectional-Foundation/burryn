@@ -1016,6 +1016,150 @@ println(1)`, "deadlock")
 ch <- 1`, "deadlock")
 }
 
+// ---- select ----
+
+func TestSelectDefaultWhenNothingReady(t *testing.T) {
+	expectOut(t, `let ch = chan(0)
+select {
+    v = <-ch => { println("got", v) },
+    default => { println("idle") },
+}`, "idle\n")
+}
+
+func TestSelectPicksReadyReceive(t *testing.T) {
+	expectOut(t, `let ch = chan(1)
+ch <- 42
+select {
+    v = <-ch => { println("recv", v) },
+    default => { println("idle") },
+}`, "recv 42\n")
+}
+
+func TestSelectPicksReadySend(t *testing.T) {
+	expectOut(t, `let ch = chan(1)
+select {
+    ch <- 7 => { println("sent") },
+    default => { println("idle") },
+}
+println(<-ch)`, "sent\n7\n")
+}
+
+func TestSelectDeclarationOrderPriority(t *testing.T) {
+	expectOut(t, `let a = chan(1)
+let b = chan(1)
+a <- 1
+b <- 2
+select {
+    x = <-a => { println("a", x) },
+    y = <-b => { println("b", y) },
+}`, "a 1\n")
+}
+
+func TestSelectBlocksUntilReceiveReady(t *testing.T) {
+	expectOut(t, `fn worker(ch, tag) { ch <- tag }
+let a = chan(0)
+let b = chan(0)
+spawn worker(b, 99)
+select {
+    x = <-a => { println("a", x) },
+    y = <-b => { println("b", y) },
+}`, "b 99\n")
+}
+
+func TestSelectBlocksUntilSendReady(t *testing.T) {
+	expectOut(t, `fn consumer(ch, done) {
+    let v = <-ch
+    done <- v
+}
+let c = chan(0)
+let done = chan(0)
+spawn consumer(c, done)
+select {
+    c <- 7 => { println("sent") },
+}
+println(<-done)`, "sent\n7\n")
+}
+
+func TestSelectNonBindingReceive(t *testing.T) {
+	expectOut(t, `let ch = chan(1)
+ch <- 5
+select {
+    <-ch => { println("drained") },
+    default => { println("idle") },
+}`, "drained\n")
+}
+
+func TestSelectReceiveOnClosedTraps(t *testing.T) {
+	// a receive arm on a closed, drained channel is ready and traps when taken
+	expectRuntimeError(t, `let ch = chan(0)
+close(ch)
+select {
+    v = <-ch => { println(v) },
+}`, "receive on closed channel")
+}
+
+func TestSelectSendOnClosedTraps(t *testing.T) {
+	expectRuntimeError(t, `let ch = chan(1)
+close(ch)
+select {
+    ch <- 1 => { println("sent") },
+}`, "send on closed channel")
+}
+
+func TestSelectBlockingDeadlocks(t *testing.T) {
+	expectRuntimeError(t, `let a = chan(0)
+select {
+    x = <-a => { println(x) },
+}`, "deadlock")
+}
+
+func TestSelectArmNeedsChannel(t *testing.T) {
+	expectTypeError(t, `select {
+    v = <-42 => { println(v) },
+    default => {},
+}`, "E0308")
+}
+
+func TestSelectSendTypeChecked(t *testing.T) {
+	expectTypeError(t, `let ch = chan(1)
+select {
+    ch <- "str" => {},
+    default => {},
+}
+ch <- 1`, "E0308")
+}
+
+func TestSelectAtMostOneDefault(t *testing.T) {
+	expectCompileError(t, `let ch = chan(1)
+select {
+    v = <-ch => {},
+    default => {},
+    default => {},
+}`, "at most one `default`")
+}
+
+func TestSelectNeedsAnArm(t *testing.T) {
+	expectCompileError(t, `select {
+}`, "at least one")
+}
+
+func TestSelectBreakFromArmInLoop(t *testing.T) {
+	// break inside a receive arm must unwind past the arm's bound value
+	expectOut(t, `let a = chan(1)
+a <- 5
+let mut n = 0
+while true {
+    select {
+        x = <-a => {
+            n = x
+            break
+        },
+        default => { break },
+    }
+}
+println(n)`, "5\n")
+}
+
 func TestSieveSmall(t *testing.T) {
 	expectOut(t, `fn generate(ch) {
     let mut i = 2

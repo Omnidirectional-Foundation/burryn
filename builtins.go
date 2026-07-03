@@ -199,6 +199,7 @@ var nativeDefs = []nativeDef{
 			vm.schedule(r)
 		}
 		ch.recvq = nil
+		vm.wakeWaiters(ch) // select arms on this channel are now ready
 		return Unit, nil
 	}},
 	{"recv", 1, func(vm *VM, args []Value) (Value, error) {
@@ -211,6 +212,7 @@ var nativeDefs = []nativeDef{
 			f.push(v) // root v across the Some allocation
 			opt := vm.some(f.peek(0))
 			f.pop()
+			vm.wakeWaiters(ch)
 			return opt, nil
 		}
 		if ch.closed {

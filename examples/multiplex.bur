@@ -1,0 +1,41 @@
+// Merge two producers with `select`: on each turn take from whichever channel
+// is ready, blocking until one is. The running sum is order-independent, so the
+// result is the same however the two fibers interleave.
+
+fn produce(ch, base, n) {
+    for i in range(0, n) {
+        ch <- base + i
+    }
+}
+
+fn main_loop() {
+    let a = chan(4)
+    let b = chan(4)
+    spawn produce(a, 100, 3)
+    spawn produce(b, 200, 3)
+
+    let mut got = 0
+    let mut sum = 0
+    while got < 6 {
+        select {
+            x = <-a => {
+                sum = sum + x
+                got = got + 1
+            },
+            y = <-b => {
+                sum = sum + y
+                got = got + 1
+            },
+        }
+    }
+    println("merged sum =", sum)
+
+    // `default` makes select non-blocking: it runs when no arm is ready
+    let idle = chan(0)
+    select {
+        v = <-idle => { println("unexpected", v) },
+        default => { println("nothing buffered, moving on") },
+    }
+}
+
+main_loop()

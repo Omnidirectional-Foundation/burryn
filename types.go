@@ -918,6 +918,29 @@ func (c *Checker) inferStmt(s Stmt) {
 		c.unifyAt(c.retTys[len(c.retTys)-1], t, st.Span, "in this `return`")
 	case *SpawnStmt:
 		c.inferExpr(st.CallE)
+	case *SelectStmt:
+		for i := range st.Arms {
+			arm := &st.Arms[i]
+			el := c.fresh("")
+			ct := c.inferExpr(arm.Chan)
+			c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, arm.Chan.span(),
+				"in this `select` arm (need a channel)")
+			if arm.IsSend {
+				vt := c.inferExpr(arm.Val)
+				c.unifyAt(el, vt, arm.Val.span(), "in this `select` send")
+				c.inferExpr(arm.Body)
+			} else {
+				c.pushScope()
+				if arm.Bind != "" && arm.Bind != "_" {
+					c.declare(arm.Bind, &Scheme{t: el}, false, "local", arm.BindSpan)
+				}
+				c.inferExpr(arm.Body)
+				c.popScope()
+			}
+		}
+		if st.HasDefault {
+			c.inferExpr(st.Default)
+		}
 	case *SendStmt:
 		el := c.fresh("")
 		ct := c.inferExpr(st.Chan)

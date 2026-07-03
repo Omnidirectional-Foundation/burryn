@@ -182,9 +182,10 @@ type OChannel struct {
 	GCHeader
 	cap    int
 	buf    []Value
-	sendq  []*Fiber // fibers blocked sending (value in fiber.sendVal)
-	recvq  []*Fiber // fibers blocked receiving
-	closed bool     // close(ch): further sends trap, drained receives observe closure
+	sendq   []*Fiber // fibers blocked sending (value in fiber.sendVal)
+	recvq   []*Fiber // fibers blocked receiving
+	waiters []*Fiber // fibers parked in a select, to notify on any state change
+	closed  bool     // close(ch): further sends trap, drained receives observe closure
 }
 
 type NativeFn func(vm *VM, args []Value) (Value, error)

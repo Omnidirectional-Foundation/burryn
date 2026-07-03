@@ -14,6 +14,7 @@ const (
 	FReady FiberStatus = iota
 	FBlockedSend
 	FBlockedRecv
+	FBlockedSelect
 	FDone
 )
 
@@ -30,9 +31,10 @@ type Fiber struct {
 	stack      []Value
 	top        int
 	frames     []Frame
-	status     FiberStatus
-	sendVal    Value // pending value while blocked on send
-	openUpvals []*OUpvalue
+	status      FiberStatus
+	sendVal     Value       // pending value while blocked on send
+	selectChans []*OChannel // channels this fiber waits on while blocked in select
+	openUpvals  []*OUpvalue
 }
 
 func (f *Fiber) push(v Value) {
@@ -117,7 +119,7 @@ func (vm *VM) run(mainFn *OFunc) error {
 			// main finished => program over (checked in exec); otherwise deadlock
 			blocked := 0
 			for _, f := range vm.fibers {
-				if f.status == FBlockedSend || f.status == FBlockedRecv {
+				if f.status == FBlockedSend || f.status == FBlockedRecv || f.status == FBlockedSelect {
 					blocked++
 				}
 			}
@@ -301,6 +303,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 				vm.parkRecv = nil
 				f.status = FBlockedRecv
 				ch.recvq = append(ch.recvq, f)
+				vm.wakeWaiters(ch) // a select send arm can now proceed
 				frame.ip = startIP // re-run the call (and recv) once woken
 				return false, nil
 			}
@@ -457,12 +460,15 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 				r := ch.recvq[0]
 				ch.recvq = ch.recvq[1:]
 				vm.schedule(r)
+				vm.wakeWaiters(ch)
 			} else if len(ch.buf) < ch.cap {
 				ch.buf = append(ch.buf, val)
+				vm.wakeWaiters(ch)
 			} else {
 				f.sendVal = val
 				f.status = FBlockedSend
 				ch.sendq = append(ch.sendq, f)
+				vm.wakeWaiters(ch) // a select receive arm can now proceed
 				return false, nil
 			}
 		case OpRecv:
@@ -475,12 +481,14 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			if v, ready := vm.chanTryRecv(ch); ready {
 				f.pop()
 				f.push(v)
+				vm.wakeWaiters(ch)
 			} else if ch.closed {
 				f.pop()
 				return false, rtErr("receive on closed channel")
 			} else {
 				f.status = FBlockedRecv
 				ch.recvq = append(ch.recvq, f)
+				vm.wakeWaiters(ch) // a select send arm can now proceed
 				frame.ip = startIP // re-run once woken
 				return false, nil
 			}
@@ -494,6 +502,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			if v, ready := vm.chanTryRecv(ch); ready {
 				f.pop()
 				f.push(v)
+				vm.wakeWaiters(ch)
 				frame.ip += 2 // skip the jump operand: fall through into the body
 			} else if ch.closed {
 				f.pop()
@@ -501,13 +510,161 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			} else {
 				f.status = FBlockedRecv
 				ch.recvq = append(ch.recvq, f)
+				vm.wakeWaiters(ch) // a select send arm can now proceed
 				frame.ip = startIP // re-run once woken
+				return false, nil
+			}
+		case OpSelect:
+			// on re-entry after a park, drop stale waiter registrations
+			if len(f.selectChans) > 0 {
+				for _, ch := range f.selectChans {
+					removeWaiter(ch, f)
+				}
+				f.selectChans = f.selectChans[:0]
+			}
+			p := frame.ip
+			nArms := int(chunk.Code[p])
+			hasDefault := chunk.Code[p+1] != 0
+			p += 2
+			type selArm struct {
+				send   bool
+				target int
+			}
+			arms := make([]selArm, nArms)
+			slots := 0 // operand stack slots consumed by all arms
+			for i := 0; i < nArms; i++ {
+				kind := chunk.Code[p]
+				p++
+				dist := int(readU16(chunk.Code, p))
+				p += 2
+				arms[i] = selArm{send: kind == 1, target: p + dist}
+				if kind == 1 {
+					slots += 2
+				} else {
+					slots++
+				}
+			}
+			defaultTarget := -1
+			if hasDefault {
+				dist := int(readU16(chunk.Code, p))
+				p += 2
+				defaultTarget = p + dist
+			}
+			base := f.top - slots
+			// resolve each arm's operand positions from the bottom up
+			chanPos := make([]int, nArms)
+			valPos := make([]int, nArms)
+			off := base
+			for i := range arms {
+				chanPos[i] = off
+				if arms[i].send {
+					valPos[i] = off + 1
+					off += 2
+				} else {
+					off++
+				}
+			}
+			chanAt := func(pos int) (*OChannel, error) {
+				ch, ok := asChannelV(f.stack[pos])
+				if !ok {
+					return nil, rtErr("select arm needs a channel, got %s", typeOf(f.stack[pos]))
+				}
+				return ch, nil
+			}
+			// pick the first ready arm in declaration order
+			chosen := -1
+			for i := range arms {
+				ch, err := chanAt(chanPos[i])
+				if err != nil {
+					return false, err
+				}
+				if arms[i].send {
+					if chanSendReady(ch) {
+						chosen = i
+						break
+					}
+				} else if chanRecvReady(ch) {
+					chosen = i
+					break
+				}
+			}
+			if chosen >= 0 {
+				ch, _ := chanAt(chanPos[chosen])
+				if arms[chosen].send {
+					if ch.closed {
+						return false, rtErr("send on closed channel")
+					}
+					val := f.stack[valPos[chosen]]
+					if len(ch.recvq) > 0 {
+						ch.buf = append(ch.buf, val)
+						r := ch.recvq[0]
+						ch.recvq = ch.recvq[1:]
+						vm.schedule(r)
+					} else {
+						ch.buf = append(ch.buf, val)
+					}
+					vm.wakeWaiters(ch)
+					f.top = base
+				} else {
+					v, ready := vm.chanTryRecv(ch)
+					if !ready { // ready implies closed here
+						f.top = base
+						return false, rtErr("receive on closed channel")
+					}
+					vm.wakeWaiters(ch)
+					f.top = base
+					f.push(v) // left on the stack for a binding arm
+				}
+				frame.ip = arms[chosen].target
+			} else if hasDefault {
+				f.top = base
+				frame.ip = defaultTarget
+			} else {
+				// nothing ready: park on every arm's channel and retry when woken
+				for i := range arms {
+					ch, _ := chanAt(chanPos[i])
+					ch.waiters = append(ch.waiters, f)
+					f.selectChans = append(f.selectChans, ch)
+				}
+				f.status = FBlockedSelect
+				frame.ip = startIP
 				return false, nil
 			}
 		default:
 			return false, rtErr("bad opcode %d (VM bug)", op)
 		}
 	}
+}
+
+// wakeWaiters reschedules every fiber parked in a select on ch, so each
+// re-polls its arms; a fiber woken elsewhere first is skipped.
+func (vm *VM) wakeWaiters(ch *OChannel) {
+	if len(ch.waiters) == 0 {
+		return
+	}
+	for _, w := range ch.waiters {
+		if w.status == FBlockedSelect {
+			vm.schedule(w)
+		}
+	}
+	ch.waiters = nil
+}
+
+func removeWaiter(ch *OChannel, f *Fiber) {
+	for i, w := range ch.waiters {
+		if w == f {
+			ch.waiters = append(ch.waiters[:i], ch.waiters[i+1:]...)
+			return
+		}
+	}
+}
+
+func chanRecvReady(ch *OChannel) bool {
+	return len(ch.buf) > 0 || len(ch.sendq) > 0 || ch.closed
+}
+
+func chanSendReady(ch *OChannel) bool {
+	return ch.closed || len(ch.recvq) > 0 || len(ch.buf) < ch.cap
 }
 
 func asChannelV(v Value) (*OChannel, bool) {

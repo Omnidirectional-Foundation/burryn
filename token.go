@@ -61,6 +61,7 @@ const (
 	TContinue
 	TPub
 	TImport
+	TSelect
 
 	TEOF
 )
@@ -106,4 +107,5 @@ var keywords = map[string]TokType{
 	"continue": TContinue,
 	"pub":      TPub,
 	"import":   TImport,
+	"select":   TSelect,
 }

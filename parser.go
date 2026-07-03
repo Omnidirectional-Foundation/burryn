@@ -67,7 +67,7 @@ func (p *Parser) synchronize() {
 		}
 		if depth == 0 {
 			switch p.peek().Type {
-			case TLet, TFn, TEnum, TWhile, TFor, TReturn, TSpawn, TBreak, TContinue, TPub, TImport:
+			case TLet, TFn, TEnum, TWhile, TFor, TReturn, TSpawn, TSelect, TBreak, TContinue, TPub, TImport:
 				return
 			}
 		}
@@ -160,6 +160,8 @@ func (p *Parser) statement() Stmt {
 		return &ReturnStmt{Val: val, Span: sp}
 	case p.check(TSpawn):
 		return p.spawnStmt()
+	case p.check(TSelect):
+		return p.selectStmt()
 	case p.check(TBreak):
 		tok := p.advance()
 		p.endStmt()
@@ -386,6 +388,74 @@ func (p *Parser) spawnStmt() Stmt {
 	}
 	p.endStmt()
 	return &SpawnStmt{CallE: call, Span: tok.Span.union(call.Span)}
+}
+
+// selectStmt parses `select { arm, arm, default => body }`. Each arm is a
+// receive (`v = <-ch => body` / `<-ch => body`), a send (`ch <- v => body`),
+// or `default => body` (at most one).
+func (p *Parser) selectStmt() Stmt {
+	tok := p.advance() // select
+	p.expect(TLBrace, "'{' after select")
+	sel := &SelectStmt{Span: tok.Span}
+	p.skipSemis()
+	for !p.check(TRBrace) && !p.check(TEOF) {
+		if p.check(TIdent) && p.peek().Lex == "default" {
+			d := p.advance()
+			if sel.HasDefault {
+				p.fail(d.Span, "E1115", "", "`select` may have at most one `default` arm")
+			}
+			p.expect(TArrow, "'=>' after default")
+			p.skipSemis()
+			sel.HasDefault = true
+			sel.DefaultSpan = d.Span
+			sel.Default = p.expression()
+		} else {
+			sel.Arms = append(sel.Arms, p.selectArm())
+		}
+		if !p.match(TComma) && !p.check(TSemi) && !p.check(TRBrace) {
+			p.fail(p.peek().Span, "E1104", "", "expected ',' or newline between select arms")
+		}
+		p.skipSemis()
+	}
+	rb := p.expect(TRBrace, "'}' after select arms")
+	sel.Span = tok.Span.union(rb.Span)
+	if len(sel.Arms) == 0 && !sel.HasDefault {
+		p.fail(sel.Span, "E1116", "", "`select` needs at least one communication arm")
+	}
+	return sel
+}
+
+func (p *Parser) selectArm() SelectArm {
+	arm := SelectArm{}
+	if p.check(TLArrow) { // <-ch => body  (receive, value discarded)
+		start := p.advance()
+		arm.Chan = p.expression()
+		arm.Span = start.Span
+	} else {
+		e := p.expression()
+		arm.Span = e.span()
+		if p.match(TEq) { // v = <-ch => body  (receive, bound)
+			id, ok := e.(*Ident)
+			if !ok {
+				p.fail(e.span(), "E1117", "", "only a name can bind a received value: `name = <-ch`")
+			}
+			arm.Bind, arm.BindSpan = id.Name, id.Span
+			p.expect(TLArrow, "'<-' after `=` in a select receive arm")
+			arm.Chan = p.expression()
+		} else if p.match(TLArrow) { // ch <- v => body  (send)
+			arm.IsSend = true
+			arm.Chan = e
+			arm.Val = p.expression()
+		} else {
+			p.fail(p.peek().Span, "E1118", "a select arm is a receive (`v = <-ch`), a send (`ch <- v`), or `default`",
+				"expected `=`, `<-`, or `=>` in this select arm")
+		}
+	}
+	p.expect(TArrow, "'=>' after a select arm")
+	p.skipSemis()
+	arm.Body = p.expression()
+	arm.Span = arm.Span.union(arm.Body.span())
+	return arm
 }
 
 func (p *Parser) block() *Block {
