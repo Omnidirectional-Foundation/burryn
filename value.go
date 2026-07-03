@@ -53,6 +53,66 @@ type OList struct {
 	Elems []Value
 }
 
+// OMap is a hash map with int|str keys that iterates in insertion order.
+type OMap struct {
+	GCHeader
+	entries []mapEntry     // insertion order
+	index   map[mapKey]int // canonical key -> position in entries
+}
+
+type mapEntry struct {
+	k        mapKey
+	key, val Value
+}
+
+// mapKey is the canonical comparable form of an int or str key.
+type mapKey struct {
+	isStr bool
+	s     string
+	i     int64
+}
+
+func toMapKey(v Value) (mapKey, bool) {
+	switch v.T {
+	case VInt:
+		return mapKey{i: v.I}, true
+	case VObj:
+		if s, ok := v.O.(*OString); ok {
+			return mapKey{isStr: true, s: s.S}, true
+		}
+	}
+	return mapKey{}, false
+}
+
+func (m *OMap) get(k mapKey) (Value, bool) {
+	pos, ok := m.index[k]
+	if !ok {
+		return Unit, false
+	}
+	return m.entries[pos].val, true
+}
+
+func (m *OMap) set(k mapKey, key, val Value) {
+	if pos, ok := m.index[k]; ok {
+		m.entries[pos].val = val
+		return
+	}
+	m.index[k] = len(m.entries)
+	m.entries = append(m.entries, mapEntry{k: k, key: key, val: val})
+}
+
+func (m *OMap) del(k mapKey) {
+	pos, ok := m.index[k]
+	if !ok {
+		return
+	}
+	m.entries = append(m.entries[:pos], m.entries[pos+1:]...)
+	delete(m.index, k)
+	for i := pos; i < len(m.entries); i++ {
+		m.index[m.entries[i].k] = i
+	}
+}
+
 // compiled function (created at compile time, lives in chunk constants)
 type OFunc struct {
 	GCHeader
@@ -137,6 +197,7 @@ type ONative struct {
 
 func (o *OString) hdr() *GCHeader      { return &o.GCHeader }
 func (o *OList) hdr() *GCHeader        { return &o.GCHeader }
+func (o *OMap) hdr() *GCHeader         { return &o.GCHeader }
 func (o *OFunc) hdr() *GCHeader        { return &o.GCHeader }
 func (o *OClosure) hdr() *GCHeader     { return &o.GCHeader }
 func (o *OUpvalue) hdr() *GCHeader     { return &o.GCHeader }
@@ -148,6 +209,7 @@ func (o *ONative) hdr() *GCHeader      { return &o.GCHeader }
 
 func (o *OString) typeName() string      { return "string" }
 func (o *OList) typeName() string        { return "list" }
+func (o *OMap) typeName() string         { return "map" }
 func (o *OFunc) typeName() string        { return "function" }
 func (o *OClosure) typeName() string     { return "function" }
 func (o *OUpvalue) typeName() string     { return "upvalue" }
@@ -216,6 +278,18 @@ func objEqual(a, b Obj) bool {
 			}
 		}
 		return true
+	case *OMap:
+		y, ok := b.(*OMap)
+		if !ok || len(x.entries) != len(y.entries) {
+			return false
+		}
+		for _, e := range x.entries { // order-insensitive
+			pos, ok := y.index[e.k]
+			if !ok || !valuesEqual(e.val, y.entries[pos].val) {
+				return false
+			}
+		}
+		return true
 	case *OEnumInst:
 		y, ok := b.(*OEnumInst)
 		if !ok || x.Enum != y.Enum || x.Variant != y.Variant {
@@ -270,6 +344,19 @@ func format(v Value, quote bool) string {
 				b.WriteString(repr(e))
 			}
 			b.WriteByte(']')
+			return b.String()
+		case *OMap:
+			var b strings.Builder
+			b.WriteByte('{')
+			for i, e := range o.entries {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(repr(e.key))
+				b.WriteString(": ")
+				b.WriteString(repr(e.val))
+			}
+			b.WriteByte('}')
 			return b.String()
 		case *OFunc:
 			return "<fn " + o.Name + ">"

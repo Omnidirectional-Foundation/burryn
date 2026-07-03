@@ -93,6 +93,11 @@ func (g *GC) collect() int {
 			for _, e := range t.Elems {
 				markValue(e)
 			}
+		case *OMap:
+			for _, e := range t.entries {
+				markValue(e.key)
+				markValue(e.val)
+			}
 		case *OFunc:
 			for _, c := range t.Chunk.Consts {
 				markValue(c)

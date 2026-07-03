@@ -596,6 +596,142 @@ func TestIndexOutOfBounds(t *testing.T) {
 println(l[5])`, "out of bounds")
 }
 
+// ---- maps ----
+
+func TestMapGetPut(t *testing.T) {
+	expectOut(t, `let mut m = map()
+put(m, "a", 1)
+put(m, "b", 2)
+match get(m, "a") {
+    Some(v) => println(v),
+    None => println("missing"),
+}
+match get(m, "z") {
+    Some(v) => println(v),
+    None => println("missing"),
+}`, "1\nmissing\n")
+}
+
+func TestMapOverwrite(t *testing.T) {
+	expectOut(t, `let mut m = map()
+put(m, "a", 1)
+put(m, "a", 9)
+match get(m, "a") {
+    Some(v) => println(v),
+    None => println("?"),
+}
+println(len(keys(m)))`, "9\n1\n")
+}
+
+func TestMapIntKeys(t *testing.T) {
+	expectOut(t, `let mut m = map()
+put(m, 10, "ten")
+put(m, 20, "twenty")
+match get(m, 20) {
+    Some(v) => println(v),
+    None => println("?"),
+}`, "twenty\n")
+}
+
+func TestMapKeysInsertionOrder(t *testing.T) {
+	expectOut(t, `let mut m = map()
+put(m, "x", 1)
+put(m, "a", 2)
+put(m, "m", 3)
+println(keys(m))`, `["x", "a", "m"]`+"\n")
+}
+
+func TestMapDelete(t *testing.T) {
+	expectOut(t, `let mut m = map()
+put(m, "a", 1)
+put(m, "b", 2)
+delete(m, "a")
+println(keys(m))
+match get(m, "a") {
+    Some(v) => println(v),
+    None => println("gone"),
+}`, `["b"]`+"\ngone\n")
+}
+
+func TestMapDeleteReindexes(t *testing.T) {
+	// deleting a middle key keeps the remaining insertion order intact
+	expectOut(t, `let mut m = map()
+put(m, "a", 1)
+put(m, "b", 2)
+put(m, "c", 3)
+delete(m, "b")
+put(m, "d", 4)
+println(keys(m))`, `["a", "c", "d"]`+"\n")
+}
+
+func TestMapInFunction(t *testing.T) {
+	// the map type is named by get/put, so map helpers typecheck everywhere
+	expectOut(t, `fn bump(mut counts, k) {
+    let n = match get(counts, k) {
+        Some(v) => v,
+        None => 0,
+    }
+    put(counts, k, n + 1)
+}
+let mut m = map()
+bump(m, "x")
+bump(m, "x")
+bump(m, "y")
+match get(m, "x") {
+    Some(v) => println(v),
+    None => println("?"),
+}`, "2\n")
+}
+
+func TestMapDisplay(t *testing.T) {
+	expectOut(t, `let mut m = map()
+put(m, "a", 1)
+put(m, "b", 2)
+println(m)`, `{"a": 1, "b": 2}`+"\n")
+}
+
+func TestMapEquality(t *testing.T) {
+	expectOut(t, `let mut a = map()
+put(a, "x", 1)
+put(a, "y", 2)
+let mut b = map()
+put(b, "y", 2)
+put(b, "x", 1)
+println(a == b)`, "true\n")
+}
+
+func TestMapImmutableRejectsPut(t *testing.T) {
+	expectTypeError(t, `let m = map()
+put(m, "a", 1)`, "E0596")
+	expectTypeError(t, `let m = map()
+delete(m, "a")`, "E0596")
+}
+
+func TestMapKeyMustBeIntOrStr(t *testing.T) {
+	expectTypeError(t, `let mut m = map()
+put(m, true, 1)`, "E0308")
+}
+
+func TestMapValuesAreHomogeneous(t *testing.T) {
+	expectTypeError(t, `let mut m = map()
+put(m, "a", 1)
+put(m, "b", "two")`, "E0308")
+}
+
+func TestMapGetIsMustUse(t *testing.T) {
+	// get returns an Option that must be handled
+	expectTypeError(t, `let mut m = map()
+put(m, "a", 1)
+get(m, "a")`, "unused_must_use")
+}
+
+func TestMapIndexingRejected(t *testing.T) {
+	// `[]` is list-only; a map indexed with `[]` is a type error
+	expectTypeError(t, `let mut m = map()
+put(m, "a", 1)
+let _ = m["a"]`, "E0308")
+}
+
 // ---- enums and match ----
 
 func TestEnumMatch(t *testing.T) {
