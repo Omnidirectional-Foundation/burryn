@@ -110,6 +110,9 @@ func compileProgram(gc *GC, stmts []Stmt) (fn *OFunc, shared *Shared, err error)
 	}
 	c.emit(OpUnit, 0)
 	c.emit(OpReturn, 0)
+	if err := verifyAll(c.fn); err != nil {
+		return nil, nil, err
+	}
 	return c.fn, shared, nil
 }
 
