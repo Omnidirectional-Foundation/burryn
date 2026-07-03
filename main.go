@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 const version = "0.2.0"
@@ -34,6 +35,8 @@ func main() {
 			os.Exit(exitUsage)
 		}
 		runFile(args[1], modeDis, nil)
+	case "build":
+		buildCmd(args[1:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -63,8 +66,51 @@ usage:
   bur run <dir>          run a module package (needs bur.mod, fn main)
   bur <file.bur|dir>     same as run
   bur check <file|dir>   typecheck only (rustc-style diagnostics)
+  bur build <file|dir>   compile to a native binary via C
   bur dis <file|dir>     disassemble compiled bytecode
-  bur version`)
+  bur version
+
+bur build flags:
+  -o <path>              output path (binary, or C file with --emit c)
+  --emit c               emit generated C instead of a binary`)
+}
+
+// buildCmd parses the `bur build` flags and drives the C backend.
+func buildCmd(args []string) {
+	var input, out string
+	emitC := false
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "-o":
+			if i+1 >= len(args) {
+				usage()
+				os.Exit(exitUsage)
+			}
+			i++
+			out = args[i]
+		case a == "--emit":
+			if i+1 >= len(args) || args[i+1] != "c" {
+				usage()
+				os.Exit(exitUsage)
+			}
+			i++
+			emitC = true
+		case strings.HasPrefix(a, "-"):
+			usage()
+			os.Exit(exitUsage)
+		default:
+			if input != "" {
+				usage()
+				os.Exit(exitUsage)
+			}
+			input = a
+		}
+	}
+	if input == "" {
+		usage()
+		os.Exit(exitUsage)
+	}
+	buildFile(input, emitC, out)
 }
 
 func runFile(path string, mode int, argv []string) {
