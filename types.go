@@ -79,13 +79,13 @@ type EnumSig struct {
 }
 
 type Checker struct {
-	diags   []Diag
-	scopes  []map[string]*binding
-	enums   map[string]*EnumSig
-	nextID  int
-	level   int
-	retTys  []Ty // stack of enclosing function return types
-	loop    int
+	diags  []Diag
+	scopes []map[string]*binding
+	enums  map[string]*EnumSig
+	nextID int
+	level  int
+	retTys []Ty // stack of enclosing function return types
+	loop   int
 }
 
 func typecheck(stmts []Stmt) []Diag {
@@ -119,6 +119,9 @@ func typecheck(stmts []Stmt) []Diag {
 	for _, s := range stmts {
 		switch st := s.(type) {
 		case *FnDecl:
+			if st.Pub {
+				c.errPubScript(st.Span)
+			}
 			c.level++
 			ft := c.inferExpr(st.Fn)
 			c.level--
@@ -130,9 +133,15 @@ func typecheck(stmts []Stmt) []Diag {
 			b.scheme = c.generalize(ft)
 			c.unifyAt(pre[st.Name], ft, st.NameSpan, "in this function")
 		case *LetStmt:
+			if st.Pub {
+				c.errPubScript(st.Span)
+			}
 			t := c.inferLetInit(st)
 			c.unifyAt(pre[st.Name], t, st.NameSpan, "in this binding")
 		case *EnumDecl:
+			if st.Pub {
+				c.errPubScript(st.Span)
+			}
 			// already registered
 		default:
 			c.inferStmt(s)
@@ -163,6 +172,14 @@ func (c *Checker) errorf(sp Span, code, help, format string, args ...any) {
 		IsErr: true, Code: code, Span: sp,
 		Msg: fmt.Sprintf(format, args...), Help: help,
 	})
+}
+
+// errPubScript rejects `pub` outside a package: single-file scripts and
+// nested scopes have nothing to export.
+func (c *Checker) errPubScript(sp Span) {
+	c.errorf(sp, "E0449",
+		"`pub` exports items from a package (a directory with bur.mod); remove it here",
+		"`pub` is not allowed here")
 }
 
 func (c *Checker) warnf(sp Span, code, help, format string, args ...any) {
@@ -427,6 +444,10 @@ func (c *Checker) registerEnum(st *EnumDecl) {
 func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
 	switch x := te.(type) {
 	case *TEName:
+		if x.Pkg != "" {
+			c.errorf(x.Span, "E0433", "", "cannot find package `%s`", x.Pkg)
+			return
+		}
 		switch x.Name {
 		case "int", "float", "bool", "str", "unit":
 			if len(x.Args) > 0 {
@@ -535,6 +556,9 @@ func (c *Checker) inferLetInit(st *LetStmt) Ty {
 func (c *Checker) inferStmt(s Stmt) {
 	switch st := s.(type) {
 	case *LetStmt:
+		if st.Pub {
+			c.errPubScript(st.Span)
+		}
 		t := c.inferLetInit(st)
 		var sch *Scheme
 		if _, isFn := st.Init.(*FnLit); isFn {
@@ -544,6 +568,9 @@ func (c *Checker) inferStmt(s Stmt) {
 		}
 		c.declare(st.Name, sch, st.Mut, "local", st.NameSpan)
 	case *FnDecl:
+		if st.Pub {
+			c.errPubScript(st.Span)
+		}
 		tv := c.fresh("")
 		c.declare(st.Name, &Scheme{t: tv}, false, "local", st.NameSpan)
 		b := c.lookup(st.Name)
@@ -556,6 +583,10 @@ func (c *Checker) inferStmt(s Stmt) {
 		c.unifyAt(tv, ft, st.NameSpan, "in this function")
 	case *EnumDecl:
 		c.errorf(st.Span, "E0637", "", "enum declarations are only allowed at top level")
+	case *ImportDecl:
+		c.errorf(st.Span, "E0432",
+			"imports go at the top of a file in a module (a directory with bur.mod); single-file scripts cannot import",
+			"`import` is not allowed here")
 	case *ExprStmt:
 		t := c.inferExpr(st.E)
 		switch r := resolve(t).(type) {
@@ -688,6 +719,12 @@ func (c *Checker) inferExpr(e Expr) Ty {
 			}
 		}
 		c.errorf(ex.Span, "E0599", "", "enum `%s` has no variant `%s`", ex.EnumName, ex.Variant)
+		return c.fresh("")
+	case *PkgAccess:
+		c.errorf(ex.Span, "E0433", "", "cannot find package `%s`", ex.Pkg)
+		return c.fresh("")
+	case *QualVariantAccess:
+		c.errorf(ex.Span, "E0433", "", "cannot find package `%s`", ex.Pkg)
 		return c.fresh("")
 	case *Unary:
 		t := c.inferExpr(ex.Rhs)
@@ -987,7 +1024,9 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 		case *PatVariant:
 			var sig *EnumSig
 			idx := -1
-			if pat.EnumName != "" {
+			if pat.Pkg != "" {
+				c.errorf(pat.Span, "E0433", "", "cannot find package `%s`", pat.Pkg)
+			} else if pat.EnumName != "" {
 				s, ok := c.enums[pat.EnumName]
 				if !ok {
 					c.errorf(pat.Span, "E0412", "", "cannot find enum `%s`", pat.EnumName)

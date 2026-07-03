@@ -26,10 +26,10 @@ type Value struct {
 
 var Unit = Value{T: VUnit}
 
-func BoolV(b bool) Value    { return Value{T: VBool, B: b} }
-func IntV(i int64) Value    { return Value{T: VInt, I: i} }
+func BoolV(b bool) Value     { return Value{T: VBool, B: b} }
+func IntV(i int64) Value     { return Value{T: VInt, I: i} }
 func FloatV(f float64) Value { return Value{T: VFloat, F: f} }
-func ObjV(o Obj) Value      { return Value{T: VObj, O: o} }
+func ObjV(o Obj) Value       { return Value{T: VObj, O: o} }
 
 // ---- heap objects ----
 
@@ -64,8 +64,8 @@ type OFunc struct {
 
 type OClosure struct {
 	GCHeader
-	Fn      *OFunc
-	Upvals  []*OUpvalue
+	Fn     *OFunc
+	Upvals []*OUpvalue
 }
 
 // an upvalue references a stack slot of its origin fiber while open,
@@ -135,15 +135,15 @@ type ONative struct {
 }
 
 func (o *OString) hdr() *GCHeader      { return &o.GCHeader }
-func (o *OList) hdr() *GCHeader       { return &o.GCHeader }
-func (o *OFunc) hdr() *GCHeader       { return &o.GCHeader }
-func (o *OClosure) hdr() *GCHeader    { return &o.GCHeader }
-func (o *OUpvalue) hdr() *GCHeader    { return &o.GCHeader }
-func (o *OEnumType) hdr() *GCHeader   { return &o.GCHeader }
+func (o *OList) hdr() *GCHeader        { return &o.GCHeader }
+func (o *OFunc) hdr() *GCHeader        { return &o.GCHeader }
+func (o *OClosure) hdr() *GCHeader     { return &o.GCHeader }
+func (o *OUpvalue) hdr() *GCHeader     { return &o.GCHeader }
+func (o *OEnumType) hdr() *GCHeader    { return &o.GCHeader }
 func (o *OVariantCtor) hdr() *GCHeader { return &o.GCHeader }
-func (o *OEnumInst) hdr() *GCHeader   { return &o.GCHeader }
-func (o *OChannel) hdr() *GCHeader    { return &o.GCHeader }
-func (o *ONative) hdr() *GCHeader     { return &o.GCHeader }
+func (o *OEnumInst) hdr() *GCHeader    { return &o.GCHeader }
+func (o *OChannel) hdr() *GCHeader     { return &o.GCHeader }
+func (o *ONative) hdr() *GCHeader      { return &o.GCHeader }
 
 func (o *OString) typeName() string      { return "string" }
 func (o *OList) typeName() string        { return "list" }

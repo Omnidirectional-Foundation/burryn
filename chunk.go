@@ -39,10 +39,10 @@ const (
 	OpCall           // u8 argc
 	OpClosure        // u16 fn const, then per-upval: u8 isLocal, u16 idx
 	OpReturn
-	OpList     // u16 count
-	OpIndexGet // pops idx, target; push elem
-	OpIndexSet // pops val, idx, target
-	OpLen      // pops, push int
+	OpList        // u16 count
+	OpIndexGet    // pops idx, target; push elem
+	OpIndexSet    // pops val, idx, target
+	OpLen         // pops, push int
 	OpTestVariant // u8 variant idx: pops enum type, pops candidate, push bool
 	OpGetField    // u8 field idx: pops enum inst, push field
 	OpNoMatch     // runtime error: unmatched value at top
