@@ -14,20 +14,28 @@ type Lexer struct {
 	last  TokType // last token type emitted (for semicolon insertion)
 	begun bool    // whether any token was emitted yet
 	toks  []Token
-	err   error
+	diags []Diag
 }
 
-func lex(src string) ([]Token, error) {
+// lex scans src into tokens, collecting lex errors as diagnostics; scanning
+// continues past errors so several can be reported at once.
+func lex(src string) ([]Token, []Diag) {
 	src = strings.TrimPrefix(src, string(rune(0xFEFF))) // tolerate a UTF-8 BOM
 	l := &Lexer{src: src}
-	for l.err == nil && !l.atEnd() {
+	for !l.atEnd() {
 		l.start = l.pos
 		l.scan()
 	}
 	l.start = l.pos // spans of the synthetic trailing tokens sit at EOF
 	l.maybeSemi()   // final newline may be missing
 	l.emit(TEOF, "")
-	return l.toks, l.err
+	return l.toks, l.diags
+}
+
+func (l *Lexer) fail(sp Span, code, help, format string, args ...any) {
+	l.diags = append(l.diags, Diag{
+		IsErr: true, Code: code, Msg: fmt.Sprintf(format, args...), Help: help, Span: sp,
+	})
 }
 
 func (l *Lexer) atEnd() bool { return l.pos >= len(l.src) }
@@ -64,12 +72,6 @@ func (l *Lexer) emit(t TokType, lexeme string) {
 	l.toks = append(l.toks, Token{Type: t, Lex: lexeme, Span: Span{Start: l.start, End: l.pos}})
 	l.last = t
 	l.begun = true
-}
-
-// lineAt computes the 1-based line of a byte offset; only used on the rare
-// error paths, so counting is fine.
-func (l *Lexer) lineAt(off int) int {
-	return 1 + strings.Count(l.src[:min(off, len(l.src))], "\n")
 }
 
 // statement-ending token types trigger semicolon insertion at newline
@@ -168,13 +170,15 @@ func (l *Lexer) scan() {
 		if l.match('&') {
 			l.emit(TAndAnd, "&&")
 		} else {
-			l.err = fmt.Errorf("line %d: unexpected '&'", l.lineAt(l.start))
+			l.fail(Span{Start: l.start, End: l.pos}, "E1001",
+				"Burryn has no bitwise operators; logical and is `&&`", "unexpected '&'")
 		}
 	case '|':
 		if l.match('|') {
 			l.emit(TOrOr, "||")
 		} else {
-			l.err = fmt.Errorf("line %d: unexpected '|'", l.lineAt(l.start))
+			l.fail(Span{Start: l.start, End: l.pos}, "E1001",
+				"Burryn has no bitwise operators; logical or is `||`", "unexpected '|'")
 		}
 	case '"':
 		l.scanString()
@@ -184,7 +188,8 @@ func (l *Lexer) scan() {
 		} else if isAlpha(c) {
 			l.scanIdent()
 		} else {
-			l.err = fmt.Errorf("line %d: unexpected character %q", l.lineAt(l.start), string(c))
+			l.fail(Span{Start: l.start, End: l.pos}, "E1001", "",
+				"unexpected character %q", string(c))
 		}
 	}
 }
@@ -205,15 +210,17 @@ func (l *Lexer) scanString() {
 			case '\\':
 				buf = append(buf, '\\')
 			default:
-				l.err = fmt.Errorf("line %d: bad escape \\%s", l.lineAt(l.pos-1), string(e))
-				return
+				l.fail(Span{Start: l.pos - 2, End: l.pos}, "E1003",
+					`supported escapes: \n \t \" \\`, `bad escape \%s`, string(e))
+				buf = append(buf, e) // keep scanning the rest of the string
 			}
 		} else {
 			buf = append(buf, c)
 		}
 	}
 	if l.atEnd() {
-		l.err = fmt.Errorf("line %d: unterminated string", l.lineAt(l.start))
+		l.fail(Span{Start: l.start, End: l.start + 1}, "E1002",
+			"add a closing '\"'", "unterminated string")
 		return
 	}
 	l.pos++ // closing quote

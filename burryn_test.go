@@ -13,8 +13,8 @@ import (
 // only — it bypasses the checker to exercise the VM's defensive runtime
 // traps (the language itself has no dynamic mode).
 func interpretMode(src string, skipCheck bool) (out string, compileError error, runtimeError error) {
-	toks, err := lex(src)
-	if err != nil {
+	toks, lexDiags := lex(src)
+	if err := diagsToErr(lexDiags); err != nil {
 		return "", err, nil
 	}
 	stmts, err := parse(src, toks)
@@ -49,11 +49,31 @@ func interpretMode(src string, skipCheck bool) (out string, compileError error, 
 
 func interpret(src string) (string, error, error) { return interpretMode(src, false) }
 
+// diagsToErr flattens error diagnostics into a single error for test helpers
+// that assert on message substrings; nil when the list has no errors.
+func diagsToErr(diags []Diag) error {
+	var msgs []string
+	for _, d := range diags {
+		if !d.IsErr {
+			continue
+		}
+		if d.Code != "" {
+			msgs = append(msgs, fmt.Sprintf("[%s] %s", d.Code, d.Msg))
+		} else {
+			msgs = append(msgs, d.Msg)
+		}
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(msgs, "\n"))
+}
+
 // checkDiags returns all diagnostics (errors and warnings) for a source.
 func checkDiags(t *testing.T, src string) []Diag {
 	t.Helper()
-	toks, err := lex(src)
-	if err != nil {
+	toks, lexDiags := lex(src)
+	if err := diagsToErr(lexDiags); err != nil {
 		t.Fatalf("lex error: %v", err)
 	}
 	stmts, err := parse(src, toks)
@@ -130,6 +150,31 @@ func expectRuntimeError(t *testing.T, src, contains string) {
 	}
 	if !strings.Contains(rerr.Error(), contains) {
 		t.Fatalf("runtime error %q does not contain %q", rerr.Error(), contains)
+	}
+}
+
+// ---- lexer diagnostics ----
+
+func TestLexErrorsAreCollected(t *testing.T) {
+	_, diags := lex("let a = 1 & 2\nlet b = $\nlet s = \"x\\qy\"")
+	want := []string{"E1001", "E1001", "E1003"}
+	if len(diags) != len(want) {
+		t.Fatalf("expected %d lex diags, got %d: %v", len(want), len(diags), diags)
+	}
+	for i, d := range diags {
+		if d.Code != want[i] {
+			t.Errorf("diag %d: expected code %s, got %s (%s)", i, want[i], d.Code, d.Msg)
+		}
+		if !d.IsErr || d.Span.End <= d.Span.Start {
+			t.Errorf("diag %d: bad IsErr/span: %+v", i, d)
+		}
+	}
+}
+
+func TestLexUnterminatedString(t *testing.T) {
+	_, diags := lex("let s = \"oops")
+	if len(diags) != 1 || diags[0].Code != "E1002" {
+		t.Fatalf("expected one E1002 diag, got %v", diags)
 	}
 }
 

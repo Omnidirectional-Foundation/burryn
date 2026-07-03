@@ -73,9 +73,10 @@ func runFile(path string, mode int) {
 		os.Exit(exitNoInput)
 	}
 	src := string(srcBytes)
-	toks, err := lex(src)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	toks, lexDiags := lex(src)
+	if len(lexDiags) > 0 {
+		errs, _ := renderDiags(os.Stderr, lexDiags, path, src)
+		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
 	stmts, err := parse(src, toks)
