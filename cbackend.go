@@ -234,13 +234,13 @@ func (g *cgen) emitMain(entry int) {
 	bur_register_natives();
 	bur_gc_ready = true;
 	OClosure *entry = bur_new_closure((OFunc *)bur_K[%d]);
-	bur_push(bur_obj((Obj *)entry));
-	bur_cur_closure = entry;
-	((OFunc *)bur_K[%d])->code();
+	bur_main_fiber = bur_new_fiber(entry, NULL, 0, BUR_MAIN_STACK_SIZE);
+	bur_schedule(bur_main_fiber);
+	bur_scheduler();
 	fflush(stdout);
 	return 0;
 }
-`, entry, entry)
+`, entry)
 }
 
 func (g *cgen) fail(err error) {
@@ -268,6 +268,7 @@ func (g *cgen) emitBody(fn *OFunc) {
 	fmt.Fprintf(&g.b, "static void bur_fn_%d(void) { // %s\n", id, fn.Name)
 	fmt.Fprintf(&g.b, "\tint base = bur_cur->top - %d - 1; (void)base;\n", fn.Arity)
 	g.b.WriteString("\tOClosure *self = bur_cur_closure; (void)self;\n")
+	g.b.WriteString("\tif (--bur_cur->budget <= 0) bur_preempt();\n") // preemption hook on entry
 
 	ip := 0
 	for ip < len(code) {
@@ -301,6 +302,24 @@ func (g *cgen) jumpTargets(fn *OFunc) map[int]bool {
 		case OpLoop:
 			targets[ip+3-int(readU16(code, ip+1))] = true
 			ip += 3
+		case OpChanNext:
+			targets[ip+3+int(readU16(code, ip+1))] = true // loop-exit label
+			ip += 3
+		case OpSelect:
+			p := ip + 1
+			nArms := int(code[p])
+			hasDefault := code[p+1] != 0
+			p += 2
+			for i := 0; i < nArms; i++ {
+				p++ // kind byte
+				targets[p+2+int(readU16(code, p))] = true
+				p += 2
+			}
+			if hasDefault {
+				targets[p+2+int(readU16(code, p))] = true
+				p += 2
+			}
+			ip = p
 		default:
 			ip += instLen(op, code, ip, fn)
 		}
@@ -315,16 +334,31 @@ func instLen(op byte, code []byte, ip int, fn *OFunc) int {
 	switch op {
 	case OpConst, OpGetLocal, OpSetLocal, OpGetGlobal, OpDefGlobal, OpSetGlobal,
 		OpGetUpval, OpSetUpval, OpJump, OpJumpIfFalse, OpJumpIfTrue,
-		OpJumpIfFalsePop, OpLoop, OpList:
+		OpJumpIfFalsePop, OpLoop, OpList, OpChanNext:
 		return 3
 	case OpPopN, OpCall, OpSpawn, OpEndBlock, OpTestVariant, OpGetField:
 		return 2
 	case OpClosure:
 		target := fn.Chunk.Consts[readU16(code, ip+1)].O.(*OFunc)
 		return 3 + target.NumUpvals*3
+	case OpSelect:
+		return selectLen(code, ip)
 	default:
 		return 1
 	}
+}
+
+// selectLen returns the byte length of an OpSelect instruction: the opcode,
+// its nArms/flags bytes, one {kind u8, jump u16} triple per arm, and an
+// optional default jump u16.
+func selectLen(code []byte, ip int) int {
+	nArms := int(code[ip+1])
+	hasDefault := code[ip+2] != 0
+	n := 3 + nArms*3
+	if hasDefault {
+		n += 2
+	}
+	return n
 }
 
 func (g *cgen) emitInst(id int, code []byte, ip int) int {
@@ -417,6 +451,7 @@ func (g *cgen) emitInst(id int, code []byte, ip int) int {
 		w("{ Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %%s\", bur_typename(c)); bool t = c.u.b; bur_pop(); if (!t) goto L%d; }", ip+3+u16(0))
 		return ip + 3
 	case OpLoop:
+		w("if (--bur_cur->budget <= 0) bur_preempt();") // preemption hook on back-edge
 		w("goto L%d;", ip+3-u16(0))
 		return ip + 3
 	case OpCall:
@@ -452,9 +487,21 @@ func (g *cgen) emitInst(id int, code []byte, ip int) int {
 	case OpTry:
 		g.emitTry()
 		return ip + 1
-	case OpSpawn, OpSend, OpRecv, OpChanNext, OpSelect:
-		g.fail(fmt.Errorf("C backend: concurrency is not supported yet (opcode %d); use `bur run`", op))
-		return len(code)
+	case OpSpawn:
+		w("bur_spawn(%d);", code[ip+1])
+		return ip + 2
+	case OpSend:
+		w("{ Value val = bur_pop(); Value ch = bur_pop(); bur_send(ch, val); }")
+		return ip + 1
+	case OpRecv:
+		// keep the channel at peek(0) so it stays rooted if bur_recv parks
+		w("{ Value v = bur_recv(bur_peek(0)); bur_pop(); bur_push(v); }")
+		return ip + 1
+	case OpChanNext:
+		w("{ Value v; if (bur_chan_next(bur_peek(0), &v)) { bur_pop(); bur_push(v); } else { bur_pop(); goto L%d; } }", ip+3+u16(0))
+		return ip + 3
+	case OpSelect:
+		return g.emitSelect(id, code, ip)
 	default:
 		g.fail(fmt.Errorf("C backend: unknown opcode %d", op))
 		return len(code)
@@ -467,6 +514,46 @@ func (g *cgen) emitTry() {
 	g.b.WriteString("\t  if (!in || (in->enm != bur_opt_enum && in->enm != bur_res_enum)) bur_trap(\"'?' needs an Option or Result, got %s\", bur_typename(v));\n")
 	g.b.WriteString("\t  if (in->variant == 0) { Value inner = in->fields[0]; bur_pop(); bur_push(inner); }\n")
 	g.b.WriteString("\t  else { bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(v); return; } }\n")
+}
+
+// emitSelect emits an OpSelect: a static array of arm kinds (1=send, 0=recv)
+// handed to bur_select, then a switch on the chosen arm index that jumps to
+// that arm's body (or the default arm when the index equals nArms).
+func (g *cgen) emitSelect(id int, code []byte, ip int) int {
+	p := ip + 1
+	nArms := int(code[p])
+	hasDefault := code[p+1] != 0
+	p += 2
+	kinds := make([]byte, nArms)
+	targets := make([]int, nArms)
+	for i := 0; i < nArms; i++ {
+		kinds[i] = code[p]
+		p++
+		targets[i] = p + 2 + int(readU16(code, p))
+		p += 2
+	}
+	defaultTarget := -1
+	if hasDefault {
+		defaultTarget = p + 2 + int(readU16(code, p))
+		p += 2
+	}
+	var ks strings.Builder
+	for i, k := range kinds {
+		if i > 0 {
+			ks.WriteString(", ")
+		}
+		fmt.Fprintf(&ks, "%d", k)
+	}
+	fmt.Fprintf(&g.b, "\t{ static const unsigned char selk_%d_%d[] = {%s};\n", id, ip, ks.String())
+	fmt.Fprintf(&g.b, "\t  switch (bur_select(selk_%d_%d, %d, %v)) {\n", id, ip, nArms, hasDefault)
+	for i, t := range targets {
+		fmt.Fprintf(&g.b, "\t  case %d: goto L%d;\n", i, t)
+	}
+	if hasDefault {
+		fmt.Fprintf(&g.b, "\t  case %d: goto L%d;\n", nArms, defaultTarget)
+	}
+	g.b.WriteString("\t  }\n\t}\n")
+	return p
 }
 
 // emitClosure walks the OpClosure operands (fn const + per-upvalue capture

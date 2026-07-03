@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <ucontext.h>
 
 // ---- Value ------------------------------------------------------------
 
@@ -57,7 +58,8 @@ static inline Value bur_obj(Obj *o)     { Value v; v.t = VOBJ; v.u.o = o; return
 
 typedef enum {
     OBJ_STRING, OBJ_LIST, OBJ_MAP, OBJ_FUNC, OBJ_CLOSURE,
-    OBJ_UPVALUE, OBJ_ENUMTYPE, OBJ_VARIANTCTOR, OBJ_ENUMINST, OBJ_NATIVE
+    OBJ_UPVALUE, OBJ_ENUMTYPE, OBJ_VARIANTCTOR, OBJ_ENUMINST, OBJ_NATIVE,
+    OBJ_CHANNEL
 } ObjType;
 
 struct Obj {
@@ -161,16 +163,67 @@ typedef struct {
     NativeFn fn;
 } ONative;
 
-// ---- fiber (single, in the sequential core) ---------------------------
+// ---- fibers & channels (concurrency core) -----------------------------
+//
+// Each fiber owns a ucontext and its own C stack; blocking a fiber means
+// swapcontext-ing its entire native call stack out to the scheduler, and
+// resuming means swapping it back. This mirrors the Go VM's cooperative,
+// single-threaded scheduler (vm.go): a FIFO ready queue, park/wake on
+// channels, and deterministic interleaving — never OS threads.
+
+typedef struct OChannel OChannel;
+typedef struct OClosure OClosure; // full struct is defined above; alias needed here
+
+typedef enum {
+    FREADY, FBLOCKED_SEND, FBLOCKED_RECV, FBLOCKED_SELECT, FDONE
+} FiberStatus;
 
 struct Fiber {
     Value *stack;
     int top, cap;
     OUpvalue **openUpvals;
     int nopen, opencap;
+
+    int id;
+    FiberStatus status;
+    Value sendVal;          // pending value while blocked on send
+    OClosure *entry;        // closure the fiber runs on first resume
+    int call_depth;         // per-fiber call depth, for stack-overflow trapping
+    int budget;             // instructions remaining before a forced yield
+
+    ucontext_t ctx;
+    char *cstack;           // heap-allocated native stack backing ctx
+
+    OChannel **selectChans; // channels this fiber waits on while parked in select
+    int nselect, selectcap;
 };
 
-static Fiber *bur_cur;
+// a channel: a bounded FIFO buffer plus queues of fibers blocked sending,
+// blocked receiving, or parked in a select waiting for any state change
+struct OChannel {
+    Obj obj;
+    int cap;
+    Value *buf;
+    int buflen, bufcap;
+    Fiber **sendq; int nsendq, sendqcap;
+    Fiber **recvq; int nrecvq, recvqcap;
+    Fiber **waiters; int nwait, waitcap;
+    bool closed;
+};
+
+static Fiber *bur_cur;                 // the running fiber
+static Fiber *bur_main_fiber;          // program ends (Go semantics) when this returns
+static ucontext_t bur_sched_ctx;       // the scheduler's own context
+
+static Fiber **bur_fibers;             // every fiber ever created, for GC root scanning
+static int64_t bur_nfibers, bur_fiberscap;
+static Fiber **bur_ready;              // FIFO ready queue
+static int64_t bur_ready_head, bur_ready_len, bur_ready_cap;
+static int bur_next_fiber_id;
+
+#define BUR_TIMESLICE 10000            // instructions per fiber turn (matches vm.go)
+#define BUR_STACK_SIZE (1 << 20)       // 1 MiB per spawned fiber
+#define BUR_MAIN_STACK_SIZE (8 << 20)  // 8 MiB for the main fiber (deep recursion)
 
 // ---- runtime state ----------------------------------------------------
 
@@ -180,7 +233,6 @@ static bool bur_gc_ready; // collection disabled until boot completes
 
 // the closure currently executing; generated functions snapshot this at
 // entry to reach their upvalues (bur_call saves/restores it around calls)
-typedef struct OClosure OClosure;
 static OClosure *bur_cur_closure;
 
 static OEnumType *bur_opt_enum, *bur_res_enum, *bur_out_enum;
@@ -351,6 +403,12 @@ static void bur_gc_trace(Obj *o) {
         for (int i = 0; i < in->nfields; i++) bur_mark_value(in->fields[i]);
         break;
     }
+    case OBJ_CHANNEL: {
+        OChannel *ch = (OChannel *)o;
+        for (int i = 0; i < ch->buflen; i++) bur_mark_value(ch->buf[i]);
+        // blocked senders' pending values are marked via fiber roots
+        break;
+    }
     }
 }
 
@@ -376,13 +434,16 @@ static void bur_gc_collect(void) {
     bur_gc_cycles++;
     bur_gray_len = 0;
 
-    // roots: permanent constants, globals, fiber stack, open upvalues
+    // roots: permanent constants, globals, and every fiber's operand stack,
+    // open upvalues, and pending send value (mirrors gc.go scanning all fibers)
     for (int64_t i = 0; i < bur_nroots; i++) bur_gray_push(bur_roots[i]);
     for (int64_t i = 0; i < bur_globals_cap; i++)
         if (bur_globals[i].used) bur_mark_value(bur_globals[i].val);
-    if (bur_cur) {
-        for (int i = 0; i < bur_cur->top; i++) bur_mark_value(bur_cur->stack[i]);
-        for (int i = 0; i < bur_cur->nopen; i++) bur_gray_push((Obj *)bur_cur->openUpvals[i]);
+    for (int64_t fi = 0; fi < bur_nfibers; fi++) {
+        Fiber *f = bur_fibers[fi];
+        for (int i = 0; i < f->top; i++) bur_mark_value(f->stack[i]);
+        for (int i = 0; i < f->nopen; i++) bur_gray_push((Obj *)f->openUpvals[i]);
+        bur_mark_value(f->sendVal);
     }
 
     while (bur_gray_len > 0) bur_gc_trace(bur_gray[--bur_gray_len]);
@@ -408,6 +469,11 @@ static void bur_gc_collect(void) {
             }
             case OBJ_CLOSURE: free(((OClosure *)o)->upvals); break;
             case OBJ_ENUMINST: free(((OEnumInst *)o)->fields); break;
+            case OBJ_CHANNEL: {
+                OChannel *ch = (OChannel *)o;
+                free(ch->buf); free(ch->sendq); free(ch->recvq); free(ch->waiters);
+                break;
+            }
             default: break;
             }
             free(o);
@@ -449,6 +515,7 @@ static const char *bur_typename(Value v) {
         case OBJ_VARIANTCTOR: return "variant constructor";
         case OBJ_ENUMINST: return ((OEnumInst *)v.u.o)->enm->name;
         case OBJ_NATIVE: return "native function";
+        case OBJ_CHANNEL: return "channel";
         }
     }
     return "?";
@@ -638,6 +705,13 @@ static void bur_format(Buf *b, Value v, bool quote) {
             bur_format(b, in->fields[i], true);
         }
         buf_char(b, ')');
+        return;
+    }
+    case OBJ_CHANNEL: {
+        OChannel *ch = (OChannel *)o;
+        char t[64];
+        snprintf(t, sizeof t, "<chan cap=%d len=%d>", ch->cap, ch->buflen);
+        buf_str(b, t);
         return;
     }
     default: return;
@@ -938,8 +1012,6 @@ static void bur_close_upvalues(int from) {
 
 // ---- calls ------------------------------------------------------------
 
-static int bur_call_depth;
-
 // Invoke the value at peek(argc). Closures run their compiled body via the
 // C call stack; natives and variant constructors are handled inline. The
 // callee and its argc arguments occupy the top argc+1 stack slots and are
@@ -952,12 +1024,12 @@ static void bur_call(int argc) {
         OClosure *cl = (OClosure *)callee.u.o;
         if (argc != cl->fn->arity)
             bur_trap("%s expects %d argument(s), got %d", cl->fn->name, cl->fn->arity, argc);
-        if (++bur_call_depth > 2048) bur_trap("stack overflow (call depth > 2048)");
+        if (++bur_cur->call_depth > 2048) bur_trap("stack overflow (call depth > 2048)");
         OClosure *prev = bur_cur_closure;
         bur_cur_closure = cl;
         cl->fn->code();
         bur_cur_closure = prev;
-        bur_call_depth--;
+        bur_cur->call_depth--;
         return;
     }
     case OBJ_NATIVE: {
@@ -1056,6 +1128,302 @@ static void bur_set_global(const char *name, int64_t n, Value v) {
     bur_globals_put(name, n, v);
 }
 
+// ---- scheduler, channels, and blocking operations ---------------------
+//
+// A faithful C port of vm.go's cooperative scheduler. Because generated
+// functions run on the native C call stack (frames == C frames), a fiber's
+// suspended state is its whole C stack: blocking swaps that stack out to the
+// scheduler with swapcontext and resumes it later. The VM's "rewind ip and
+// retry once woken" becomes a real C-level retry loop around bur_park.
+
+static void bur_fiber_entry(void); // trampoline for a fiber's first resume
+
+// growable FIFO of fibers (used for channel send/recv/waiter queues)
+static void fq_push(Fiber ***a, int *n, int *cap, Fiber *f) {
+    if (*n == *cap) { *cap = *cap * 2 + 4; *a = (Fiber **)realloc(*a, sizeof(Fiber *) * (size_t)(*cap)); }
+    (*a)[(*n)++] = f;
+}
+static Fiber *fq_pop(Fiber ***a, int *n) {
+    Fiber *f = (*a)[0];
+    memmove(*a, *a + 1, sizeof(Fiber *) * (size_t)(*n - 1));
+    (*n)--;
+    return f;
+}
+
+// channel buffer: a bounded FIFO of Values
+static void chan_buf_push(OChannel *ch, Value v) {
+    if (ch->buflen == ch->bufcap) { ch->bufcap = ch->bufcap * 2 + 4; ch->buf = (Value *)realloc(ch->buf, sizeof(Value) * (size_t)ch->bufcap); }
+    ch->buf[ch->buflen++] = v;
+}
+static Value chan_buf_pop(OChannel *ch) {
+    Value v = ch->buf[0];
+    memmove(ch->buf, ch->buf + 1, sizeof(Value) * (size_t)(ch->buflen - 1));
+    ch->buflen--;
+    return v;
+}
+
+// ready queue (FIFO, head-index drained)
+static void bur_ready_push(Fiber *f) {
+    if (bur_ready_len == bur_ready_cap) {
+        bur_ready_cap = bur_ready_cap * 2 + 64;
+        bur_ready = (Fiber **)realloc(bur_ready, sizeof(Fiber *) * (size_t)bur_ready_cap);
+    }
+    bur_ready[bur_ready_len++] = f;
+}
+static Fiber *bur_ready_pop(void) {
+    if (bur_ready_head == bur_ready_len) return NULL;
+    Fiber *f = bur_ready[bur_ready_head++];
+    if (bur_ready_head == bur_ready_len) bur_ready_head = bur_ready_len = 0;
+    return f;
+}
+static void bur_fibers_push(Fiber *f) {
+    if (bur_nfibers == bur_fiberscap) {
+        bur_fiberscap = bur_fiberscap * 2 + 16;
+        bur_fibers = (Fiber **)realloc(bur_fibers, sizeof(Fiber *) * (size_t)bur_fiberscap);
+    }
+    bur_fibers[bur_nfibers++] = f;
+}
+
+static void bur_schedule(Fiber *f) { f->status = FREADY; bur_ready_push(f); }
+
+// wakeWaiters: reschedule every fiber parked in a select on ch so each
+// re-polls its arms; a fiber woken elsewhere first is skipped.
+static void bur_wake_waiters(OChannel *ch) {
+    if (ch->nwait == 0) return;
+    for (int i = 0; i < ch->nwait; i++)
+        if (ch->waiters[i]->status == FBLOCKED_SELECT) bur_schedule(ch->waiters[i]);
+    ch->nwait = 0;
+}
+static void bur_remove_waiter(OChannel *ch, Fiber *f) {
+    for (int i = 0; i < ch->nwait; i++)
+        if (ch->waiters[i] == f) {
+            memmove(&ch->waiters[i], &ch->waiters[i + 1], sizeof(Fiber *) * (size_t)(ch->nwait - i - 1));
+            ch->nwait--;
+            return;
+        }
+}
+static void bur_clear_select(Fiber *f) {
+    for (int i = 0; i < f->nselect; i++) bur_remove_waiter(f->selectChans[i], f);
+    f->nselect = 0;
+}
+static void bur_select_add(Fiber *f, OChannel *ch) {
+    if (f->nselect == f->selectcap) { f->selectcap = f->selectcap * 2 + 4; f->selectChans = (OChannel **)realloc(f->selectChans, sizeof(OChannel *) * (size_t)f->selectcap); }
+    f->selectChans[f->nselect++] = ch;
+}
+
+static bool chan_recv_ready(OChannel *ch) { return ch->buflen > 0 || ch->nsendq > 0 || ch->closed; }
+static bool chan_send_ready(OChannel *ch) { return ch->closed || ch->nrecvq > 0 || ch->buflen < ch->cap; }
+
+// chanTryRecv: non-blocking receive, waking one blocked sender to refill the
+// slot it drains. Returns false when nothing is available yet.
+static bool chan_try_recv(OChannel *ch, Value *out) {
+    if (ch->buflen > 0) {
+        *out = chan_buf_pop(ch);
+        if (ch->nsendq > 0) {
+            Fiber *s = fq_pop(&ch->sendq, &ch->nsendq);
+            chan_buf_push(ch, s->sendVal);
+            s->sendVal = bur_unit();
+            bur_schedule(s);
+        }
+        return true;
+    }
+    if (ch->nsendq > 0) { // unbuffered rendezvous
+        Fiber *s = fq_pop(&ch->sendq, &ch->nsendq);
+        *out = s->sendVal;
+        s->sendVal = bur_unit();
+        bur_schedule(s);
+        return true;
+    }
+    return false;
+}
+
+// park the running fiber (swap its C stack out to the scheduler); execution
+// resumes here once the scheduler picks it again, with a fresh time slice.
+static void bur_park(FiberStatus st) {
+    bur_cur->status = st;
+    swapcontext(&bur_cur->ctx, &bur_sched_ctx);
+    bur_cur->budget = BUR_TIMESLICE;
+}
+static void bur_switch_to_sched(void) {
+    swapcontext(&bur_cur->ctx, &bur_sched_ctx);
+    bur_cur->budget = BUR_TIMESLICE;
+}
+// preemption: the running fiber has spent its time slice; yield the CPU by
+// putting itself at the back of the ready queue. Invoked from the budget
+// hooks the backend plants at back-edges and function entry.
+static void bur_preempt(void) {
+    bur_schedule(bur_cur);
+    bur_switch_to_sched();
+}
+
+static OChannel *as_channel_opt(Value v) {
+    return (v.t == VOBJ && v.u.o->type == OBJ_CHANNEL) ? (OChannel *)v.u.o : NULL;
+}
+
+static Fiber *bur_new_fiber(OClosure *cl, Value *args, int argc, size_t stacksize) {
+    Fiber *f = (Fiber *)calloc(1, sizeof(Fiber));
+    f->id = bur_next_fiber_id++;
+    f->cap = 256;
+    f->stack = (Value *)malloc(sizeof(Value) * 256);
+    f->status = FREADY;
+    f->sendVal = bur_unit();
+    f->budget = BUR_TIMESLICE;
+    f->entry = cl;
+    f->stack[f->top++] = bur_obj((Obj *)cl); // closure + args, like vm.newFiber
+    for (int i = 0; i < argc; i++) f->stack[f->top++] = args[i];
+    f->cstack = (char *)malloc(stacksize);
+    getcontext(&f->ctx);
+    f->ctx.uc_stack.ss_sp = f->cstack;
+    f->ctx.uc_stack.ss_size = stacksize;
+    f->ctx.uc_link = &bur_sched_ctx;
+    makecontext(&f->ctx, bur_fiber_entry, 0);
+    bur_fibers_push(f);
+    return f;
+}
+
+static void bur_fiber_entry(void) {
+    Fiber *f = bur_cur;
+    bur_cur_closure = f->entry;
+    f->budget = BUR_TIMESLICE;
+    f->entry->fn->code(); // run the body on this fiber's own C stack
+    f->status = FDONE;
+    setcontext(&bur_sched_ctx); // hand control back for good
+}
+
+// the scheduler loop: run ready fibers FIFO until the main fiber returns
+// (Go semantics) or nothing is left. All fibers blocked => deadlock.
+static void bur_scheduler(void) {
+    for (;;) {
+        if (bur_main_fiber->status == FDONE) return;
+        Fiber *f = bur_ready_pop();
+        if (!f) {
+            int blocked = 0;
+            for (int64_t i = 0; i < bur_nfibers; i++) {
+                FiberStatus s = bur_fibers[i]->status;
+                if (s == FBLOCKED_SEND || s == FBLOCKED_RECV || s == FBLOCKED_SELECT) blocked++;
+            }
+            if (blocked > 0) {
+                fflush(stdout);
+                fprintf(stderr, "fatal: deadlock \xe2\x80\x94 all %d remaining fiber(s) are blocked on channels\n", blocked);
+                exit(4);
+            }
+            return;
+        }
+        if (f->status != FREADY) continue; // stale ready entry (already woken elsewhere)
+        bur_cur = f;
+        swapcontext(&bur_sched_ctx, &f->ctx);
+    }
+}
+
+// ---- concurrency opcodes ----------------------------------------------
+
+static void bur_spawn(int argc) {
+    Value callee = bur_peek(argc);
+    if (callee.t != VOBJ || callee.u.o->type != OBJ_CLOSURE)
+        bur_trap("spawn needs a function, got %s", bur_typename(callee));
+    OClosure *cl = (OClosure *)callee.u.o;
+    if (cl->fn->arity != argc)
+        bur_trap("%s expects %d argument(s), got %d", cl->fn->name, cl->fn->arity, argc);
+    Fiber *nf = bur_new_fiber(cl, &bur_cur->stack[bur_cur->top - argc], argc, BUR_STACK_SIZE);
+    bur_schedule(nf);
+    bur_cur->top -= argc + 1;
+}
+
+static void bur_send(Value chv, Value val) {
+    OChannel *ch = as_channel_opt(chv);
+    if (!ch) bur_trap("cannot send to %s (need a channel)", bur_typename(chv));
+    if (ch->closed) bur_trap("send on closed channel");
+    if (ch->nrecvq > 0) {
+        chan_buf_push(ch, val); // hand off through the buffer; woken receiver finds it
+        bur_schedule(fq_pop(&ch->recvq, &ch->nrecvq));
+        bur_wake_waiters(ch);
+    } else if (ch->buflen < ch->cap) {
+        chan_buf_push(ch, val);
+        bur_wake_waiters(ch);
+    } else {
+        bur_cur->sendVal = val;
+        fq_push(&ch->sendq, &ch->nsendq, &ch->sendqcap, bur_cur);
+        bur_wake_waiters(ch);       // a select receive arm can now proceed
+        bur_park(FBLOCKED_SEND);    // woken means a receiver took our sendVal
+    }
+}
+
+static Value bur_recv(Value chv) {
+    OChannel *ch = as_channel_opt(chv);
+    if (!ch) bur_trap("cannot receive from %s (need a channel)", bur_typename(chv));
+    for (;;) {
+        Value v;
+        if (chan_try_recv(ch, &v)) { bur_wake_waiters(ch); return v; }
+        if (ch->closed) bur_trap("receive on closed channel");
+        fq_push(&ch->recvq, &ch->nrecvq, &ch->recvqcap, bur_cur);
+        bur_wake_waiters(ch);       // a select send arm can now proceed
+        bur_park(FBLOCKED_RECV);    // re-run once woken
+    }
+}
+
+// for v in ch: yield successive values; returns false once closed and drained
+static bool bur_chan_next(Value chv, Value *out) {
+    OChannel *ch = as_channel_opt(chv);
+    if (!ch) bur_trap("cannot iterate %s (need a channel)", bur_typename(chv));
+    for (;;) {
+        if (chan_try_recv(ch, out)) { bur_wake_waiters(ch); return true; }
+        if (ch->closed) return false;
+        fq_push(&ch->recvq, &ch->nrecvq, &ch->recvqcap, bur_cur);
+        bur_wake_waiters(ch);
+        bur_park(FBLOCKED_RECV);
+    }
+}
+
+// select over kinds[] (1=send arm, 0=recv arm). Returns the chosen arm index
+// (nArms when the default arm runs); a chosen recv leaves its value on the
+// stack for a binding arm. Operands were pushed in declaration order.
+static int bur_select(const unsigned char *kinds, int nArms, bool hasDefault) {
+    int slots = 0;
+    for (int i = 0; i < nArms; i++) slots += kinds[i] ? 2 : 1;
+    int base = bur_cur->top - slots;
+    int chanPos[nArms], valPos[nArms];
+    int off = base;
+    for (int i = 0; i < nArms; i++) {
+        chanPos[i] = off;
+        if (kinds[i]) { valPos[i] = off + 1; off += 2; } else { valPos[i] = -1; off++; }
+    }
+    for (;;) {
+        bur_clear_select(bur_cur); // drop stale waiter registrations from a prior park
+        int chosen = -1;
+        for (int i = 0; i < nArms; i++) {
+            OChannel *ch = as_channel_opt(bur_cur->stack[chanPos[i]]);
+            if (!ch) bur_trap("select arm needs a channel, got %s", bur_typename(bur_cur->stack[chanPos[i]]));
+            if (kinds[i] ? chan_send_ready(ch) : chan_recv_ready(ch)) { chosen = i; break; }
+        }
+        if (chosen >= 0) {
+            OChannel *ch = (OChannel *)bur_cur->stack[chanPos[chosen]].u.o;
+            if (kinds[chosen]) {
+                if (ch->closed) bur_trap("send on closed channel");
+                Value val = bur_cur->stack[valPos[chosen]];
+                if (ch->nrecvq > 0) { chan_buf_push(ch, val); bur_schedule(fq_pop(&ch->recvq, &ch->nrecvq)); }
+                else chan_buf_push(ch, val);
+                bur_wake_waiters(ch);
+                bur_cur->top = base;
+            } else {
+                Value v;
+                if (!chan_try_recv(ch, &v)) { bur_cur->top = base; bur_trap("receive on closed channel"); }
+                bur_wake_waiters(ch);
+                bur_cur->top = base;
+                bur_push(v); // left on the stack for a binding arm
+            }
+            return chosen;
+        }
+        if (hasDefault) { bur_cur->top = base; return nArms; }
+        // nothing ready: park on every arm's channel, retry when any wakes us
+        for (int i = 0; i < nArms; i++) {
+            OChannel *ch = (OChannel *)bur_cur->stack[chanPos[i]].u.o;
+            fq_push(&ch->waiters, &ch->nwait, &ch->waitcap, bur_cur);
+            bur_select_add(bur_cur, ch);
+        }
+        bur_park(FBLOCKED_SELECT);
+    }
+}
+
 #include "burrt_natives.h"
 
 // ---- boot -------------------------------------------------------------
@@ -1065,9 +1433,7 @@ static void bur_boot(int argc, char **argv) {
     bur_argv = argv;
     clock_gettime(CLOCK_MONOTONIC, &bur_start_time);
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
-    bur_cur = (Fiber *)calloc(1, sizeof(Fiber));
-    bur_cur->cap = 256;
-    bur_cur->stack = (Value *)malloc(sizeof(Value) * 256);
+    // fibers (including the main one) are created by generated main()
 }
 
 #endif // BURRT_H

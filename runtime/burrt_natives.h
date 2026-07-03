@@ -465,6 +465,60 @@ static Value nat_assert(Value *args, int argc) {
     }
     return bur_unit();
 }
+// ---- concurrency ------------------------------------------------------
+
+static Value nat_chan(Value *args, int argc) {
+    int cap = 0;
+    if (argc > 1) bur_trap("chan() takes at most one argument");
+    if (argc == 1) {
+        if (args[0].t != VINT || args[0].u.i < 0) bur_trap("chan() capacity must be a non-negative int");
+        cap = (int)args[0].u.i;
+    }
+    OChannel *ch = (OChannel *)bur_alloc(sizeof(OChannel), OBJ_CHANNEL);
+    ch->cap = cap; // bur_alloc zeroes the rest (empty buffer/queues, not closed)
+    return bur_obj((Obj *)ch);
+}
+static Value nat_close(Value *args, int argc) {
+    (void)argc;
+    OChannel *ch = as_channel_opt(args[0]);
+    if (!ch) bur_trap("close() needs a channel, got %s", bur_typename(args[0]));
+    if (ch->closed) bur_trap("close of closed channel");
+    ch->closed = true;
+    // wake every blocked receiver: each re-runs its receive, drains any
+    // buffered values, then observes closure
+    for (int i = 0; i < ch->nrecvq; i++) bur_schedule(ch->recvq[i]);
+    ch->nrecvq = 0;
+    bur_wake_waiters(ch); // select arms on this channel are now ready
+    return bur_unit();
+}
+// recv(ch): blocking receive exposed as an Option (None means closed+drained).
+// Unlike the VM it can park directly, since natives run on the fiber's C stack.
+static Value nat_recv(Value *args, int argc) {
+    (void)argc;
+    OChannel *ch = as_channel_opt(args[0]);
+    if (!ch) bur_trap("recv() needs a channel, got %s", bur_typename(args[0]));
+    for (;;) {
+        Value v;
+        if (chan_try_recv(ch, &v)) {
+            bur_push(v); // root v across the Some allocation
+            Value opt = bur_some(bur_peek(0));
+            bur_pop();
+            bur_wake_waiters(ch);
+            return opt;
+        }
+        if (ch->closed) return bur_none();
+        fq_push(&ch->recvq, &ch->nrecvq, &ch->recvqcap, bur_cur);
+        bur_wake_waiters(ch);
+        bur_park(FBLOCKED_RECV);
+    }
+}
+static Value nat_yield(Value *args, int argc) {
+    (void)args; (void)argc;
+    bur_schedule(bur_cur); // cooperative handoff: reschedule at the back
+    bur_switch_to_sched();
+    return bur_unit();
+}
+
 static Value nat_gc(Value *args, int argc) { (void)args; (void)argc; bur_gc_collect(); return bur_int(bur_gc_last_freed); }
 static Value nat_heap_objects(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_count); }
 static Value nat_gc_cycles(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_cycles); }
@@ -522,6 +576,10 @@ static void bur_register_natives(void) {
     bur_register_native("gc", 0, nat_gc);
     bur_register_native("heap_objects", 0, nat_heap_objects);
     bur_register_native("gc_cycles", 0, nat_gc_cycles);
+    bur_register_native("chan", -1, nat_chan);
+    bur_register_native("close", 1, nat_close);
+    bur_register_native("recv", 1, nat_recv);
+    bur_register_native("yield", 0, nat_yield);
 
     // built-in enum types are also visible as globals (mirrors newVM)
     if (bur_opt_enum) bur_globals_put("Option", 6, bur_obj((Obj *)bur_opt_enum));
