@@ -70,7 +70,7 @@ func runFile(path string, mode int) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(65)
 	}
-	stmts, err := parse(toks)
+	stmts, err := parse(src, toks)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(65)
@@ -92,7 +92,7 @@ func runFile(path string, mode int) {
 	}
 
 	gc := newGC()
-	fn, shared, err := compileProgram(gc, stmts)
+	fn, shared, err := compileProgram(gc, src, stmts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(65)

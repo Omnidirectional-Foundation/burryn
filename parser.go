@@ -6,11 +6,12 @@ import (
 )
 
 type Parser struct {
-	toks []Token
-	pos  int
+	toks  []Token
+	pos   int
+	lines lineIndex // for line numbers in parse-error messages
 }
 
-func parse(toks []Token) (stmts []Stmt, err error) {
+func parse(src string, toks []Token) (stmts []Stmt, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pe, ok := r.(parseErr); ok {
@@ -20,7 +21,7 @@ func parse(toks []Token) (stmts []Stmt, err error) {
 			panic(r)
 		}
 	}()
-	p := &Parser{toks: toks}
+	p := &Parser{toks: toks, lines: newLineIndex(src)}
 	p.skipSemis()
 	for !p.check(TEOF) {
 		stmts = append(stmts, p.statement())
@@ -31,13 +32,13 @@ func parse(toks []Token) (stmts []Stmt, err error) {
 
 type parseErr string
 
-func (p *Parser) fail(line int, format string, args ...any) {
+func (p *Parser) fail(sp Span, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	panic(parseErr(fmt.Sprintf("parse error at line %d: %s", line, msg)))
+	panic(parseErr(fmt.Sprintf("parse error at line %d: %s", p.lines.line(sp.Start), msg)))
 }
 
-func (p *Parser) peek() Token     { return p.toks[p.pos] }
-func (p *Parser) prev() Token     { return p.toks[p.pos-1] }
+func (p *Parser) peek() Token          { return p.toks[p.pos] }
+func (p *Parser) prev() Token          { return p.toks[p.pos-1] }
 func (p *Parser) check(t TokType) bool { return p.peek().Type == t }
 
 func (p *Parser) advance() Token {
@@ -63,7 +64,7 @@ func (p *Parser) expect(t TokType, what string) Token {
 		return p.advance()
 	}
 	tok := p.peek()
-	p.fail(tok.Line, "expected %s, got %q", what, tok.Lex)
+	p.fail(tok.Span, "expected %s, got %q", what, tok.Lex)
 	return Token{}
 }
 
@@ -83,7 +84,7 @@ func (p *Parser) endStmt() {
 		return
 	}
 	tok := p.peek()
-	p.fail(tok.Line, "expected end of statement, got %q", tok.Lex)
+	p.fail(tok.Span, "expected end of statement, got %q", tok.Lex)
 }
 
 // ---- statements ----
@@ -102,44 +103,44 @@ func (p *Parser) statement() Stmt {
 		return p.forStmt()
 	case p.check(TReturn):
 		tok := p.advance()
+		sp := tok.Span
 		var val Expr
 		if !p.check(TSemi) && !p.check(TRBrace) && !p.check(TEOF) {
 			val = p.expression()
+			sp = sp.union(val.span())
 		}
 		p.endStmt()
-		return &ReturnStmt{Val: val, Line: tok.Line, Col: tok.Col}
+		return &ReturnStmt{Val: val, Span: sp}
 	case p.check(TSpawn):
 		return p.spawnStmt()
 	case p.check(TBreak):
 		tok := p.advance()
 		p.endStmt()
-		return &BreakStmt{Line: tok.Line, Col: tok.Col}
+		return &BreakStmt{Span: tok.Span}
 	case p.check(TContinue):
 		tok := p.advance()
 		p.endStmt()
-		return &ContinueStmt{Line: tok.Line, Col: tok.Col}
+		return &ContinueStmt{Span: tok.Span}
 	}
 	// expression statement / assignment / send
-	first := p.peek()
 	e := p.expression()
-	line, col := first.Line, first.Col
 	if p.match(TEq) {
 		val := p.expression()
 		switch e.(type) {
 		case *Ident, *Index:
 		default:
-			p.fail(line, "invalid assignment target")
+			p.fail(e.span(), "invalid assignment target")
 		}
 		p.endStmt()
-		return &AssignStmt{Target: e, Val: val, Line: line, Col: col}
+		return &AssignStmt{Target: e, Val: val, Span: e.span().union(val.span())}
 	}
 	if p.match(TLArrow) {
 		val := p.expression()
 		p.endStmt()
-		return &SendStmt{Chan: e, Val: val, Line: line, Col: col}
+		return &SendStmt{Chan: e, Val: val, Span: e.span().union(val.span())}
 	}
 	p.endStmt()
-	return &ExprStmt{E: e, Line: line, Col: col}
+	return &ExprStmt{E: e, Span: e.span()}
 }
 
 func (p *Parser) letStmt() Stmt {
@@ -149,23 +150,27 @@ func (p *Parser) letStmt() Stmt {
 	p.expect(TEq, "'=' in let binding")
 	init := p.expression()
 	p.endStmt()
-	return &LetStmt{Name: name.Lex, Mut: mut, Init: init, Line: tok.Line, Col: tok.Col}
+	return &LetStmt{Name: name.Lex, NameSpan: name.Span, Mut: mut, Init: init,
+		Span: tok.Span.union(init.span())}
 }
 
 func (p *Parser) fnDecl() Stmt {
 	tok := p.advance() // fn
 	name := p.expect(TIdent, "function name")
-	lit := p.fnRest(name.Lex, tok.Line, tok.Col)
-	return &FnDecl{Name: name.Lex, Fn: lit, Line: tok.Line, Col: tok.Col}
+	lit := p.fnRest(name.Lex, tok.Span)
+	return &FnDecl{Name: name.Lex, NameSpan: name.Span, Fn: lit, Span: lit.Span}
 }
 
-// params and body, after 'fn [name]'
-func (p *Parser) fnRest(name string, line, col int) *FnLit {
+// params and body, after 'fn [name]'; fnSpan is the span of the `fn` keyword
+func (p *Parser) fnRest(name string, fnSpan Span) *FnLit {
 	p.expect(TLParen, "'(' after fn")
 	var params []string
+	var paramSpans []Span
 	p.skipSemis()
 	for !p.check(TRParen) {
-		params = append(params, p.expect(TIdent, "parameter name").Lex)
+		ptok := p.expect(TIdent, "parameter name")
+		params = append(params, ptok.Lex)
+		paramSpans = append(paramSpans, ptok.Span)
 		if !p.match(TComma) {
 			break
 		}
@@ -174,7 +179,8 @@ func (p *Parser) fnRest(name string, line, col int) *FnLit {
 	p.skipSemis()
 	p.expect(TRParen, "')' after parameters")
 	body := p.block()
-	return &FnLit{Params: params, Body: body, Name: name, Line: line, Col: col}
+	return &FnLit{Params: params, ParamSpans: paramSpans, Body: body, Name: name,
+		Span: fnSpan.union(body.Span)}
 }
 
 func (p *Parser) enumDecl() Stmt {
@@ -208,12 +214,13 @@ func (p *Parser) enumDecl() Stmt {
 		}
 		variants = append(variants, v)
 		if !p.match(TComma) && !p.check(TSemi) && !p.check(TRBrace) {
-			p.fail(p.peek().Line, "expected ',' or newline between enum variants")
+			p.fail(p.peek().Span, "expected ',' or newline between enum variants")
 		}
 		p.skipSemis()
 	}
-	p.expect(TRBrace, "'}' after enum variants")
-	return &EnumDecl{Name: name.Lex, Params: params, Variants: variants, Line: tok.Line, Col: tok.Col}
+	rb := p.expect(TRBrace, "'}' after enum variants")
+	return &EnumDecl{Name: name.Lex, Params: params, Variants: variants,
+		Span: tok.Span.union(rb.Span)}
 }
 
 // typeExpr := "[" typeExpr "]" | "fn" "(" list ")" "->" typeExpr | IDENT ["(" list ")"]
@@ -223,8 +230,8 @@ func (p *Parser) typeExpr() TypeExpr {
 	case TLBracket:
 		p.advance()
 		el := p.typeExpr()
-		p.expect(TRBracket, "']' in list type")
-		return &TEList{Elem: el, Line: tok.Line, Col: tok.Col}
+		rb := p.expect(TRBracket, "']' in list type")
+		return &TEList{Elem: el, Span: tok.Span.union(rb.Span)}
 	case TFn:
 		p.advance()
 		p.expect(TLParen, "'(' in fn type")
@@ -238,10 +245,10 @@ func (p *Parser) typeExpr() TypeExpr {
 		p.expect(TRParen, "')' in fn type")
 		p.expect(TThinArrow, "'->' in fn type")
 		ret := p.typeExpr()
-		return &TEFn{Params: ps, Ret: ret, Line: tok.Line, Col: tok.Col}
+		return &TEFn{Params: ps, Ret: ret, Span: tok.Span.union(ret.span())}
 	case TIdent:
 		p.advance()
-		te := &TEName{Name: tok.Lex, Line: tok.Line, Col: tok.Col}
+		te := &TEName{Name: tok.Lex, Span: tok.Span}
 		if p.match(TLParen) {
 			for !p.check(TRParen) {
 				te.Args = append(te.Args, p.typeExpr())
@@ -249,11 +256,12 @@ func (p *Parser) typeExpr() TypeExpr {
 					break
 				}
 			}
-			p.expect(TRParen, "')' in type arguments")
+			rp := p.expect(TRParen, "')' in type arguments")
+			te.Span = te.Span.union(rp.Span)
 		}
 		return te
 	}
-	p.fail(tok.Line, "expected a type, got %q", tok.Lex)
+	p.fail(tok.Span, "expected a type, got %q", tok.Lex)
 	return nil
 }
 
@@ -261,7 +269,7 @@ func (p *Parser) whileStmt() Stmt {
 	tok := p.advance()
 	cond := p.expression()
 	body := p.block()
-	return &WhileStmt{Cond: cond, Body: body, Line: tok.Line, Col: tok.Col}
+	return &WhileStmt{Cond: cond, Body: body, Span: tok.Span.union(body.Span)}
 }
 
 func (p *Parser) forStmt() Stmt {
@@ -270,7 +278,8 @@ func (p *Parser) forStmt() Stmt {
 	p.expect(TIn, "'in' in for loop")
 	iter := p.expression()
 	body := p.block()
-	return &ForStmt{Var: v.Lex, Iter: iter, Body: body, Line: tok.Line, Col: tok.Col}
+	return &ForStmt{Var: v.Lex, VarSpan: v.Span, Iter: iter, Body: body,
+		Span: tok.Span.union(body.Span)}
 }
 
 func (p *Parser) spawnStmt() Stmt {
@@ -278,21 +287,22 @@ func (p *Parser) spawnStmt() Stmt {
 	e := p.expression()
 	call, ok := e.(*Call)
 	if !ok {
-		p.fail(tok.Line, "spawn expects a function call, e.g. `spawn worker(ch)`")
+		p.fail(tok.Span, "spawn expects a function call, e.g. `spawn worker(ch)`")
 	}
 	p.endStmt()
-	return &SpawnStmt{CallE: call, Line: tok.Line, Col: tok.Col}
+	return &SpawnStmt{CallE: call, Span: tok.Span.union(call.Span)}
 }
 
 func (p *Parser) block() *Block {
 	lb := p.expect(TLBrace, "'{'")
-	b := &Block{Line: lb.Line, Col: lb.Col}
+	b := &Block{Span: lb.Span}
 	p.skipSemis()
 	for !p.check(TRBrace) && !p.check(TEOF) {
 		b.Stmts = append(b.Stmts, p.statement())
 		p.skipSemis()
 	}
-	p.expect(TRBrace, "'}'")
+	rb := p.expect(TRBrace, "'}'")
+	b.Span = b.Span.union(rb.Span)
 	return b
 }
 
@@ -303,9 +313,9 @@ func (p *Parser) expression() Expr { return p.orExpr() }
 func (p *Parser) orExpr() Expr {
 	e := p.andExpr()
 	for p.check(TOrOr) {
-		op := p.advance()
+		p.advance()
 		rhs := p.andExpr()
-		e = &Logical{Op: TOrOr, Lhs: e, Rhs: rhs, Line: op.Line, Col: op.Col}
+		e = &Logical{Op: TOrOr, Lhs: e, Rhs: rhs, Span: e.span().union(rhs.span())}
 	}
 	return e
 }
@@ -313,9 +323,9 @@ func (p *Parser) orExpr() Expr {
 func (p *Parser) andExpr() Expr {
 	e := p.equality()
 	for p.check(TAndAnd) {
-		op := p.advance()
+		p.advance()
 		rhs := p.equality()
-		e = &Logical{Op: TAndAnd, Lhs: e, Rhs: rhs, Line: op.Line, Col: op.Col}
+		e = &Logical{Op: TAndAnd, Lhs: e, Rhs: rhs, Span: e.span().union(rhs.span())}
 	}
 	return e
 }
@@ -325,7 +335,7 @@ func (p *Parser) equality() Expr {
 	for p.check(TEqEq) || p.check(TBangEq) {
 		op := p.advance()
 		rhs := p.comparison()
-		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Line: op.Line, Col: op.Col}
+		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Span: e.span().union(rhs.span())}
 	}
 	return e
 }
@@ -335,7 +345,7 @@ func (p *Parser) comparison() Expr {
 	for p.check(TLt) || p.check(TLtEq) || p.check(TGt) || p.check(TGtEq) {
 		op := p.advance()
 		rhs := p.term()
-		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Line: op.Line, Col: op.Col}
+		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Span: e.span().union(rhs.span())}
 	}
 	return e
 }
@@ -345,7 +355,7 @@ func (p *Parser) term() Expr {
 	for p.check(TPlus) || p.check(TMinus) {
 		op := p.advance()
 		rhs := p.factor()
-		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Line: op.Line, Col: op.Col}
+		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Span: e.span().union(rhs.span())}
 	}
 	return e
 }
@@ -355,7 +365,7 @@ func (p *Parser) factor() Expr {
 	for p.check(TStar) || p.check(TSlash) || p.check(TPercent) {
 		op := p.advance()
 		rhs := p.unary()
-		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Line: op.Line, Col: op.Col}
+		e = &Binary{Op: op.Type, Lhs: e, Rhs: rhs, Span: e.span().union(rhs.span())}
 	}
 	return e
 }
@@ -365,11 +375,11 @@ func (p *Parser) unary() Expr {
 	case p.check(TBang), p.check(TMinus):
 		op := p.advance()
 		rhs := p.unary()
-		return &Unary{Op: op.Type, Rhs: rhs, Line: op.Line, Col: op.Col}
+		return &Unary{Op: op.Type, Rhs: rhs, Span: op.Span.union(rhs.span())}
 	case p.check(TLArrow): // <-ch  (receive)
 		op := p.advance()
 		rhs := p.unary()
-		return &RecvExpr{Chan: rhs, Line: op.Line, Col: op.Col}
+		return &RecvExpr{Chan: rhs, Span: op.Span.union(rhs.span())}
 	}
 	return p.postfix()
 }
@@ -379,7 +389,7 @@ func (p *Parser) postfix() Expr {
 	for {
 		switch {
 		case p.check(TLParen):
-			lp := p.advance()
+			p.advance()
 			var args []Expr
 			p.skipSemis()
 			for !p.check(TRParen) {
@@ -390,24 +400,24 @@ func (p *Parser) postfix() Expr {
 				p.skipSemis()
 			}
 			p.skipSemis()
-			p.expect(TRParen, "')' after arguments")
-			e = &Call{Callee: e, Args: args, Line: lp.Line, Col: lp.Col}
+			rp := p.expect(TRParen, "')' after arguments")
+			e = &Call{Callee: e, Args: args, Span: e.span().union(rp.Span)}
 		case p.check(TLBracket):
-			lb := p.advance()
+			p.advance()
 			idx := p.expression()
-			p.expect(TRBracket, "']' after index")
-			e = &Index{Target: e, Idx: idx, Line: lb.Line, Col: lb.Col}
+			rb := p.expect(TRBracket, "']' after index")
+			e = &Index{Target: e, Idx: idx, Span: e.span().union(rb.Span)}
 		case p.check(TQuestion):
 			q := p.advance()
-			e = &TryExpr{Inner: e, Line: q.Line, Col: q.Col}
+			e = &TryExpr{Inner: e, Span: e.span().union(q.Span)}
 		case p.check(TDot):
 			d := p.advance()
 			id, ok := e.(*Ident)
 			if !ok {
-				p.fail(d.Line, "'.' is only used for enum variants (Enum.Variant)")
+				p.fail(d.Span, "'.' is only used for enum variants (Enum.Variant)")
 			}
 			v := p.expect(TIdent, "variant name after '.'")
-			e = &VariantAccess{EnumName: id.Name, Variant: v.Lex, Line: d.Line, Col: d.Col}
+			e = &VariantAccess{EnumName: id.Name, Variant: v.Lex, Span: id.Span.union(v.Span)}
 		default:
 			return e
 		}
@@ -421,28 +431,28 @@ func (p *Parser) primary() Expr {
 		p.advance()
 		n, err := strconv.ParseInt(tok.Lex, 10, 64)
 		if err != nil {
-			p.fail(tok.Line, "bad integer literal %q", tok.Lex)
+			p.fail(tok.Span, "bad integer literal %q", tok.Lex)
 		}
-		return &IntLit{Val: n, Line: tok.Line, Col: tok.Col}
+		return &IntLit{Val: n, Span: tok.Span}
 	case TFloat:
 		p.advance()
 		f, err := strconv.ParseFloat(tok.Lex, 64)
 		if err != nil {
-			p.fail(tok.Line, "bad float literal %q", tok.Lex)
+			p.fail(tok.Span, "bad float literal %q", tok.Lex)
 		}
-		return &FloatLit{Val: f, Line: tok.Line, Col: tok.Col}
+		return &FloatLit{Val: f, Span: tok.Span}
 	case TString:
 		p.advance()
-		return &StrLit{Val: tok.Lex, Line: tok.Line, Col: tok.Col}
+		return &StrLit{Val: tok.Lex, Span: tok.Span}
 	case TTrue:
 		p.advance()
-		return &BoolLit{Val: true, Line: tok.Line, Col: tok.Col}
+		return &BoolLit{Val: true, Span: tok.Span}
 	case TFalse:
 		p.advance()
-		return &BoolLit{Val: false, Line: tok.Line, Col: tok.Col}
+		return &BoolLit{Val: false, Span: tok.Span}
 	case TIdent:
 		p.advance()
-		return &Ident{Name: tok.Lex, Line: tok.Line, Col: tok.Col}
+		return &Ident{Name: tok.Lex, Span: tok.Span}
 	case TLParen:
 		p.advance()
 		e := p.expression()
@@ -460,11 +470,11 @@ func (p *Parser) primary() Expr {
 			p.skipSemis()
 		}
 		p.skipSemis()
-		p.expect(TRBracket, "']' after list elements")
-		return &ListLit{Elems: elems, Line: tok.Line, Col: tok.Col}
+		rb := p.expect(TRBracket, "']' after list elements")
+		return &ListLit{Elems: elems, Span: tok.Span.union(rb.Span)}
 	case TFn:
 		p.advance()
-		return p.fnRest("", tok.Line, tok.Col)
+		return p.fnRest("", tok.Span)
 	case TIf:
 		return p.ifExpr()
 	case TMatch:
@@ -472,7 +482,7 @@ func (p *Parser) primary() Expr {
 	case TLBrace:
 		return p.block()
 	}
-	p.fail(tok.Line, "unexpected token %q", tok.Lex)
+	p.fail(tok.Span, "unexpected token %q", tok.Lex)
 	return nil
 }
 
@@ -480,6 +490,7 @@ func (p *Parser) ifExpr() Expr {
 	tok := p.advance() // if
 	cond := p.expression()
 	then := p.block()
+	sp := tok.Span.union(then.Span)
 	var els Expr
 	if p.match(TElse) {
 		if p.check(TIf) {
@@ -487,30 +498,32 @@ func (p *Parser) ifExpr() Expr {
 		} else {
 			els = p.block()
 		}
+		sp = sp.union(els.span())
 	}
-	return &IfExpr{Cond: cond, Then: then, Else: els, Line: tok.Line, Col: tok.Col}
+	return &IfExpr{Cond: cond, Then: then, Else: els, Span: sp}
 }
 
 func (p *Parser) matchExpr() Expr {
 	tok := p.advance() // match
 	scrut := p.expression()
 	p.expect(TLBrace, "'{' after match scrutinee")
-	m := &MatchExpr{Scrut: scrut, Line: tok.Line, Col: tok.Col}
+	m := &MatchExpr{Scrut: scrut, Span: tok.Span}
 	p.skipSemis()
 	for !p.check(TRBrace) && !p.check(TEOF) {
 		pat := p.pattern()
 		p.expect(TArrow, "'=>' after pattern")
 		p.skipSemis()
 		body := p.expression()
-		m.Arms = append(m.Arms, MatchArm{Pat: pat, Body: body, Line: tok.Line, Col: tok.Col})
+		m.Arms = append(m.Arms, MatchArm{Pat: pat, Body: body, Span: pat.span().union(body.span())})
 		if !p.match(TComma) && !p.check(TSemi) && !p.check(TRBrace) {
-			p.fail(p.peek().Line, "expected ',' or newline between match arms")
+			p.fail(p.peek().Span, "expected ',' or newline between match arms")
 		}
 		p.skipSemis()
 	}
-	p.expect(TRBrace, "'}' after match arms")
+	rb := p.expect(TRBrace, "'}' after match arms")
+	m.Span = m.Span.union(rb.Span)
 	if len(m.Arms) == 0 {
-		p.fail(tok.Line, "match must have at least one arm")
+		p.fail(m.Span, "match must have at least one arm")
 	}
 	return m
 }
@@ -520,7 +533,7 @@ func (p *Parser) pattern() Pattern {
 	switch tok.Type {
 	case TInt, TFloat, TString, TTrue, TFalse:
 		lit := p.primary()
-		return &PatLiteral{Val: lit, Line: tok.Line, Col: tok.Col}
+		return &PatLiteral{Val: lit, Span: lit.span()}
 	case TMinus: // negative number literal
 		p.advance()
 		lit := p.primary()
@@ -530,42 +543,46 @@ func (p *Parser) pattern() Pattern {
 		case *FloatLit:
 			l.Val = -l.Val
 		default:
-			p.fail(tok.Line, "'-' in pattern must precede a number")
+			p.fail(tok.Span, "'-' in pattern must precede a number")
 		}
-		return &PatLiteral{Val: lit, Line: tok.Line, Col: tok.Col}
+		return &PatLiteral{Val: lit, Span: tok.Span.union(lit.span())}
 	case TIdent:
 		p.advance()
 		if tok.Lex == "_" {
-			return &PatWildcard{Line: tok.Line, Col: tok.Col}
+			return &PatWildcard{Span: tok.Span}
 		}
 		enumName, variant := "", tok.Lex
+		sp := tok.Span
 		if p.match(TDot) {
 			enumName = tok.Lex
-			variant = p.expect(TIdent, "variant name after '.'").Lex
+			vtok := p.expect(TIdent, "variant name after '.'")
+			variant = vtok.Lex
+			sp = sp.union(vtok.Span)
 		}
 		if p.match(TLParen) {
-			pv := &PatVariant{EnumName: enumName, Variant: variant, Line: tok.Line, Col: tok.Col}
+			pv := &PatVariant{EnumName: enumName, Variant: variant}
 			for !p.check(TRParen) {
 				sub := p.pattern()
 				switch sub.(type) {
 				case *PatBinding, *PatWildcard:
 				default:
-					p.fail(tok.Line, "variant fields may only bind names or use '_'")
+					p.fail(sub.span(), "variant fields may only bind names or use '_'")
 				}
 				pv.Binds = append(pv.Binds, sub)
 				if !p.match(TComma) {
 					break
 				}
 			}
-			p.expect(TRParen, "')' after variant pattern")
+			rp := p.expect(TRParen, "')' after variant pattern")
+			pv.Span = sp.union(rp.Span)
 			return pv
 		}
 		if enumName != "" {
-			return &PatVariant{EnumName: enumName, Variant: variant, Line: tok.Line, Col: tok.Col}
+			return &PatVariant{EnumName: enumName, Variant: variant, Span: sp}
 		}
 		// bare name: binding, or a nullary variant like None ??compiler decides
-		return &PatBinding{Name: variant, Line: tok.Line, Col: tok.Col}
+		return &PatBinding{Name: variant, Span: sp}
 	}
-	p.fail(tok.Line, "invalid pattern %q", tok.Lex)
+	p.fail(tok.Span, "invalid pattern %q", tok.Lex)
 	return nil
 }

@@ -63,8 +63,7 @@ type binding struct {
 	used    bool
 	isFn    bool
 	special string // "chan", "printf" for irregular natives
-	line    int
-	col     int
+	span    Span
 	kind    string // "local", "param", "global", "native"
 }
 
@@ -107,12 +106,12 @@ func typecheck(stmts []Stmt) []Diag {
 		case *FnDecl:
 			tv := c.fresh("")
 			pre[st.Name] = tv
-			c.declare(st.Name, &Scheme{t: tv}, false, "global", st.Line, st.Col)
+			c.declare(st.Name, &Scheme{t: tv}, false, "global", st.NameSpan)
 			c.scopes[len(c.scopes)-1][st.Name].isFn = true
 		case *LetStmt:
 			tv := c.fresh("")
 			pre[st.Name] = tv
-			c.declare(st.Name, &Scheme{t: tv}, st.Mut, "global", st.Line, st.Col)
+			c.declare(st.Name, &Scheme{t: tv}, st.Mut, "global", st.NameSpan)
 		}
 	}
 
@@ -129,10 +128,10 @@ func typecheck(stmts []Stmt) []Diag {
 			// their concrete types during instantiation, which stays sound.
 			b := c.lookup(st.Name)
 			b.scheme = c.generalize(ft)
-			c.unifyAt(pre[st.Name], ft, st.Line, st.Col, "in this function")
+			c.unifyAt(pre[st.Name], ft, st.NameSpan, "in this function")
 		case *LetStmt:
 			t := c.inferLetInit(st)
-			c.unifyAt(pre[st.Name], t, st.Line, st.Col, "in this binding")
+			c.unifyAt(pre[st.Name], t, st.NameSpan, "in this binding")
 		case *EnumDecl:
 			// already registered
 		default:
@@ -147,31 +146,28 @@ func typecheck(stmts []Stmt) []Diag {
 			if b.isFn {
 				what = "function"
 			}
-			c.warnf(b.line, b.col, "unused_variable",
+			c.warnf(b.span, "unused_variable",
 				fmt.Sprintf("if this is intentional, prefix it with an underscore: `_%s`", name),
 				"unused %s: `%s`", what, name)
 		}
 	}
 
 	sort.SliceStable(c.diags, func(i, j int) bool {
-		if c.diags[i].Line != c.diags[j].Line {
-			return c.diags[i].Line < c.diags[j].Line
-		}
-		return c.diags[i].Col < c.diags[j].Col
+		return c.diags[i].Span.Start < c.diags[j].Span.Start
 	})
 	return c.diags
 }
 
-func (c *Checker) errorf(line, col int, code, help, format string, args ...any) {
+func (c *Checker) errorf(sp Span, code, help, format string, args ...any) {
 	c.diags = append(c.diags, Diag{
-		IsErr: true, Code: code, Line: line, Col: col,
+		IsErr: true, Code: code, Span: sp,
 		Msg: fmt.Sprintf(format, args...), Help: help,
 	})
 }
 
-func (c *Checker) warnf(line, col int, code, help, format string, args ...any) {
+func (c *Checker) warnf(sp Span, code, help, format string, args ...any) {
 	c.diags = append(c.diags, Diag{
-		IsErr: false, Code: code, Line: line, Col: col,
+		IsErr: false, Code: code, Span: sp,
 		Msg: fmt.Sprintf(format, args...), Help: help,
 	})
 }
@@ -188,7 +184,7 @@ func (c *Checker) popScope() {
 			if b.kind == "param" {
 				what = "parameter"
 			}
-			c.warnf(b.line, b.col, "unused_variable",
+			c.warnf(b.span, "unused_variable",
 				fmt.Sprintf("if this is intentional, prefix it with an underscore: `_%s`", name),
 				"unused %s: `%s`", what, name)
 		}
@@ -196,8 +192,8 @@ func (c *Checker) popScope() {
 	c.scopes = c.scopes[:len(c.scopes)-1]
 }
 
-func (c *Checker) declare(name string, s *Scheme, mut bool, kind string, line, col int) {
-	c.scopes[len(c.scopes)-1][name] = &binding{scheme: s, mut: mut, kind: kind, line: line, col: col}
+func (c *Checker) declare(name string, s *Scheme, mut bool, kind string, sp Span) {
+	c.scopes[len(c.scopes)-1][name] = &binding{scheme: s, mut: mut, kind: kind, span: sp}
 }
 
 func (c *Checker) lookup(name string) *binding {
@@ -338,9 +334,9 @@ func (c *Checker) unify(a, b Ty) error {
 	return fmt.Errorf("expected `%s`, found `%s`", pretty(a), pretty(b))
 }
 
-func (c *Checker) unifyAt(a, b Ty, line, col int, context string) {
+func (c *Checker) unifyAt(a, b Ty, sp Span, context string) {
 	if err := c.unify(a, b); err != nil {
-		c.errorf(line, col, "E0308", "", "mismatched types %s: %s", context, err.Error())
+		c.errorf(sp, "E0308", "", "mismatched types %s: %s", context, err.Error())
 	}
 }
 
@@ -408,7 +404,7 @@ func (c *Checker) instantiate(s *Scheme) Ty {
 
 func (c *Checker) registerEnum(st *EnumDecl) {
 	if _, exists := c.enums[st.Name]; exists {
-		c.errorf(st.Line, st.Col, "E0428", "", "enum `%s` is declared more than once", st.Name)
+		c.errorf(st.Span, "E0428", "", "enum `%s` is declared more than once", st.Name)
 		return
 	}
 	sig := &EnumSig{Name: st.Name, Params: st.Params}
@@ -434,24 +430,24 @@ func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
 		switch x.Name {
 		case "int", "float", "bool", "str", "unit":
 			if len(x.Args) > 0 {
-				c.errorf(x.Line, x.Col, "E0109", "", "`%s` takes no type arguments", x.Name)
+				c.errorf(x.Span, "E0109", "", "`%s` takes no type arguments", x.Name)
 			}
 		case "chan":
 			if len(x.Args) != 1 {
-				c.errorf(x.Line, x.Col, "E0107", "", "`chan` takes exactly one type argument, e.g. chan(int)")
+				c.errorf(x.Span, "E0107", "", "`chan` takes exactly one type argument, e.g. chan(int)")
 			}
 		default:
 			if params[x.Name] {
 				if len(x.Args) > 0 {
-					c.errorf(x.Line, x.Col, "E0109", "", "type parameter `%s` takes no arguments", x.Name)
+					c.errorf(x.Span, "E0109", "", "type parameter `%s` takes no arguments", x.Name)
 				}
 			} else if sig, ok := c.enums[x.Name]; ok {
 				if len(x.Args) != len(sig.Params) {
-					c.errorf(x.Line, x.Col, "E0107", "",
+					c.errorf(x.Span, "E0107", "",
 						"enum `%s` takes %d type argument(s), %d given", x.Name, len(sig.Params), len(x.Args))
 				}
 			} else {
-				c.errorf(x.Line, x.Col, "E0412", "", "cannot find type `%s`", x.Name)
+				c.errorf(x.Span, "E0412", "", "cannot find type `%s`", x.Name)
 			}
 		}
 		for _, a := range x.Args {
@@ -546,10 +542,10 @@ func (c *Checker) inferStmt(s Stmt) {
 		} else {
 			sch = &Scheme{t: t}
 		}
-		c.declare(st.Name, sch, st.Mut, "local", st.Line, st.Col)
+		c.declare(st.Name, sch, st.Mut, "local", st.NameSpan)
 	case *FnDecl:
 		tv := c.fresh("")
-		c.declare(st.Name, &Scheme{t: tv}, false, "local", st.Line, st.Col)
+		c.declare(st.Name, &Scheme{t: tv}, false, "local", st.NameSpan)
 		b := c.lookup(st.Name)
 		b.isFn = true
 		b.used = true // don't lint named helper fns
@@ -557,15 +553,15 @@ func (c *Checker) inferStmt(s Stmt) {
 		ft := c.inferExpr(st.Fn)
 		c.level--
 		b.scheme = c.generalize(ft) // before unify: see top-level FnDecl note
-		c.unifyAt(tv, ft, st.Line, st.Col, "in this function")
+		c.unifyAt(tv, ft, st.NameSpan, "in this function")
 	case *EnumDecl:
-		c.errorf(st.Line, st.Col, "E0637", "", "enum declarations are only allowed at top level")
+		c.errorf(st.Span, "E0637", "", "enum declarations are only allowed at top level")
 	case *ExprStmt:
 		t := c.inferExpr(st.E)
 		switch r := resolve(t).(type) {
 		case *TCon:
 			if r.Name == "Result" || r.Name == "Option" {
-				c.errorf(st.Line, st.Col, "unused_must_use",
+				c.errorf(st.Span, "unused_must_use",
 					"handle it with `match`/`?`, or discard explicitly with `let _ = ...`",
 					"unused `%s` value must be handled", r.Name)
 			}
@@ -575,31 +571,31 @@ func (c *Checker) inferStmt(s Stmt) {
 		case *Ident:
 			b := c.lookup(tgt.Name)
 			if b == nil {
-				c.errorf(tgt.Line, tgt.Col, "E0425", "declare it first: `let mut "+tgt.Name+" = ...`",
+				c.errorf(tgt.Span, "E0425", "declare it first: `let mut "+tgt.Name+" = ...`",
 					"cannot assign to undeclared variable `%s`", tgt.Name)
 				c.inferExpr(st.Val)
 				return
 			}
 			if !b.mut {
-				c.errorf(tgt.Line, tgt.Col, "E0384",
+				c.errorf(tgt.Span, "E0384",
 					fmt.Sprintf("make this binding mutable: `let mut %s`", tgt.Name),
 					"cannot assign twice to immutable variable `%s`", tgt.Name)
 			}
 			vt := c.inferExpr(st.Val)
-			c.unifyAt(c.instantiate(b.scheme), vt, st.Line, st.Col, "in this assignment")
+			c.unifyAt(c.instantiate(b.scheme), vt, st.Val.span(), "in this assignment")
 		case *Index:
-			c.requireMutRoot(tgt, tgt.Line, tgt.Col, "assign to this element")
+			c.requireMutRoot(tgt, "assign to this element")
 			el := c.fresh("")
 			tt := c.inferExpr(tgt.Target)
-			c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, tgt.Line, tgt.Col, "when indexing")
+			c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, tgt.Target.span(), "when indexing")
 			it := c.inferExpr(tgt.Idx)
-			c.unifyAt(it, tInt, tgt.Line, tgt.Col, "in this index")
+			c.unifyAt(it, tInt, tgt.Idx.span(), "in this index")
 			vt := c.inferExpr(st.Val)
-			c.unifyAt(el, vt, st.Line, st.Col, "in this assignment")
+			c.unifyAt(el, vt, st.Val.span(), "in this assignment")
 		}
 	case *WhileStmt:
 		ct := c.inferExpr(st.Cond)
-		c.unifyAt(ct, tBool, st.Line, st.Col, "in this `while` condition")
+		c.unifyAt(ct, tBool, st.Cond.span(), "in this `while` condition")
 		c.loop++
 		c.pushScope()
 		c.inferBlockStmts(st.Body)
@@ -608,10 +604,10 @@ func (c *Checker) inferStmt(s Stmt) {
 	case *ForStmt:
 		el := c.fresh("")
 		it := c.inferExpr(st.Iter)
-		c.unifyAt(it, &TCon{Name: "list", Args: []Ty{el}}, st.Line, st.Col, "in this `for` loop (iterate over a list)")
+		c.unifyAt(it, &TCon{Name: "list", Args: []Ty{el}}, st.Iter.span(), "in this `for` loop (iterate over a list)")
 		c.loop++
 		c.pushScope()
-		c.declare(st.Var, &Scheme{t: el}, false, "local", st.Line, st.Col)
+		c.declare(st.Var, &Scheme{t: el}, false, "local", st.VarSpan)
 		c.inferBlockStmts(st.Body)
 		c.popScope()
 		c.loop--
@@ -621,18 +617,18 @@ func (c *Checker) inferStmt(s Stmt) {
 			t = c.inferExpr(st.Val)
 		}
 		if len(c.retTys) == 0 {
-			c.errorf(st.Line, st.Col, "E0572", "", "`return` outside of a function")
+			c.errorf(st.Span, "E0572", "", "`return` outside of a function")
 			return
 		}
-		c.unifyAt(c.retTys[len(c.retTys)-1], t, st.Line, st.Col, "in this `return`")
+		c.unifyAt(c.retTys[len(c.retTys)-1], t, st.Span, "in this `return`")
 	case *SpawnStmt:
 		c.inferExpr(st.CallE)
 	case *SendStmt:
 		el := c.fresh("")
 		ct := c.inferExpr(st.Chan)
-		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, st.Line, st.Col, "on the left of `<-` (need a channel)")
+		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, st.Chan.span(), "on the left of `<-` (need a channel)")
 		vt := c.inferExpr(st.Val)
-		c.unifyAt(el, vt, st.Line, st.Col, "in this send")
+		c.unifyAt(el, vt, st.Val.span(), "in this send")
 	case *BreakStmt, *ContinueStmt:
 		// loop nesting validated by the compiler
 	}
@@ -671,19 +667,19 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		}
 		// bare enum variant
 		if sig, idx, amb := c.findVariantSig(ex.Name); amb {
-			c.errorf(ex.Line, ex.Col, "E0659",
+			c.errorf(ex.Span, "E0659",
 				fmt.Sprintf("qualify it, e.g. `SomeEnum.%s`", ex.Name),
 				"`%s` is a variant of several enums", ex.Name)
 			return c.fresh("")
 		} else if idx >= 0 {
 			return c.variantType(sig, idx)
 		}
-		c.errorf(ex.Line, ex.Col, "E0425", "", "cannot find `%s` in this scope", ex.Name)
+		c.errorf(ex.Span, "E0425", "", "cannot find `%s` in this scope", ex.Name)
 		return c.fresh("")
 	case *VariantAccess:
 		sig, ok := c.enums[ex.EnumName]
 		if !ok {
-			c.errorf(ex.Line, ex.Col, "E0412", "", "cannot find enum `%s`", ex.EnumName)
+			c.errorf(ex.Span, "E0412", "", "cannot find enum `%s`", ex.EnumName)
 			return c.fresh("")
 		}
 		for i, v := range sig.Variants {
@@ -691,62 +687,62 @@ func (c *Checker) inferExpr(e Expr) Ty {
 				return c.variantType(sig, i)
 			}
 		}
-		c.errorf(ex.Line, ex.Col, "E0599", "", "enum `%s` has no variant `%s`", ex.EnumName, ex.Variant)
+		c.errorf(ex.Span, "E0599", "", "enum `%s` has no variant `%s`", ex.EnumName, ex.Variant)
 		return c.fresh("")
 	case *Unary:
 		t := c.inferExpr(ex.Rhs)
 		if ex.Op == TMinus {
-			c.unifyAt(t, c.fresh("num"), ex.Line, ex.Col, "with unary `-`")
+			c.unifyAt(t, c.fresh("num"), ex.Span, "with unary `-`")
 			return t
 		}
-		c.unifyAt(t, tBool, ex.Line, ex.Col, "with `!`")
+		c.unifyAt(t, tBool, ex.Span, "with `!`")
 		return tBool
 	case *Binary:
 		lt := c.inferExpr(ex.Lhs)
 		rt := c.inferExpr(ex.Rhs)
 		switch ex.Op {
 		case TPlus:
-			c.unifyAt(lt, rt, ex.Line, ex.Col, "with `+` (no implicit conversions: use to_float()/trunc())")
-			c.unifyAt(lt, c.fresh("addord"), ex.Line, ex.Col, "with `+`")
+			c.unifyAt(lt, rt, ex.Span, "with `+` (no implicit conversions: use to_float()/trunc())")
+			c.unifyAt(lt, c.fresh("addord"), ex.Span, "with `+`")
 			return lt
 		case TMinus, TStar, TSlash:
-			c.unifyAt(lt, rt, ex.Line, ex.Col, "with this operator (no implicit conversions: use to_float()/trunc())")
-			c.unifyAt(lt, c.fresh("num"), ex.Line, ex.Col, "with this arithmetic operator")
+			c.unifyAt(lt, rt, ex.Span, "with this operator (no implicit conversions: use to_float()/trunc())")
+			c.unifyAt(lt, c.fresh("num"), ex.Span, "with this arithmetic operator")
 			return lt
 		case TPercent:
-			c.unifyAt(lt, tInt, ex.Line, ex.Col, "with `%` (int only)")
-			c.unifyAt(rt, tInt, ex.Line, ex.Col, "with `%` (int only)")
+			c.unifyAt(lt, tInt, ex.Span, "with `%` (int only)")
+			c.unifyAt(rt, tInt, ex.Span, "with `%` (int only)")
 			return tInt
 		case TLt, TLtEq, TGt, TGtEq:
-			c.unifyAt(lt, rt, ex.Line, ex.Col, "in this comparison (no implicit conversions)")
-			c.unifyAt(lt, c.fresh("addord"), ex.Line, ex.Col, "in this comparison")
+			c.unifyAt(lt, rt, ex.Span, "in this comparison (no implicit conversions)")
+			c.unifyAt(lt, c.fresh("addord"), ex.Span, "in this comparison")
 			return tBool
 		case TEqEq, TBangEq:
-			c.unifyAt(lt, rt, ex.Line, ex.Col, "in this equality (both sides must be the same type)")
+			c.unifyAt(lt, rt, ex.Span, "in this equality (both sides must be the same type)")
 			return tBool
 		}
 		return c.fresh("")
 	case *Logical:
 		lt := c.inferExpr(ex.Lhs)
 		rt := c.inferExpr(ex.Rhs)
-		c.unifyAt(lt, tBool, ex.Line, ex.Col, "with `&&`/`||`")
-		c.unifyAt(rt, tBool, ex.Line, ex.Col, "with `&&`/`||`")
+		c.unifyAt(lt, tBool, ex.Lhs.span(), "with `&&`/`||`")
+		c.unifyAt(rt, tBool, ex.Rhs.span(), "with `&&`/`||`")
 		return tBool
 	case *Call:
 		return c.inferCall(ex)
 	case *Index:
 		el := c.fresh("")
 		tt := c.inferExpr(ex.Target)
-		c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, ex.Line, ex.Col,
+		c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, ex.Target.span(),
 			"when indexing (only lists; for strings use char_at())")
 		it := c.inferExpr(ex.Idx)
-		c.unifyAt(it, tInt, ex.Line, ex.Col, "in this index")
+		c.unifyAt(it, tInt, ex.Idx.span(), "in this index")
 		return el
 	case *ListLit:
 		el := c.fresh("")
 		for _, e := range ex.Elems {
 			t := c.inferExpr(e)
-			c.unifyAt(el, t, ex.Line, ex.Col, "in this list (all elements must share one type)")
+			c.unifyAt(el, t, e.span(), "in this list (all elements must share one type)")
 		}
 		return &TCon{Name: "list", Args: []Ty{el}}
 	case *FnLit:
@@ -754,12 +750,12 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		params := make([]Ty, len(ex.Params))
 		for i, p := range ex.Params {
 			params[i] = c.fresh("")
-			c.declare(p, &Scheme{t: params[i]}, false, "param", ex.Line, ex.Col)
+			c.declare(p, &Scheme{t: params[i]}, false, "param", ex.ParamSpans[i])
 		}
 		ret := c.fresh("")
 		c.retTys = append(c.retTys, ret)
 		bt := c.inferBlockExpr(ex.Body)
-		c.unifyAt(ret, bt, ex.Line, ex.Col, "as this function's result")
+		c.unifyAt(ret, bt, ex.Body.Span, "as this function's result")
 		c.retTys = c.retTys[:len(c.retTys)-1]
 		c.popScope()
 		return &TFunc{Params: params, Ret: ret}
@@ -770,15 +766,15 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		return t
 	case *IfExpr:
 		ct := c.inferExpr(ex.Cond)
-		c.unifyAt(ct, tBool, ex.Line, ex.Col, "in this `if` condition")
+		c.unifyAt(ct, tBool, ex.Cond.span(), "in this `if` condition")
 		tt := c.inferExpr(ex.Then)
 		if ex.Else == nil {
-			c.unifyAt(tt, tUnit, ex.Line, ex.Col,
+			c.unifyAt(tt, tUnit, ex.Then.Span,
 				"in this `if` (without an `else`, the branch must be unit)")
 			return tUnit
 		}
 		et := c.inferExpr(ex.Else)
-		c.unifyAt(tt, et, ex.Line, ex.Col, "between `if` and `else` branches")
+		c.unifyAt(tt, et, ex.Else.span(), "between `if` and `else` branches")
 		return tt
 	case *MatchExpr:
 		return c.inferMatch(ex)
@@ -787,7 +783,7 @@ func (c *Checker) inferExpr(e Expr) Ty {
 	case *RecvExpr:
 		el := c.fresh("")
 		ct := c.inferExpr(ex.Chan)
-		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, ex.Line, ex.Col, "with `<-` (need a channel)")
+		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, ex.Span, "with `<-` (need a channel)")
 		return el
 	}
 	return c.fresh("")
@@ -850,7 +846,7 @@ func mutRoot(e Expr) *Ident {
 
 // requireMutRoot enforces deep `mut`: the root binding of a mutated place
 // must be declared mutable. what describes the mutation for the message.
-func (c *Checker) requireMutRoot(e Expr, line, col int, what string) {
+func (c *Checker) requireMutRoot(e Expr, what string) {
 	id := mutRoot(e)
 	if id == nil {
 		return
@@ -863,14 +859,14 @@ func (c *Checker) requireMutRoot(e Expr, line, col int, what string) {
 	if b.kind == "param" {
 		help = fmt.Sprintf("parameters are immutable; build a new list instead of mutating `%s`", id.Name)
 	}
-	c.errorf(line, col, "E0596", help,
+	c.errorf(e.span(), "E0596", help,
 		"cannot %s, as `%s` is not declared as mutable", what, id.Name)
 }
 
 func (c *Checker) inferCall(ex *Call) Ty {
 	if id, ok := ex.Callee.(*Ident); ok && mutatingNatives[id.Name] && len(ex.Args) > 0 {
 		if b := c.lookup(id.Name); b != nil && b.kind == "native" {
-			c.requireMutRoot(ex.Args[0], ex.Line, ex.Col, fmt.Sprintf("mutate this list with `%s()`", id.Name))
+			c.requireMutRoot(ex.Args[0], fmt.Sprintf("mutate this list with `%s()`", id.Name))
 		}
 	}
 	// special-cased natives
@@ -885,11 +881,11 @@ func (c *Checker) inferCall(ex *Call) Ty {
 				return tUnit
 			case "chan":
 				if len(ex.Args) > 1 {
-					c.errorf(ex.Line, ex.Col, "E0061", "", "chan() takes at most one argument (the capacity)")
+					c.errorf(ex.Span, "E0061", "", "chan() takes at most one argument (the capacity)")
 				}
 				for _, a := range ex.Args {
 					at := c.inferExpr(a)
-					c.unifyAt(at, tInt, ex.Line, ex.Col, "as the channel capacity")
+					c.unifyAt(at, tInt, a.span(), "as the channel capacity")
 				}
 				return &TCon{Name: "chan", Args: []Ty{c.fresh("")}}
 			}
@@ -902,19 +898,19 @@ func (c *Checker) inferCall(ex *Call) Ty {
 	}
 	// better arity errors when the callee type is already concrete
 	if f, ok := resolve(ct).(*TFunc); ok && len(f.Params) != len(args) {
-		c.errorf(ex.Line, ex.Col, "E0061", "",
+		c.errorf(ex.Span, "E0061", "",
 			"this call takes %d argument(s) but %d were supplied", len(f.Params), len(args))
 		return f.Ret
 	}
 	ret := c.fresh("")
-	c.unifyAt(ct, &TFunc{Params: args, Ret: ret}, ex.Line, ex.Col, "in this call")
+	c.unifyAt(ct, &TFunc{Params: args, Ret: ret}, ex.Span, "in this call")
 	return ret
 }
 
 func (c *Checker) inferTry(ex *TryExpr) Ty {
 	t := c.inferExpr(ex.Inner)
 	if len(c.retTys) == 0 {
-		c.errorf(ex.Line, ex.Col, "E0277", "", "`?` can only be used inside a function")
+		c.errorf(ex.Span, "E0277", "", "`?` can only be used inside a function")
 		return c.fresh("")
 	}
 	ret := c.retTys[len(c.retTys)-1]
@@ -924,21 +920,21 @@ func (c *Checker) inferTry(ex *TryExpr) Ty {
 		case "Result":
 			e := c.fresh("")
 			ok := c.fresh("")
-			c.unifyAt(t, &TCon{Name: "Result", Args: []Ty{ok, e}}, ex.Line, ex.Col, "with `?`")
+			c.unifyAt(t, &TCon{Name: "Result", Args: []Ty{ok, e}}, ex.Span, "with `?`")
 			b := c.fresh("")
-			c.unifyAt(ret, &TCon{Name: "Result", Args: []Ty{b, e}}, ex.Line, ex.Col,
+			c.unifyAt(ret, &TCon{Name: "Result", Args: []Ty{b, e}}, ex.Span,
 				"with `?` (the enclosing function must return a Result with the same error type)")
 			return ok
 		case "Option":
 			v := c.fresh("")
-			c.unifyAt(t, &TCon{Name: "Option", Args: []Ty{v}}, ex.Line, ex.Col, "with `?`")
+			c.unifyAt(t, &TCon{Name: "Option", Args: []Ty{v}}, ex.Span, "with `?`")
 			b := c.fresh("")
-			c.unifyAt(ret, &TCon{Name: "Option", Args: []Ty{b}}, ex.Line, ex.Col,
+			c.unifyAt(ret, &TCon{Name: "Option", Args: []Ty{b}}, ex.Span,
 				"with `?` (the enclosing function must return an Option)")
 			return v
 		}
 	}
-	c.errorf(ex.Line, ex.Col, "E0277", "", "`?` needs an `Option` or `Result`, found `%s`", pretty(t))
+	c.errorf(ex.Span, "E0277", "", "`?` needs an `Option` or `Result`, found `%s`", pretty(t))
 	return c.fresh("")
 }
 
@@ -971,22 +967,22 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 					covered[fmt.Sprintf("%v", b.Val)] = true
 				}
 			}
-			c.unifyAt(scrutT, lt, pat.Line, pat.Col, "between this pattern and the matched value")
+			c.unifyAt(scrutT, lt, pat.Span, "between this pattern and the matched value")
 		case *PatBinding:
 			if sig, idx, amb := c.findVariantSig(pat.Name); amb {
-				c.errorf(pat.Line, pat.Col, "E0659",
+				c.errorf(pat.Span, "E0659",
 					fmt.Sprintf("qualify it, e.g. `SomeEnum.%s`", pat.Name),
 					"`%s` is a variant of several enums", pat.Name)
 			} else if idx >= 0 && len(sig.Variants[idx].Fields) == 0 {
 				enumTy, _ := c.instantiateEnum(sig)
-				c.unifyAt(scrutT, enumTy, pat.Line, pat.Col, "between this pattern and the matched value")
+				c.unifyAt(scrutT, enumTy, pat.Span, "between this pattern and the matched value")
 				covered[pat.Name] = true
 			} else if idx >= 0 {
-				c.errorf(pat.Line, pat.Col, "E0532", "",
+				c.errorf(pat.Span, "E0532", "",
 					"variant `%s` has %d field(s); bind them: `%s(...)`", pat.Name, len(sig.Variants[idx].Fields), pat.Name)
 			} else {
 				hasCatchAll = true
-				c.declare(pat.Name, &Scheme{t: scrutT}, false, "local", pat.Line, pat.Col)
+				c.declare(pat.Name, &Scheme{t: scrutT}, false, "local", pat.Span)
 			}
 		case *PatVariant:
 			var sig *EnumSig
@@ -994,7 +990,7 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 			if pat.EnumName != "" {
 				s, ok := c.enums[pat.EnumName]
 				if !ok {
-					c.errorf(pat.Line, pat.Col, "E0412", "", "cannot find enum `%s`", pat.EnumName)
+					c.errorf(pat.Span, "E0412", "", "cannot find enum `%s`", pat.EnumName)
 				} else {
 					sig = s
 					for i, v := range sig.Variants {
@@ -1004,34 +1000,34 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 						}
 					}
 					if idx < 0 {
-						c.errorf(pat.Line, pat.Col, "E0599", "", "enum `%s` has no variant `%s`", pat.EnumName, pat.Variant)
+						c.errorf(pat.Span, "E0599", "", "enum `%s` has no variant `%s`", pat.EnumName, pat.Variant)
 						sig = nil
 					}
 				}
 			} else {
 				s, i, amb := c.findVariantSig(pat.Variant)
 				if amb {
-					c.errorf(pat.Line, pat.Col, "E0659",
+					c.errorf(pat.Span, "E0659",
 						fmt.Sprintf("qualify it, e.g. `SomeEnum.%s`", pat.Variant),
 						"`%s` is a variant of several enums", pat.Variant)
 				} else if i < 0 {
-					c.errorf(pat.Line, pat.Col, "E0425", "", "cannot find variant `%s`", pat.Variant)
+					c.errorf(pat.Span, "E0425", "", "cannot find variant `%s`", pat.Variant)
 				} else {
 					sig, idx = s, i
 				}
 			}
 			if sig != nil && idx >= 0 {
 				enumTy, subst := c.instantiateEnum(sig)
-				c.unifyAt(scrutT, enumTy, pat.Line, pat.Col, "between this pattern and the matched value")
+				c.unifyAt(scrutT, enumTy, pat.Span, "between this pattern and the matched value")
 				fields := sig.Variants[idx].Fields
 				if len(pat.Binds) != len(fields) {
-					c.errorf(pat.Line, pat.Col, "E0023", "",
+					c.errorf(pat.Span, "E0023", "",
 						"variant `%s` has %d field(s), pattern binds %d", pat.Variant, len(fields), len(pat.Binds))
 				} else {
 					for i, sub := range pat.Binds {
 						ft := c.convertTypeExpr(fields[i], subst)
 						if b, ok := sub.(*PatBinding); ok {
-							c.declare(b.Name, &Scheme{t: ft}, false, "local", b.Line, b.Col)
+							c.declare(b.Name, &Scheme{t: ft}, false, "local", b.Span)
 						}
 					}
 				}
@@ -1039,7 +1035,7 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 			}
 		}
 		bt := c.inferExpr(arm.Body)
-		c.unifyAt(resT, bt, arm.Line, arm.Col, "between the arms of this `match` (all arms must produce one type)")
+		c.unifyAt(resT, bt, arm.Body.span(), "between the arms of this `match` (all arms must produce one type)")
 		c.popScope()
 	}
 
@@ -1055,23 +1051,23 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 					}
 				}
 				if len(missing) > 0 {
-					c.errorf(m.Line, m.Col, "E0004",
+					c.errorf(m.Span, "E0004",
 						"add the missing arms, or a `_ => ...` catch-all",
 						"non-exhaustive `match`: variant(s) %s not covered", strings.Join(missing, ", "))
 				}
 			} else if s.Name == "bool" {
 				if !covered["true"] || !covered["false"] {
-					c.errorf(m.Line, m.Col, "E0004",
+					c.errorf(m.Span, "E0004",
 						"cover both `true` and `false`, or add `_ => ...`",
 						"non-exhaustive `match` on bool")
 				}
 			} else {
-				c.errorf(m.Line, m.Col, "E0004",
+				c.errorf(m.Span, "E0004",
 					"add a final binding or `_ => ...` arm",
 					"non-exhaustive `match`: `%s` cannot be enumerated", pretty(scrutT))
 			}
 		default:
-			c.errorf(m.Line, m.Col, "E0004",
+			c.errorf(m.Span, "E0004",
 				"add a final binding or `_ => ...` arm",
 				"non-exhaustive `match`")
 		}
@@ -1107,7 +1103,7 @@ func (c *Checker) declareBuiltins() {
 	}
 
 	decl := func(name string, s *Scheme) {
-		c.declare(name, s, false, "native", 0, 0)
+		c.declare(name, s, false, "native", Span{})
 	}
 
 	decl("len", poly1(func(a *TV) *TFunc { return fn(tInt, list(a)) }))

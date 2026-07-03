@@ -17,7 +17,7 @@ func interpretMode(src string, skipCheck bool) (out string, compileError error, 
 	if err != nil {
 		return "", err, nil
 	}
-	stmts, err := parse(toks)
+	stmts, err := parse(src, toks)
 	if err != nil {
 		return "", err, nil
 	}
@@ -34,7 +34,7 @@ func interpretMode(src string, skipCheck bool) (out string, compileError error, 
 		}
 	}
 	gc := newGC()
-	fn, shared, err := compileProgram(gc, stmts)
+	fn, shared, err := compileProgram(gc, src, stmts)
 	if err != nil {
 		return "", err, nil
 	}
@@ -56,7 +56,7 @@ func checkDiags(t *testing.T, src string) []Diag {
 	if err != nil {
 		t.Fatalf("lex error: %v", err)
 	}
-	stmts, err := parse(toks)
+	stmts, err := parse(src, toks)
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}

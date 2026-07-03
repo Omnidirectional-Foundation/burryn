@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -11,8 +12,35 @@ type Diag struct {
 	Code  string
 	Msg   string
 	Help  string
-	Line  int
-	Col   int
+	Span  Span
+}
+
+// lineIndex maps byte offsets to line/column positions: lineIndex[i] is the
+// byte offset where 1-based line i+1 starts.
+type lineIndex []int
+
+func newLineIndex(src string) lineIndex {
+	ix := lineIndex{0}
+	for i := 0; i < len(src); i++ {
+		if src[i] == '\n' {
+			ix = append(ix, i+1)
+		}
+	}
+	return ix
+}
+
+// lineCol converts a byte offset to 1-based line and column.
+func (ix lineIndex) lineCol(off int) (line, col int) {
+	if off < 0 {
+		off = 0
+	}
+	line = sort.Search(len(ix), func(i int) bool { return ix[i] > off })
+	return line, off - ix[line-1] + 1
+}
+
+func (ix lineIndex) line(off int) int {
+	l, _ := ix.lineCol(off)
+	return l
 }
 
 // renderDiags prints diagnostics rustc-style:
@@ -26,6 +54,7 @@ type Diag struct {
 //	  = help: ...
 func renderDiags(w io.Writer, diags []Diag, file, src string) (errs, warns int) {
 	lines := strings.Split(src, "\n")
+	ix := newLineIndex(src)
 	for _, d := range diags {
 		head := "error"
 		if !d.IsErr {
@@ -36,28 +65,23 @@ func renderDiags(w io.Writer, diags []Diag, file, src string) (errs, warns int) 
 		} else {
 			fmt.Fprintf(w, "%s: %s\n", head, d.Msg)
 		}
-		if d.Line >= 1 && d.Line <= len(lines) {
-			srcLine := strings.ReplaceAll(lines[d.Line-1], "\t", "    ")
-			gutter := fmt.Sprintf("%d", d.Line)
+		start := min(max(d.Span.Start, 0), len(src))
+		line, col := ix.lineCol(start)
+		if line >= 1 && line <= len(lines) {
+			raw := lines[line-1]
+			srcLine := strings.ReplaceAll(raw, "\t", "    ")
+			gutter := fmt.Sprintf("%d", line)
 			pad := strings.Repeat(" ", len(gutter))
-			fmt.Fprintf(w, "%s--> %s:%d:%d\n", pad, file, d.Line, max(d.Col, 1))
+			fmt.Fprintf(w, "%s--> %s:%d:%d\n", pad, file, line, col)
 			fmt.Fprintf(w, "%s |\n", pad)
 			fmt.Fprintf(w, "%s | %s\n", gutter, srcLine)
-			col := d.Col
-			if col < 1 || col > len(srcLine)+1 {
-				col = 1
-			}
-			// underline the token starting at col (tabs already expanded)
-			width := tokenWidthAt(lines[d.Line-1], d.Col)
-			// adjust col for expanded tabs before it
-			expCol := col
-			if d.Line-1 < len(lines) {
-				prefix := lines[d.Line-1]
-				if col-1 <= len(prefix) {
-					prefix = prefix[:col-1]
-				}
-				expCol = col + 3*strings.Count(prefix, "\t")
-			}
+			// underline the span, clamped to the end of its first line
+			width := max(min(d.Span.End, ix[line-1]+len(raw))-start, 1)
+			// adjust for expanded tabs before and inside the underlined range
+			prefix := raw[:min(col-1, len(raw))]
+			seg := raw[min(col-1, len(raw)):min(col-1+width, len(raw))]
+			expCol := col + 3*strings.Count(prefix, "\t")
+			width += 3 * strings.Count(seg, "\t")
 			fmt.Fprintf(w, "%s | %s%s\n", pad, strings.Repeat(" ", expCol-1), strings.Repeat("^", width))
 		}
 		if d.Help != "" {
@@ -71,37 +95,4 @@ func renderDiags(w io.Writer, diags []Diag, file, src string) (errs, warns int) 
 		}
 	}
 	return errs, warns
-}
-
-// tokenWidthAt estimates how many characters to underline: the run of
-// identifier characters (or one char) starting at 1-based column col.
-func tokenWidthAt(line string, col int) int {
-	i := col - 1
-	if i < 0 || i >= len(line) {
-		return 1
-	}
-	c := line[i]
-	if isAlpha(c) || isDigit(c) {
-		j := i
-		for j < len(line) && (isAlpha(line[j]) || isDigit(line[j])) {
-			j++
-		}
-		return j - i
-	}
-	// operators: extend across a short symbol run
-	j := i
-	for j < len(line) && strings.ContainsRune("+-*/%<>=!&|?", rune(line[j])) && j-i < 2 {
-		j++
-	}
-	if j == i {
-		return 1
-	}
-	return j - i
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

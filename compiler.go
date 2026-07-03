@@ -15,10 +15,11 @@ type Shared struct {
 	gc        *GC
 	enums     map[string]*EnumInfo
 	globalMut map[string]bool // declared globals -> is mutable
+	lines     lineIndex       // maps AST spans to source lines for chunk.Lines
 }
 
-func newShared(gc *GC) *Shared {
-	s := &Shared{gc: gc, enums: map[string]*EnumInfo{}, globalMut: map[string]bool{}}
+func newShared(gc *GC, src string) *Shared {
+	s := &Shared{gc: gc, enums: map[string]*EnumInfo{}, globalMut: map[string]bool{}, lines: newLineIndex(src)}
 	s.declareEnum("Option", []VariantInfo{{"Some", 1}, {"None", 0}})
 	s.declareEnum("Result", []VariantInfo{{"Ok", 1}, {"Err", 1}})
 	for _, n := range nativeNames() {
@@ -91,7 +92,7 @@ type Compiler struct {
 
 type compileErr string
 
-func compileProgram(gc *GC, stmts []Stmt) (fn *OFunc, shared *Shared, err error) {
+func compileProgram(gc *GC, src string, stmts []Stmt) (fn *OFunc, shared *Shared, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if ce, ok := r.(compileErr); ok {
@@ -101,58 +102,67 @@ func compileProgram(gc *GC, stmts []Stmt) (fn *OFunc, shared *Shared, err error)
 			panic(r)
 		}
 	}()
-	shared = newShared(gc)
+	shared = newShared(gc, src)
 	c := &Compiler{shared: shared, fn: &OFunc{Name: "<script>"}}
 	gc.alloc(c.fn)
 	c.locals = append(c.locals, LocalVar{name: "", depth: 0, slot: 0}) // slot 0: script itself
 	for _, s := range stmts {
 		c.stmt(s)
 	}
-	c.emit(OpUnit, 0)
-	c.emit(OpReturn, 0)
+	c.emit(OpUnit, Span{})
+	c.emit(OpReturn, Span{})
 	if err := verifyAll(c.fn); err != nil {
 		return nil, nil, err
 	}
 	return c.fn, shared, nil
 }
 
-func (c *Compiler) fail(line int, format string, args ...any) {
+func (c *Compiler) fail(sp Span, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	panic(compileErr(fmt.Sprintf("compile error at line %d: %s", line, msg)))
+	panic(compileErr(fmt.Sprintf("compile error at line %d: %s", c.line(sp), msg)))
 }
 
 func (c *Compiler) chunk() *Chunk { return &c.fn.Chunk }
 
-func (c *Compiler) emit(b byte, line int)        { c.chunk().write(b, line) }
-func (c *Compiler) emitU16(v uint16, line int)   { c.chunk().writeU16(v, line) }
-func (c *Compiler) emitConst(v Value, line int) {
-	idx := c.chunk().addConst(v)
-	c.emit(OpConst, line)
-	c.emitU16(idx, line)
+// line maps a span to its source line for chunk line tables and error
+// messages; the zero span (synthetic code) stays line 0.
+func (c *Compiler) line(sp Span) int {
+	if sp == (Span{}) {
+		return 0
+	}
+	return c.shared.lines.line(sp.Start)
 }
 
-func (c *Compiler) emitJump(op Op, line int) int {
-	c.emit(op, line)
-	c.emitU16(0xffff, line)
+func (c *Compiler) emit(b byte, sp Span)      { c.chunk().write(b, c.line(sp)) }
+func (c *Compiler) emitU16(v uint16, sp Span) { c.chunk().writeU16(v, c.line(sp)) }
+func (c *Compiler) emitConst(v Value, sp Span) {
+	idx := c.chunk().addConst(v)
+	c.emit(OpConst, sp)
+	c.emitU16(idx, sp)
+}
+
+func (c *Compiler) emitJump(op Op, sp Span) int {
+	c.emit(op, sp)
+	c.emitU16(0xffff, sp)
 	return len(c.chunk().Code) - 2
 }
 
 func (c *Compiler) patchJump(at int) {
 	dist := len(c.chunk().Code) - (at + 2)
 	if dist > 0xffff {
-		c.fail(0, "jump too large")
+		c.fail(Span{}, "jump too large")
 	}
 	c.chunk().Code[at] = byte(dist >> 8)
 	c.chunk().Code[at+1] = byte(dist & 0xff)
 }
 
-func (c *Compiler) emitLoop(to int, line int) {
-	c.emit(OpLoop, line)
+func (c *Compiler) emitLoop(to int, sp Span) {
+	c.emit(OpLoop, sp)
 	dist := len(c.chunk().Code) + 2 - to
 	if dist > 0xffff {
-		c.fail(line, "loop body too large")
+		c.fail(sp, "loop body too large")
 	}
-	c.emitU16(uint16(dist), line)
+	c.emitU16(uint16(dist), sp)
 }
 
 // ---- scopes and locals ----
@@ -169,10 +179,10 @@ func (c *Compiler) nextSlot() int {
 // computes from the locals list (which excludes that value) plus any
 // temporaries pushed since the previous local, which is exactly the slot
 // the value landed on
-func (c *Compiler) declareLocal(name string, mut bool, line int) {
+func (c *Compiler) declareLocal(name string, mut bool, sp Span) {
 	slot := c.nextSlot()
 	if slot > 0xfffe {
-		c.fail(line, "too many locals")
+		c.fail(sp, "too many locals")
 	}
 	c.locals = append(c.locals, LocalVar{
 		name: name, depth: c.scopeDepth, slot: slot, mut: mut, tempsBelow: c.temps,
@@ -182,13 +192,13 @@ func (c *Compiler) declareLocal(name string, mut bool, line int) {
 func (c *Compiler) beginScope() { c.scopeDepth++ }
 
 // endScope for statement contexts: emits pop/close for each local
-func (c *Compiler) endScope(line int) {
+func (c *Compiler) endScope(sp Span) {
 	c.scopeDepth--
 	for len(c.locals) > 0 && c.locals[len(c.locals)-1].depth > c.scopeDepth {
 		if c.locals[len(c.locals)-1].captured {
-			c.emit(OpCloseUpvalue, line)
+			c.emit(OpCloseUpvalue, sp)
 		} else {
-			c.emit(OpPop, line)
+			c.emit(OpPop, sp)
 		}
 		c.locals = c.locals[:len(c.locals)-1]
 	}
@@ -196,7 +206,7 @@ func (c *Compiler) endScope(line int) {
 
 // endScopeExpr for expression blocks: result is on top; OpEndBlock removes
 // the scope's locals underneath it (closing captured ones)
-func (c *Compiler) endScopeExpr(line int) {
+func (c *Compiler) endScopeExpr(sp Span) {
 	c.scopeDepth--
 	n := 0
 	for len(c.locals) > 0 && c.locals[len(c.locals)-1].depth > c.scopeDepth {
@@ -205,10 +215,10 @@ func (c *Compiler) endScopeExpr(line int) {
 	}
 	if n > 0 {
 		if n > 255 {
-			c.fail(line, "too many locals in block")
+			c.fail(sp, "too many locals in block")
 		}
-		c.emit(OpEndBlock, line)
-		c.emit(byte(n), line)
+		c.emit(OpEndBlock, sp)
+		c.emit(byte(n), sp)
 	}
 }
 
@@ -221,31 +231,31 @@ func (c *Compiler) resolveLocal(name string) int {
 	return -1
 }
 
-func (c *Compiler) addUpvalue(index uint16, isLocal, mut bool, line int) int {
+func (c *Compiler) addUpvalue(index uint16, isLocal, mut bool, sp Span) int {
 	for i, uv := range c.upvals {
 		if uv.index == index && uv.isLocal == isLocal {
 			return i
 		}
 	}
 	if len(c.upvals) >= 255 {
-		c.fail(line, "too many captured variables")
+		c.fail(sp, "too many captured variables")
 	}
 	c.upvals = append(c.upvals, UpvalMeta{index: index, isLocal: isLocal, mut: mut})
 	c.fn.NumUpvals = len(c.upvals)
 	return len(c.upvals) - 1
 }
 
-func (c *Compiler) resolveUpvalue(name string, line int) int {
+func (c *Compiler) resolveUpvalue(name string, sp Span) int {
 	if c.enclosing == nil {
 		return -1
 	}
 	if li := c.enclosing.resolveLocal(name); li >= 0 {
 		l := &c.enclosing.locals[li]
 		l.captured = true
-		return c.addUpvalue(uint16(l.slot), true, l.mut, line)
+		return c.addUpvalue(uint16(l.slot), true, l.mut, sp)
 	}
-	if ui := c.enclosing.resolveUpvalue(name, line); ui >= 0 {
-		return c.addUpvalue(uint16(ui), false, c.enclosing.upvals[ui].mut, line)
+	if ui := c.enclosing.resolveUpvalue(name, sp); ui >= 0 {
+		return c.addUpvalue(uint16(ui), false, c.enclosing.upvals[ui].mut, sp)
 	}
 	return -1
 }
@@ -257,47 +267,47 @@ func (c *Compiler) stmt(s Stmt) {
 	case *LetStmt:
 		c.expr(st.Init)
 		if c.scopeDepth == 0 {
-			c.defineGlobal(st.Name, st.Mut, st.Line)
+			c.defineGlobal(st.Name, st.Mut, st.Span)
 		} else {
-			c.declareLocal(st.Name, st.Mut, st.Line)
+			c.declareLocal(st.Name, st.Mut, st.Span)
 		}
 	case *FnDecl:
 		if c.scopeDepth == 0 {
 			c.function(st.Fn)
-			c.defineGlobal(st.Name, false, st.Line)
+			c.defineGlobal(st.Name, false, st.Span)
 		} else {
 			// declare first so the body can refer to itself
-			c.emit(OpUnit, st.Line)
-			c.declareLocal(st.Name, true, st.Line) // internally mutable for the fixup below
+			c.emit(OpUnit, st.Span)
+			c.declareLocal(st.Name, true, st.Span) // internally mutable for the fixup below
 			c.function(st.Fn)
 			slot := c.locals[c.resolveLocal(st.Name)].slot
-			c.emit(OpSetLocal, st.Line)
-			c.emitU16(uint16(slot), st.Line)
-			c.emit(OpPop, st.Line)
+			c.emit(OpSetLocal, st.Span)
+			c.emitU16(uint16(slot), st.Span)
+			c.emit(OpPop, st.Span)
 			c.locals[c.resolveLocal(st.Name)].mut = false
 		}
 	case *EnumDecl:
 		c.enumDecl(st)
 	case *ExprStmt:
 		c.expr(st.E)
-		c.emit(OpPop, st.Line)
+		c.emit(OpPop, st.Span)
 	case *AssignStmt:
 		c.assign(st)
 	case *ReturnStmt:
 		if st.Val != nil {
 			c.expr(st.Val)
 		} else {
-			c.emit(OpUnit, st.Line)
+			c.emit(OpUnit, st.Span)
 		}
-		c.emit(OpReturn, st.Line)
+		c.emit(OpReturn, st.Span)
 	case *WhileStmt:
 		c.whileStmt(st)
 	case *ForStmt:
 		c.forStmt(st)
 	case *BreakStmt:
-		c.breakStmt(st.Line)
+		c.breakStmt(st.Span)
 	case *ContinueStmt:
-		c.continueStmt(st.Line)
+		c.continueStmt(st.Span)
 	case *SpawnStmt:
 		c.expr(st.CallE.Callee)
 		c.temps++
@@ -307,31 +317,31 @@ func (c *Compiler) stmt(s Stmt) {
 		}
 		c.temps -= len(st.CallE.Args) + 1
 		if len(st.CallE.Args) > 255 {
-			c.fail(st.Line, "too many arguments")
+			c.fail(st.Span, "too many arguments")
 		}
-		c.emit(OpSpawn, st.Line)
-		c.emit(byte(len(st.CallE.Args)), st.Line)
+		c.emit(OpSpawn, st.Span)
+		c.emit(byte(len(st.CallE.Args)), st.Span)
 	case *SendStmt:
 		c.expr(st.Chan)
 		c.temps++
 		c.expr(st.Val)
 		c.temps--
-		c.emit(OpSend, st.Line)
+		c.emit(OpSend, st.Span)
 	default:
 		panic(fmt.Sprintf("unhandled stmt %T", s))
 	}
 }
 
-func (c *Compiler) defineGlobal(name string, mut bool, line int) {
+func (c *Compiler) defineGlobal(name string, mut bool, sp Span) {
 	if _, exists := c.shared.globalMut[name]; exists {
 		if _, isEnum := c.shared.enums[name]; isEnum {
-			c.fail(line, "cannot redeclare enum %q", name)
+			c.fail(sp, "cannot redeclare enum %q", name)
 		}
 	}
 	c.shared.globalMut[name] = mut
 	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(name)))
-	c.emit(OpDefGlobal, line)
-	c.emitU16(idx, line)
+	c.emit(OpDefGlobal, sp)
+	c.emitU16(idx, sp)
 }
 
 func (c *Compiler) assign(st *AssignStmt) {
@@ -341,27 +351,27 @@ func (c *Compiler) assign(st *AssignStmt) {
 		if li := c.resolveLocal(t.Name); li >= 0 {
 			l := c.locals[li]
 			if !l.mut {
-				c.fail(st.Line, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
+				c.fail(st.Span, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
 			}
-			c.emit(OpSetLocal, st.Line)
-			c.emitU16(uint16(l.slot), st.Line)
-		} else if ui := c.resolveUpvalue(t.Name, st.Line); ui >= 0 {
+			c.emit(OpSetLocal, st.Span)
+			c.emitU16(uint16(l.slot), st.Span)
+		} else if ui := c.resolveUpvalue(t.Name, st.Span); ui >= 0 {
 			if !c.upvals[ui].mut {
-				c.fail(st.Line, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
+				c.fail(st.Span, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
 			}
-			c.emit(OpSetUpval, st.Line)
-			c.emitU16(uint16(ui), st.Line)
+			c.emit(OpSetUpval, st.Span)
+			c.emitU16(uint16(ui), st.Span)
 		} else if mut, ok := c.shared.globalMut[t.Name]; ok {
 			if !mut {
-				c.fail(st.Line, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
+				c.fail(st.Span, "cannot assign to immutable variable %q (declare it with `let mut`)", t.Name)
 			}
 			idx := c.chunk().addConst(ObjV(c.shared.gc.newString(t.Name)))
-			c.emit(OpSetGlobal, st.Line)
-			c.emitU16(idx, st.Line)
+			c.emit(OpSetGlobal, st.Span)
+			c.emitU16(idx, st.Span)
 		} else {
-			c.fail(st.Line, "cannot assign to undeclared variable %q", t.Name)
+			c.fail(st.Span, "cannot assign to undeclared variable %q", t.Name)
 		}
-		c.emit(OpPop, st.Line)
+		c.emit(OpPop, st.Span)
 	case *Index:
 		c.expr(t.Target)
 		c.temps++
@@ -369,9 +379,9 @@ func (c *Compiler) assign(st *AssignStmt) {
 		c.temps++
 		c.expr(st.Val)
 		c.temps -= 2
-		c.emit(OpIndexSet, st.Line)
+		c.emit(OpIndexSet, st.Span)
 	default:
-		c.fail(st.Line, "invalid assignment target")
+		c.fail(st.Span, "invalid assignment target")
 	}
 }
 
@@ -379,9 +389,9 @@ func (c *Compiler) whileStmt(st *WhileStmt) {
 	start := len(c.chunk().Code)
 	c.loops = append(c.loops, loopCtx{baseSlot: c.nextSlot(), continueTo: start})
 	c.expr(st.Cond)
-	exitJ := c.emitJump(OpJumpIfFalsePop, st.Line)
+	exitJ := c.emitJump(OpJumpIfFalsePop, st.Span)
 	c.blockAsStmts(st.Body)
-	c.emitLoop(start, st.Line)
+	c.emitLoop(start, st.Span)
 	c.patchJump(exitJ)
 	lp := c.loops[len(c.loops)-1]
 	for _, j := range lp.breakJumps {
@@ -393,34 +403,34 @@ func (c *Compiler) whileStmt(st *WhileStmt) {
 func (c *Compiler) forStmt(st *ForStmt) {
 	c.beginScope()
 	c.expr(st.Iter)
-	c.declareLocal("(iter)", false, st.Line)
+	c.declareLocal("(iter)", false, st.Span)
 	iterSlot := c.locals[len(c.locals)-1].slot
-	c.emitConst(IntV(0), st.Line)
-	c.declareLocal("(idx)", false, st.Line)
+	c.emitConst(IntV(0), st.Span)
+	c.declareLocal("(idx)", false, st.Span)
 	idxSlot := c.locals[len(c.locals)-1].slot
 
 	c.loops = append(c.loops, loopCtx{baseSlot: c.nextSlot(), continueTo: -1})
 
 	condStart := len(c.chunk().Code)
-	c.emit(OpGetLocal, st.Line)
-	c.emitU16(uint16(idxSlot), st.Line)
-	c.emit(OpGetLocal, st.Line)
-	c.emitU16(uint16(iterSlot), st.Line)
-	c.emit(OpLen, st.Line)
-	c.emit(OpLt, st.Line)
-	exitJ := c.emitJump(OpJumpIfFalsePop, st.Line)
+	c.emit(OpGetLocal, st.Span)
+	c.emitU16(uint16(idxSlot), st.Span)
+	c.emit(OpGetLocal, st.Span)
+	c.emitU16(uint16(iterSlot), st.Span)
+	c.emit(OpLen, st.Span)
+	c.emit(OpLt, st.Span)
+	exitJ := c.emitJump(OpJumpIfFalsePop, st.Span)
 
 	c.beginScope()
-	c.emit(OpGetLocal, st.Line)
-	c.emitU16(uint16(iterSlot), st.Line)
-	c.emit(OpGetLocal, st.Line)
-	c.emitU16(uint16(idxSlot), st.Line)
-	c.emit(OpIndexGet, st.Line)
-	c.declareLocal(st.Var, false, st.Line)
+	c.emit(OpGetLocal, st.Span)
+	c.emitU16(uint16(iterSlot), st.Span)
+	c.emit(OpGetLocal, st.Span)
+	c.emitU16(uint16(idxSlot), st.Span)
+	c.emit(OpIndexGet, st.Span)
+	c.declareLocal(st.Var, false, st.Span)
 	for _, s := range st.Body.Stmts {
 		c.stmt(s)
 	}
-	c.endScope(st.Line)
+	c.endScope(st.Span)
 
 	// continue lands here: increment
 	incr := len(c.chunk().Code)
@@ -429,75 +439,75 @@ func (c *Compiler) forStmt(st *ForStmt) {
 		c.patchJump(j)
 	}
 	_ = incr
-	c.emit(OpGetLocal, st.Line)
-	c.emitU16(uint16(idxSlot), st.Line)
-	c.emitConst(IntV(1), st.Line)
-	c.emit(OpAdd, st.Line)
-	c.emit(OpSetLocal, st.Line)
-	c.emitU16(uint16(idxSlot), st.Line)
-	c.emit(OpPop, st.Line)
-	c.emitLoop(condStart, st.Line)
+	c.emit(OpGetLocal, st.Span)
+	c.emitU16(uint16(idxSlot), st.Span)
+	c.emitConst(IntV(1), st.Span)
+	c.emit(OpAdd, st.Span)
+	c.emit(OpSetLocal, st.Span)
+	c.emitU16(uint16(idxSlot), st.Span)
+	c.emit(OpPop, st.Span)
+	c.emitLoop(condStart, st.Span)
 
 	c.patchJump(exitJ)
 	for _, j := range lp.breakJumps {
 		c.patchJump(j)
 	}
 	c.loops = c.loops[:len(c.loops)-1]
-	c.endScope(st.Line) // pops idx, iter
+	c.endScope(st.Span) // pops idx, iter
 }
 
 // emit pops for locals above the innermost loop's base without altering
 // compiler bookkeeping (execution continues past the jump for other paths)
-func (c *Compiler) unwindToLoop(line int) *loopCtx {
+func (c *Compiler) unwindToLoop(sp Span) *loopCtx {
 	if len(c.loops) == 0 {
-		c.fail(line, "break/continue outside of a loop")
+		c.fail(sp, "break/continue outside of a loop")
 	}
 	lp := &c.loops[len(c.loops)-1]
 	for i := len(c.locals) - 1; i >= 0 && c.locals[i].slot >= lp.baseSlot; i-- {
 		if c.locals[i].captured {
-			c.emit(OpCloseUpvalue, line)
+			c.emit(OpCloseUpvalue, sp)
 		} else {
-			c.emit(OpPop, line)
+			c.emit(OpPop, sp)
 		}
 	}
 	return lp
 }
 
-func (c *Compiler) breakStmt(line int) {
-	lp := c.unwindToLoop(line)
-	lp.breakJumps = append(lp.breakJumps, c.emitJump(OpJump, line))
+func (c *Compiler) breakStmt(sp Span) {
+	lp := c.unwindToLoop(sp)
+	lp.breakJumps = append(lp.breakJumps, c.emitJump(OpJump, sp))
 }
 
-func (c *Compiler) continueStmt(line int) {
-	lp := c.unwindToLoop(line)
+func (c *Compiler) continueStmt(sp Span) {
+	lp := c.unwindToLoop(sp)
 	if lp.continueTo >= 0 {
-		c.emitLoop(lp.continueTo, line)
+		c.emitLoop(lp.continueTo, sp)
 	} else {
-		lp.continueJumps = append(lp.continueJumps, c.emitJump(OpJump, line))
+		lp.continueJumps = append(lp.continueJumps, c.emitJump(OpJump, sp))
 	}
 }
 
 func (c *Compiler) enumDecl(st *EnumDecl) {
 	if c.scopeDepth > 0 {
-		c.fail(st.Line, "enum declarations are only allowed at top level")
+		c.fail(st.Span, "enum declarations are only allowed at top level")
 	}
 	if _, exists := c.shared.enums[st.Name]; exists {
-		c.fail(st.Line, "enum %q is already declared", st.Name)
+		c.fail(st.Span, "enum %q is already declared", st.Name)
 	}
 	seen := map[string]bool{}
 	var variants []VariantInfo
 	for _, v := range st.Variants {
 		if seen[v.Name] {
-			c.fail(st.Line, "duplicate variant %q in enum %q", v.Name, st.Name)
+			c.fail(st.Span, "duplicate variant %q in enum %q", v.Name, st.Name)
 		}
 		seen[v.Name] = true
 		variants = append(variants, VariantInfo{Name: v.Name, Arity: v.Arity})
 	}
 	info := c.shared.declareEnum(st.Name, variants)
-	c.emitConst(ObjV(info.runtime), st.Line)
+	c.emitConst(ObjV(info.runtime), st.Span)
 	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(st.Name)))
-	c.emit(OpDefGlobal, st.Line)
-	c.emitU16(idx, st.Line)
+	c.emit(OpDefGlobal, st.Span)
+	c.emitU16(idx, st.Span)
 }
 
 // ---- expressions ----
@@ -505,25 +515,25 @@ func (c *Compiler) enumDecl(st *EnumDecl) {
 func (c *Compiler) expr(e Expr) {
 	switch ex := e.(type) {
 	case *IntLit:
-		c.emitConst(IntV(ex.Val), ex.Line)
+		c.emitConst(IntV(ex.Val), ex.Span)
 	case *FloatLit:
-		c.emitConst(FloatV(ex.Val), ex.Line)
+		c.emitConst(FloatV(ex.Val), ex.Span)
 	case *StrLit:
-		c.emitConst(ObjV(c.shared.gc.newString(ex.Val)), ex.Line)
+		c.emitConst(ObjV(c.shared.gc.newString(ex.Val)), ex.Span)
 	case *BoolLit:
 		if ex.Val {
-			c.emit(OpTrue, ex.Line)
+			c.emit(OpTrue, ex.Span)
 		} else {
-			c.emit(OpFalse, ex.Line)
+			c.emit(OpFalse, ex.Span)
 		}
 	case *Ident:
 		c.identExpr(ex)
 	case *Unary:
 		c.expr(ex.Rhs)
 		if ex.Op == TMinus {
-			c.emit(OpNeg, ex.Line)
+			c.emit(OpNeg, ex.Span)
 		} else {
-			c.emit(OpNot, ex.Line)
+			c.emit(OpNot, ex.Span)
 		}
 	case *Binary:
 		c.expr(ex.Lhs)
@@ -532,37 +542,37 @@ func (c *Compiler) expr(e Expr) {
 		c.temps--
 		switch ex.Op {
 		case TPlus:
-			c.emit(OpAdd, ex.Line)
+			c.emit(OpAdd, ex.Span)
 		case TMinus:
-			c.emit(OpSub, ex.Line)
+			c.emit(OpSub, ex.Span)
 		case TStar:
-			c.emit(OpMul, ex.Line)
+			c.emit(OpMul, ex.Span)
 		case TSlash:
-			c.emit(OpDiv, ex.Line)
+			c.emit(OpDiv, ex.Span)
 		case TPercent:
-			c.emit(OpMod, ex.Line)
+			c.emit(OpMod, ex.Span)
 		case TEqEq:
-			c.emit(OpEq, ex.Line)
+			c.emit(OpEq, ex.Span)
 		case TBangEq:
-			c.emit(OpNeq, ex.Line)
+			c.emit(OpNeq, ex.Span)
 		case TGt:
-			c.emit(OpGt, ex.Line)
+			c.emit(OpGt, ex.Span)
 		case TGtEq:
-			c.emit(OpGtEq, ex.Line)
+			c.emit(OpGtEq, ex.Span)
 		case TLt:
-			c.emit(OpLt, ex.Line)
+			c.emit(OpLt, ex.Span)
 		case TLtEq:
-			c.emit(OpLtEq, ex.Line)
+			c.emit(OpLtEq, ex.Span)
 		}
 	case *Logical:
 		c.expr(ex.Lhs)
 		var end int
 		if ex.Op == TAndAnd {
-			end = c.emitJump(OpJumpIfFalse, ex.Line)
+			end = c.emitJump(OpJumpIfFalse, ex.Span)
 		} else {
-			end = c.emitJump(OpJumpIfTrue, ex.Line)
+			end = c.emitJump(OpJumpIfTrue, ex.Span)
 		}
-		c.emit(OpPop, ex.Line)
+		c.emit(OpPop, ex.Span)
 		c.expr(ex.Rhs)
 		c.patchJump(end)
 	case *Call:
@@ -574,16 +584,16 @@ func (c *Compiler) expr(e Expr) {
 		}
 		c.temps -= len(ex.Args) + 1
 		if len(ex.Args) > 255 {
-			c.fail(ex.Line, "too many arguments")
+			c.fail(ex.Span, "too many arguments")
 		}
-		c.emit(OpCall, ex.Line)
-		c.emit(byte(len(ex.Args)), ex.Line)
+		c.emit(OpCall, ex.Span)
+		c.emit(byte(len(ex.Args)), ex.Span)
 	case *Index:
 		c.expr(ex.Target)
 		c.temps++
 		c.expr(ex.Idx)
 		c.temps--
-		c.emit(OpIndexGet, ex.Line)
+		c.emit(OpIndexGet, ex.Span)
 	case *ListLit:
 		for _, el := range ex.Elems {
 			c.expr(el)
@@ -591,10 +601,10 @@ func (c *Compiler) expr(e Expr) {
 		}
 		c.temps -= len(ex.Elems)
 		if len(ex.Elems) > 0xffff {
-			c.fail(ex.Line, "list literal too large")
+			c.fail(ex.Span, "list literal too large")
 		}
-		c.emit(OpList, ex.Line)
-		c.emitU16(uint16(len(ex.Elems)), ex.Line)
+		c.emit(OpList, ex.Span)
+		c.emitU16(uint16(len(ex.Elems)), ex.Span)
 	case *FnLit:
 		c.function(ex)
 	case *Block:
@@ -604,13 +614,13 @@ func (c *Compiler) expr(e Expr) {
 	case *MatchExpr:
 		c.matchExpr(ex)
 	case *VariantAccess:
-		c.variantAccess(ex.EnumName, ex.Variant, ex.Line)
+		c.variantAccess(ex.EnumName, ex.Variant, ex.Span)
 	case *TryExpr:
 		c.expr(ex.Inner)
-		c.emit(OpTry, ex.Line)
+		c.emit(OpTry, ex.Span)
 	case *RecvExpr:
 		c.expr(ex.Chan)
-		c.emit(OpRecv, ex.Line)
+		c.emit(OpRecv, ex.Span)
 	default:
 		panic(fmt.Sprintf("unhandled expr %T", e))
 	}
@@ -618,61 +628,61 @@ func (c *Compiler) expr(e Expr) {
 
 func (c *Compiler) identExpr(ex *Ident) {
 	if li := c.resolveLocal(ex.Name); li >= 0 {
-		c.emit(OpGetLocal, ex.Line)
-		c.emitU16(uint16(c.locals[li].slot), ex.Line)
+		c.emit(OpGetLocal, ex.Span)
+		c.emitU16(uint16(c.locals[li].slot), ex.Span)
 		return
 	}
-	if ui := c.resolveUpvalue(ex.Name, ex.Line); ui >= 0 {
-		c.emit(OpGetUpval, ex.Line)
-		c.emitU16(uint16(ui), ex.Line)
+	if ui := c.resolveUpvalue(ex.Name, ex.Span); ui >= 0 {
+		c.emit(OpGetUpval, ex.Span)
+		c.emitU16(uint16(ui), ex.Span)
 		return
 	}
 	if _, declared := c.shared.globalMut[ex.Name]; !declared {
 		// bare enum variant like Some / None / Ok / Err
 		if info, idx, amb := c.shared.findVariant(ex.Name); amb {
-			c.fail(ex.Line, "variant %q exists in several enums; qualify it as Enum.%s", ex.Name, ex.Name)
+			c.fail(ex.Span, "variant %q exists in several enums; qualify it as Enum.%s", ex.Name, ex.Name)
 		} else if idx >= 0 {
-			c.emitVariant(info, idx, ex.Line)
+			c.emitVariant(info, idx, ex.Span)
 			return
 		}
 	}
 	// global (possibly defined later in the script)
 	idx := c.chunk().addConst(ObjV(c.shared.gc.newString(ex.Name)))
-	c.emit(OpGetGlobal, ex.Line)
-	c.emitU16(idx, ex.Line)
+	c.emit(OpGetGlobal, ex.Span)
+	c.emitU16(idx, ex.Span)
 }
 
-func (c *Compiler) variantAccess(enumName, variant string, line int) {
+func (c *Compiler) variantAccess(enumName, variant string, sp Span) {
 	info, ok := c.shared.enums[enumName]
 	if !ok {
-		c.fail(line, "unknown enum %q", enumName)
+		c.fail(sp, "unknown enum %q", enumName)
 	}
 	for i, v := range info.Variants {
 		if v.Name == variant {
-			c.emitVariant(info, i, line)
+			c.emitVariant(info, i, sp)
 			return
 		}
 	}
-	c.fail(line, "enum %q has no variant %q", enumName, variant)
+	c.fail(sp, "enum %q has no variant %q", enumName, variant)
 }
 
 // nullary variants become singleton instance constants; variants with fields
 // become constructor constants (called like functions)
-func (c *Compiler) emitVariant(info *EnumInfo, idx int, line int) {
+func (c *Compiler) emitVariant(info *EnumInfo, idx int, sp Span) {
 	if info.Variants[idx].Arity == 0 {
 		if info.singletons[idx] == nil {
 			inst := &OEnumInst{Enum: info.runtime, Variant: idx}
 			c.shared.gc.alloc(inst)
 			info.singletons[idx] = inst
 		}
-		c.emitConst(ObjV(info.singletons[idx]), line)
+		c.emitConst(ObjV(info.singletons[idx]), sp)
 	} else {
 		if info.ctors[idx] == nil {
 			ctor := &OVariantCtor{Enum: info.runtime, Idx: idx}
 			c.shared.gc.alloc(ctor)
 			info.ctors[idx] = ctor
 		}
-		c.emitConst(ObjV(info.ctors[idx]), line)
+		c.emitConst(ObjV(info.ctors[idx]), sp)
 	}
 }
 
@@ -690,12 +700,12 @@ func (c *Compiler) function(lit *FnLit) {
 	}
 	sub.locals = append(sub.locals, LocalVar{name: selfName, depth: sub.scopeDepth, slot: 0})
 	if len(lit.Params) > 255 {
-		sub.fail(lit.Line, "too many parameters")
+		sub.fail(lit.Span, "too many parameters")
 	}
 	seen := map[string]bool{}
 	for _, p := range lit.Params {
 		if seen[p] {
-			sub.fail(lit.Line, "duplicate parameter %q", p)
+			sub.fail(lit.Span, "duplicate parameter %q", p)
 		}
 		seen[p] = true
 		sub.locals = append(sub.locals, LocalVar{
@@ -703,18 +713,18 @@ func (c *Compiler) function(lit *FnLit) {
 		})
 	}
 	sub.blockExpr(lit.Body)
-	sub.emit(OpReturn, lit.Line)
+	sub.emit(OpReturn, lit.Span)
 
 	idx := c.chunk().addConst(ObjV(sub.fn))
-	c.emit(OpClosure, lit.Line)
-	c.emitU16(idx, lit.Line)
+	c.emit(OpClosure, lit.Span)
+	c.emitU16(idx, lit.Span)
 	for _, uv := range sub.upvals {
 		if uv.isLocal {
-			c.emit(1, lit.Line)
+			c.emit(1, lit.Span)
 		} else {
-			c.emit(0, lit.Line)
+			c.emit(0, lit.Span)
 		}
-		c.emitU16(uv.index, lit.Line)
+		c.emitU16(uv.index, lit.Span)
 	}
 }
 
@@ -734,9 +744,9 @@ func (c *Compiler) blockExpr(b *Block) {
 		c.stmt(s)
 	}
 	if !valueProduced {
-		c.emit(OpUnit, b.Line)
+		c.emit(OpUnit, b.Span)
 	}
-	c.endScopeExpr(b.Line)
+	c.endScopeExpr(b.Span)
 }
 
 // blockAsStmts compiles a block purely for effect (loop bodies)
@@ -745,24 +755,24 @@ func (c *Compiler) blockAsStmts(b *Block) {
 	for _, s := range b.Stmts {
 		c.stmt(s)
 	}
-	c.endScope(b.Line)
+	c.endScope(b.Span)
 }
 
 func (c *Compiler) ifExpr(ex *IfExpr) {
 	c.expr(ex.Cond)
-	elseJ := c.emitJump(OpJumpIfFalsePop, ex.Line)
+	elseJ := c.emitJump(OpJumpIfFalsePop, ex.Span)
 	c.blockExpr(ex.Then)
-	endJ := c.emitJump(OpJump, ex.Line)
+	endJ := c.emitJump(OpJump, ex.Span)
 	c.patchJump(elseJ)
 	switch els := ex.Else.(type) {
 	case nil:
-		c.emit(OpUnit, ex.Line)
+		c.emit(OpUnit, ex.Span)
 	case *Block:
 		c.blockExpr(els)
 	case *IfExpr:
 		c.ifExpr(els)
 	default:
-		c.fail(ex.Line, "invalid else branch")
+		c.fail(ex.Span, "invalid else branch")
 	}
 	c.patchJump(endJ)
 }
@@ -770,7 +780,7 @@ func (c *Compiler) ifExpr(ex *IfExpr) {
 func (c *Compiler) matchExpr(m *MatchExpr) {
 	c.beginScope()
 	c.expr(m.Scrut)
-	c.declareLocal("(match)", false, m.Line)
+	c.declareLocal("(match)", false, m.Span)
 	scrutSlot := c.locals[len(c.locals)-1].slot
 
 	var endJumps []int
@@ -783,26 +793,26 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 		case *PatWildcard:
 			// always matches
 		case *PatLiteral:
-			c.emit(OpGetLocal, arm.Line)
-			c.emitU16(uint16(scrutSlot), arm.Line)
+			c.emit(OpGetLocal, arm.Span)
+			c.emitU16(uint16(scrutSlot), arm.Span)
 			c.temps++
 			c.expr(pat.Val)
 			c.temps--
-			c.emit(OpEq, arm.Line)
-			failJ = c.emitJump(OpJumpIfFalsePop, arm.Line)
+			c.emit(OpEq, arm.Span)
+			failJ = c.emitJump(OpJumpIfFalsePop, arm.Span)
 		case *PatBinding:
 			// a bare name is a nullary-variant test if such a variant exists,
 			// otherwise a catch-all binding
 			if info, idx, amb := c.shared.findVariant(pat.Name); amb {
-				c.fail(arm.Line, "variant %q exists in several enums; qualify it as Enum.%s", pat.Name, pat.Name)
+				c.fail(arm.Span, "variant %q exists in several enums; qualify it as Enum.%s", pat.Name, pat.Name)
 			} else if idx >= 0 && info.Variants[idx].Arity == 0 {
-				failJ = c.emitVariantTest(info, idx, scrutSlot, arm.Line)
+				failJ = c.emitVariantTest(info, idx, scrutSlot, arm.Span)
 			} else if idx >= 0 {
-				c.fail(arm.Line, "variant %q has %d field(s); bind them: %s(...)", pat.Name, info.Variants[idx].Arity, pat.Name)
+				c.fail(arm.Span, "variant %q has %d field(s); bind them: %s(...)", pat.Name, info.Variants[idx].Arity, pat.Name)
 			} else {
-				c.emit(OpGetLocal, arm.Line)
-				c.emitU16(uint16(scrutSlot), arm.Line)
-				c.declareLocal(pat.Name, false, arm.Line)
+				c.emit(OpGetLocal, arm.Span)
+				c.emitU16(uint16(scrutSlot), arm.Span)
+				c.declareLocal(pat.Name, false, arm.Span)
 				armLocals++
 			}
 		case *PatVariant:
@@ -812,7 +822,7 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 				var ok bool
 				info, ok = c.shared.enums[pat.EnumName]
 				if !ok {
-					c.fail(arm.Line, "unknown enum %q", pat.EnumName)
+					c.fail(arm.Span, "unknown enum %q", pat.EnumName)
 				}
 				idx = -1
 				for i, v := range info.Variants {
@@ -822,23 +832,23 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 					}
 				}
 				if idx < 0 {
-					c.fail(arm.Line, "enum %q has no variant %q", pat.EnumName, pat.Variant)
+					c.fail(arm.Span, "enum %q has no variant %q", pat.EnumName, pat.Variant)
 				}
 			} else {
 				var amb bool
 				info, idx, amb = c.shared.findVariant(pat.Variant)
 				if amb {
-					c.fail(arm.Line, "variant %q exists in several enums; qualify it as Enum.%s", pat.Variant, pat.Variant)
+					c.fail(arm.Span, "variant %q exists in several enums; qualify it as Enum.%s", pat.Variant, pat.Variant)
 				}
 				if idx < 0 {
-					c.fail(arm.Line, "unknown variant %q", pat.Variant)
+					c.fail(arm.Span, "unknown variant %q", pat.Variant)
 				}
 			}
 			arity := info.Variants[idx].Arity
 			if len(pat.Binds) != arity {
-				c.fail(arm.Line, "variant %s has %d field(s), pattern binds %d", pat.Variant, arity, len(pat.Binds))
+				c.fail(arm.Span, "variant %s has %d field(s), pattern binds %d", pat.Variant, arity, len(pat.Binds))
 			}
-			failJ = c.emitVariantTest(info, idx, scrutSlot, arm.Line)
+			failJ = c.emitVariantTest(info, idx, scrutSlot, arm.Span)
 			for i, sub := range pat.Binds {
 				name := "_"
 				if b, ok := sub.(*PatBinding); ok {
@@ -847,45 +857,45 @@ func (c *Compiler) matchExpr(m *MatchExpr) {
 				if name == "_" {
 					continue
 				}
-				c.emit(OpGetLocal, arm.Line)
-				c.emitU16(uint16(scrutSlot), arm.Line)
-				c.emit(OpGetField, arm.Line)
-				c.emit(byte(i), arm.Line)
-				c.declareLocal(name, false, arm.Line)
+				c.emit(OpGetLocal, arm.Span)
+				c.emitU16(uint16(scrutSlot), arm.Span)
+				c.emit(OpGetField, arm.Span)
+				c.emit(byte(i), arm.Span)
+				c.declareLocal(name, false, arm.Span)
 				armLocals++
 			}
 		}
 
 		c.expr(arm.Body)
 		if armLocals > 0 {
-			c.emit(OpEndBlock, arm.Line)
-			c.emit(byte(armLocals), arm.Line)
+			c.emit(OpEndBlock, arm.Span)
+			c.emit(byte(armLocals), arm.Span)
 		}
 		c.scopeDepth--
 		for len(c.locals) > 0 && c.locals[len(c.locals)-1].depth > c.scopeDepth {
 			c.locals = c.locals[:len(c.locals)-1]
 		}
-		endJumps = append(endJumps, c.emitJump(OpJump, arm.Line))
+		endJumps = append(endJumps, c.emitJump(OpJump, arm.Span))
 		if failJ >= 0 {
 			c.patchJump(failJ)
 		}
 	}
-	c.emit(OpNoMatch, m.Line)
+	c.emit(OpNoMatch, m.Span)
 	for _, j := range endJumps {
 		c.patchJump(j)
 	}
 	// squash the scrutinee slot, leaving the arm value
 	c.scopeDepth--
 	c.locals = c.locals[:len(c.locals)-1]
-	c.emit(OpEndBlock, m.Line)
-	c.emit(1, m.Line)
+	c.emit(OpEndBlock, m.Span)
+	c.emit(1, m.Span)
 }
 
-func (c *Compiler) emitVariantTest(info *EnumInfo, idx int, scrutSlot int, line int) int {
-	c.emit(OpGetLocal, line)
-	c.emitU16(uint16(scrutSlot), line)
-	c.emitConst(ObjV(info.runtime), line)
-	c.emit(OpTestVariant, line)
-	c.emit(byte(idx), line)
-	return c.emitJump(OpJumpIfFalsePop, line)
+func (c *Compiler) emitVariantTest(info *EnumInfo, idx int, scrutSlot int, sp Span) int {
+	c.emit(OpGetLocal, sp)
+	c.emitU16(uint16(scrutSlot), sp)
+	c.emitConst(ObjV(info.runtime), sp)
+	c.emit(OpTestVariant, sp)
+	c.emit(byte(idx), sp)
+	return c.emitJump(OpJumpIfFalsePop, sp)
 }
