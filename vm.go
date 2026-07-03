@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 )
@@ -250,6 +251,9 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			v := f.pop()
 			switch v.T {
 			case VInt:
+				if v.I == math.MinInt64 {
+					return false, rtErr("integer overflow: -(%d)", v.I)
+				}
 				f.push(IntV(-v.I))
 			case VFloat:
 				f.push(FloatV(-v.F))
@@ -572,17 +576,36 @@ func (vm *VM) arith(f *Fiber, op Op, line int) error {
 		return fail()
 	}
 	if a.T == VInt && b.T == VInt {
+		// integer overflow always traps — never wraps silently (GOALS)
+		overflow := func(sym string) error {
+			return &runtimeErr{msg: fmt.Sprintf("integer overflow: %d %s %d", a.I, sym, b.I), line: line}
+		}
 		f.top -= 2
 		switch op {
 		case OpAdd:
-			f.push(IntV(a.I + b.I))
+			r := a.I + b.I
+			if (r > a.I) != (b.I > 0) {
+				return overflow("+")
+			}
+			f.push(IntV(r))
 		case OpSub:
-			f.push(IntV(a.I - b.I))
+			r := a.I - b.I
+			if (r < a.I) != (b.I > 0) {
+				return overflow("-")
+			}
+			f.push(IntV(r))
 		case OpMul:
-			f.push(IntV(a.I * b.I))
+			r := a.I * b.I
+			if a.I != 0 && (r/a.I != b.I || (a.I == -1 && b.I == math.MinInt64)) {
+				return overflow("*")
+			}
+			f.push(IntV(r))
 		case OpDiv:
 			if b.I == 0 {
 				return &runtimeErr{msg: "integer division by zero", line: line}
+			}
+			if a.I == math.MinInt64 && b.I == -1 {
+				return overflow("/")
 			}
 			f.push(IntV(a.I / b.I))
 		case OpMod:

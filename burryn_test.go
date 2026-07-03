@@ -149,6 +149,24 @@ println(char_at(s, 0) + char_at(s, 3))`, "rg\n")
 	expectOut(t, `println("tab\tquote\"done")`, "tab\tquote\"done\n")
 }
 
+func TestIntegerOverflowTraps(t *testing.T) {
+	// overflow always traps — never wraps silently
+	max := "9223372036854775807"
+	expectRuntimeError(t, `println(`+max+` + 1)`, "integer overflow")
+	expectRuntimeError(t, `println(0 - `+max+` - 2)`, "integer overflow")
+	expectRuntimeError(t, `println(`+max+` * 2)`, "integer overflow")
+	expectRuntimeError(t, `println((0 - `+max+` - 1) * (0 - 1))`, "integer overflow")
+	expectRuntimeError(t, `println((0 - `+max+` - 1) / (0 - 1))`, "integer overflow")
+	expectRuntimeError(t, `let n = 0 - `+max+` - 1
+println(0 - n)`, "integer overflow")
+	expectRuntimeError(t, `let n = 0 - `+max+` - 1
+println(-n)`, "integer overflow")
+	// boundary values themselves are fine
+	expectOut(t, `println(`+max+`, 0 - `+max+` - 1)`,
+		"9223372036854775807 -9223372036854775808\n")
+	expectOut(t, `println((0 - `+max+` - 1) % (0 - 1))`, "0\n")
+}
+
 func TestDivisionByZero(t *testing.T) {
 	expectRuntimeError(t, `println(1 / 0)`, "division by zero")
 	expectRuntimeError(t, `println(1 % 0)`, "modulo by zero")
