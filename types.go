@@ -588,6 +588,7 @@ func (c *Checker) inferStmt(s Stmt) {
 			vt := c.inferExpr(st.Val)
 			c.unifyAt(c.instantiate(b.scheme), vt, st.Line, st.Col, "in this assignment")
 		case *Index:
+			c.requireMutRoot(tgt, tgt.Line, tgt.Col, "assign to this element")
 			el := c.fresh("")
 			tt := c.inferExpr(tgt.Target)
 			c.unifyAt(tt, &TCon{Name: "list", Args: []Ty{el}}, tgt.Line, tgt.Col, "when indexing")
@@ -825,7 +826,53 @@ func (c *Checker) variantType(sig *EnumSig, idx int) Ty {
 	return &TFunc{Params: fields, Ret: enumTy}
 }
 
+// mutatingNatives are builtins that mutate their first argument in place.
+// Calling them on a place rooted in an immutable binding is an error:
+// `mut` is deep (GOALS: default immutability must mean what it says).
+var mutatingNatives = map[string]bool{"push": true, "pop": true}
+
+// mutRoot walks an index chain (`xs`, `xs[i]`, `xs[i][j]`, ...) back to its
+// root identifier. A place reached through a binding may only be mutated if
+// that binding is `mut`. Non-identifier roots (call results, literals) are
+// unnamed temporaries with no binding to check.
+func mutRoot(e Expr) *Ident {
+	for {
+		switch t := e.(type) {
+		case *Ident:
+			return t
+		case *Index:
+			e = t.Target
+		default:
+			return nil
+		}
+	}
+}
+
+// requireMutRoot enforces deep `mut`: the root binding of a mutated place
+// must be declared mutable. what describes the mutation for the message.
+func (c *Checker) requireMutRoot(e Expr, line, col int, what string) {
+	id := mutRoot(e)
+	if id == nil {
+		return
+	}
+	b := c.lookup(id.Name)
+	if b == nil || b.mut {
+		return
+	}
+	help := fmt.Sprintf("make this binding mutable: `let mut %s`", id.Name)
+	if b.kind == "param" {
+		help = fmt.Sprintf("parameters are immutable; build a new list instead of mutating `%s`", id.Name)
+	}
+	c.errorf(line, col, "E0596", help,
+		"cannot %s, as `%s` is not declared as mutable", what, id.Name)
+}
+
 func (c *Checker) inferCall(ex *Call) Ty {
+	if id, ok := ex.Callee.(*Ident); ok && mutatingNatives[id.Name] && len(ex.Args) > 0 {
+		if b := c.lookup(id.Name); b != nil && b.kind == "native" {
+			c.requireMutRoot(ex.Args[0], ex.Line, ex.Col, fmt.Sprintf("mutate this list with `%s()`", id.Name))
+		}
+	}
 	// special-cased natives
 	if id, ok := ex.Callee.(*Ident); ok {
 		if b := c.lookup(id.Name); b != nil && b.special != "" {
