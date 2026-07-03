@@ -15,6 +15,8 @@ reads like **burin** — the engraver's tool for precise, quiet work.
 bur run examples/sieve.bur
 ```
 
+New to the language? Start with the tutorial: [`docs/tutorial.md`](docs/tutorial.md).
+
 ## What it takes from Rust
 
 - **Immutable by default.** `let x = 1` cannot be reassigned — enforced at
@@ -125,20 +127,23 @@ source ──lexer──▶ tokens ──parser──▶ AST ──compiler─�
 ## Commands
 
 ```sh
-bur run <file.bur>    typecheck and run
-bur <file.bur>        same
-bur check <file.bur>  typecheck only (rustc-style diagnostics)
-bur dis <file.bur>    disassemble the compiled bytecode
+bur run <file|dir>    typecheck and run on the VM
+bur <file|dir>        same
+bur check <file|dir>  typecheck only (rustc-style diagnostics)
+bur build <file|dir>  compile to a native binary via C (needs cc/gcc/clang)
+bur dis <file|dir>    disassemble the compiled bytecode
 bur version
 ```
 
 Build: `go build -o bur.exe .` &nbsp;•&nbsp; Test: `go test .` (includes a
 golden test for every example)
 
-## Honest limitations (v2)
+## Honest limitations (v3, in progress)
 
-No maps, no string interpolation, no modules yet — those are the v3
-milestone, together with a C backend on the road to self-hosting. Deep
-`mut` is a binding-level discipline, not a borrow checker: two `mut`
-bindings may still alias the same list. Function parameters are immutable,
-so a helper cannot mutate a list passed to it.
+Maps, modules (`import`/`pub`, directory-as-package), `mut` parameters and a
+C backend (`bur build`) now exist; the C backend's concurrency is still being
+built, so run concurrent programs on the VM for now. No records/structs yet —
+model product types with single-variant enums. No `defer` or string
+interpolation yet, and no third-party dependency fetching (only local
+packages). Deep `mut` is a binding-level discipline, not a borrow checker: two
+`mut` bindings may still alias the same list.
