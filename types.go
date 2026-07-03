@@ -62,8 +62,10 @@ type binding struct {
 	mut     bool
 	used    bool
 	isFn    bool
+	pub     bool
 	special string // "chan", "printf" for irregular natives
 	span    Span
+	file    string // file the binding was declared in
 	kind    string // "local", "param", "global", "native"
 }
 
@@ -74,24 +76,60 @@ type VariantSig struct {
 
 type EnumSig struct {
 	Name     string
+	Qual     string // globally unique type-constructor name: <pkg>.<Name>, or Name outside packages
+	Prefix   string // import path of the defining package; "" for scripts and builtins
+	Pub      bool
 	Params   []string
 	Variants []VariantSig
 }
 
+// pkgSymbols is what one checked package offers to its importers.
+type pkgSymbols struct {
+	vals  map[string]*binding // every top-level value binding; pub gates access
+	enums map[string]*EnumSig // every enum; Pub gates access
+}
+
 type Checker struct {
-	diags  []Diag
-	scopes []map[string]*binding
-	enums  map[string]*EnumSig
-	nextID int
-	level  int
-	retTys []Ty // stack of enclosing function return types
-	loop   int
+	diags     []Diag
+	scopes    []map[string]*binding
+	enums     map[string]*EnumSig    // keyed by EnumSig.Qual
+	pkgs      map[string]*pkgSymbols // import path -> checked package symbols
+	pkgPrefix string                 // import path of the package being checked; "" for scripts
+	curFile   string                 // stamped onto diagnostics; "" for scripts
+	nextID    int
+	level     int
+	retTys    []Ty // stack of enclosing function return types
+	loop      int
+}
+
+func newChecker() *Checker {
+	c := &Checker{enums: map[string]*EnumSig{}, pkgs: map[string]*pkgSymbols{}}
+	c.pushScope()
+	c.declareBuiltins()
+	return c
+}
+
+// qualName maps a bare enum name written in the current package to its
+// globally unique type-constructor name.
+func (c *Checker) qualName(name string) string {
+	if c.pkgPrefix == "" {
+		return name
+	}
+	return c.pkgPrefix + "." + name
+}
+
+// enumSig resolves a bare enum name: the current package's enums shadow the
+// builtin ones.
+func (c *Checker) enumSig(name string) (*EnumSig, bool) {
+	if sig, ok := c.enums[c.qualName(name)]; ok {
+		return sig, true
+	}
+	sig, ok := c.enums[name]
+	return sig, ok && sig.Prefix == ""
 }
 
 func typecheck(stmts []Stmt) []Diag {
-	c := &Checker{enums: map[string]*EnumSig{}}
-	c.pushScope()
-	c.declareBuiltins()
+	c := newChecker()
 
 	// pass 1: register enums, pre-declare every top-level name (monomorphic)
 	for _, s := range stmts {
@@ -167,9 +205,131 @@ func typecheck(stmts []Stmt) []Diag {
 	return c.diags
 }
 
+// typecheckModule checks every package of a loaded module in dependency
+// order (imports before importers) and validates the entry package's main.
+func typecheckModule(m *Module) []Diag {
+	c := newChecker()
+	fileOrder := map[string]int{}
+	for _, pkg := range m.Packages {
+		for _, f := range pkg.Files {
+			fileOrder[f.Path] = len(fileOrder) + 1
+		}
+	}
+	for _, pkg := range m.Packages {
+		c.checkPackage(pkg, pkg == m.Entry)
+	}
+	sort.SliceStable(c.diags, func(i, j int) bool {
+		if fileOrder[c.diags[i].File] != fileOrder[c.diags[j].File] {
+			return fileOrder[c.diags[i].File] < fileOrder[c.diags[j].File]
+		}
+		return c.diags[i].Span.Start < c.diags[j].Span.Start
+	})
+	return c.diags
+}
+
+// checkPackage runs the two-pass top-level inference over all files of one
+// package sharing a single package scope, then snapshots its symbols for
+// importers.
+func (c *Checker) checkPackage(pkg *Package, isEntry bool) {
+	c.pkgPrefix = pkg.ImportPath
+	sym := &pkgSymbols{vals: map[string]*binding{}, enums: map[string]*EnumSig{}}
+	c.pkgs[pkg.ImportPath] = sym
+	c.pushScope()
+
+	// pass 1: register enums from every file
+	for _, f := range pkg.Files {
+		c.curFile = f.Path
+		for _, s := range f.Stmts {
+			if st, ok := s.(*EnumDecl); ok {
+				c.registerEnum(st)
+				if sig, ok := c.enums[c.qualName(st.Name)]; ok {
+					sym.enums[st.Name] = sig
+				}
+			}
+		}
+	}
+	// pass 1.5: pre-declare every package-level value name (monomorphic)
+	pre := map[string]*TV{}
+	top := c.scopes[len(c.scopes)-1]
+	for _, f := range pkg.Files {
+		c.curFile = f.Path
+		for _, s := range f.Stmts {
+			switch st := s.(type) {
+			case *FnDecl:
+				tv := c.fresh("")
+				pre[st.Name] = tv
+				c.declare(st.Name, &Scheme{t: tv}, false, "global", st.NameSpan)
+				top[st.Name].isFn = true
+				top[st.Name].pub = st.Pub
+			case *LetStmt:
+				tv := c.fresh("")
+				pre[st.Name] = tv
+				c.declare(st.Name, &Scheme{t: tv}, st.Mut, "global", st.NameSpan)
+				top[st.Name].pub = st.Pub
+			}
+		}
+	}
+	// pass 2: infer file by file, in load order
+	for _, f := range pkg.Files {
+		c.curFile = f.Path
+		for _, s := range f.Stmts {
+			switch st := s.(type) {
+			case *FnDecl:
+				c.level++
+				ft := c.inferExpr(st.Fn)
+				c.level--
+				// generalize before linking the placeholder: see typecheck
+				b := c.lookup(st.Name)
+				b.scheme = c.generalize(ft)
+				c.unifyAt(pre[st.Name], ft, st.NameSpan, "in this function")
+			case *LetStmt:
+				t := c.inferLetInit(st)
+				c.unifyAt(pre[st.Name], t, st.NameSpan, "in this binding")
+			case *EnumDecl:
+				// registered in pass 1
+			default:
+				c.inferStmt(s) // unreachable: the loader admits only declarations
+			}
+		}
+	}
+
+	if isEntry {
+		if b, ok := top["main"]; ok && b.isFn {
+			b.used = true
+			if err := c.unify(c.instantiate(b.scheme), &TFunc{Ret: c.fresh("")}); err != nil {
+				c.curFile = b.file
+				c.errorf(b.span, "E0580", "declare it as `fn main() { ... }`",
+					"`main` must take no parameters")
+			}
+		} else {
+			c.curFile = pkg.Files[0].Path
+			c.errorf(Span{}, "E0601", "declare `fn main() { ... }` in the package you run",
+				"no `main` function in package %q", pkg.ImportPath)
+		}
+	}
+
+	// lint unused non-pub bindings (pub ones are the package's API), then
+	// snapshot the scope for importers and pop it without local/param lint
+	for name, b := range top {
+		if b.kind == "global" && !b.pub && !b.used && !strings.HasPrefix(name, "_") {
+			what := "variable"
+			if b.isFn {
+				what = "function"
+			}
+			c.curFile = b.file
+			c.warnf(b.span, "unused_variable",
+				fmt.Sprintf("if this is intentional, prefix it with an underscore: `_%s`", name),
+				"unused %s: `%s`", what, name)
+		}
+		sym.vals[name] = b
+	}
+	c.scopes = c.scopes[:len(c.scopes)-1]
+	c.curFile, c.pkgPrefix = "", ""
+}
+
 func (c *Checker) errorf(sp Span, code, help, format string, args ...any) {
 	c.diags = append(c.diags, Diag{
-		IsErr: true, Code: code, Span: sp,
+		IsErr: true, Code: code, File: c.curFile, Span: sp,
 		Msg: fmt.Sprintf(format, args...), Help: help,
 	})
 }
@@ -184,7 +344,7 @@ func (c *Checker) errPubScript(sp Span) {
 
 func (c *Checker) warnf(sp Span, code, help, format string, args ...any) {
 	c.diags = append(c.diags, Diag{
-		IsErr: false, Code: code, Span: sp,
+		IsErr: false, Code: code, File: c.curFile, Span: sp,
 		Msg: fmt.Sprintf(format, args...), Help: help,
 	})
 }
@@ -210,7 +370,7 @@ func (c *Checker) popScope() {
 }
 
 func (c *Checker) declare(name string, s *Scheme, mut bool, kind string, sp Span) {
-	c.scopes[len(c.scopes)-1][name] = &binding{scheme: s, mut: mut, kind: kind, span: sp}
+	c.scopes[len(c.scopes)-1][name] = &binding{scheme: s, mut: mut, kind: kind, span: sp, file: c.curFile}
 }
 
 func (c *Checker) lookup(name string) *binding {
@@ -420,15 +580,16 @@ func (c *Checker) instantiate(s *Scheme) Ty {
 // ---- enums ----
 
 func (c *Checker) registerEnum(st *EnumDecl) {
-	if _, exists := c.enums[st.Name]; exists {
+	if _, exists := c.enums[c.qualName(st.Name)]; exists {
 		c.errorf(st.Span, "E0428", "", "enum `%s` is declared more than once", st.Name)
 		return
 	}
-	sig := &EnumSig{Name: st.Name, Params: st.Params}
+	sig := &EnumSig{Name: st.Name, Qual: c.qualName(st.Name), Prefix: c.pkgPrefix,
+		Pub: st.Pub, Params: st.Params}
 	for _, v := range st.Variants {
 		sig.Variants = append(sig.Variants, VariantSig{Name: v.Name, Fields: v.Types})
 	}
-	c.enums[st.Name] = sig
+	c.enums[sig.Qual] = sig
 	// validate field type expressions
 	pm := map[string]bool{}
 	for _, p := range st.Params {
@@ -445,7 +606,15 @@ func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
 	switch x := te.(type) {
 	case *TEName:
 		if x.Pkg != "" {
-			c.errorf(x.Span, "E0433", "", "cannot find package `%s`", x.Pkg)
+			if sig := c.lookupPkgEnum(x.Pkg, x.Name, x.Span); sig != nil {
+				if len(x.Args) != len(sig.Params) {
+					c.errorf(x.Span, "E0107", "",
+						"enum `%s` takes %d type argument(s), %d given", x.Name, len(sig.Params), len(x.Args))
+				}
+			}
+			for _, a := range x.Args {
+				c.validateTypeExpr(a, params)
+			}
 			return
 		}
 		switch x.Name {
@@ -462,7 +631,7 @@ func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
 				if len(x.Args) > 0 {
 					c.errorf(x.Span, "E0109", "", "type parameter `%s` takes no arguments", x.Name)
 				}
-			} else if sig, ok := c.enums[x.Name]; ok {
+			} else if sig, ok := c.enumSig(x.Name); ok {
 				if len(x.Args) != len(sig.Params) {
 					c.errorf(x.Span, "E0107", "",
 						"enum `%s` takes %d type argument(s), %d given", x.Name, len(sig.Params), len(x.Args))
@@ -484,30 +653,44 @@ func (c *Checker) validateTypeExpr(te TypeExpr, params map[string]bool) {
 	}
 }
 
-func (c *Checker) convertTypeExpr(te TypeExpr, subst map[string]Ty) Ty {
+// convertTypeExpr lowers a written type to a Ty. prefix is the import path of
+// the package the type expression was written in: bare enum names resolve
+// against it, so an enum type keeps its identity across packages.
+func (c *Checker) convertTypeExpr(te TypeExpr, subst map[string]Ty, prefix string) Ty {
 	switch x := te.(type) {
 	case *TEName:
-		if t, ok := subst[x.Name]; ok {
-			return t
+		if x.Pkg == "" {
+			if t, ok := subst[x.Name]; ok {
+				return t
+			}
 		}
 		args := make([]Ty, len(x.Args))
 		for i, a := range x.Args {
-			args[i] = c.convertTypeExpr(a, subst)
+			args[i] = c.convertTypeExpr(a, subst, prefix)
 		}
-		switch x.Name {
-		case "chan":
-			return &TCon{Name: "chan", Args: args}
-		default:
+		switch {
+		case x.Pkg != "":
+			return &TCon{Name: x.Pkg + "." + x.Name, Args: args}
+		case x.Name == "int" || x.Name == "float" || x.Name == "bool" ||
+			x.Name == "str" || x.Name == "unit" || x.Name == "chan":
 			return &TCon{Name: x.Name, Args: args}
+		default:
+			name := x.Name
+			if prefix != "" {
+				if _, local := c.enums[prefix+"."+x.Name]; local {
+					name = prefix + "." + x.Name
+				}
+			}
+			return &TCon{Name: name, Args: args}
 		}
 	case *TEList:
-		return &TCon{Name: "list", Args: []Ty{c.convertTypeExpr(x.Elem, subst)}}
+		return &TCon{Name: "list", Args: []Ty{c.convertTypeExpr(x.Elem, subst, prefix)}}
 	case *TEFn:
 		ps := make([]Ty, len(x.Params))
 		for i, p := range x.Params {
-			ps[i] = c.convertTypeExpr(p, subst)
+			ps[i] = c.convertTypeExpr(p, subst, prefix)
 		}
-		return &TFunc{Params: ps, Ret: c.convertTypeExpr(x.Ret, subst)}
+		return &TFunc{Params: ps, Ret: c.convertTypeExpr(x.Ret, subst, prefix)}
 	}
 	return &TCon{Name: "unit"}
 }
@@ -522,13 +705,39 @@ func (c *Checker) instantiateEnum(sig *EnumSig) (Ty, map[string]Ty) {
 		subst[p] = v
 		args[i] = v
 	}
-	return &TCon{Name: sig.Name, Args: args}, subst
+	return &TCon{Name: sig.Qual, Args: args}, subst
 }
 
+// lookupPkgEnum resolves pkgPath.name to another package's enum, reporting
+// resolution and visibility errors; nil means an error was already emitted.
+func (c *Checker) lookupPkgEnum(pkgPath, name string, sp Span) *EnumSig {
+	sym, ok := c.pkgs[pkgPath]
+	if !ok {
+		c.errorf(sp, "E0433", "", "cannot find package `%s`", pkgPath)
+		return nil
+	}
+	sig, ok := sym.enums[name]
+	if !ok {
+		c.errorf(sp, "E0412", "", "cannot find enum `%s` in package `%s`", name, pkgPath)
+		return nil
+	}
+	if !sig.Pub {
+		c.errorf(sp, "E0603", fmt.Sprintf("mark it `pub enum %s` to export it", name),
+			"enum `%s` is private to package `%s`", name, pkgPath)
+		return nil
+	}
+	return sig
+}
+
+// findVariantSig resolves a bare variant name against the enums visible
+// without a qualifier: the current package's and the builtins.
 func (c *Checker) findVariantSig(name string) (*EnumSig, int, bool) {
 	var found *EnumSig
 	idx := -1
 	for _, sig := range c.enums {
+		if sig.Prefix != c.pkgPrefix && sig.Prefix != "" {
+			continue
+		}
 		for i, v := range sig.Variants {
 			if v.Name == name {
 				if idx >= 0 {
@@ -708,7 +917,7 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		c.errorf(ex.Span, "E0425", "", "cannot find `%s` in this scope", ex.Name)
 		return c.fresh("")
 	case *VariantAccess:
-		sig, ok := c.enums[ex.EnumName]
+		sig, ok := c.enumSig(ex.EnumName)
 		if !ok {
 			c.errorf(ex.Span, "E0412", "", "cannot find enum `%s`", ex.EnumName)
 			return c.fresh("")
@@ -721,10 +930,38 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		c.errorf(ex.Span, "E0599", "", "enum `%s` has no variant `%s`", ex.EnumName, ex.Variant)
 		return c.fresh("")
 	case *PkgAccess:
-		c.errorf(ex.Span, "E0433", "", "cannot find package `%s`", ex.Pkg)
-		return c.fresh("")
+		sym, ok := c.pkgs[ex.Pkg]
+		if !ok {
+			c.errorf(ex.Span, "E0433", "", "cannot find package `%s`", ex.Pkg)
+			return c.fresh("")
+		}
+		b, ok := sym.vals[ex.Name]
+		if !ok {
+			if _, isEnum := sym.enums[ex.Name]; isEnum {
+				c.errorf(ex.Span, "E0423", "name a variant: `"+ex.Pkg+"."+ex.Name+".SomeVariant`",
+					"enum `%s` cannot be used as a value", ex.Name)
+			} else {
+				c.errorf(ex.Span, "E0425", "", "cannot find `%s` in package `%s`", ex.Name, ex.Pkg)
+			}
+			return c.fresh("")
+		}
+		if !b.pub {
+			c.errorf(ex.Span, "E0603", fmt.Sprintf("mark it `pub` in package `%s` to export it", ex.Pkg),
+				"`%s` is private to package `%s`", ex.Name, ex.Pkg)
+		}
+		b.used = true
+		return c.instantiate(b.scheme)
 	case *QualVariantAccess:
-		c.errorf(ex.Span, "E0433", "", "cannot find package `%s`", ex.Pkg)
+		sig := c.lookupPkgEnum(ex.Pkg, ex.Enum, ex.Span)
+		if sig == nil {
+			return c.fresh("")
+		}
+		for i, v := range sig.Variants {
+			if v.Name == ex.Variant {
+				return c.variantType(sig, i)
+			}
+		}
+		c.errorf(ex.Span, "E0599", "", "enum `%s` has no variant `%s`", ex.Enum, ex.Variant)
 		return c.fresh("")
 	case *Unary:
 		t := c.inferExpr(ex.Rhs)
@@ -854,7 +1091,7 @@ func (c *Checker) variantType(sig *EnumSig, idx int) Ty {
 	}
 	fields := make([]Ty, len(v.Fields))
 	for i, f := range v.Fields {
-		fields[i] = c.convertTypeExpr(f, subst)
+		fields[i] = c.convertTypeExpr(f, subst, sig.Prefix)
 	}
 	return &TFunc{Params: fields, Ret: enumTy}
 }
@@ -864,40 +1101,42 @@ func (c *Checker) variantType(sig *EnumSig, idx int) Ty {
 // `mut` is deep (GOALS: default immutability must mean what it says).
 var mutatingNatives = map[string]bool{"push": true, "pop": true}
 
-// mutRoot walks an index chain (`xs`, `xs[i]`, `xs[i][j]`, ...) back to its
-// root identifier. A place reached through a binding may only be mutated if
-// that binding is `mut`. Non-identifier roots (call results, literals) are
-// unnamed temporaries with no binding to check.
-func mutRoot(e Expr) *Ident {
-	for {
-		switch t := e.(type) {
-		case *Ident:
-			return t
-		case *Index:
-			e = t.Target
-		default:
-			return nil
-		}
-	}
-}
-
-// requireMutRoot enforces deep `mut`: the root binding of a mutated place
+// requireMutRoot walks an index chain (`xs`, `xs[i]`, `xs[i][j]`, ...) back
+// to its root binding — a local, a global, or an imported package member —
+// and enforces deep `mut`: the root binding of a mutated place
 // must be declared mutable. what describes the mutation for the message.
 func (c *Checker) requireMutRoot(e Expr, what string) {
-	id := mutRoot(e)
-	if id == nil {
-		return
+	root := e
+	for {
+		if ix, ok := root.(*Index); ok {
+			root = ix.Target
+			continue
+		}
+		break
 	}
-	b := c.lookup(id.Name)
+	var name string
+	var b *binding
+	switch r := root.(type) {
+	case *Ident:
+		name = r.Name
+		b = c.lookup(name)
+	case *PkgAccess:
+		name = r.Name
+		if sym, ok := c.pkgs[r.Pkg]; ok {
+			b = sym.vals[name]
+		}
+	default:
+		return // unnamed temporary: no binding to check
+	}
 	if b == nil || b.mut {
 		return
 	}
-	help := fmt.Sprintf("make this binding mutable: `let mut %s`", id.Name)
+	help := fmt.Sprintf("make this binding mutable: `let mut %s`", name)
 	if b.kind == "param" {
-		help = fmt.Sprintf("parameters are immutable; build a new list instead of mutating `%s`", id.Name)
+		help = fmt.Sprintf("parameters are immutable; build a new list instead of mutating `%s`", name)
 	}
 	c.errorf(e.span(), "E0596", help,
-		"cannot %s, as `%s` is not declared as mutable", what, id.Name)
+		"cannot %s, as `%s` is not declared as mutable", what, name)
 }
 
 func (c *Checker) inferCall(ex *Call) Ty {
@@ -1025,9 +1264,21 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 			var sig *EnumSig
 			idx := -1
 			if pat.Pkg != "" {
-				c.errorf(pat.Span, "E0433", "", "cannot find package `%s`", pat.Pkg)
+				if s := c.lookupPkgEnum(pat.Pkg, pat.EnumName, pat.Span); s != nil {
+					sig = s
+					for i, v := range sig.Variants {
+						if v.Name == pat.Variant {
+							idx = i
+							break
+						}
+					}
+					if idx < 0 {
+						c.errorf(pat.Span, "E0599", "", "enum `%s` has no variant `%s`", pat.EnumName, pat.Variant)
+						sig = nil
+					}
+				}
 			} else if pat.EnumName != "" {
-				s, ok := c.enums[pat.EnumName]
+				s, ok := c.enumSig(pat.EnumName)
 				if !ok {
 					c.errorf(pat.Span, "E0412", "", "cannot find enum `%s`", pat.EnumName)
 				} else {
@@ -1064,7 +1315,7 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 						"variant `%s` has %d field(s), pattern binds %d", pat.Variant, len(fields), len(pat.Binds))
 				} else {
 					for i, sub := range pat.Binds {
-						ft := c.convertTypeExpr(fields[i], subst)
+						ft := c.convertTypeExpr(fields[i], subst, sig.Prefix)
 						if b, ok := sub.(*PatBinding); ok {
 							c.declare(b.Name, &Scheme{t: ft}, false, "local", b.Span)
 						}
@@ -1118,14 +1369,14 @@ func (c *Checker) inferMatch(m *MatchExpr) Ty {
 
 func (c *Checker) declareBuiltins() {
 	c.enums["Option"] = &EnumSig{
-		Name: "Option", Params: []string{"a"},
+		Name: "Option", Qual: "Option", Pub: true, Params: []string{"a"},
 		Variants: []VariantSig{
 			{Name: "Some", Fields: []TypeExpr{&TEName{Name: "a"}}},
 			{Name: "None"},
 		},
 	}
 	c.enums["Result"] = &EnumSig{
-		Name: "Result", Params: []string{"a", "e"},
+		Name: "Result", Qual: "Result", Pub: true, Params: []string{"a", "e"},
 		Variants: []VariantSig{
 			{Name: "Ok", Fields: []TypeExpr{&TEName{Name: "a"}}},
 			{Name: "Err", Fields: []TypeExpr{&TEName{Name: "e"}}},
