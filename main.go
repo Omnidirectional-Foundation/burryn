@@ -73,21 +73,26 @@ func runFile(path string, mode int) {
 		os.Exit(exitNoInput)
 	}
 	src := string(srcBytes)
+	srcs := map[string]string{path: src}
+	render := func(diags []Diag) (errs, warns int) {
+		stampFile(diags, path)
+		return renderDiags(os.Stderr, diags, srcs)
+	}
 	toks, lexDiags := lex(src)
 	if len(lexDiags) > 0 {
-		errs, _ := renderDiags(os.Stderr, lexDiags, path, src)
+		errs, _ := render(lexDiags)
 		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
 	stmts, parseDiags := parse(toks)
 	if len(parseDiags) > 0 {
-		errs, _ := renderDiags(os.Stderr, parseDiags, path, src)
+		errs, _ := render(parseDiags)
 		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
 
 	diags := typecheck(stmts)
-	errs, warns := renderDiags(os.Stderr, diags, path, src)
+	errs, warns := render(diags)
 	if mode == modeCheck {
 		if errs > 0 {
 			fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s); %d warning(s)\n", errs, warns)
@@ -104,7 +109,7 @@ func runFile(path string, mode int) {
 	gc := newGC()
 	fn, shared, compDiags := compileProgram(gc, src, stmts)
 	if len(compDiags) > 0 {
-		errs, _ := renderDiags(os.Stderr, compDiags, path, src)
+		errs, _ := render(compDiags)
 		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
 		os.Exit(exitStatic)
 	}
@@ -115,7 +120,7 @@ func runFile(path string, mode int) {
 	vm := newVM(gc, shared)
 	if err := vm.run(fn); err != nil {
 		if re, ok := err.(*runtimeErr); ok {
-			renderDiags(os.Stderr, []Diag{{IsErr: true, Msg: re.msg, Span: re.span}}, path, src)
+			render([]Diag{{IsErr: true, Msg: re.msg, Span: re.span}})
 		} else {
 			fmt.Fprintln(os.Stderr, err) // deadlock etc.: whole-program, no span
 		}
