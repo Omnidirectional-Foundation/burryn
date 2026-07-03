@@ -11,7 +11,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		usage()
-		os.Exit(64)
+		os.Exit(exitUsage)
 	}
 	switch args[0] {
 	case "version", "-v", "--version":
@@ -19,19 +19,19 @@ func main() {
 	case "run":
 		if len(args) < 2 {
 			usage()
-			os.Exit(64)
+			os.Exit(exitUsage)
 		}
 		runFile(args[1], modeRun)
 	case "check":
 		if len(args) < 2 {
 			usage()
-			os.Exit(64)
+			os.Exit(exitUsage)
 		}
 		runFile(args[1], modeCheck)
 	case "dis":
 		if len(args) < 2 {
 			usage()
-			os.Exit(64)
+			os.Exit(exitUsage)
 		}
 		runFile(args[1], modeDis)
 	case "help", "-h", "--help":
@@ -45,6 +45,14 @@ const (
 	modeRun = iota
 	modeCheck
 	modeDis
+)
+
+// exit codes: sequential, one per failure stage
+const (
+	exitStatic  = 1 // lex/parse/type/compile error
+	exitUsage   = 2 // CLI misuse
+	exitNoInput = 3 // source file unreadable
+	exitRuntime = 4 // runtime trap
 )
 
 func usage() {
@@ -62,18 +70,18 @@ func runFile(path string, mode int) {
 	srcBytes, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(66)
+		os.Exit(exitNoInput)
 	}
 	src := string(srcBytes)
 	toks, err := lex(src)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(65)
+		os.Exit(exitStatic)
 	}
 	stmts, err := parse(src, toks)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(65)
+		os.Exit(exitStatic)
 	}
 
 	diags := typecheck(stmts)
@@ -81,21 +89,21 @@ func runFile(path string, mode int) {
 	if mode == modeCheck {
 		if errs > 0 {
 			fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s); %d warning(s)\n", errs, warns)
-			os.Exit(65)
+			os.Exit(exitStatic)
 		}
 		fmt.Fprintf(os.Stderr, "ok: 0 errors, %d warning(s)\n", warns)
 		return
 	}
 	if errs > 0 {
 		fmt.Fprintf(os.Stderr, "error: could not compile due to %d previous error(s)\n", errs)
-		os.Exit(65)
+		os.Exit(exitStatic)
 	}
 
 	gc := newGC()
 	fn, shared, err := compileProgram(gc, src, stmts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(65)
+		os.Exit(exitStatic)
 	}
 	if mode == modeDis {
 		disasmAll(fn)
@@ -104,6 +112,6 @@ func runFile(path string, mode int) {
 	vm := newVM(gc, shared)
 	if err := vm.run(fn); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(70)
+		os.Exit(exitRuntime)
 	}
 }
