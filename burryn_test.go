@@ -520,6 +520,58 @@ let mut l = [1]
 add(l, 2)`, "E0596")
 }
 
+// ---- `fn f(mut xs)`: mutable parameters, unmarked at the call site ----
+
+func TestMutParamAllowsPush(t *testing.T) {
+	expectOut(t, `fn add(mut xs, v) { push(xs, v) }
+let mut l = [1]
+add(l, 2)
+println(l)`, "[1, 2]\n")
+}
+
+func TestMutParamAllowsRebind(t *testing.T) {
+	expectOut(t, `fn bump(mut n) {
+    n = n + 1
+    n
+}
+println(bump(41))`, "42\n")
+}
+
+func TestMutParamDeepIndexAssign(t *testing.T) {
+	expectOut(t, `fn set(mut m) { m[0][0] = 9 }
+let mut m = [[1]]
+set(m)
+println(m)`, "[[9]]\n")
+}
+
+func TestMutParamDoesNotUnfreezeOthers(t *testing.T) {
+	expectTypeError(t, `fn add(mut _xs, ys) { push(ys, 1) }
+println(add)`, "E0596")
+	expectTypeError(t, `fn add(mut _xs, n) {
+    n = 2
+    n
+}
+println(add)`, "E0384")
+}
+
+func TestMutParamInFnLiteral(t *testing.T) {
+	expectOut(t, `let add = fn(mut xs, v) { push(xs, v) }
+let mut l = [1]
+add(l, 2)
+println(l)`, "[1, 2]\n")
+}
+
+func TestMutParamCapturedByClosure(t *testing.T) {
+	expectOut(t, `fn make(mut n) {
+    fn() {
+        n = n + 1
+        n
+    }
+}
+let tick = make(10)
+println(tick(), tick())`, "11 12\n")
+}
+
 func TestDeepMutTemporariesAreFree(t *testing.T) {
 	// unnamed temporaries have no binding to freeze
 	expectOut(t, `fn fresh() { [1] }

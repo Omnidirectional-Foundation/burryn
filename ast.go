@@ -58,6 +58,7 @@ type ListLit struct {
 }
 type FnLit struct { // fn(a, b) { ... }
 	Params     []string
+	ParamMuts  []bool // parallel to Params: `fn f(mut xs)` marks xs mutable
 	ParamSpans []Span // parallel to Params
 	Body       *Block
 	Name       string // "" for anonymous; set for fn declarations

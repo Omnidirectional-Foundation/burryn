@@ -252,11 +252,14 @@ func (p *Parser) fnDecl() Stmt {
 func (p *Parser) fnRest(name string, fnSpan Span) *FnLit {
 	p.expect(TLParen, "'(' after fn")
 	var params []string
+	var paramMuts []bool
 	var paramSpans []Span
 	p.skipSemis()
 	for !p.check(TRParen) {
+		mut := p.match(TMut)
 		ptok := p.expect(TIdent, "parameter name")
 		params = append(params, ptok.Lex)
+		paramMuts = append(paramMuts, mut)
 		paramSpans = append(paramSpans, ptok.Span)
 		if !p.match(TComma) {
 			break
@@ -266,7 +269,7 @@ func (p *Parser) fnRest(name string, fnSpan Span) *FnLit {
 	p.skipSemis()
 	p.expect(TRParen, "')' after parameters")
 	body := p.block()
-	return &FnLit{Params: params, ParamSpans: paramSpans, Body: body, Name: name,
+	return &FnLit{Params: params, ParamMuts: paramMuts, ParamSpans: paramSpans, Body: body, Name: name,
 		Span: fnSpan.union(body.Span)}
 }
 

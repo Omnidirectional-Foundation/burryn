@@ -817,8 +817,11 @@ func (c *Checker) inferStmt(s Stmt) {
 				return
 			}
 			if !b.mut {
-				c.errorf(tgt.Span, "E0384",
-					fmt.Sprintf("make this binding mutable: `let mut %s`", tgt.Name),
+				help := fmt.Sprintf("make this binding mutable: `let mut %s`", tgt.Name)
+				if b.kind == "param" {
+					help = fmt.Sprintf("declare the parameter as mutable: `mut %s`", tgt.Name)
+				}
+				c.errorf(tgt.Span, "E0384", help,
 					"cannot assign twice to immutable variable `%s`", tgt.Name)
 			}
 			vt := c.inferExpr(st.Val)
@@ -1024,7 +1027,7 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		params := make([]Ty, len(ex.Params))
 		for i, p := range ex.Params {
 			params[i] = c.fresh("")
-			c.declare(p, &Scheme{t: params[i]}, false, "param", ex.ParamSpans[i])
+			c.declare(p, &Scheme{t: params[i]}, ex.ParamMuts[i], "param", ex.ParamSpans[i])
 		}
 		ret := c.fresh("")
 		c.retTys = append(c.retTys, ret)
@@ -1133,7 +1136,7 @@ func (c *Checker) requireMutRoot(e Expr, what string) {
 	}
 	help := fmt.Sprintf("make this binding mutable: `let mut %s`", name)
 	if b.kind == "param" {
-		help = fmt.Sprintf("parameters are immutable; build a new list instead of mutating `%s`", name)
+		help = fmt.Sprintf("declare the parameter as mutable: `mut %s`", name)
 	}
 	c.errorf(e.span(), "E0596", help,
 		"cannot %s, as `%s` is not declared as mutable", what, name)

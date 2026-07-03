@@ -872,13 +872,14 @@ func (c *Compiler) function(lit *FnLit) {
 		sub.fail(lit.Span, "E2019", "", "too many parameters")
 	}
 	seen := map[string]bool{}
-	for _, p := range lit.Params {
+	for i, p := range lit.Params {
 		if seen[p] {
 			sub.fail(lit.Span, "E2020", "", "duplicate parameter %q", p)
 		}
 		seen[p] = true
 		sub.locals = append(sub.locals, LocalVar{
 			name: p, depth: sub.scopeDepth, slot: sub.locals[len(sub.locals)-1].slot + 1,
+			mut: lit.ParamMuts[i],
 		})
 	}
 	sub.blockExpr(lit.Body)
