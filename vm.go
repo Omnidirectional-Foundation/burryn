@@ -69,11 +69,11 @@ type VM struct {
 
 type runtimeErr struct {
 	msg  string
-	line int
+	span Span
 }
 
 func (e *runtimeErr) Error() string {
-	return fmt.Sprintf("runtime error at line %d: %s", e.line, e.msg)
+	return "runtime error: " + e.msg
 }
 
 func newVM(gc *GC, shared *Shared) *VM {
@@ -159,11 +159,11 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 		}
 		budget--
 		op := chunk.Code[frame.ip]
-		line := chunk.Lines[frame.ip]
+		sp := chunk.Spans[frame.ip]
 		frame.ip++
 
 		rtErr := func(format string, args ...any) error {
-			return &runtimeErr{msg: fmt.Sprintf(format, args...), line: line}
+			return &runtimeErr{msg: fmt.Sprintf(format, args...), span: sp}
 		}
 
 		switch op {
@@ -240,11 +240,11 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			a := f.pop()
 			f.push(BoolV(!valuesEqual(a, b)))
 		case OpGt, OpGtEq, OpLt, OpLtEq:
-			if err := vm.compare(f, op, line); err != nil {
+			if err := vm.compare(f, op, sp); err != nil {
 				return false, err
 			}
 		case OpAdd, OpSub, OpMul, OpDiv, OpMod:
-			if err := vm.arith(f, op, line); err != nil {
+			if err := vm.arith(f, op, sp); err != nil {
 				return false, err
 			}
 		case OpNeg:
@@ -286,7 +286,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 		case OpCall:
 			argc := int(chunk.Code[frame.ip])
 			frame.ip++
-			if err := vm.callValue(f, argc, line); err != nil {
+			if err := vm.callValue(f, argc, sp); err != nil {
 				return false, err
 			}
 			if vm.yieldFlag { // a native (yield) asked us to hand off
@@ -333,7 +333,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 		case OpIndexGet:
 			idx := f.pop()
 			target := f.pop()
-			v, err := vm.indexGet(target, idx, line)
+			v, err := vm.indexGet(target, idx, sp)
 			if err != nil {
 				return false, err
 			}
@@ -358,7 +358,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			lst.Elems[idx.I] = val
 		case OpLen:
 			v := f.pop()
-			n, err := lengthOf(v, line)
+			n, err := lengthOf(v, sp)
 			if err != nil {
 				return false, err
 			}
@@ -428,7 +428,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			f.top -= argc + 1
 		case OpSend:
 			val := f.pop()
-			ch, err := popChannel(f, "send to", line)
+			ch, err := popChannel(f, "send to", sp)
 			if err != nil {
 				return false, err
 			}
@@ -446,7 +446,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 				return false, nil
 			}
 		case OpRecv:
-			ch, err := popChannel(f, "receive from", line)
+			ch, err := popChannel(f, "receive from", sp)
 			if err != nil {
 				return false, err
 			}
@@ -478,39 +478,39 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 	}
 }
 
-func popChannel(f *Fiber, what string, line int) (*OChannel, error) {
+func popChannel(f *Fiber, what string, sp Span) (*OChannel, error) {
 	v := f.pop()
 	if v.T == VObj {
 		if ch, ok := v.O.(*OChannel); ok {
 			return ch, nil
 		}
 	}
-	return nil, &runtimeErr{msg: fmt.Sprintf("cannot %s %s (need a channel)", what, typeOf(v)), line: line}
+	return nil, &runtimeErr{msg: fmt.Sprintf("cannot %s %s (need a channel)", what, typeOf(v)), span: sp}
 }
 
-func (vm *VM) callValue(f *Fiber, argc int, line int) error {
+func (vm *VM) callValue(f *Fiber, argc int, sp Span) error {
 	callee := f.peek(argc)
 	if callee.T != VObj {
-		return &runtimeErr{msg: fmt.Sprintf("cannot call %s", typeOf(callee)), line: line}
+		return &runtimeErr{msg: fmt.Sprintf("cannot call %s", typeOf(callee)), span: sp}
 	}
 	switch o := callee.O.(type) {
 	case *OClosure:
 		if argc != o.Fn.Arity {
-			return &runtimeErr{msg: fmt.Sprintf("%s expects %d argument(s), got %d", display(callee), o.Fn.Arity, argc), line: line}
+			return &runtimeErr{msg: fmt.Sprintf("%s expects %d argument(s), got %d", display(callee), o.Fn.Arity, argc), span: sp}
 		}
 		if len(f.frames) >= 2048 {
-			return &runtimeErr{msg: "stack overflow (call depth > 2048)", line: line}
+			return &runtimeErr{msg: "stack overflow (call depth > 2048)", span: sp}
 		}
 		f.frames = append(f.frames, Frame{closure: o, ip: 0, base: f.top - argc - 1})
 		return nil
 	case *ONative:
 		if o.Arity >= 0 && argc != o.Arity {
-			return &runtimeErr{msg: fmt.Sprintf("%s expects %d argument(s), got %d", o.Name, o.Arity, argc), line: line}
+			return &runtimeErr{msg: fmt.Sprintf("%s expects %d argument(s), got %d", o.Name, o.Arity, argc), span: sp}
 		}
 		args := f.stack[f.top-argc : f.top]
 		res, err := o.Fn(vm, args)
 		if err != nil {
-			return &runtimeErr{msg: err.Error(), line: line}
+			return &runtimeErr{msg: err.Error(), span: sp}
 		}
 		f.top -= argc + 1
 		f.push(res)
@@ -518,7 +518,7 @@ func (vm *VM) callValue(f *Fiber, argc int, line int) error {
 	case *OVariantCtor:
 		arity := o.Enum.Variants[o.Idx].Arity
 		if argc != arity {
-			return &runtimeErr{msg: fmt.Sprintf("%s.%s expects %d field(s), got %d", o.Enum.Name, o.Enum.Variants[o.Idx].Name, arity, argc), line: line}
+			return &runtimeErr{msg: fmt.Sprintf("%s.%s expects %d field(s), got %d", o.Enum.Name, o.Enum.Variants[o.Idx].Name, arity, argc), span: sp}
 		}
 		fields := make([]Value, argc)
 		copy(fields, f.stack[f.top-argc:f.top])
@@ -528,7 +528,7 @@ func (vm *VM) callValue(f *Fiber, argc int, line int) error {
 		f.push(ObjV(inst))
 		return nil
 	}
-	return &runtimeErr{msg: fmt.Sprintf("cannot call %s", typeOf(callee)), line: line}
+	return &runtimeErr{msg: fmt.Sprintf("cannot call %s", typeOf(callee)), span: sp}
 }
 
 func (vm *VM) captureUpvalue(f *Fiber, slot int) *OUpvalue {
@@ -556,12 +556,12 @@ func (vm *VM) closeUpvalues(f *Fiber, from int) {
 	f.openUpvals = kept
 }
 
-func (vm *VM) arith(f *Fiber, op Op, line int) error {
+func (vm *VM) arith(f *Fiber, op Op, sp Span) error {
 	b := f.peek(0)
 	a := f.peek(1)
 	fail := func() error {
 		opName := map[Op]string{OpAdd: "+", OpSub: "-", OpMul: "*", OpDiv: "/", OpMod: "%"}[op]
-		return &runtimeErr{msg: fmt.Sprintf("cannot apply %q to %s and %s", opName, typeOf(a), typeOf(b)), line: line}
+		return &runtimeErr{msg: fmt.Sprintf("cannot apply %q to %s and %s", opName, typeOf(a), typeOf(b)), span: sp}
 	}
 	// string concatenation
 	if op == OpAdd && a.T == VObj && b.T == VObj {
@@ -578,7 +578,7 @@ func (vm *VM) arith(f *Fiber, op Op, line int) error {
 	if a.T == VInt && b.T == VInt {
 		// integer overflow always traps — never wraps silently (GOALS)
 		overflow := func(sym string) error {
-			return &runtimeErr{msg: fmt.Sprintf("integer overflow: %d %s %d", a.I, sym, b.I), line: line}
+			return &runtimeErr{msg: fmt.Sprintf("integer overflow: %d %s %d", a.I, sym, b.I), span: sp}
 		}
 		f.top -= 2
 		switch op {
@@ -602,7 +602,7 @@ func (vm *VM) arith(f *Fiber, op Op, line int) error {
 			f.push(IntV(r))
 		case OpDiv:
 			if b.I == 0 {
-				return &runtimeErr{msg: "integer division by zero", line: line}
+				return &runtimeErr{msg: "integer division by zero", span: sp}
 			}
 			if a.I == math.MinInt64 && b.I == -1 {
 				return overflow("/")
@@ -610,7 +610,7 @@ func (vm *VM) arith(f *Fiber, op Op, line int) error {
 			f.push(IntV(a.I / b.I))
 		case OpMod:
 			if b.I == 0 {
-				return &runtimeErr{msg: "integer modulo by zero", line: line}
+				return &runtimeErr{msg: "integer modulo by zero", span: sp}
 			}
 			f.push(IntV(a.I % b.I))
 		}
@@ -634,7 +634,7 @@ func (vm *VM) arith(f *Fiber, op Op, line int) error {
 	return nil
 }
 
-func (vm *VM) compare(f *Fiber, op Op, line int) error {
+func (vm *VM) compare(f *Fiber, op Op, sp Span) error {
 	b := f.pop()
 	a := f.pop()
 	if a.T == VObj && b.T == VObj {
@@ -658,7 +658,7 @@ func (vm *VM) compare(f *Fiber, op Op, line int) error {
 	}
 	af, bf, ok := toFloats(a, b)
 	if !ok {
-		return &runtimeErr{msg: fmt.Sprintf("cannot compare %s and %s", typeOf(a), typeOf(b)), line: line}
+		return &runtimeErr{msg: fmt.Sprintf("cannot compare %s and %s", typeOf(a), typeOf(b)), span: sp}
 	}
 	var r bool
 	switch op {
@@ -696,32 +696,32 @@ func toFloats(a, b Value) (float64, float64, bool) {
 	return af, bf, true
 }
 
-func (vm *VM) indexGet(target, idx Value, line int) (Value, error) {
+func (vm *VM) indexGet(target, idx Value, sp Span) (Value, error) {
 	if target.T != VObj {
-		return Unit, &runtimeErr{msg: fmt.Sprintf("cannot index %s", typeOf(target)), line: line}
+		return Unit, &runtimeErr{msg: fmt.Sprintf("cannot index %s", typeOf(target)), span: sp}
 	}
 	switch o := target.O.(type) {
 	case *OList:
 		if idx.T != VInt {
-			return Unit, &runtimeErr{msg: fmt.Sprintf("list index must be an int, got %s", typeOf(idx)), line: line}
+			return Unit, &runtimeErr{msg: fmt.Sprintf("list index must be an int, got %s", typeOf(idx)), span: sp}
 		}
 		if idx.I < 0 || idx.I >= int64(len(o.Elems)) {
-			return Unit, &runtimeErr{msg: fmt.Sprintf("list index %d out of bounds (len %d)", idx.I, len(o.Elems)), line: line}
+			return Unit, &runtimeErr{msg: fmt.Sprintf("list index %d out of bounds (len %d)", idx.I, len(o.Elems)), span: sp}
 		}
 		return o.Elems[idx.I], nil
 	case *OString:
 		if idx.T != VInt {
-			return Unit, &runtimeErr{msg: fmt.Sprintf("string index must be an int, got %s", typeOf(idx)), line: line}
+			return Unit, &runtimeErr{msg: fmt.Sprintf("string index must be an int, got %s", typeOf(idx)), span: sp}
 		}
 		if idx.I < 0 || idx.I >= int64(len(o.S)) {
-			return Unit, &runtimeErr{msg: fmt.Sprintf("string index %d out of bounds (len %d)", idx.I, len(o.S)), line: line}
+			return Unit, &runtimeErr{msg: fmt.Sprintf("string index %d out of bounds (len %d)", idx.I, len(o.S)), span: sp}
 		}
 		return ObjV(vm.gc.newString(string(o.S[idx.I]))), nil
 	}
-	return Unit, &runtimeErr{msg: fmt.Sprintf("cannot index %s", typeOf(target)), line: line}
+	return Unit, &runtimeErr{msg: fmt.Sprintf("cannot index %s", typeOf(target)), span: sp}
 }
 
-func lengthOf(v Value, line int) (int64, error) {
+func lengthOf(v Value, sp Span) (int64, error) {
 	if v.T == VObj {
 		switch o := v.O.(type) {
 		case *OList:
@@ -730,5 +730,5 @@ func lengthOf(v Value, line int) (int64, error) {
 			return int64(len(o.S)), nil
 		}
 	}
-	return 0, &runtimeErr{msg: fmt.Sprintf("len() needs a list or string, got %s", typeOf(v)), line: line}
+	return 0, &runtimeErr{msg: fmt.Sprintf("len() needs a list or string, got %s", typeOf(v)), span: sp}
 }

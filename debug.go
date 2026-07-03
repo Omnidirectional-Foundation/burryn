@@ -4,19 +4,19 @@ import "fmt"
 
 // disasmAll prints the bytecode of a function and, recursively, of every
 // function found in its constant table.
-func disasmAll(fn *OFunc) {
-	disasm(fn)
+func disasmAll(fn *OFunc, lines lineIndex) {
+	disasm(fn, lines)
 	for _, c := range fn.Chunk.Consts {
 		if c.T == VObj {
 			if sub, ok := c.O.(*OFunc); ok {
 				fmt.Println()
-				disasmAll(sub)
+				disasmAll(sub, lines)
 			}
 		}
 	}
 }
 
-func disasm(fn *OFunc) {
+func disasm(fn *OFunc, lines lineIndex) {
 	name := fn.Name
 	if name == "" {
 		name = "<anonymous>"
@@ -24,12 +24,16 @@ func disasm(fn *OFunc) {
 	fmt.Printf("== %s (arity %d, upvals %d) ==\n", name, fn.Arity, fn.NumUpvals)
 	ch := &fn.Chunk
 	for ip := 0; ip < len(ch.Code); {
-		ip = disasmInst(ch, ip)
+		ip = disasmInst(ch, lines, ip)
 	}
 }
 
-func disasmInst(ch *Chunk, ip int) int {
-	fmt.Printf("%04d %4d  ", ip, ch.Lines[ip])
+func disasmInst(ch *Chunk, lines lineIndex, ip int) int {
+	line := 0 // synthetic code has the zero span and stays line 0
+	if ch.Spans[ip] != (Span{}) {
+		line = lines.line(ch.Spans[ip].Start)
+	}
+	fmt.Printf("%04d %4d  ", ip, line)
 	op := ch.Code[ip]
 	simple := func(name string) int {
 		fmt.Println(name)

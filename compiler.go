@@ -128,17 +128,8 @@ func (c *Compiler) fail(sp Span, code, help, format string, args ...any) {
 
 func (c *Compiler) chunk() *Chunk { return &c.fn.Chunk }
 
-// line maps a span to its source line for chunk line tables and error
-// messages; the zero span (synthetic code) stays line 0.
-func (c *Compiler) line(sp Span) int {
-	if sp == (Span{}) {
-		return 0
-	}
-	return c.shared.lines.line(sp.Start)
-}
-
-func (c *Compiler) emit(b byte, sp Span)      { c.chunk().write(b, c.line(sp)) }
-func (c *Compiler) emitU16(v uint16, sp Span) { c.chunk().writeU16(v, c.line(sp)) }
+func (c *Compiler) emit(b byte, sp Span)      { c.chunk().write(b, sp) }
+func (c *Compiler) emitU16(v uint16, sp Span) { c.chunk().writeU16(v, sp) }
 func (c *Compiler) emitConst(v Value, sp Span) {
 	idx := c.chunk().addConst(v)
 	c.emit(OpConst, sp)

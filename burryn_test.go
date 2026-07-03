@@ -139,6 +139,18 @@ func expectWarning(t *testing.T, src, contains string) {
 	t.Fatalf("expected a warning containing %q\nsource:\n%s", contains, src)
 }
 
+func TestRuntimeErrorCarriesSpan(t *testing.T) {
+	src := "let xs = [1]\nprintln(xs[3])"
+	_, _, rerr := interpret(src)
+	re, ok := rerr.(*runtimeErr)
+	if !ok {
+		t.Fatalf("expected *runtimeErr, got %v", rerr)
+	}
+	if got := src[re.span.Start:re.span.End]; got != "xs[3]" {
+		t.Fatalf("expected span to cover the index expression, got %q", got)
+	}
+}
+
 func expectRuntimeError(t *testing.T, src, contains string) {
 	t.Helper()
 	_, cerr, rerr := interpret(src)
