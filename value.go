@@ -180,10 +180,11 @@ type OEnumInst struct {
 
 type OChannel struct {
 	GCHeader
-	cap   int
-	buf   []Value
-	sendq []*Fiber // fibers blocked sending (value in fiber.sendVal)
-	recvq []*Fiber // fibers blocked receiving
+	cap    int
+	buf    []Value
+	sendq  []*Fiber // fibers blocked sending (value in fiber.sendVal)
+	recvq  []*Fiber // fibers blocked receiving
+	closed bool     // close(ch): further sends trap, drained receives observe closure
 }
 
 type NativeFn func(vm *VM, args []Value) (Value, error)

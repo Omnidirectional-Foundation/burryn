@@ -49,7 +49,8 @@ const (
 	OpTry         // ?: unwrap Ok/Some or early-return Err/None
 	OpSpawn       // u8 argc: pops callee+args, new fiber
 	OpSend        // pops val, chan (may park fiber)
-	OpRecv        // pops chan, push received (may park fiber)
+	OpRecv        // pops chan, push received (may park fiber); traps on closed
+	OpChanNext    // u16 fwd: pops chan; push next value, or jump when closed+drained
 )
 
 type Chunk struct {

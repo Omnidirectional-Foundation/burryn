@@ -538,6 +538,10 @@ func (c *Compiler) whileStmt(st *WhileStmt) {
 }
 
 func (c *Compiler) forStmt(st *ForStmt) {
+	if st.IterIsChan {
+		c.forChanStmt(st)
+		return
+	}
 	c.beginScope()
 	c.expr(st.Iter)
 	c.declareLocal("(iter)", false, st.Span)
@@ -591,6 +595,40 @@ func (c *Compiler) forStmt(st *ForStmt) {
 	}
 	c.loops = c.loops[:len(c.loops)-1]
 	c.endScope(st.Span) // pops idx, iter
+}
+
+// forChanStmt compiles `for v in ch`: receive until the channel is closed and
+// drained, then fall out of the loop. OpChanNext parks the fiber when the
+// channel is empty but still open.
+func (c *Compiler) forChanStmt(st *ForStmt) {
+	c.beginScope()
+	c.expr(st.Iter)
+	c.declareLocal("(chan)", false, st.Span)
+	chanSlot := c.locals[len(c.locals)-1].slot
+
+	condStart := len(c.chunk().Code)
+	c.loops = append(c.loops, loopCtx{baseSlot: c.nextSlot(), continueTo: condStart})
+
+	c.emit(OpGetLocal, st.Span)
+	c.emitU16(uint16(chanSlot), st.Span)
+	exitJ := c.emitJump(OpChanNext, st.Span)
+
+	c.beginScope()
+	c.declareLocal(st.Var, false, st.Span) // received value is already on the stack
+	for _, s := range st.Body.Stmts {
+		c.stmt(s)
+	}
+	c.endScope(st.Span)
+
+	c.emitLoop(condStart, st.Span)
+
+	c.patchJump(exitJ)
+	lp := c.loops[len(c.loops)-1]
+	for _, j := range lp.breakJumps {
+		c.patchJump(j)
+	}
+	c.loops = c.loops[:len(c.loops)-1]
+	c.endScope(st.Span) // pops the channel local
 }
 
 // emit pops for locals above the innermost loop's base without altering

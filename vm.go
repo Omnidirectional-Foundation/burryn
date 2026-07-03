@@ -64,6 +64,7 @@ type VM struct {
 	optEnum   *OEnumType
 	resEnum   *OEnumType
 	yieldFlag bool
+	parkRecv  *OChannel // set by the recv() native to ask OpCall to park & retry
 	out       io.Writer
 }
 
@@ -163,6 +164,7 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			return false, nil
 		}
 		budget--
+		startIP := frame.ip // opcode position, for rewinding a parked receive
 		op := chunk.Code[frame.ip]
 		sp := chunk.Spans[frame.ip]
 		frame.ip++
@@ -293,6 +295,14 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			frame.ip++
 			if err := vm.callValue(f, argc, sp); err != nil {
 				return false, err
+			}
+			if vm.parkRecv != nil { // the recv() native asked to block on a channel
+				ch := vm.parkRecv
+				vm.parkRecv = nil
+				f.status = FBlockedRecv
+				ch.recvq = append(ch.recvq, f)
+				frame.ip = startIP // re-run the call (and recv) once woken
+				return false, nil
 			}
 			if vm.yieldFlag { // a native (yield) asked us to hand off
 				vm.yieldFlag = false
@@ -437,10 +447,15 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			if err != nil {
 				return false, err
 			}
+			if ch.closed {
+				return false, rtErr("send on closed channel")
+			}
 			if len(ch.recvq) > 0 {
+				// hand the value off through the buffer; the woken receiver
+				// re-runs its receive and finds it there
+				ch.buf = append(ch.buf, val)
 				r := ch.recvq[0]
 				ch.recvq = ch.recvq[1:]
-				r.push(val)
 				vm.schedule(r)
 			} else if len(ch.buf) < ch.cap {
 				ch.buf = append(ch.buf, val)
@@ -451,36 +466,83 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 				return false, nil
 			}
 		case OpRecv:
-			ch, err := popChannel(f, "receive from", sp)
-			if err != nil {
-				return false, err
+			chv := f.peek(0) // keep the channel on the stack in case we park
+			ch, ok := asChannelV(chv)
+			if !ok {
+				f.pop()
+				return false, rtErr("cannot receive from %s (need a channel)", typeOf(chv))
 			}
-			if len(ch.buf) > 0 {
-				v := ch.buf[0]
-				ch.buf = ch.buf[1:]
-				if len(ch.sendq) > 0 {
-					s := ch.sendq[0]
-					ch.sendq = ch.sendq[1:]
-					ch.buf = append(ch.buf, s.sendVal)
-					s.sendVal = Unit
-					vm.schedule(s)
-				}
+			if v, ready := vm.chanTryRecv(ch); ready {
+				f.pop()
 				f.push(v)
-			} else if len(ch.sendq) > 0 { // unbuffered rendezvous
-				s := ch.sendq[0]
-				ch.sendq = ch.sendq[1:]
-				f.push(s.sendVal)
-				s.sendVal = Unit
-				vm.schedule(s)
+			} else if ch.closed {
+				f.pop()
+				return false, rtErr("receive on closed channel")
 			} else {
 				f.status = FBlockedRecv
 				ch.recvq = append(ch.recvq, f)
+				frame.ip = startIP // re-run once woken
+				return false, nil
+			}
+		case OpChanNext:
+			chv := f.peek(0)
+			ch, ok := asChannelV(chv)
+			if !ok {
+				f.pop()
+				return false, rtErr("cannot iterate %s (need a channel)", typeOf(chv))
+			}
+			if v, ready := vm.chanTryRecv(ch); ready {
+				f.pop()
+				f.push(v)
+				frame.ip += 2 // skip the jump operand: fall through into the body
+			} else if ch.closed {
+				f.pop()
+				frame.ip += 2 + int(readU16(chunk.Code, frame.ip)) // exit the loop
+			} else {
+				f.status = FBlockedRecv
+				ch.recvq = append(ch.recvq, f)
+				frame.ip = startIP // re-run once woken
 				return false, nil
 			}
 		default:
 			return false, rtErr("bad opcode %d (VM bug)", op)
 		}
 	}
+}
+
+func asChannelV(v Value) (*OChannel, bool) {
+	if v.T == VObj {
+		ch, ok := v.O.(*OChannel)
+		return ch, ok
+	}
+	return nil, false
+}
+
+// chanTryRecv performs a non-blocking receive, waking one blocked sender to
+// refill the slot it drains. ready is false when nothing is available yet
+// (the caller decides whether to block or observe closure).
+func (vm *VM) chanTryRecv(ch *OChannel) (Value, bool) {
+	if len(ch.buf) > 0 {
+		v := ch.buf[0]
+		ch.buf = ch.buf[1:]
+		if len(ch.sendq) > 0 {
+			s := ch.sendq[0]
+			ch.sendq = ch.sendq[1:]
+			ch.buf = append(ch.buf, s.sendVal)
+			s.sendVal = Unit
+			vm.schedule(s)
+		}
+		return v, true
+	}
+	if len(ch.sendq) > 0 { // unbuffered rendezvous
+		s := ch.sendq[0]
+		ch.sendq = ch.sendq[1:]
+		v := s.sendVal
+		s.sendVal = Unit
+		vm.schedule(s)
+		return v, true
+	}
+	return Unit, false
 }
 
 func popChannel(f *Fiber, what string, sp Span) (*OChannel, error) {
@@ -516,6 +578,9 @@ func (vm *VM) callValue(f *Fiber, argc int, sp Span) error {
 		res, err := o.Fn(vm, args)
 		if err != nil {
 			return &runtimeErr{msg: err.Error(), span: sp}
+		}
+		if vm.parkRecv != nil {
+			return nil // leave callee+args on the stack; OpCall parks and retries
 		}
 		f.top -= argc + 1
 		f.push(res)

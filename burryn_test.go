@@ -327,6 +327,118 @@ ch <- "two"`, "E0308")
 	expectTypeError(t, `let n = <-42`, "E0308")
 }
 
+// ---- close / recv / for-in over channels ----
+
+func TestForInChannelSumsUntilClosed(t *testing.T) {
+	expectOut(t, `fn producer(ch) {
+    for i in range(0, 5) {
+        ch <- i * i
+    }
+    close(ch)
+}
+let ch = chan(2)
+spawn producer(ch)
+let mut total = 0
+for v in ch {
+    total = total + v
+}
+println(total)`, "30\n")
+}
+
+func TestRecvReturnsOptionNoneAfterClose(t *testing.T) {
+	expectOut(t, `fn producer(ch) {
+    ch <- 1
+    ch <- 2
+    close(ch)
+}
+let ch = chan(0)
+spawn producer(ch)
+let mut sum = 0
+let mut done = false
+while !done {
+    match recv(ch) {
+        Some(v) => { sum = sum + v },
+        None => { done = true },
+    }
+}
+println(sum)`, "3\n")
+}
+
+func TestRecvOnClosedEmptyIsNone(t *testing.T) {
+	expectOut(t, `let ch = chan(1)
+close(ch)
+match recv(ch) {
+    Some(v) => println(v),
+    None => println("closed"),
+}`, "closed\n")
+}
+
+func TestBareRecvDrainsThenTraps(t *testing.T) {
+	expectOut(t, `let ch = chan(1)
+ch <- 7
+close(ch)
+println(<-ch)`, "7\n")
+	expectRuntimeError(t, `let ch = chan(1)
+close(ch)
+let _ = <-ch`, "receive on closed channel")
+}
+
+func TestSendOnClosedTraps(t *testing.T) {
+	expectRuntimeError(t, `let ch = chan(1)
+close(ch)
+ch <- 1`, "send on closed channel")
+}
+
+func TestDoubleCloseTraps(t *testing.T) {
+	expectRuntimeError(t, `let ch = chan(1)
+close(ch)
+close(ch)`, "close of closed channel")
+}
+
+func TestCloseWakesBlockedReceiver(t *testing.T) {
+	// a receiver parked on an empty channel is woken by close and observes None
+	expectOut(t, `fn waiter(ch, done) {
+    match recv(ch) {
+        Some(v) => { done <- v },
+        None => { done <- -1 },
+    }
+}
+let ch = chan(0)
+let done = chan(0)
+spawn waiter(ch, done)
+close(ch)
+println(<-done)`, "-1\n")
+}
+
+func TestForInChannelRespectsBreak(t *testing.T) {
+	expectOut(t, `fn producer(ch) {
+    for i in range(0, 100) {
+        ch <- i
+    }
+    close(ch)
+}
+let ch = chan(4)
+spawn producer(ch)
+let mut last = 0
+for v in ch {
+    last = v
+    if v == 3 {
+        break
+    }
+}
+println(last)`, "3\n")
+}
+
+func TestCloseTypeChecked(t *testing.T) {
+	expectTypeError(t, `close(42)`, "E0308")
+	expectTypeError(t, `let x = recv(42)`, "E0308")
+}
+
+func TestRecvIsMustUse(t *testing.T) {
+	expectTypeError(t, `let ch = chan(1)
+recv(ch)`, "unused_must_use")
+}
+
 func TestMustUseResult(t *testing.T) {
 	expectTypeError(t, `fn f() { Ok(1) }
 f()`, "unused_must_use")

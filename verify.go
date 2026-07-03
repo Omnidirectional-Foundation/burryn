@@ -167,6 +167,14 @@ func verifyStack(fn *OFunc) error {
 				pops, next = 2, ip+1
 			case OpRecv:
 				pops, pushes, next = 1, 1, ip+1
+			case OpChanNext:
+				// pops the channel; on a value it pushes one and falls through
+				// (net zero), on closure it jumps with nothing pushed
+				if depth < floor+1 {
+					return errf(ip, "chan-next with no channel on the stack (depth %d, floor %d)", depth, floor)
+				}
+				work = append(work, state{ip + 3 + u16(), depth - 1})
+				next = ip + 3 // fall-through depth unchanged: -1 chan, +1 value
 			default:
 				return errf(ip, "unknown opcode %d", op)
 			}

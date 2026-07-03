@@ -216,11 +216,12 @@ type WhileStmt struct {
 	Span Span
 }
 type ForStmt struct {
-	Var     string
-	VarSpan Span // the loop variable identifier
-	Iter    Expr // must evaluate to a list
-	Body    *Block
-	Span    Span
+	Var       string
+	VarSpan   Span // the loop variable identifier
+	Iter      Expr // evaluates to a list or a channel
+	IterIsChan bool // set by the checker: iterate by receiving until closed
+	Body      *Block
+	Span      Span
 }
 type ReturnStmt struct {
 	Val  Expr // nil for bare return
