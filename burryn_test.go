@@ -34,8 +34,8 @@ func interpretMode(src string, skipCheck bool) (out string, compileError error, 
 		}
 	}
 	gc := newGC()
-	fn, shared, err := compileProgram(gc, src, stmts)
-	if err != nil {
+	fn, shared, compDiags := compileProgram(gc, src, stmts)
+	if err := diagsToErr(compDiags); err != nil {
 		return "", err, nil
 	}
 	var buf bytes.Buffer
