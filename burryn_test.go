@@ -354,12 +354,67 @@ func TestBreakOutsideLoop(t *testing.T) {
 // ---- lists ----
 
 func TestListOps(t *testing.T) {
-	expectOut(t, `let l = [1, 2, 3]
+	expectOut(t, `let mut l = [1, 2, 3]
 push(l, 4)
 l[0] = 10
 println(l, len(l))
 println(pop(l), l)`, "[10, 2, 3, 4] 4\n4 [10, 2, 3]\n")
 	expectOut(t, `println([[1], [2, 3]])`, "[[1], [2, 3]]\n")
+}
+
+// ---- deep mut: an immutable binding freezes its contents too ----
+
+func TestDeepMutPushNeedsMut(t *testing.T) {
+	expectTypeError(t, `let l = [1]
+push(l, 2)`, "E0596")
+	expectTypeError(t, `let l = [1]
+let _ = pop(l)`, "E0596")
+}
+
+func TestDeepMutIndexAssignNeedsMut(t *testing.T) {
+	expectTypeError(t, `let l = [1]
+l[0] = 2`, "E0596")
+}
+
+func TestDeepMutReachesThroughNesting(t *testing.T) {
+	expectTypeError(t, `let m = [[1]]
+m[0][0] = 2`, "E0596")
+	expectOut(t, `let mut m = [[1]]
+m[0][0] = 2
+push(m[0], 3)
+println(m)`, "[[2, 3]]\n")
+}
+
+func TestDeepMutImmutableAlias(t *testing.T) {
+	// an immutable alias of a mut list cannot be used to mutate it
+	expectTypeError(t, `let mut a = [1]
+let b = a
+push(b, 2)`, "E0596")
+}
+
+func TestDeepMutParamsAreImmutable(t *testing.T) {
+	expectTypeError(t, `fn add(xs, v) { push(xs, v) }
+let mut l = [1]
+add(l, 2)`, "E0596")
+}
+
+func TestDeepMutTemporariesAreFree(t *testing.T) {
+	// unnamed temporaries have no binding to freeze
+	expectOut(t, `fn fresh() { [1] }
+push(fresh(), 2)
+println("ok")`, "ok\n")
+}
+
+func TestDeepMutReadsStayLegal(t *testing.T) {
+	expectOut(t, `let l = [10, 20]
+println(l[1], len(l))`, "20 2\n")
+}
+
+func TestDeepMutShadowedPushIsNotChecked(t *testing.T) {
+	// a user fn named push is an ordinary call, not the mutating native
+	expectOut(t, `fn push(a, b) { a + b }
+let l = [1]
+println(push(2, 3), l)`, "5 [1]\n")
 }
 
 func TestIndexOutOfBounds(t *testing.T) {
