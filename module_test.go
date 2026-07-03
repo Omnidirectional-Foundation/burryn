@@ -240,3 +240,201 @@ func TestLoadModuleEntryIsSubdir(t *testing.T) {
 		t.Fatalf("entry path = %q", m.Entry.ImportPath)
 	}
 }
+
+// checkTree loads a module (failing the test on load errors) and typechecks it.
+func checkTree(t *testing.T, files map[string]string, entry string) []Diag {
+	t.Helper()
+	m, diags := loadTree(t, files, entry)
+	for _, d := range diags {
+		if d.IsErr {
+			t.Fatalf("load error: [%s] %s", d.Code, d.Msg)
+		}
+	}
+	return typecheckModule(m)
+}
+
+func expectModuleError(t *testing.T, files map[string]string, code string) {
+	t.Helper()
+	diags := checkTree(t, files, ".")
+	if !hasDiagCode(diags, code, true) {
+		t.Fatalf("expected a %s error, got %v", code, diags)
+	}
+}
+
+func expectModuleClean(t *testing.T, files map[string]string) {
+	t.Helper()
+	for _, d := range checkTree(t, files, ".") {
+		t.Fatalf("expected no diagnostics, got: [%s] %s", d.Code, d.Msg)
+	}
+}
+
+const geoSrc = `pub enum Shape {
+    Circle(float),
+    Rect(int, int),
+}
+
+pub fn area(s) {
+    match s {
+        Circle(r) => 3.14 * r * r,
+        Rect(w, h) => to_float(w * h),
+    }
+}
+
+pub let inc = fn(x) { x + 1 }
+`
+
+func TestModuleCheckCleanCrossPackage(t *testing.T) {
+	expectModuleClean(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur": `import "example.com/m/geo"
+
+fn main() {
+    let s = geo.Shape.Circle(2.0)
+    println(geo.area(s))
+    match s {
+        geo.Shape.Circle(r) => println(r),
+        geo.Shape.Rect(w, h) => println(w, h),
+    }
+    println(geo.inc(41))
+}
+`,
+	})
+}
+
+func TestModuleCheckCrossPackageTypeError(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    println(geo.area(1))\n}\n",
+	}, "E0308")
+}
+
+func TestModuleCheckPrivateFn(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": "fn secret() { 1 }\npub fn ok() { secret() }\n",
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    println(geo.secret())\n}\n",
+	}, "E0603")
+}
+
+func TestModuleCheckPrivateEnum(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": "enum Hidden { X }\npub fn tag() { X }\n",
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    let _ = geo.Hidden.X\n}\n",
+	}, "E0603")
+}
+
+func TestModuleCheckUnknownMember(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    println(geo.nope())\n}\n",
+	}, "E0425")
+}
+
+func TestModuleCheckEnumAsValue(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    let _ = geo.Shape\n}\n",
+	}, "E0423")
+}
+
+func TestModuleCheckMainMissing(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":  modHeader,
+		"main.bur": "pub fn helper() { 1 }\n",
+	}, "E0601")
+}
+
+func TestModuleCheckMainWithParams(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":  modHeader,
+		"main.bur": "fn main(x) { println(x) }\n",
+	}, "E0580")
+}
+
+func TestModuleCheckCrossPackagePushImmutable(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": "pub let xs = [1, 2]\n",
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    push(geo.xs, 3)\n}\n",
+	}, "E0596")
+}
+
+func TestModuleCheckCrossPackagePushMutable(t *testing.T) {
+	expectModuleClean(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": "pub let mut xs = [1, 2]\n",
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    push(geo.xs, 3)\n    println(geo.xs)\n}\n",
+	})
+}
+
+func TestModuleCheckUnusedPrivateWarns(t *testing.T) {
+	diags := checkTree(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": "fn dead() { 1 }\npub fn ok() { 2 }\n",
+		"main.bur":  "import \"example.com/m/geo\"\n\nfn main() {\n    println(geo.ok())\n}\n",
+	}, ".")
+	if !hasDiagCode(diags, "unused_variable", false) {
+		t.Fatalf("expected an unused_variable warning for `dead`, got %v", diags)
+	}
+	for _, d := range diags {
+		if d.IsErr {
+			t.Fatalf("unexpected error: [%s] %s", d.Code, d.Msg)
+		}
+	}
+}
+
+func TestModuleCheckSameEnumNameIsDistinct(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur": `import "example.com/m/geo"
+
+enum Shape {
+    Circle(float),
+}
+
+fn main() {
+    println(geo.area(Circle(1.0)))
+}
+`,
+	}, "E0308")
+}
+
+func TestModuleCheckQualifiedTypeInEnumField(t *testing.T) {
+	expectModuleClean(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur": `import "example.com/m/geo"
+
+enum Wrap {
+    W(geo.Shape),
+}
+
+fn main() {
+    match Wrap.W(geo.Shape.Circle(1.0)) {
+        Wrap.W(s) => println(geo.area(s)),
+    }
+}
+`,
+	})
+}
+
+func TestModuleCheckExhaustivenessAcrossPackages(t *testing.T) {
+	expectModuleError(t, map[string]string{
+		"bur.mod":   modHeader,
+		"geo/g.bur": geoSrc,
+		"main.bur": `import "example.com/m/geo"
+
+fn main() {
+    match geo.Shape.Circle(1.0) {
+        geo.Shape.Circle(r) => println(r),
+    }
+}
+`,
+	}, "E0004")
+}
