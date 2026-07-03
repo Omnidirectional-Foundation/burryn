@@ -12,7 +12,18 @@ type Diag struct {
 	Code  string
 	Msg   string
 	Help  string
+	File  string // source file the Span refers to; "" = the driver's single input
 	Span  Span
+}
+
+// stampFile attributes file-less diagnostics to file. Single-file drivers use
+// it so stages below the module loader never need to know their file name.
+func stampFile(diags []Diag, file string) {
+	for i := range diags {
+		if diags[i].File == "" {
+			diags[i].File = file
+		}
+	}
 }
 
 // lineIndex maps byte offsets to line/column positions: lineIndex[i] is the
@@ -52,10 +63,22 @@ func (ix lineIndex) line(off int) int {
 //	  |             ^^^ expected `int`, found `str`
 //	  |
 //	  = help: ...
-func renderDiags(w io.Writer, diags []Diag, file, src string) (errs, warns int) {
-	lines := strings.Split(src, "\n")
-	ix := newLineIndex(src)
+//
+// srcs maps each Diag.File to its source text; spans are file-local offsets.
+func renderDiags(w io.Writer, diags []Diag, srcs map[string]string) (errs, warns int) {
+	type indexed struct {
+		lines []string
+		ix    lineIndex
+	}
+	cache := map[string]indexed{}
 	for _, d := range diags {
+		src, hasSrc := srcs[d.File]
+		fx, ok := cache[d.File]
+		if !ok && hasSrc {
+			fx = indexed{lines: strings.Split(src, "\n"), ix: newLineIndex(src)}
+			cache[d.File] = fx
+		}
+		lines, ix := fx.lines, fx.ix
 		head := "error"
 		if !d.IsErr {
 			head = "warning"
@@ -66,13 +89,16 @@ func renderDiags(w io.Writer, diags []Diag, file, src string) (errs, warns int) 
 			fmt.Fprintf(w, "%s: %s\n", head, d.Msg)
 		}
 		start := min(max(d.Span.Start, 0), len(src))
-		line, col := ix.lineCol(start)
+		line, col := 0, 0
+		if hasSrc {
+			line, col = ix.lineCol(start)
+		}
 		if line >= 1 && line <= len(lines) {
 			raw := lines[line-1]
 			srcLine := strings.ReplaceAll(raw, "\t", "    ")
 			gutter := fmt.Sprintf("%d", line)
 			pad := strings.Repeat(" ", len(gutter))
-			fmt.Fprintf(w, "%s--> %s:%d:%d\n", pad, file, line, col)
+			fmt.Fprintf(w, "%s--> %s:%d:%d\n", pad, d.File, line, col)
 			fmt.Fprintf(w, "%s |\n", pad)
 			fmt.Fprintf(w, "%s | %s\n", gutter, srcLine)
 			// underline the span, clamped to the end of its first line
