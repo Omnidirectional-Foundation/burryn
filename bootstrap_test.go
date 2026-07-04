@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -115,7 +116,7 @@ func (p *burcProgram) run(t *testing.T, argv ...string) string {
 func burCorpus(t *testing.T) []string {
 	t.Helper()
 	var files []string
-	for _, pat := range []string{"examples/*.bur", "examples/*/*.bur", "examples/*/*/*.bur", "burc/*.bur", "testdata/parse/*.bur"} {
+	for _, pat := range []string{"examples/*.bur", "examples/*/*.bur", "examples/*/*/*.bur", "burc/*.bur", "testdata/*/*.bur"} {
 		fs, err := filepath.Glob(pat)
 		if err != nil {
 			t.Fatal(err)
@@ -365,6 +366,124 @@ func dumpGoParse(src string) string {
 	}
 	dumpDiags(&b, parseDiags)
 	return b.String()
+}
+
+// ---- check dump (mirrors burc's `check` command) ----
+
+// dumpGoCheck runs lex/parse/typecheck with the same stop-at-first-failing-
+// stage behavior as burc's cmd_check, dumping bind lines (top-level globals
+// sorted by name) when error-free, then diagnostics.
+func dumpGoCheck(src string) string {
+	toks, lexDiags := lex(src)
+	var b strings.Builder
+	if len(lexDiags) > 0 {
+		dumpDiags(&b, lexDiags)
+		return b.String()
+	}
+	stmts, parseDiags := parse(toks)
+	if len(parseDiags) > 0 {
+		dumpDiags(&b, parseDiags)
+		return b.String()
+	}
+	// replicate typecheck() but keep the checker for the bind dump
+	c := newChecker()
+	for _, s := range stmts {
+		if st, ok := s.(*EnumDecl); ok {
+			c.registerEnum(st)
+		}
+	}
+	pre := map[string]*TV{}
+	for _, s := range stmts {
+		switch st := s.(type) {
+		case *FnDecl:
+			tv := c.fresh("")
+			pre[st.Name] = tv
+			c.declare(st.Name, &Scheme{t: tv}, false, "global", st.NameSpan)
+			c.scopes[len(c.scopes)-1][st.Name].isFn = true
+		case *LetStmt:
+			tv := c.fresh("")
+			pre[st.Name] = tv
+			c.declare(st.Name, &Scheme{t: tv}, st.Mut, "global", st.NameSpan)
+		}
+	}
+	for _, s := range stmts {
+		switch st := s.(type) {
+		case *FnDecl:
+			if st.Pub {
+				c.errPubScript(st.Span)
+			}
+			c.level++
+			ft := c.inferExpr(st.Fn)
+			c.level--
+			bind := c.lookup(st.Name)
+			bind.scheme = c.generalize(ft)
+			c.unifyAt(pre[st.Name], ft, st.NameSpan, "in this function")
+		case *LetStmt:
+			if st.Pub {
+				c.errPubScript(st.Span)
+			}
+			ty := c.inferLetInit(st)
+			c.unifyAt(pre[st.Name], ty, st.NameSpan, "in this binding")
+		case *EnumDecl:
+			if st.Pub {
+				c.errPubScript(st.Span)
+			}
+		default:
+			c.inferStmt(s)
+		}
+	}
+	for name, bind := range c.scopes[0] {
+		if bind.kind == "global" && !bind.used && !strings.HasPrefix(name, "_") {
+			what := "variable"
+			if bind.isFn {
+				what = "function"
+			}
+			c.warnf(bind.span, "unused_variable",
+				fmt.Sprintf("if this is intentional, prefix it with an underscore: `_%s`", name),
+				"unused %s: `%s`", what, name)
+		}
+	}
+	sort.SliceStable(c.diags, func(i, j int) bool {
+		return c.diags[i].Span.Start < c.diags[j].Span.Start
+	})
+
+	hasErr := false
+	for _, d := range c.diags {
+		if d.IsErr {
+			hasErr = true
+		}
+	}
+	if !hasErr {
+		var names []string
+		for name, bind := range c.scopes[0] {
+			if bind.kind == "global" {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(&b, "bind %s :: %s\n", name, pretty(c.scopes[0][name].scheme.t))
+		}
+	}
+	dumpDiags(&b, c.diags)
+	return b.String()
+}
+
+func TestBurcCheckParity(t *testing.T) {
+	prog := loadBurc(t)
+	for _, file := range burCorpus(t) {
+		t.Run(file, func(t *testing.T) {
+			srcBytes, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := dumpGoCheck(string(srcBytes))
+			got := prog.run(t, "check", file)
+			if got != want {
+				t.Errorf("check dump mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
+			}
+		})
+	}
 }
 
 func TestBurcLexParity(t *testing.T) {
