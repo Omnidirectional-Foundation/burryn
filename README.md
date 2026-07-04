@@ -2,10 +2,19 @@
 
 > **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
 
-Burryn is a small programming language forged from Go and Rust, implemented
-from scratch in ~3000 lines of Go: hand-written lexer, recursive-descent
-parser, single-pass bytecode compiler, and a stack-based VM with its own
-mark-sweep garbage collector and a green-thread scheduler.
+Burryn is a small programming language forged from Go and Rust: hand-written
+lexer, recursive-descent parser, Hindley-Milner type inference with zero
+annotations, single-pass bytecode compiler, a stack-based VM with its own
+mark-sweep garbage collector and green-thread scheduler, and a C backend that
+turns programs into standalone native binaries.
+
+**The compiler is self-hosted.** `burc/` reimplements the whole pipeline —
+lexer, parser, type checker, bytecode compiler, C code generator — in Burryn
+itself (~7000 lines). It compiles itself to C byte-identical to the Go
+toolchain's output, and the resulting native `burc` compiles the same source
+to the same bytes again: a closed bootstrap fixpoint, checked in CI
+(`TestBurcSelfHost`). The Go implementation (~11k lines) stays as the
+reference oracle.
 
 The name: a **burrow** is where a gopher (Go) lives, and it puns on Rust's
 *borrow* checker; a **burr** is what forging leaves on metal; and *burrin*
@@ -101,15 +110,27 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/gc_stress.bur` | watch the collector work |
 | `examples/fib.bur` | recursion micro-benchmark |
 | `examples/brainfuck.bur` | a Brainfuck interpreter written in Burryn |
+| `examples/multiplex.bur` | `select` over several channels |
+| `examples/streaming.bur` | channel close / for-in draining |
+| `examples/textproc.bur` | files, exec, argv: a small text tool |
+| `examples/wordcount.bur` | maps and string functions |
+| `examples/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
+| `burc/` | the self-hosted compiler — the biggest Burryn program there is |
 
 ## Architecture
 
 ```markdown
-source ──lexer──▶ tokens ──parser──▶ AST ──compiler──▶ bytecode ──▶ BurrynVM
- (lexer.go)        (auto-semicolons)  (parser.go)      (compiler.go)   (vm.go)
+source ──lexer──▶ tokens ──parser──▶ AST ──checker──▶ typed ──compiler──▶ bytecode
+ (lexer.go)        (auto-semicolons)  (parser.go)  (types.go, HM)   (compiler.go)
                                                                         │
-                                              fibers + channels + scheduler
-                                              mark-sweep GC (gc.go)
+                                        ┌───────────────────────────────┤
+                                        ▼                               ▼
+                                  BurrynVM (vm.go)            C backend (cbackend.go)
+                                  fibers + channels           ──▶ .c ──cc──▶ native
+                                  scheduler, GC (gc.go)       runtime/burrt*.h
+
+burc/ mirrors the same pipeline in Burryn (token/lexer/parser/types/compiler/
+cgen/module .bur) and reproduces the C output byte for byte.
 ```
 
 - **Compiler**: single pass, clox-style locals/upvalues, with a
@@ -138,12 +159,14 @@ bur version
 Build: `go build -o bur.exe .` &nbsp;•&nbsp; Test: `go test .` (includes a
 golden test for every example)
 
-## Honest limitations (v3, in progress)
+## Honest limitations
 
-Maps, modules (`import`/`pub`, directory-as-package), `mut` parameters and a
-C backend (`bur build`) now exist; the C backend's concurrency is still being
-built, so run concurrent programs on the VM for now. No records/structs yet —
-model product types with single-variant enums. No `defer` or string
-interpolation yet, and no third-party dependency fetching (only local
-packages). Deep `mut` is a binding-level discipline, not a borrow checker: two
-`mut` bindings may still alias the same list.
+The v3 milestone (C backend, modules, maps, `select`/`close`, `mut`
+parameters, a fully self-hosted compiler) is done; both backends produce
+byte-identical output for the whole language, concurrency included. Still
+missing: records/structs (model product types with single-variant enums),
+`defer`, string interpolation, and third-party dependency fetching (only
+local packages resolve). The self-hosted `burc` handles single, import-free
+packages; multi-package builds still go through the Go toolchain. Deep `mut`
+is a binding-level discipline, not a borrow checker: two `mut` bindings may
+still alias the same list.

@@ -479,12 +479,12 @@ select {
 }
 ```
 
-> C 后端的并发部分正在做(路线 ②-b)。现在**并发程序请用 `bur run`**;顺序程序两条
-> 路径输出逐字节一致。
+> 并发在两条路径上行为一致:`bur run`(VM)与 `bur build`(经 C 出原生二进制)
+> 对同一程序——包括纤程与 channel——输出逐字节相同,这一点由测试保证。
 >
-> The C backend's concurrency is in progress (roadmap ②-b). For now **run
-> concurrent programs with `bur run`**; sequential programs match byte-for-byte
-> on both paths.
+> Concurrency behaves identically on both paths: `bur run` (the VM) and
+> `bur build` (a native binary via C) produce byte-identical output for the
+> same program, fibers and channels included — enforced by tests.
 
 ---
 
@@ -558,8 +558,8 @@ returns that enum.
   `str_index_of(s, sub) -> Option`, `ord(s)`, `chr(n)`
 
 **转换 / Conversions**
-- `str(v)`, `to_float(i)`, `trunc(f)`, `parse_int(s) -> Option`,
-  `parse_float(s) -> Option`, `type_of(v)`
+- `str(v)`, `to_float(i)`, `trunc(f)`, `float_bits(f)`,
+  `parse_int(s) -> Option`, `parse_float(s) -> Option`, `type_of(v)`
 
 **文件系统 / Filesystem**
 - `read_file(p) -> Result`, `write_file(p, s) -> Result`, `file_exists(p)`,
@@ -600,14 +600,14 @@ and suggests `bur run`.
 Exit codes: `0` success, `1` static error, `2` usage error, `3` input unreadable,
 `4` runtime trap.
 
-**两套后端** / **Two backends**:VM(`bur run`,零依赖,当前主力)与 C 后端
-(`bur build`,经系统 cc 出原生二进制)。判定标准是 **stdout 逐字节 + 退出码一致**;
-顺序程序已达成,并发在 ②-b。
+**两套后端** / **Two backends**:VM(`bur run`,零依赖)与 C 后端(`bur build`,
+经系统 cc 出原生二进制)。判定标准是 **stdout 逐字节 + 退出码一致**,整门语言
+(含并发)两条路径已一致,由测试持续保证。
 
-The VM (`bur run`, dependency-free, current workhorse) and the C backend
-(`bur build`, native binary via the system cc). The contract is **byte-identical
-stdout + matching exit code**; sequential programs already match, concurrency
-lands in ②-b.
+The VM (`bur run`, dependency-free) and the C backend (`bur build`, native
+binary via the system cc). The contract is **byte-identical stdout + matching
+exit code**; the whole language, concurrency included, matches on both paths,
+enforced by tests.
 
 ---
 
@@ -634,14 +634,14 @@ lands in ②-b.
 - `fmt`(官方格式化)、`test` 命令:规划中。
   `fmt` and a `test` command are planned.
 
-后端 / backend:
-
-- C 后端的**并发**部分还没做(②-b);并发程序请用 `bur run`。
-  The C backend's **concurrency** isn't done (②-b); run concurrent programs with
-  `bur run`.
 
 ---
 
-*语言当前是 v3 在建;语法未冻结,自举后冻结并产出正式 grammar。*
-*The language is v3 in progress; the grammar is not yet frozen — it freezes after
-self-hosting.*
+*v3 里程碑「编译器完全自举」已达成:编译器 `burc/` 用 Burryn 本身写成,能把自己
+编译成 C 并经 cc 落地,且与 Go 工具链的输出逐字节一致。想看一个"真实规模"的 Burryn
+程序,`burc/` 就是最好的读物。语法尚未冻结;冻结与正式 grammar 是 v4 的事。*
+
+*The v3 milestone — a fully self-hosted compiler — is done: `burc/` is written
+in Burryn itself, compiles itself to C (built by cc), byte-identical to the Go
+toolchain's output. For a real-sized Burryn program to read, `burc/` is the best
+material. The grammar is not frozen yet; freezing it is a v4 matter.*
