@@ -1,0 +1,1526 @@
+// Single-pass bytecode compiler ported from compiler.go. Go aborts on the
+// first compile error via panic; here every compile function returns Result
+// and errors bounce out (same idiom as parser.bur). Compiler instances live
+// in an arena so closures can walk the enclosing chain and mark captured
+// locals; see compile_script below.
+
+// opcodes, mirroring chunk.go's order and numbering
+let op_const = 0
+let op_unit = 1
+let op_true = 2
+let op_false = 3
+let op_pop = 4
+let op_pop_n = 5
+let op_close_upvalue = 6
+let op_end_block = 7
+let op_get_local = 8
+let op_set_local = 9
+let op_get_global = 10
+let op_def_global = 11
+let op_set_global = 12
+let op_get_upval = 13
+let op_set_upval = 14
+let op_eq = 15
+let op_neq = 16
+let op_gt = 17
+let op_gt_eq = 18
+let op_lt = 19
+let op_lt_eq = 20
+let op_add = 21
+let op_sub = 22
+let op_mul = 23
+let op_div = 24
+let op_mod = 25
+let op_neg = 26
+let op_not = 27
+let op_jump = 28
+let op_jump_if_false = 29
+let op_jump_if_true = 30
+let op_jump_if_false_pop = 31
+let op_loop = 32
+let op_call = 33
+let op_closure = 34
+let op_return = 35
+let op_list = 36
+let op_index_get = 37
+let op_index_set = 38
+let op_len = 39
+let op_test_variant = 40
+let op_get_field = 41
+let op_no_match = 42
+let op_try = 43
+let op_spawn = 44
+let op_send = 45
+let op_recv = 46
+let op_chan_next = 47
+let op_select = 48
+
+// native global names, mirroring nativeNames() in builtins.go
+let native_names = ["print", "println", "len", "map", "get", "put", "delete",
+    "keys", "push", "pop", "str", "trunc", "to_float", "parse_int",
+    "parse_float", "str_len", "char_at", "range", "split", "join", "substr",
+    "str_contains", "str_index_of", "trim", "slice", "concat", "contains",
+    "read_file", "write_file", "file_exists", "read_dir", "exec", "args",
+    "exit", "chan", "close", "recv", "chr", "ord", "clock", "type_of",
+    "assert", "gc", "heap_objects", "gc_cycles", "yield"]
+
+// compile_script compiles a script's statements, mirroring compileProgram.
+// chan_fors carries the checker's channel-for span starts (Go sets
+// ForStmt.IterIsChan on the AST instead).
+fn compile_script(stmts, chan_fors) {
+    // ---- function arena ----
+    let mut f_name = []
+    let mut f_file = []
+    let mut f_arity = []
+    let mut f_nupvals = []
+    let mut f_code = []
+    let mut f_spans = []
+    let mut f_consts = []
+    // ---- enum arena (compile-time EnumInfo) ----
+    let mut en_qual = []
+    let mut en_vnames = []
+    let mut en_varities = []
+    let mut enum_by = map()
+    let mut global_mut = map()
+    // ---- compiler arena ----
+    let mut c_enclosing = []
+    let mut c_fn = []
+    let mut c_scope_depth = []
+    let mut c_temps = []
+    let mut c_l_name = []
+    let mut c_l_depth = []
+    let mut c_l_slot = []
+    let mut c_l_mut = []
+    let mut c_l_captured = []
+    let mut c_l_tempsbelow = []
+    let mut c_u_index = []
+    let mut c_u_islocal = []
+    let mut c_u_mut = []
+    let mut c_lp_base = []
+    let mut c_lp_contto = []
+    let mut c_lp_breaks = []
+    let mut c_lp_conts = []
+
+    fn new_func(name, file, arity) {
+        push(f_name, name)
+        push(f_file, file)
+        push(f_arity, arity)
+        push(f_nupvals, 0)
+        push(f_code, [])
+        push(f_spans, [])
+        push(f_consts, [])
+        len(f_name) - 1
+    }
+    fn new_compiler(enc, fh) {
+        push(c_enclosing, enc)
+        push(c_fn, fh)
+        push(c_scope_depth, 0)
+        push(c_temps, 0)
+        push(c_l_name, [])
+        push(c_l_depth, [])
+        push(c_l_slot, [])
+        push(c_l_mut, [])
+        push(c_l_captured, [])
+        push(c_l_tempsbelow, [])
+        push(c_u_index, [])
+        push(c_u_islocal, [])
+        push(c_u_mut, [])
+        push(c_lp_base, [])
+        push(c_lp_contto, [])
+        push(c_lp_breaks, [])
+        push(c_lp_conts, [])
+        len(c_fn) - 1
+    }
+    fn push_local(ch, name, depth, slot, is_mut, tempsbelow) {
+        push(c_l_name[ch], name)
+        push(c_l_depth[ch], depth)
+        push(c_l_slot[ch], slot)
+        push(c_l_mut[ch], is_mut)
+        push(c_l_captured[ch], false)
+        push(c_l_tempsbelow[ch], tempsbelow)
+    }
+    fn pop_local(ch) {
+        let _ = pop(c_l_name[ch])
+        let _ = pop(c_l_depth[ch])
+        let _ = pop(c_l_slot[ch])
+        let _ = pop(c_l_mut[ch])
+        let _ = pop(c_l_captured[ch])
+        let _ = pop(c_l_tempsbelow[ch])
+    }
+    fn n_locals(ch) {
+        len(c_l_name[ch])
+    }
+
+    fn declare_enum(qual, vnames, varities) {
+        push(en_qual, qual)
+        push(en_vnames, vnames)
+        push(en_varities, varities)
+        put(enum_by, qual, len(en_qual) - 1)
+        put(global_mut, qual, false)
+        len(en_qual) - 1
+    }
+    // find a variant by bare name; returns [eh, idx], eh = -2 when ambiguous
+    fn find_variant(name) {
+        let mut found = -1
+        let mut idx = -1
+        let mut amb = false
+        for q in keys(enum_by) {
+            match get(enum_by, q) {
+                Some(eh) => {
+                    let mut i = 0
+                    while i < len(en_vnames[eh]) {
+                        if en_vnames[eh][i] == name {
+                            if found >= 0 {
+                                amb = true
+                            }
+                            found = eh
+                            idx = i
+                        }
+                        i = i + 1
+                    }
+                },
+                None => {},
+            }
+        }
+        if amb {
+            [-2, -1]
+        } else {
+            [found, idx]
+        }
+    }
+    fn local_enum(name) {
+        match get(enum_by, name) {
+            Some(eh) => eh,
+            None => -1,
+        }
+    }
+
+    // ---- emit helpers ----
+    fn emit(ch, b, sp) {
+        push(f_code[c_fn[ch]], b)
+        push(f_spans[c_fn[ch]], sp)
+    }
+    fn emit_u16(ch, v, sp) {
+        emit(ch, v / 256, sp)
+        emit(ch, v % 256, sp)
+    }
+    fn code_len(ch) {
+        len(f_code[c_fn[ch]])
+    }
+    fn add_const(ch, cv) {
+        push(f_consts[c_fn[ch]], cv)
+        len(f_consts[c_fn[ch]]) - 1
+    }
+    fn emit_const(ch, cv, sp) {
+        let idx = add_const(ch, cv)
+        emit(ch, op_const, sp)
+        emit_u16(ch, idx, sp)
+    }
+    fn emit_jump(ch, op, sp) {
+        emit(ch, op, sp)
+        emit_u16(ch, 65535, sp)
+        code_len(ch) - 2
+    }
+    fn patch_jump(ch, at) {
+        let dist = code_len(ch) - (at + 2)
+        if dist > 65535 {
+            return perr("E2001", "", "jump too large", Sp(0, 0))
+        }
+        f_code[c_fn[ch]][at] = dist / 256
+        f_code[c_fn[ch]][at + 1] = dist % 256
+        Ok(true)
+    }
+    fn emit_loop(ch, to, sp) {
+        emit(ch, op_loop, sp)
+        let dist = code_len(ch) + 2 - to
+        if dist > 65535 {
+            return perr("E2002", "", "loop body too large", sp)
+        }
+        emit_u16(ch, dist, sp)
+        Ok(true)
+    }
+
+    // ---- scopes and locals ----
+    fn next_slot(ch) {
+        let n = n_locals(ch)
+        if n > 0 {
+            c_l_slot[ch][n - 1] + 1 + (c_temps[ch] - c_l_tempsbelow[ch][n - 1])
+        } else {
+            c_temps[ch]
+        }
+    }
+    // the value is already on the stack top; next_slot computes exactly the
+    // slot it landed on
+    fn declare_local(ch, name, is_mut, sp) {
+        let slot = next_slot(ch)
+        if slot > 65534 {
+            return perr("E2003", "", "too many locals", sp)
+        }
+        push_local(ch, name, c_scope_depth[ch], slot, is_mut, c_temps[ch])
+        Ok(true)
+    }
+    fn begin_scope(ch) {
+        c_scope_depth[ch] = c_scope_depth[ch] + 1
+    }
+    // endScope for statement contexts: emits pop/close for each local
+    fn end_scope(ch, sp) {
+        c_scope_depth[ch] = c_scope_depth[ch] - 1
+        while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
+            if c_l_captured[ch][n_locals(ch) - 1] {
+                emit(ch, op_close_upvalue, sp)
+            } else {
+                emit(ch, op_pop, sp)
+            }
+            pop_local(ch)
+        }
+    }
+    // endScopeExpr for expression blocks: result on top; OpEndBlock removes
+    // the scope's locals underneath it
+    fn end_scope_expr(ch, sp) {
+        c_scope_depth[ch] = c_scope_depth[ch] - 1
+        let mut n = 0
+        while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
+            n = n + 1
+            pop_local(ch)
+        }
+        if n > 0 {
+            if n > 255 {
+                return perr("E2003", "", "too many locals in block", sp)
+            }
+            emit(ch, op_end_block, sp)
+            emit(ch, n, sp)
+        }
+        Ok(true)
+    }
+    fn resolve_local(ch, name) {
+        let mut i = n_locals(ch) - 1
+        let mut hit = -1
+        while i >= 0 && hit < 0 {
+            if c_l_name[ch][i] == name {
+                hit = i
+            }
+            i = i - 1
+        }
+        hit
+    }
+    fn add_upvalue(ch, index, is_local, is_mut, sp) {
+        let mut i = 0
+        while i < len(c_u_index[ch]) {
+            if c_u_index[ch][i] == index && c_u_islocal[ch][i] == is_local {
+                return Ok(i)
+            }
+            i = i + 1
+        }
+        if len(c_u_index[ch]) >= 255 {
+            return perr("E2004", "", "too many captured variables", sp)
+        }
+        push(c_u_index[ch], index)
+        push(c_u_islocal[ch], is_local)
+        push(c_u_mut[ch], is_mut)
+        f_nupvals[c_fn[ch]] = len(c_u_index[ch])
+        Ok(len(c_u_index[ch]) - 1)
+    }
+    fn resolve_upvalue(ch, name, sp) {
+        if c_enclosing[ch] < 0 {
+            return Ok(-1)
+        }
+        let enc = c_enclosing[ch]
+        let li = resolve_local(enc, name)
+        if li >= 0 {
+            c_l_captured[enc][li] = true
+            return add_upvalue(ch, c_l_slot[enc][li], true, c_l_mut[enc][li], sp)
+        }
+        let ui = match resolve_upvalue(enc, name, sp) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); 0 },
+        }
+        if ui >= 0 {
+            return add_upvalue(ch, ui, false, c_u_mut[enc][ui], sp)
+        }
+        Ok(-1)
+    }
+
+    // ---- variants ----
+    // nullary variants become singleton instance constants; variants with
+    // fields become constructor constants
+    fn emit_variant(ch, eh, idx, sp) {
+        if en_varities[eh][idx] == 0 {
+            emit_const(ch, CSingleton(eh, idx), sp)
+        } else {
+            emit_const(ch, CCtor(eh, idx), sp)
+        }
+    }
+    fn emit_variant_of(ch, eh, variant, sp) {
+        let mut i = 0
+        while i < len(en_vnames[eh]) {
+            if en_vnames[eh][i] == variant {
+                emit_variant(ch, eh, i, sp)
+                return Ok(true)
+            }
+            i = i + 1
+        }
+        perr("E2016", "", "enum \"" + en_qual[eh] + "\" has no variant \"" + variant + "\"", sp)
+    }
+    fn emit_variant_test(ch, eh, idx, scrut_slot, sp) {
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, scrut_slot, sp)
+        emit_const(ch, CEnumType(eh), sp)
+        emit(ch, op_test_variant, sp)
+        emit(ch, idx, sp)
+        Ok(emit_jump(ch, op_jump_if_false_pop, sp))
+    }
+
+    fn define_global(ch, name, is_mut, sp) {
+        // scripts: qualify(name) == name
+        let exists = match get(global_mut, name) {
+            Some(_) => true,
+            None => false,
+        }
+        if exists {
+            let is_enum = match get(enum_by, name) {
+                Some(_) => true,
+                None => false,
+            }
+            if is_enum {
+                return perr("E2007", "", "cannot redeclare enum \"" + name + "\"", sp)
+            }
+        }
+        put(global_mut, name, is_mut)
+        let idx = add_const(ch, CStr(name))
+        emit(ch, op_def_global, sp)
+        emit_u16(ch, idx, sp)
+        Ok(true)
+    }
+
+    fn register_enum_decl(_ch, name, variants, sp) {
+        let exists = match get(enum_by, name) {
+            Some(_) => true,
+            None => false,
+        }
+        if exists {
+            return perr("E2007", "", "enum \"" + name + "\" is already declared", sp)
+        }
+        let mut seen = map()
+        let mut vnames = []
+        let mut varities = []
+        for vd in variants {
+            match vd {
+                EnumVariantDecl(vn, arity, _) => {
+                    let dup = match get(seen, vn) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if dup {
+                        return perr("E2009", "",
+                            "duplicate variant \"" + vn + "\" in enum \"" + name + "\"", sp)
+                    }
+                    put(seen, vn, true)
+                    push(vnames, vn)
+                    push(varities, arity)
+                },
+                _ => {},
+            }
+        }
+        Ok(declare_enum(name, vnames, varities))
+    }
+
+    // loop bookkeeping
+    fn push_loop(ch, base, cont_to) {
+        push(c_lp_base[ch], base)
+        push(c_lp_contto[ch], cont_to)
+        push(c_lp_breaks[ch], [])
+        push(c_lp_conts[ch], [])
+    }
+    fn pop_loop(ch) {
+        let _ = pop(c_lp_base[ch])
+        let _ = pop(c_lp_contto[ch])
+        let _ = pop(c_lp_breaks[ch])
+        let _ = pop(c_lp_conts[ch])
+    }
+    // emit pops for locals above the innermost loop's base without altering
+    // compiler bookkeeping; returns the loop index
+    fn unwind_to_loop(ch, sp) {
+        if len(c_lp_base[ch]) == 0 {
+            return perr("E2013", "", "break/continue outside of a loop", sp)
+        }
+        let li = len(c_lp_base[ch]) - 1
+        let base = c_lp_base[ch][li]
+        let mut i = n_locals(ch) - 1
+        while i >= 0 && c_l_slot[ch][i] >= base {
+            if c_l_captured[ch][i] {
+                emit(ch, op_close_upvalue, sp)
+            } else {
+                emit(ch, op_pop, sp)
+            }
+            i = i - 1
+        }
+        Ok(li)
+    }
+
+    // ---- the cp_expr <-> cp_stmt knot ----
+    let mut cp_expr_ref = fn(_c, _e) { Ok(true) }
+    let mut cp_stmt_ref = fn(_c, _s) { Ok(true) }
+
+    fn cp_ident(ch, name, sp) {
+        let li = resolve_local(ch, name)
+        if li >= 0 {
+            emit(ch, op_get_local, sp)
+            emit_u16(ch, c_l_slot[ch][li], sp)
+            return Ok(true)
+        }
+        let ui = match resolve_upvalue(ch, name, sp) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); 0 },
+        }
+        if ui >= 0 {
+            emit(ch, op_get_upval, sp)
+            emit_u16(ch, ui, sp)
+            return Ok(true)
+        }
+        let declared = match get(global_mut, name) {
+            Some(_) => true,
+            None => false,
+        }
+        if !declared {
+            // bare enum variant like Some / None / Ok / Err
+            let fv = find_variant(name)
+            if fv[0] == -2 {
+                return perr("E2014", "qualify it as Enum." + name,
+                    "variant \"" + name + "\" exists in several enums", sp)
+            }
+            if fv[1] >= 0 {
+                emit_variant(ch, fv[0], fv[1], sp)
+                return Ok(true)
+            }
+        }
+        // global (possibly defined later in the script)
+        let idx = add_const(ch, CStr(name))
+        emit(ch, op_get_global, sp)
+        emit_u16(ch, idx, sp)
+        Ok(true)
+    }
+
+    fn cp_assign(ch, target, val, sp) {
+        match target {
+            Ident(name, _) => {
+                match cp_expr_ref(ch, val) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                let li = resolve_local(ch, name)
+                if li >= 0 {
+                    if !c_l_mut[ch][li] {
+                        return perr("E2010", "declare it with `let mut`",
+                            "cannot assign to immutable variable \"" + name + "\"", sp)
+                    }
+                    emit(ch, op_set_local, sp)
+                    emit_u16(ch, c_l_slot[ch][li], sp)
+                } else {
+                    let ui = match resolve_upvalue(ch, name, sp) {
+                        Ok(v) => v,
+                        Err(d) => { return Err(d); 0 },
+                    }
+                    if ui >= 0 {
+                        if !c_u_mut[ch][ui] {
+                            return perr("E2010", "declare it with `let mut`",
+                                "cannot assign to immutable variable \"" + name + "\"", sp)
+                        }
+                        emit(ch, op_set_upval, sp)
+                        emit_u16(ch, ui, sp)
+                    } else {
+                        match get(global_mut, name) {
+                            Some(is_mut) => {
+                                if !is_mut {
+                                    return perr("E2010", "declare it with `let mut`",
+                                        "cannot assign to immutable variable \"" + name + "\"", sp)
+                                }
+                                let idx = add_const(ch, CStr(name))
+                                emit(ch, op_set_global, sp)
+                                emit_u16(ch, idx, sp)
+                            },
+                            None => {
+                                return perr("E2011", "",
+                                    "cannot assign to undeclared variable \"" + name + "\"", sp)
+                            },
+                        }
+                    }
+                }
+                emit(ch, op_pop, sp)
+                Ok(true)
+            },
+            Index(itarget, iidx, _) => {
+                match cp_expr_ref(ch, itarget) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] + 1
+                match cp_expr_ref(ch, iidx) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] + 1
+                match cp_expr_ref(ch, val) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] - 2
+                emit(ch, op_index_set, sp)
+                Ok(true)
+            },
+            _ => perr("E2012", "", "invalid assignment target", sp),
+        }
+    }
+
+    fn cp_block_stmts(ch, blk) {
+        begin_scope(ch)
+        match blk {
+            Block(ss, bsp) => {
+                for s in ss {
+                    match cp_stmt_ref(ch, s) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                }
+                end_scope(ch, bsp)
+            },
+            _ => {},
+        }
+        Ok(true)
+    }
+
+    // blockExpr compiles a block leaving its value on the stack
+    fn cp_block_expr(ch, blk) {
+        begin_scope(ch)
+        match blk {
+            Block(ss, bsp) => {
+                let n = len(ss)
+                let mut produced = false
+                let mut i = 0
+                while i < n {
+                    let s = ss[i]
+                    let last_expr = if i == n - 1 {
+                        match s {
+                            ExprStmt(_, _) => true,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                    if last_expr {
+                        match s {
+                            ExprStmt(e, _) => {
+                                match cp_expr_ref(ch, e) {
+                                    Ok(_) => {},
+                                    Err(d) => { return Err(d) },
+                                }
+                                produced = true
+                            },
+                            _ => {},
+                        }
+                    } else {
+                        match cp_stmt_ref(ch, s) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                    }
+                    i = i + 1
+                }
+                if !produced {
+                    emit(ch, op_unit, bsp)
+                }
+                end_scope_expr(ch, bsp)
+            },
+            _ => Ok(true),
+        }
+    }
+
+    fn cp_function(ch, lit) {
+        match lit {
+            FnLit(params, muts, _, body, name, lsp) => {
+                let fh = new_func(name, "", len(params))
+                let sub = new_compiler(ch, fh)
+                begin_scope(sub)
+                // recursion through slot 0 when the fn has a name
+                push_local(sub, name, c_scope_depth[sub], 0, false, 0)
+                if len(params) > 255 {
+                    return perr("E2019", "", "too many parameters", lsp)
+                }
+                let mut seen = map()
+                let mut i = 0
+                while i < len(params) {
+                    let dup = match get(seen, params[i]) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if dup {
+                        return perr("E2020", "", "duplicate parameter \"" + params[i] + "\"", lsp)
+                    }
+                    put(seen, params[i], true)
+                    push_local(sub, params[i], c_scope_depth[sub],
+                        c_l_slot[sub][n_locals(sub) - 1] + 1, muts[i], 0)
+                    i = i + 1
+                }
+                match cp_block_expr(sub, body) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                emit(sub, op_return, lsp)
+
+                let idx = add_const(ch, CFn(fh))
+                emit(ch, op_closure, lsp)
+                emit_u16(ch, idx, lsp)
+                let mut u = 0
+                while u < len(c_u_index[sub]) {
+                    if c_u_islocal[sub][u] {
+                        emit(ch, 1, lsp)
+                    } else {
+                        emit(ch, 0, lsp)
+                    }
+                    emit_u16(ch, c_u_index[sub][u], lsp)
+                    u = u + 1
+                }
+                Ok(true)
+            },
+            _ => Ok(true),
+        }
+    }
+
+    fn cp_if(ch, cond, then, els, sp) {
+        match cp_expr_ref(ch, cond) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let else_j = emit_jump(ch, op_jump_if_false_pop, sp)
+        match cp_block_expr(ch, then) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let end_j = emit_jump(ch, op_jump, sp)
+        match patch_jump(ch, else_j) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match els {
+            NoNode => emit(ch, op_unit, sp),
+            Block(_, _) => {
+                match cp_block_expr(ch, els) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+            },
+            IfExpr(c2, t2, e2, sp2) => {
+                match cp_if(ch, c2, t2, e2, sp2) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+            },
+            _ => { return perr("E2018", "", "invalid else branch", sp) },
+        }
+        patch_jump(ch, end_j)
+    }
+
+    fn cp_while(ch, cond, body, sp) {
+        let start = code_len(ch)
+        push_loop(ch, next_slot(ch), start)
+        match cp_expr_ref(ch, cond) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let exit_j = emit_jump(ch, op_jump_if_false_pop, sp)
+        match cp_block_stmts(ch, body) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match emit_loop(ch, start, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match patch_jump(ch, exit_j) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let li = len(c_lp_breaks[ch]) - 1
+        for j in c_lp_breaks[ch][li] {
+            match patch_jump(ch, j) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        pop_loop(ch)
+        Ok(true)
+    }
+
+    fn cp_for(ch, v, iter, body, sp) {
+        begin_scope(ch)
+        match cp_expr_ref(ch, iter) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match declare_local(ch, "(iter)", false, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let iter_slot = c_l_slot[ch][n_locals(ch) - 1]
+        emit_const(ch, CInt(0), sp)
+        match declare_local(ch, "(idx)", false, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let idx_slot = c_l_slot[ch][n_locals(ch) - 1]
+
+        push_loop(ch, next_slot(ch), -1)
+
+        let cond_start = code_len(ch)
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, idx_slot, sp)
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, iter_slot, sp)
+        emit(ch, op_len, sp)
+        emit(ch, op_lt, sp)
+        let exit_j = emit_jump(ch, op_jump_if_false_pop, sp)
+
+        begin_scope(ch)
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, iter_slot, sp)
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, idx_slot, sp)
+        emit(ch, op_index_get, sp)
+        match declare_local(ch, v, false, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match body {
+            Block(ss, _) => {
+                for s in ss {
+                    match cp_stmt_ref(ch, s) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                }
+            },
+            _ => {},
+        }
+        end_scope(ch, sp)
+
+        // continue lands here: increment
+        let li = len(c_lp_conts[ch]) - 1
+        for j in c_lp_conts[ch][li] {
+            match patch_jump(ch, j) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, idx_slot, sp)
+        emit_const(ch, CInt(1), sp)
+        emit(ch, op_add, sp)
+        emit(ch, op_set_local, sp)
+        emit_u16(ch, idx_slot, sp)
+        emit(ch, op_pop, sp)
+        match emit_loop(ch, cond_start, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+
+        match patch_jump(ch, exit_j) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        for j in c_lp_breaks[ch][li] {
+            match patch_jump(ch, j) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        pop_loop(ch)
+        end_scope(ch, sp) // pops idx, iter
+        Ok(true)
+    }
+
+    // for v in ch: receive until the channel is closed and drained
+    fn cp_for_chan(ch, v, iter, body, sp) {
+        begin_scope(ch)
+        match cp_expr_ref(ch, iter) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match declare_local(ch, "(chan)", false, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let chan_slot = c_l_slot[ch][n_locals(ch) - 1]
+
+        let cond_start = code_len(ch)
+        push_loop(ch, next_slot(ch), cond_start)
+
+        emit(ch, op_get_local, sp)
+        emit_u16(ch, chan_slot, sp)
+        let exit_j = emit_jump(ch, op_chan_next, sp)
+
+        begin_scope(ch)
+        match declare_local(ch, v, false, sp) { // received value already on the stack
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match body {
+            Block(ss, _) => {
+                for s in ss {
+                    match cp_stmt_ref(ch, s) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                }
+            },
+            _ => {},
+        }
+        end_scope(ch, sp)
+
+        match emit_loop(ch, cond_start, sp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+
+        match patch_jump(ch, exit_j) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let li = len(c_lp_breaks[ch]) - 1
+        for j in c_lp_breaks[ch][li] {
+            match patch_jump(ch, j) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        pop_loop(ch)
+        end_scope(ch, sp) // pops the channel local
+        Ok(true)
+    }
+
+    fn cp_select(ch, arms, has_default, dflt, dsp, sp) {
+        let base_temps = c_temps[ch]
+        for arm in arms {
+            match arm {
+                SelectArm(is_send, _, _, cch, val, _, _) => {
+                    match cp_expr_ref(ch, cch) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    c_temps[ch] = c_temps[ch] + 1
+                    if is_send {
+                        match cp_expr_ref(ch, val) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                        c_temps[ch] = c_temps[ch] + 1
+                    }
+                },
+                _ => {},
+            }
+        }
+        c_temps[ch] = base_temps // OpSelect consumes all the operands
+
+        if len(arms) > 255 {
+            return perr("E2021", "", "too many select arms", sp)
+        }
+        emit(ch, op_select, sp)
+        emit(ch, len(arms), sp)
+        emit(ch, if has_default { 1 } else { 0 }, sp)
+        let mut arm_slots = []
+        for arm in arms {
+            match arm {
+                SelectArm(is_send, _, _, _, _, _, _) => {
+                    emit(ch, if is_send { 1 } else { 0 }, sp)
+                    emit_u16(ch, 65535, sp)
+                    push(arm_slots, code_len(ch) - 2)
+                },
+                _ => {},
+            }
+        }
+        let mut def_slot = -1
+        if has_default {
+            emit_u16(ch, 65535, sp)
+            def_slot = code_len(ch) - 2
+        }
+
+        let mut end_jumps = []
+        let mut i = 0
+        for arm in arms {
+            match arm {
+                SelectArm(is_send, bind, _, _, _, body, asp) => {
+                    match patch_jump(ch, arm_slots[i]) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    begin_scope(ch)
+                    if is_send {
+                        match cp_expr_ref(ch, body) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                        emit(ch, op_pop, asp)
+                    } else if bind != "" && bind != "_" {
+                        match declare_local(ch, bind, false, asp) { // received value on the stack
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                        match cp_expr_ref(ch, body) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                        emit(ch, op_pop, asp)
+                    } else {
+                        emit(ch, op_pop, asp) // discard the received value
+                        match cp_expr_ref(ch, body) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                        emit(ch, op_pop, asp)
+                    }
+                    end_scope(ch, asp)
+                    push(end_jumps, emit_jump(ch, op_jump, asp))
+                },
+                _ => {},
+            }
+            i = i + 1
+        }
+        if has_default {
+            match patch_jump(ch, def_slot) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+            begin_scope(ch)
+            match cp_expr_ref(ch, dflt) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+            emit(ch, op_pop, dsp)
+            end_scope(ch, dsp)
+            push(end_jumps, emit_jump(ch, op_jump, dsp))
+        }
+        for j in end_jumps {
+            match patch_jump(ch, j) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        Ok(true)
+    }
+
+    fn cp_match(ch, scrut, arms, msp) {
+        begin_scope(ch)
+        match cp_expr_ref(ch, scrut) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match declare_local(ch, "(match)", false, msp) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let scrut_slot = c_l_slot[ch][n_locals(ch) - 1]
+
+        let mut end_jumps = []
+        for arm in arms {
+            match arm {
+                MatchArm(pat, body, asp) => {
+                    let mut fail_j = -1
+                    begin_scope(ch)
+                    let mut arm_locals = 0
+
+                    match pat {
+                        PatWildcard(_) => {}, // always matches
+                        PatLiteral(v, _) => {
+                            emit(ch, op_get_local, asp)
+                            emit_u16(ch, scrut_slot, asp)
+                            c_temps[ch] = c_temps[ch] + 1
+                            match cp_expr_ref(ch, v) {
+                                Ok(_) => {},
+                                Err(d) => { return Err(d) },
+                            }
+                            c_temps[ch] = c_temps[ch] - 1
+                            emit(ch, op_eq, asp)
+                            fail_j = emit_jump(ch, op_jump_if_false_pop, asp)
+                        },
+                        PatBinding(name, _) => {
+                            // a bare name is a nullary-variant test if such a
+                            // variant exists, otherwise a catch-all binding
+                            let fv = find_variant(name)
+                            if fv[0] == -2 {
+                                return perr("E2014", "qualify it as Enum." + name,
+                                    "variant \"" + name + "\" exists in several enums", asp)
+                            } else if fv[1] >= 0 && en_varities[fv[0]][fv[1]] == 0 {
+                                fail_j = match emit_variant_test(ch, fv[0], fv[1], scrut_slot, asp) {
+                                    Ok(v) => v,
+                                    Err(d) => { return Err(d); 0 },
+                                }
+                            } else if fv[1] >= 0 {
+                                return perr("E2017", "bind them: " + name + "(...)",
+                                    "variant \"" + name + "\" has " +
+                                    str(en_varities[fv[0]][fv[1]]) + " field(s)", asp)
+                            } else {
+                                emit(ch, op_get_local, asp)
+                                emit_u16(ch, scrut_slot, asp)
+                                match declare_local(ch, name, false, asp) {
+                                    Ok(_) => {},
+                                    Err(d) => { return Err(d) },
+                                }
+                                arm_locals = arm_locals + 1
+                            }
+                        },
+                        PatVariant(ppkg, penum, pvar, binds, _) => {
+                            let mut eh = -1
+                            let mut idx = -1
+                            if ppkg != "" {
+                                return perr("E2015", "",
+                                    "unknown enum \"" + ppkg + "." + penum + "\"", asp)
+                            } else if penum != "" {
+                                eh = local_enum(penum)
+                                if eh < 0 {
+                                    return perr("E2015", "", "unknown enum \"" + penum + "\"", asp)
+                                }
+                                let mut i = 0
+                                while i < len(en_vnames[eh]) {
+                                    if en_vnames[eh][i] == pvar {
+                                        idx = i
+                                    }
+                                    i = i + 1
+                                }
+                                if idx < 0 {
+                                    return perr("E2016", "",
+                                        "enum \"" + penum + "\" has no variant \"" + pvar + "\"", asp)
+                                }
+                            } else {
+                                let fv = find_variant(pvar)
+                                if fv[0] == -2 {
+                                    return perr("E2014", "qualify it as Enum." + pvar,
+                                        "variant \"" + pvar + "\" exists in several enums", asp)
+                                }
+                                if fv[1] < 0 {
+                                    return perr("E2016", "", "unknown variant \"" + pvar + "\"", asp)
+                                }
+                                eh = fv[0]
+                                idx = fv[1]
+                            }
+                            let arity = en_varities[eh][idx]
+                            if len(binds) != arity {
+                                return perr("E2017", "", "variant " + pvar + " has " +
+                                    str(arity) + " field(s), pattern binds " + str(len(binds)), asp)
+                            }
+                            fail_j = match emit_variant_test(ch, eh, idx, scrut_slot, asp) {
+                                Ok(v) => v,
+                                Err(d) => { return Err(d); 0 },
+                            }
+                            let mut i = 0
+                            while i < len(binds) {
+                                let bname = match binds[i] {
+                                    PatBinding(bn, _) => bn,
+                                    _ => "_",
+                                }
+                                if bname != "_" {
+                                    emit(ch, op_get_local, asp)
+                                    emit_u16(ch, scrut_slot, asp)
+                                    emit(ch, op_get_field, asp)
+                                    emit(ch, i, asp)
+                                    match declare_local(ch, bname, false, asp) {
+                                        Ok(_) => {},
+                                        Err(d) => { return Err(d) },
+                                    }
+                                    arm_locals = arm_locals + 1
+                                }
+                                i = i + 1
+                            }
+                        },
+                        _ => {},
+                    }
+
+                    match cp_expr_ref(ch, body) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    if arm_locals > 0 {
+                        emit(ch, op_end_block, asp)
+                        emit(ch, arm_locals, asp)
+                    }
+                    c_scope_depth[ch] = c_scope_depth[ch] - 1
+                    while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
+                        pop_local(ch)
+                    }
+                    push(end_jumps, emit_jump(ch, op_jump, asp))
+                    if fail_j >= 0 {
+                        match patch_jump(ch, fail_j) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+        emit(ch, op_no_match, msp)
+        for j in end_jumps {
+            match patch_jump(ch, j) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        // squash the scrutinee slot, leaving the arm value
+        c_scope_depth[ch] = c_scope_depth[ch] - 1
+        pop_local(ch)
+        emit(ch, op_end_block, msp)
+        emit(ch, 1, msp)
+        Ok(true)
+    }
+
+    fn cp_expr(ch, e) {
+        match e {
+            IntLit(v, sp) => {
+                emit_const(ch, CInt(v), sp)
+                Ok(true)
+            },
+            FloatLit(v, sp) => {
+                emit_const(ch, CFloat(v), sp)
+                Ok(true)
+            },
+            StrLit(v, sp) => {
+                emit_const(ch, CStr(v), sp)
+                Ok(true)
+            },
+            BoolLit(v, sp) => {
+                emit(ch, if v { op_true } else { op_false }, sp)
+                Ok(true)
+            },
+            Ident(name, sp) => cp_ident(ch, name, sp),
+            Unary(op, rhs, sp) => {
+                match cp_expr(ch, rhs) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                emit(ch, if op == t_minus { op_neg } else { op_not }, sp)
+                Ok(true)
+            },
+            Binary(op, lhs, rhs, sp) => {
+                match cp_expr(ch, lhs) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] + 1
+                match cp_expr(ch, rhs) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] - 1
+                let bop = if op == t_plus {
+                    op_add
+                } else if op == t_minus {
+                    op_sub
+                } else if op == t_star {
+                    op_mul
+                } else if op == t_slash {
+                    op_div
+                } else if op == t_percent {
+                    op_mod
+                } else if op == t_eq_eq {
+                    op_eq
+                } else if op == t_bang_eq {
+                    op_neq
+                } else if op == t_gt {
+                    op_gt
+                } else if op == t_gt_eq {
+                    op_gt_eq
+                } else if op == t_lt {
+                    op_lt
+                } else {
+                    op_lt_eq
+                }
+                emit(ch, bop, sp)
+                Ok(true)
+            },
+            Logical(op, lhs, rhs, sp) => {
+                match cp_expr(ch, lhs) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                let end = emit_jump(ch,
+                    if op == t_and_and { op_jump_if_false } else { op_jump_if_true }, sp)
+                emit(ch, op_pop, sp)
+                match cp_expr(ch, rhs) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                patch_jump(ch, end)
+            },
+            Call(callee, cargs, sp) => {
+                match cp_expr(ch, callee) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] + 1
+                for a in cargs {
+                    match cp_expr(ch, a) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    c_temps[ch] = c_temps[ch] + 1
+                }
+                c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
+                if len(cargs) > 255 {
+                    return perr("E2005", "", "too many arguments", sp)
+                }
+                emit(ch, op_call, sp)
+                emit(ch, len(cargs), sp)
+                Ok(true)
+            },
+            Index(target, idx, sp) => {
+                match cp_expr(ch, target) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] + 1
+                match cp_expr(ch, idx) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] - 1
+                emit(ch, op_index_get, sp)
+                Ok(true)
+            },
+            ListLit(elems, sp) => {
+                for el in elems {
+                    match cp_expr(ch, el) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    c_temps[ch] = c_temps[ch] + 1
+                }
+                c_temps[ch] = c_temps[ch] - len(elems)
+                if len(elems) > 65535 {
+                    return perr("E2006", "", "list literal too large", sp)
+                }
+                emit(ch, op_list, sp)
+                emit_u16(ch, len(elems), sp)
+                Ok(true)
+            },
+            FnLit(_, _, _, _, _, _) => cp_function(ch, e),
+            Block(_, _) => cp_block_expr(ch, e),
+            IfExpr(cond, then, els, sp) => cp_if(ch, cond, then, els, sp),
+            MatchExpr(scrut, arms, sp) => cp_match(ch, scrut, arms, sp),
+            VariantAccess(en, vr, sp) => {
+                let eh = local_enum(en)
+                if eh < 0 {
+                    return perr("E2015", "", "unknown enum \"" + en + "\"", sp)
+                }
+                emit_variant_of(ch, eh, vr, sp)
+            },
+            PkgAccess(pkg, name, sp) => {
+                let idx = add_const(ch, CStr(pkg + "." + name))
+                emit(ch, op_get_global, sp)
+                emit_u16(ch, idx, sp)
+                Ok(true)
+            },
+            QualVariantAccess(pkg, en, vr, sp) => {
+                let eh = local_enum(pkg + "." + en)
+                if eh < 0 {
+                    return perr("E2015", "", "unknown enum \"" + pkg + "." + en + "\"", sp)
+                }
+                emit_variant_of(ch, eh, vr, sp)
+            },
+            TryExpr(inner, sp) => {
+                match cp_expr(ch, inner) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                emit(ch, op_try, sp)
+                Ok(true)
+            },
+            RecvExpr(cch, sp) => {
+                match cp_expr(ch, cch) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                emit(ch, op_recv, sp)
+                Ok(true)
+            },
+            _ => Ok(true),
+        }
+    }
+    cp_expr_ref = cp_expr
+
+    fn cp_stmt(ch, s) {
+        match s {
+            LetStmt(name, _, is_mut, _, init, sp) => {
+                match cp_expr(ch, init) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                if c_scope_depth[ch] == 0 {
+                    define_global(ch, name, is_mut, sp)
+                } else {
+                    declare_local(ch, name, is_mut, sp)
+                }
+            },
+            FnDecl(name, _, _, lit, sp) => {
+                if c_scope_depth[ch] == 0 {
+                    match cp_function(ch, lit) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    define_global(ch, name, false, sp)
+                } else {
+                    // declare first so the body can refer to itself
+                    emit(ch, op_unit, sp)
+                    match declare_local(ch, name, true, sp) { // internally mutable for the fixup below
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    match cp_function(ch, lit) {
+                        Ok(_) => {},
+                        Err(d) => { return Err(d) },
+                    }
+                    let slot = c_l_slot[ch][resolve_local(ch, name)]
+                    emit(ch, op_set_local, sp)
+                    emit_u16(ch, slot, sp)
+                    emit(ch, op_pop, sp)
+                    c_l_mut[ch][resolve_local(ch, name)] = false
+                    Ok(true)
+                }
+            },
+            EnumDecl(name, _, variants, _, sp) => {
+                if c_scope_depth[ch] > 0 {
+                    return perr("E2008", "", "enum declarations are only allowed at top level", sp)
+                }
+                // scripts: an existing entry is a redeclaration, reported by
+                // register_enum_decl (module builds pre-register instead)
+                let eh = match register_enum_decl(ch, name, variants, sp) {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); 0 },
+                }
+                emit_const(ch, CEnumType(eh), sp)
+                let idx = add_const(ch, CStr(name))
+                emit(ch, op_def_global, sp)
+                emit_u16(ch, idx, sp)
+                Ok(true)
+            },
+            ExprStmt(e, sp) => {
+                match cp_expr(ch, e) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                emit(ch, op_pop, sp)
+                Ok(true)
+            },
+            AssignStmt(target, val, sp) => cp_assign(ch, target, val, sp),
+            ReturnStmt(val, sp) => {
+                match val {
+                    NoNode => emit(ch, op_unit, sp),
+                    _ => {
+                        match cp_expr(ch, val) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                    },
+                }
+                emit(ch, op_return, sp)
+                Ok(true)
+            },
+            WhileStmt(cond, body, sp) => cp_while(ch, cond, body, sp),
+            ForStmt(v, _, iter, _, body, sp) => {
+                let fstart = match sp {
+                    Sp(fs, _) => fs,
+                }
+                if contains(chan_fors, fstart) {
+                    cp_for_chan(ch, v, iter, body, sp)
+                } else {
+                    cp_for(ch, v, iter, body, sp)
+                }
+            },
+            BreakStmt(sp) => {
+                let li = match unwind_to_loop(ch, sp) {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); 0 },
+                }
+                push(c_lp_breaks[ch][li], emit_jump(ch, op_jump, sp))
+                Ok(true)
+            },
+            ContinueStmt(sp) => {
+                let li = match unwind_to_loop(ch, sp) {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); 0 },
+                }
+                if c_lp_contto[ch][li] >= 0 {
+                    emit_loop(ch, c_lp_contto[ch][li], sp)
+                } else {
+                    push(c_lp_conts[ch][li], emit_jump(ch, op_jump, sp))
+                    Ok(true)
+                }
+            },
+            SpawnStmt(call, sp) => {
+                match call {
+                    Call(callee, cargs, _) => {
+                        match cp_expr(ch, callee) {
+                            Ok(_) => {},
+                            Err(d) => { return Err(d) },
+                        }
+                        c_temps[ch] = c_temps[ch] + 1
+                        for a in cargs {
+                            match cp_expr(ch, a) {
+                                Ok(_) => {},
+                                Err(d) => { return Err(d) },
+                            }
+                            c_temps[ch] = c_temps[ch] + 1
+                        }
+                        c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
+                        if len(cargs) > 255 {
+                            return perr("E2005", "", "too many arguments", sp)
+                        }
+                        emit(ch, op_spawn, sp)
+                        emit(ch, len(cargs), sp)
+                        Ok(true)
+                    },
+                    _ => Ok(true),
+                }
+            },
+            SendStmt(cch, val, sp) => {
+                match cp_expr(ch, cch) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] + 1
+                match cp_expr(ch, val) {
+                    Ok(_) => {},
+                    Err(d) => { return Err(d) },
+                }
+                c_temps[ch] = c_temps[ch] - 1
+                emit(ch, op_send, sp)
+                Ok(true)
+            },
+            SelectStmt(arms, has_default, dflt, dsp, sp) =>
+                cp_select(ch, arms, has_default, dflt, dsp, sp),
+            _ => Ok(true),
+        }
+    }
+    cp_stmt_ref = cp_stmt
+
+    // ---- driver (mirrors compileProgram) ----
+    declare_enum("Option", ["Some", "None"], [1, 0])
+    declare_enum("Result", ["Ok", "Err"], [1, 1])
+    declare_enum("Output", ["Output"], [3])
+    for n in native_names {
+        put(global_mut, n, false)
+    }
+
+    let script_fn = new_func("<script>", "", 0) // handle 0
+    let c0 = new_compiler(-1, script_fn)
+    push_local(c0, "", 0, 0, false, 0) // slot 0: the script itself
+    for s in stmts {
+        match cp_stmt(c0, s) {
+            Ok(_) => {},
+            Err(d) => {
+                return CompileFailed(d)
+            },
+        }
+    }
+    emit(c0, op_unit, Sp(0, 0))
+    emit(c0, op_return, Sp(0, 0))
+
+    Compiled(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts,
+        en_qual, en_vnames, en_varities)
+}
