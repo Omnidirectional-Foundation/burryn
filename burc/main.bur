@@ -4,7 +4,7 @@
 fn main() {
     let a = args()
     if len(a) < 2 {
-        println("usage: burc <lex|parse|check|dis> <file.bur>")
+        println("usage: burc <lex|parse|check|dis|emit-c> <file.bur>")
         exit(2)
     }
     let cmd = a[0]
@@ -23,6 +23,8 @@ fn main() {
         cmd_check(src)
     } else if cmd == "dis" {
         cmd_dis(src)
+    } else if cmd == "emit-c" {
+        cmd_emit_c(src)
     } else {
         println("unknown command:", cmd)
         exit(2)
@@ -100,6 +102,53 @@ fn cmd_dis(src) {
                                             Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) =>
                                                 dump_disasm(0, fnames, fa, fu, fc, fs, fk,
                                                     eq, ev, ea, line_starts(src)),
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// cmd_emit_c dumps every diagnostic, then (when error-free) the generated C
+// translation unit, mirroring `bur build --emit c`.
+fn cmd_emit_c(src) {
+    match lex(src) {
+        Lexed(toks, ldiags) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(dump_diag(d))
+                }
+            } else {
+                match parse(toks) {
+                    Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(dump_diag(d))
+                            }
+                        } else {
+                            match typecheck_script(stmts) {
+                                Checked(cdiags, _, chan_fors) => {
+                                    let mut errs = false
+                                    for d in cdiags {
+                                        println(dump_diag(d))
+                                        match d {
+                                            Diag(ie, _, _, _, _, _) => {
+                                                if ie {
+                                                    errs = true
+                                                }
+                                            },
+                                        }
+                                    }
+                                    if !errs {
+                                        match compile_script(stmts, chan_fors) {
+                                            CompileFailed(d) => println(dump_diag(d)),
+                                            Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
+                                                cgen_program(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
                                         }
                                     }
                                 },

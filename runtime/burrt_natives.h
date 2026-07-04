@@ -154,6 +154,13 @@ static Value nat_to_float(Value *args, int argc) {
     if (args[0].t != VINT) bur_trap("to_float() needs an int, got %s", bur_typename(args[0]));
     return bur_float((double)args[0].u.i);
 }
+static Value nat_float_bits(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VFLOAT) bur_trap("float_bits() needs a float, got %s", bur_typename(args[0]));
+    uint64_t bits;
+    memcpy(&bits, &args[0].u.f, sizeof(bits));
+    return bur_int((int64_t)bits);
+}
 static Value nat_parse_int(Value *args, int argc) {
     (void)argc;
     const char *s; int64_t n;
@@ -547,6 +554,7 @@ static void bur_register_natives(void) {
     bur_register_native("str", 1, nat_str);
     bur_register_native("trunc", 1, nat_trunc);
     bur_register_native("to_float", 1, nat_to_float);
+    bur_register_native("float_bits", 1, nat_float_bits);
     bur_register_native("parse_int", 1, nat_parse_int);
     bur_register_native("parse_float", 1, nat_parse_float);
     bur_register_native("str_len", 1, nat_str_len);
