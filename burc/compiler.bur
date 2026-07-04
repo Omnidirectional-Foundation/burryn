@@ -68,6 +68,13 @@ let native_names = ["print", "println", "len", "map", "get", "put", "delete",
 // chan_fors carries the checker's channel-for span starts (Go sets
 // ForStmt.IterIsChan on the AST instead).
 fn compile_script(stmts, chan_fors) {
+    compile_program([stmts], [""], false, "", chan_fors)
+}
+
+// compile_program compiles a script (is_pkg false) or a single package
+// (mirrors compileModule for the no-import subset): per-file init functions
+// define the package's globals, then the entry package's main runs.
+fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
     // ---- function arena ----
     let mut f_name = []
     let mut f_file = []
@@ -80,8 +87,10 @@ fn compile_script(stmts, chan_fors) {
     let mut en_qual = []
     let mut en_vnames = []
     let mut en_varities = []
+    let mut en_prefix = []
     let mut enum_by = map()
     let mut global_mut = map()
+    let mut pkg_decls = map()
     // ---- compiler arena ----
     let mut c_enclosing = []
     let mut c_fn = []
@@ -100,6 +109,7 @@ fn compile_script(stmts, chan_fors) {
     let mut c_lp_contto = []
     let mut c_lp_breaks = []
     let mut c_lp_conts = []
+    let mut cur_file = ""
 
     fn new_func(name, file, arity) {
         push(f_name, name)
@@ -151,10 +161,32 @@ fn compile_script(stmts, chan_fors) {
         len(c_l_name[ch])
     }
 
-    fn declare_enum(qual, vnames, varities) {
+    // qualify maps a top-level name of the current package to its globally
+    // unique global-table name; mangle_if_decl qualifies only declared names
+    fn qualify(name) {
+        if pkg_path == "" {
+            name
+        } else {
+            pkg_path + "." + name
+        }
+    }
+    fn mangle_if_decl(name) {
+        let hit = match get(pkg_decls, name) {
+            Some(_) => true,
+            None => false,
+        }
+        if hit {
+            qualify(name)
+        } else {
+            name
+        }
+    }
+
+    fn declare_enum(qual, prefix, vnames, varities) {
         push(en_qual, qual)
         push(en_vnames, vnames)
         push(en_varities, varities)
+        push(en_prefix, prefix)
         put(enum_by, qual, len(en_qual) - 1)
         put(global_mut, qual, false)
         len(en_qual) - 1
@@ -167,16 +199,18 @@ fn compile_script(stmts, chan_fors) {
         for q in keys(enum_by) {
             match get(enum_by, q) {
                 Some(eh) => {
-                    let mut i = 0
-                    while i < len(en_vnames[eh]) {
-                        if en_vnames[eh][i] == name {
-                            if found >= 0 {
-                                amb = true
+                    if en_prefix[eh] == pkg_path || en_prefix[eh] == "" {
+                        let mut i = 0
+                        while i < len(en_vnames[eh]) {
+                            if en_vnames[eh][i] == name {
+                                if found >= 0 {
+                                    amb = true
+                                }
+                                found = eh
+                                idx = i
                             }
-                            found = eh
-                            idx = i
+                            i = i + 1
                         }
-                        i = i + 1
                     }
                 },
                 None => {},
@@ -188,10 +222,17 @@ fn compile_script(stmts, chan_fors) {
             [found, idx]
         }
     }
+    // local_enum resolves a bare enum name: the current package's enums
+    // shadow the builtins (mirrors Shared.localEnum)
     fn local_enum(name) {
-        match get(enum_by, name) {
+        match get(enum_by, qualify(name)) {
             Some(eh) => eh,
-            None => -1,
+            None => {
+                match get(enum_by, name) {
+                    Some(eh) => if en_prefix[eh] == "" { eh } else { -1 },
+                    None => -1,
+                }
+            },
         }
     }
 
@@ -371,13 +412,13 @@ fn compile_script(stmts, chan_fors) {
     }
 
     fn define_global(ch, name, is_mut, sp) {
-        // scripts: qualify(name) == name
-        let exists = match get(global_mut, name) {
+        let qual = qualify(name)
+        let exists = match get(global_mut, qual) {
             Some(_) => true,
             None => false,
         }
         if exists {
-            let is_enum = match get(enum_by, name) {
+            let is_enum = match get(enum_by, qual) {
                 Some(_) => true,
                 None => false,
             }
@@ -385,15 +426,16 @@ fn compile_script(stmts, chan_fors) {
                 return perr("E2007", "", "cannot redeclare enum \"" + name + "\"", sp)
             }
         }
-        put(global_mut, name, is_mut)
-        let idx = add_const(ch, CStr(name))
+        put(global_mut, qual, is_mut)
+        let idx = add_const(ch, CStr(qual))
         emit(ch, op_def_global, sp)
         emit_u16(ch, idx, sp)
         Ok(true)
     }
 
     fn register_enum_decl(_ch, name, variants, sp) {
-        let exists = match get(enum_by, name) {
+        let qual = qualify(name)
+        let exists = match get(enum_by, qual) {
             Some(_) => true,
             None => false,
         }
@@ -421,7 +463,7 @@ fn compile_script(stmts, chan_fors) {
                 _ => {},
             }
         }
-        Ok(declare_enum(name, vnames, varities))
+        Ok(declare_enum(qual, pkg_path, vnames, varities))
     }
 
     // loop bookkeeping
@@ -477,7 +519,8 @@ fn compile_script(stmts, chan_fors) {
             emit_u16(ch, ui, sp)
             return Ok(true)
         }
-        let declared = match get(global_mut, name) {
+        let gname = mangle_if_decl(name)
+        let declared = match get(global_mut, gname) {
             Some(_) => true,
             None => false,
         }
@@ -494,7 +537,7 @@ fn compile_script(stmts, chan_fors) {
             }
         }
         // global (possibly defined later in the script)
-        let idx = add_const(ch, CStr(name))
+        let idx = add_const(ch, CStr(gname))
         emit(ch, op_get_global, sp)
         emit_u16(ch, idx, sp)
         Ok(true)
@@ -528,13 +571,13 @@ fn compile_script(stmts, chan_fors) {
                         emit(ch, op_set_upval, sp)
                         emit_u16(ch, ui, sp)
                     } else {
-                        match get(global_mut, name) {
+                        match get(global_mut, mangle_if_decl(name)) {
                             Some(is_mut) => {
                                 if !is_mut {
                                     return perr("E2010", "declare it with `let mut`",
                                         "cannot assign to immutable variable \"" + name + "\"", sp)
                                 }
-                                let idx = add_const(ch, CStr(name))
+                                let idx = add_const(ch, CStr(mangle_if_decl(name)))
                                 emit(ch, op_set_global, sp)
                                 emit_u16(ch, idx, sp)
                             },
@@ -637,7 +680,7 @@ fn compile_script(stmts, chan_fors) {
     fn cp_function(ch, lit) {
         match lit {
             FnLit(params, muts, _, body, name, lsp) => {
-                let fh = new_func(name, "", len(params))
+                let fh = new_func(name, cur_file, len(params))
                 let sub = new_compiler(ch, fh)
                 begin_scope(sub)
                 // recursion through slot 0 when the fn has a name
@@ -1387,14 +1430,23 @@ fn compile_script(stmts, chan_fors) {
                 if c_scope_depth[ch] > 0 {
                     return perr("E2008", "", "enum declarations are only allowed at top level", sp)
                 }
-                // scripts: an existing entry is a redeclaration, reported by
-                // register_enum_decl (module builds pre-register instead)
-                let eh = match register_enum_decl(ch, name, variants, sp) {
-                    Ok(v) => v,
-                    Err(d) => { return Err(d); 0 },
+                let qual = qualify(name)
+                // module builds pre-register every enum; in a script an
+                // existing entry is a redeclaration
+                let pre = match get(enum_by, qual) {
+                    Some(h) => h,
+                    None => -1,
+                }
+                let eh = if pre >= 0 && pkg_path != "" {
+                    pre
+                } else {
+                    match register_enum_decl(ch, name, variants, sp) {
+                        Ok(v) => v,
+                        Err(d) => { return Err(d); 0 },
+                    }
                 }
                 emit_const(ch, CEnumType(eh), sp)
-                let idx = add_const(ch, CStr(name))
+                let idx = add_const(ch, CStr(qual))
                 emit(ch, op_def_global, sp)
                 emit_u16(ch, idx, sp)
                 Ok(true)
@@ -1426,7 +1478,7 @@ fn compile_script(stmts, chan_fors) {
                 let fstart = match sp {
                     Sp(fs, _) => fs,
                 }
-                if contains(chan_fors, fstart) {
+                if contains(chan_fors, cur_file + ":" + str(fstart)) {
                     cp_for_chan(ch, v, iter, body, sp)
                 } else {
                     cp_for(ch, v, iter, body, sp)
@@ -1500,26 +1552,101 @@ fn compile_script(stmts, chan_fors) {
     cp_stmt_ref = cp_stmt
 
     // ---- driver (mirrors compileProgram) ----
-    declare_enum("Option", ["Some", "None"], [1, 0])
-    declare_enum("Result", ["Ok", "Err"], [1, 1])
-    declare_enum("Output", ["Output"], [3])
+    declare_enum("Option", "", ["Some", "None"], [1, 0])
+    declare_enum("Result", "", ["Ok", "Err"], [1, 1])
+    declare_enum("Output", "", ["Output"], [3])
     for n in native_names {
         put(global_mut, n, false)
     }
 
-    let script_fn = new_func("<script>", "", 0) // handle 0
-    let c0 = new_compiler(-1, script_fn)
-    push_local(c0, "", 0, 0, false, 0) // slot 0: the script itself
-    for s in stmts {
-        match cp_stmt(c0, s) {
-            Ok(_) => {},
-            Err(d) => {
-                return CompileFailed(d)
-            },
+    if is_pkg {
+        // ---- module driver (mirrors compileModule, one package, no imports)
+        let module_fn = new_func("<module>", "", 0) // handle 0
+        let c0 = new_compiler(-1, module_fn)
+        push_local(c0, "", 0, 0, false, 0) // slot 0: the program itself
+        let n_files = len(files_stmts)
+        let mut fi = 0
+        while fi < n_files {
+            for s in files_stmts[fi] {
+                match s {
+                    FnDecl(name, _, _, _, _) => put(pkg_decls, name, true),
+                    EnumDecl(name, _, _, _, _) => put(pkg_decls, name, true),
+                    LetStmt(name, _, _, _, _, _) => put(pkg_decls, name, true),
+                    _ => {},
+                }
+            }
+            fi = fi + 1
         }
+        // register every enum of the package before compiling any body, so
+        // variant references resolve across files regardless of order
+        fi = 0
+        while fi < n_files {
+            cur_file = file_paths[fi]
+            for s in files_stmts[fi] {
+                match s {
+                    EnumDecl(name, _, variants, _, sp) => {
+                        match register_enum_decl(c0, name, variants, sp) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return CompileFailed(d, cur_file)
+                            },
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+        // per-file init functions, called in order
+        fi = 0
+        while fi < n_files {
+            cur_file = file_paths[fi]
+            let sub_fn = new_func("<init>", cur_file, 0)
+            let sub = new_compiler(-1, sub_fn)
+            push_local(sub, "", 0, 0, false, 0)
+            for s in files_stmts[fi] {
+                match cp_stmt(sub, s) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return CompileFailed(d, cur_file)
+                    },
+                }
+            }
+            emit(sub, op_unit, Sp(0, 0))
+            emit(sub, op_return, Sp(0, 0))
+            let idx = add_const(c0, CFn(sub_fn))
+            emit(c0, op_closure, Sp(0, 0))
+            emit_u16(c0, idx, Sp(0, 0))
+            emit(c0, op_call, Sp(0, 0))
+            emit(c0, 0, Sp(0, 0))
+            emit(c0, op_pop, Sp(0, 0))
+            fi = fi + 1
+        }
+        cur_file = ""
+        let idx = add_const(c0, CStr(pkg_path + ".main"))
+        emit(c0, op_get_global, Sp(0, 0))
+        emit_u16(c0, idx, Sp(0, 0))
+        emit(c0, op_call, Sp(0, 0))
+        emit(c0, 0, Sp(0, 0))
+        emit(c0, op_pop, Sp(0, 0))
+        emit(c0, op_unit, Sp(0, 0))
+        emit(c0, op_return, Sp(0, 0))
+    } else {
+        // ---- script driver (mirrors compileProgram) ----
+        let script_fn = new_func("<script>", "", 0) // handle 0
+        let c0 = new_compiler(-1, script_fn)
+        push_local(c0, "", 0, 0, false, 0) // slot 0: the script itself
+        for s in files_stmts[0] {
+            match cp_stmt(c0, s) {
+                Ok(_) => {},
+                Err(d) => {
+                    return CompileFailed(d, "")
+                },
+            }
+        }
+        emit(c0, op_unit, Sp(0, 0))
+        emit(c0, op_return, Sp(0, 0))
     }
-    emit(c0, op_unit, Sp(0, 0))
-    emit(c0, op_return, Sp(0, 0))
 
     Compiled(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts,
         en_qual, en_vnames, en_varities)

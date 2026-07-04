@@ -4,10 +4,14 @@
 fn main() {
     let a = args()
     if len(a) < 2 {
-        println("usage: burc <lex|parse|check|dis|emit-c> <file.bur>")
+        println("usage: burc <lex|parse|check|dis|emit-c> <file.bur> | burc build-dir <dir>")
         exit(2)
     }
     let cmd = a[0]
+    if cmd == "build-dir" {
+        cmd_build_dir(a[1])
+        return
+    }
     let src = match read_file(a[1]) {
         Ok(s) => s,
         Err(msg) => {
@@ -31,6 +35,46 @@ fn main() {
     }
 }
 
+// cmd_build_dir compiles a package directory and prints its C translation
+// unit, mirroring `bur build <dir> --emit c` (no-import subset).
+fn cmd_build_dir(dir) {
+    match load_dir(dir) {
+        LoadFailed(diags, dfiles) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(dump_diag_f(diags[i], dfiles[i]))
+                i = i + 1
+            }
+        },
+        Loaded(pkg_path, files_stmts, file_paths) => {
+            match typecheck_program(files_stmts, file_paths, true, pkg_path) {
+                Checked(cdiags, cfiles, _, chan_fors) => {
+                    let mut errs = false
+                    let mut i = 0
+                    while i < len(cdiags) {
+                        println(dump_diag_f(cdiags[i], cfiles[i]))
+                        match cdiags[i] {
+                            Diag(ie, _, _, _, _, _) => {
+                                if ie {
+                                    errs = true
+                                }
+                            },
+                        }
+                        i = i + 1
+                    }
+                    if !errs {
+                        match compile_program(files_stmts, file_paths, true, pkg_path, chan_fors) {
+                            CompileFailed(d, f) => println(dump_diag_f(d, f)),
+                            Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
+                                cgen_program(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                        }
+                    }
+                },
+            }
+        },
+    }
+}
+
 // cmd_check dumps top-level binding types and checker diagnostics; each
 // stage's errors stop the pipeline, mirroring the Go CLI.
 fn cmd_check(src) {
@@ -49,7 +93,7 @@ fn cmd_check(src) {
                             }
                         } else {
                             match typecheck_script(stmts) {
-                                Checked(cdiags, binds, _) => {
+                                Checked(cdiags, _, binds, _) => {
                                     for line in binds {
                                         println(line)
                                     }
@@ -84,7 +128,7 @@ fn cmd_dis(src) {
                             }
                         } else {
                             match typecheck_script(stmts) {
-                                Checked(cdiags, _, chan_fors) => {
+                                Checked(cdiags, _, _, chan_fors) => {
                                     let mut errs = false
                                     for d in cdiags {
                                         println(dump_diag(d))
@@ -98,7 +142,7 @@ fn cmd_dis(src) {
                                     }
                                     if !errs {
                                         match compile_script(stmts, chan_fors) {
-                                            CompileFailed(d) => println(dump_diag(d)),
+                                            CompileFailed(d, _) => println(dump_diag(d)),
                                             Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) =>
                                                 dump_disasm(0, fnames, fa, fu, fc, fs, fk,
                                                     eq, ev, ea, line_starts(src)),
@@ -132,7 +176,7 @@ fn cmd_emit_c(src) {
                             }
                         } else {
                             match typecheck_script(stmts) {
-                                Checked(cdiags, _, chan_fors) => {
+                                Checked(cdiags, _, _, chan_fors) => {
                                     let mut errs = false
                                     for d in cdiags {
                                         println(dump_diag(d))
@@ -146,7 +190,7 @@ fn cmd_emit_c(src) {
                                     }
                                     if !errs {
                                         match compile_script(stmts, chan_fors) {
-                                            CompileFailed(d) => println(dump_diag(d)),
+                                            CompileFailed(d, _) => println(dump_diag(d)),
                                             Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
                                                 cgen_program(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
                                         }

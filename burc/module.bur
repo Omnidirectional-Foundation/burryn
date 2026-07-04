@@ -1,0 +1,310 @@
+// Package-directory loader: the no-import single-package subset of
+// module.go that burc needs to compile itself. bur.mod must sit in the
+// directory itself (Go also walks upward; burc does not need that).
+
+fn str_ends_with(s, suffix) {
+    let n = str_len(s)
+    let m = str_len(suffix)
+    n >= m && substr(s, n - m, m) == suffix
+}
+
+fn str_has_prefix(s, prefix) {
+    let n = str_len(s)
+    let m = str_len(prefix)
+    n >= m && substr(s, 0, m) == prefix
+}
+
+// str_fields splits on runs of spaces and tabs (strings.Fields subset)
+fn str_fields(s) {
+    let mut out = []
+    let mut start = -1
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        if c == " " || c == "\t" {
+            if start >= 0 {
+                push(out, substr(s, start, i - start))
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+        i = i + 1
+    }
+    if start >= 0 {
+        push(out, substr(s, start, str_len(s) - start))
+    }
+    out
+}
+
+fn valid_import_path(p) {
+    if p == "" || str_has_prefix(p, "/") || str_ends_with(p, "/") {
+        false
+    } else {
+        let mut ok = true
+        for el in split(p, "/") {
+            if el == "" || el == "." || el == ".." {
+                ok = false
+            }
+        }
+        if str_contains(p, "\\") || str_contains(p, " ") || str_contains(p, "\t") ||
+            str_contains(p, "\"") || str_contains(p, "'") || str_contains(p, "`") {
+            ok = false
+        }
+        ok
+    }
+}
+
+// is_const_expr: what may initialize a package-level let (mirrors module.go)
+fn is_const_expr(e) {
+    match e {
+        IntLit(_, _) => true,
+        FloatLit(_, _) => true,
+        StrLit(_, _) => true,
+        BoolLit(_, _) => true,
+        FnLit(_, _, _, _, _, _) => true,
+        Unary(_, rhs, _) => is_const_expr(rhs),
+        Binary(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
+        Logical(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
+        ListLit(elems, _) => {
+            let mut ok = true
+            for el in elems {
+                if !is_const_expr(el) {
+                    ok = false
+                }
+            }
+            ok
+        },
+        _ => false,
+    }
+}
+
+// parse_bur_mod extracts the module path; "" plus diags on failure
+fn parse_bur_mod(file, src, mut diags, mut dfiles) {
+    let mut path = ""
+    let mut off = 0
+    for line0 in split(src, "\n") {
+        let line_off = off
+        off = off + str_len(line0) + 1
+        let text = match str_index_of(line0, "//") {
+            Some(i) => substr(line0, 0, i),
+            None => line0,
+        }
+        let fields = str_fields(text)
+        if len(fields) > 0 {
+            let sp_start = line_off
+            let sp_end = line_off + str_len(text)
+            if fields[0] == "module" {
+                if len(fields) != 2 {
+                    push(diags, Diag(true, "E0432",
+                        "malformed module directive",
+                        "write `module <path>`, e.g. `module example.com/you/hello`",
+                        sp_start, sp_end))
+                    push(dfiles, file)
+                } else if path != "" {
+                    push(diags, Diag(true, "E0432", "duplicate module directive", "", sp_start, sp_end))
+                    push(dfiles, file)
+                } else if !valid_import_path(fields[1]) {
+                    push(diags, Diag(true, "E0432",
+                        "invalid module path \"" + fields[1] + "\"", "", sp_start, sp_end))
+                    push(dfiles, file)
+                } else {
+                    path = fields[1]
+                }
+            } else if fields[0] == "require" {
+                // parsed and tolerated; resolution is a later milestone
+                if len(fields) != 3 || !valid_import_path(fields[1]) || !str_has_prefix(fields[2], "v") {
+                    push(diags, Diag(true, "E0432", "malformed require directive",
+                        "write `require <path> <version>`", sp_start, sp_end))
+                    push(dfiles, file)
+                }
+            } else {
+                push(diags, Diag(true, "E0432", "unknown directive \"" + fields[0] + "\"",
+                    "bur.mod knows the directives `module` and `require`", sp_start, sp_end))
+                push(dfiles, file)
+            }
+        }
+    }
+    if path == "" && len(diags) == 0 {
+        push(diags, Diag(true, "E0432", "missing module directive in " + file,
+            "add a module directive, e.g. `module example.com/you/hello`", 0, 0))
+        push(dfiles, file)
+    }
+    path
+}
+
+// load_dir loads one package directory: bur.mod plus every .bur file, with
+// the package-file shape checks (only declarations, const lets, no dups).
+// Imports are not supported by this bootstrap loader.
+fn load_dir(dir0) {
+    let dir = if str_ends_with(dir0, "/") {
+        substr(dir0, 0, str_len(dir0) - 1)
+    } else {
+        dir0
+    }
+    let mut diags = []
+    let mut dfiles = []
+    let mod_file = dir + "/bur.mod"
+    let mod_src = match read_file(mod_file) {
+        Ok(s) => s,
+        Err(msg) => {
+            push(diags, Diag(true, "E0432", "cannot read " + mod_file + ": " + msg,
+                "create one with a module directive, e.g. `module example.com/you/hello`", 0, 0))
+            push(dfiles, "")
+            return LoadFailed(diags, dfiles)
+            ""
+        },
+    }
+    let pkg_path = parse_bur_mod(mod_file, mod_src, diags, dfiles)
+    if len(diags) > 0 {
+        return LoadFailed(diags, dfiles)
+    }
+
+    let entries = match read_dir(dir) {
+        Ok(es) => es,
+        Err(msg) => {
+            push(diags, Diag(true, "E0433",
+                "cannot find package \"" + pkg_path + "\": " + msg, "", 0, 0))
+            push(dfiles, "")
+            return LoadFailed(diags, dfiles)
+            []
+        },
+    }
+    let mut files_stmts = []
+    let mut file_paths = []
+    let mut bur_files = 0
+    for name in entries {
+        if str_ends_with(name, ".bur") {
+            bur_files = bur_files + 1
+            let disp = dir + "/" + name
+            let src = match read_file(disp) {
+                Ok(s) => s,
+                Err(msg) => {
+                    push(diags, Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
+                    push(dfiles, "")
+                    ""
+                },
+            }
+            if src != "" {
+                match lex(src) {
+                    Lexed(toks, ldiags) => {
+                        if len(ldiags) > 0 {
+                            for d in ldiags {
+                                push(diags, d)
+                                push(dfiles, disp)
+                            }
+                        } else {
+                            match parse(toks) {
+                                Parsed(stmts, pdiags) => {
+                                    if len(pdiags) > 0 {
+                                        for d in pdiags {
+                                            push(diags, d)
+                                            push(dfiles, disp)
+                                        }
+                                    } else {
+                                        let mut kept = []
+                                        for s in stmts {
+                                            match s {
+                                                ImportDecl(_, _, _, _, isp) => {
+                                                    match isp {
+                                                        Sp(is0, ie0) => {
+                                                            push(diags, Diag(true, "E0432",
+                                                                "imports are not supported by the bootstrap loader",
+                                                                "burc compiles single, import-free packages",
+                                                                is0, ie0))
+                                                            push(dfiles, disp)
+                                                        },
+                                                    }
+                                                },
+                                                _ => push(kept, s),
+                                            }
+                                        }
+                                        push(files_stmts, kept)
+                                        push(file_paths, disp)
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+    if bur_files == 0 {
+        push(diags, Diag(true, "E0433",
+            "no .bur files in package \"" + pkg_path + "\" (" + dir + ")", "", 0, 0))
+        push(dfiles, "")
+    }
+
+    // package-file shape: only declarations, const-expression lets, no dups
+    let mut declared = map() // name -> file it was first declared in
+    let mut fi = 0
+    while fi < len(files_stmts) {
+        let disp = file_paths[fi]
+        for s in files_stmts[fi] {
+            let mut name = ""
+            let mut name_sp = Sp(0, 0)
+            match s {
+                FnDecl(n, nsp, _, _, _) => {
+                    name = n
+                    name_sp = nsp
+                },
+                EnumDecl(n, _, _, _, esp) => {
+                    name = n
+                    name_sp = esp
+                },
+                LetStmt(n, nsp, _, _, init, _) => {
+                    name = n
+                    name_sp = nsp
+                    if !is_const_expr(init) {
+                        match span_of(init) {
+                            Sp(is0, ie0) => {
+                                push(diags, Diag(true, "E0802",
+                                    "package-level `let` must be initialized with a constant expression",
+                                    "package-level `let` allows literals, arithmetic on literals, list literals, and `fn` literals; compute anything else inside a function",
+                                    is0, ie0))
+                                push(dfiles, disp)
+                            },
+                        }
+                    }
+                },
+                _ => {
+                    match span_of(s) {
+                        Sp(ss0, se0) => {
+                            push(diags, Diag(true, "E0801",
+                                "only declarations are allowed at the top level of a package file",
+                                "executable code lives inside functions; the program starts at `fn main`",
+                                ss0, se0))
+                            push(dfiles, disp)
+                        },
+                    }
+                },
+            }
+            if name != "" {
+                match get(declared, name) {
+                    Some(prev) => {
+                        let where_part = if prev != disp {
+                            " (first declared in " + prev + ")"
+                        } else {
+                            ""
+                        }
+                        match name_sp {
+                            Sp(ns0, ne0) => {
+                                push(diags, Diag(true, "E0428",
+                                    "`" + name + "` is declared more than once in package \"" +
+                                    pkg_path + "\"" + where_part, "", ns0, ne0))
+                                push(dfiles, disp)
+                            },
+                        }
+                    },
+                    None => put(declared, name, disp),
+                }
+            }
+        }
+        fi = fi + 1
+    }
+    if len(diags) > 0 {
+        return LoadFailed(diags, dfiles)
+    }
+    Loaded(pkg_path, files_stmts, file_paths)
+}

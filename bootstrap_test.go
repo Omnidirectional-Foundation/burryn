@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -558,6 +559,89 @@ func TestBurcDisParity(t *testing.T) {
 	}
 }
 
+// dumpGoBuildDir renders the Go toolchain's C for a package directory (the
+// mirror of burc's build-dir command on the success path).
+func dumpGoBuildDir(t *testing.T, dir string) string {
+	t.Helper()
+	m, diags := loadModule(dir)
+	if err := diagsToErr(diags); err != nil {
+		t.Fatal(err)
+	}
+	if err := diagsToErr(typecheckModule(m)); err != nil {
+		t.Fatal(err)
+	}
+	gc := newGC()
+	fn, shared, compDiags := compileModule(gc, m)
+	if err := diagsToErr(compDiags); err != nil {
+		t.Fatal(err)
+	}
+	csrc, err := genProgram(fn, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return csrc
+}
+
+// TestBurcBuildDirParity checks burc's package-directory pipeline against
+// the Go toolchain on import-free packages (burc itself is covered by
+// TestBurcSelfHost).
+func TestBurcBuildDirParity(t *testing.T) {
+	prog := loadBurc(t)
+	for _, dir := range []string{"testdata/pkg/greeter"} {
+		t.Run(dir, func(t *testing.T) {
+			want := dumpGoBuildDir(t, dir)
+			got := prog.run(t, "build-dir", dir)
+			if got != want {
+				t.Errorf("emitted C mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
+			}
+		})
+	}
+}
+
+// TestBurcSelfHost is the S1 acceptance test (GOALS §3). Three links:
+// burc (on the VM) emits C for its own package, byte-identical to the Go
+// toolchain's output for the same package; cc turns that C into a native
+// burc; the native burc compiles the same source again to byte-identical C —
+// the self-hosting fixed point.
+func TestBurcSelfHost(t *testing.T) {
+	prog := loadBurc(t)
+	c1 := prog.run(t, "build-dir", "burc")
+
+	m, diags := loadModule("burc")
+	if err := diagsToErr(diags); err != nil {
+		t.Fatal(err)
+	}
+	if err := diagsToErr(typecheckModule(m)); err != nil {
+		t.Fatal(err)
+	}
+	gc := newGC()
+	fn, shared, compDiags := compileModule(gc, m)
+	if err := diagsToErr(compDiags); err != nil {
+		t.Fatal(err)
+	}
+	want, err := genProgram(fn, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c1 != want {
+		t.Fatalf("burc's C for itself differs from the Go toolchain's (%d vs %d bytes)\n%s",
+			len(c1), len(want), firstDiff(c1, want))
+	}
+
+	bin := buildBinary(t, c1) // skips the fixpoint half when no cc exists
+	var out bytes.Buffer
+	cmd := exec.Command(bin, "build-dir", "burc")
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("native burc failed: %v", err)
+	}
+	if c2 := out.String(); c2 != c1 {
+		t.Errorf("fixpoint broken: native burc's C differs from the VM burc's (%d vs %d bytes)\n%s",
+			len(c2), len(c1), firstDiff(c2, c1))
+	}
+}
+
 // ---- emitted C (mirrors burc's `emit-c` command) ----
 
 // dumpGoEmitC mirrors burc's cmd_emit_c: every diagnostic, then (when
@@ -589,7 +673,7 @@ func dumpGoEmitC(src string) string {
 	}
 	csrc, err := genProgram(fn, shared)
 	if err != nil {
-		b.WriteString("cgen error: " + err.Error() + "\n")
+		fmt.Fprintf(&b, "cgen error: %s\n", err)
 		return b.String()
 	}
 	b.WriteString(csrc)
