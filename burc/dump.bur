@@ -274,3 +274,316 @@ fn dump_diag(d) {
         },
     }
 }
+
+// ---- disassembly dump (mirrors debug.go byte for byte) ----
+
+fn pad_left(s, w) {
+    let mut out = s
+    while str_len(out) < w {
+        out = " " + out
+    }
+    out
+}
+
+fn pad_right(s, w) {
+    let mut out = s
+    while str_len(out) < w {
+        out = out + " "
+    }
+    out
+}
+
+fn pad_zero(n, w) {
+    let mut out = str(n)
+    while str_len(out) < w {
+        out = "0" + out
+    }
+    out
+}
+
+fn hex_digit(n) {
+    if n < 10 {
+        str(n)
+    } else {
+        chr(97 + n - 10) // a-f
+    }
+}
+
+// go_quote mirrors strconv.Quote for the byte values our sources contain:
+// the common escapes, \xNN for other control bytes, everything else raw
+fn go_quote(s) {
+    let mut parts = ["\""]
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        let o = ord(c)
+        let esc = if c == "\"" {
+            "\\\""
+        } else if c == "\\" {
+            "\\\\"
+        } else if c == "\n" {
+            "\\n"
+        } else if c == "\t" {
+            "\\t"
+        } else if o == 13 {
+            "\\r"
+        } else if o < 32 || o == 127 {
+            "\\x" + hex_digit(o / 16) + hex_digit(o % 16)
+        } else {
+            ""
+        }
+        if esc != "" {
+            push(parts, substr(s, seg, i - seg))
+            push(parts, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(s, seg, str_len(s) - seg))
+    push(parts, "\"")
+    join(parts, "")
+}
+
+// line_starts precomputes the byte offset of each line start (diag.go's
+// lineIndex); line_of is 1-based, mirroring lineIndex.line
+fn line_starts(src) {
+    let mut ix = [0]
+    let mut i = 0
+    while i < str_len(src) {
+        if char_at(src, i) == "\n" {
+            push(ix, i + 1)
+        }
+        i = i + 1
+    }
+    ix
+}
+
+fn line_of(starts, off) {
+    let o = if off < 0 { 0 } else { off }
+    let mut line = 0
+    let mut i = 0
+    while i < len(starts) {
+        if starts[i] <= o {
+            line = i + 1
+        }
+        i = i + 1
+    }
+    line
+}
+
+// dump_disasm prints the whole program's disassembly: the function fh0,
+// then recursively every function in constant tables (disasmAll's order)
+fn dump_disasm(fh0, f_name, f_arity, f_nupvals, f_code, f_spans, f_consts,
+    en_qual, en_vnames, _en_varities, starts) {
+
+    fn repr_cval(cv) {
+        match cv {
+            CInt(n) => str(n),
+            CFloat(f) => str(f),
+            CStr(s) => go_quote(s),
+            CFn(fh) => "<fn " + f_name[fh] + ">",
+            CEnumType(eh) => "<enum " + en_qual[eh] + ">",
+            CSingleton(eh, i) => en_vnames[eh][i],
+            CCtor(eh, i) => "<variant " + en_qual[eh] + "." + en_vnames[eh][i] + ">",
+        }
+    }
+
+    fn op_u16(code, ip) {
+        code[ip] * 256 + code[ip + 1]
+    }
+
+    fn dump_inst(fh, ip) {
+        let code = f_code[fh]
+        let spans = f_spans[fh]
+        let consts = f_consts[fh]
+        // synthetic code has the zero span and stays line 0
+        let line = match spans[ip] {
+            Sp(s, e) => if s == 0 && e == 0 { 0 } else { line_of(starts, s) },
+        }
+        let pre = pad_zero(ip, 4) + " " + pad_left(str(line), 4) + "  "
+        let op = code[ip]
+        if op == op_const || op == op_get_global || op == op_def_global || op == op_set_global {
+            let name = if op == op_const {
+                "CONST"
+            } else if op == op_get_global {
+                "GET_GLOBAL"
+            } else if op == op_def_global {
+                "DEF_GLOBAL"
+            } else {
+                "SET_GLOBAL"
+            }
+            let v = op_u16(code, ip + 1)
+            println(pre + pad_right(name, 16) + " " + str(v) + " (" + repr_cval(consts[v]) + ")")
+            ip + 3
+        } else if op == op_get_local || op == op_set_local || op == op_get_upval ||
+            op == op_set_upval || op == op_list {
+            let name = if op == op_get_local {
+                "GET_LOCAL"
+            } else if op == op_set_local {
+                "SET_LOCAL"
+            } else if op == op_get_upval {
+                "GET_UPVAL"
+            } else if op == op_set_upval {
+                "SET_UPVAL"
+            } else {
+                "LIST"
+            }
+            println(pre + pad_right(name, 16) + " " + str(op_u16(code, ip + 1)))
+            ip + 3
+        } else if op == op_pop_n || op == op_end_block || op == op_call ||
+            op == op_test_variant || op == op_get_field || op == op_spawn {
+            let name = if op == op_pop_n {
+                "POP_N"
+            } else if op == op_end_block {
+                "END_BLOCK"
+            } else if op == op_call {
+                "CALL"
+            } else if op == op_test_variant {
+                "TEST_VARIANT"
+            } else if op == op_get_field {
+                "GET_FIELD"
+            } else {
+                "SPAWN"
+            }
+            println(pre + pad_right(name, 16) + " " + str(code[ip + 1]))
+            ip + 2
+        } else if op == op_jump || op == op_jump_if_false || op == op_jump_if_true ||
+            op == op_jump_if_false_pop || op == op_loop || op == op_chan_next {
+            let name = if op == op_jump {
+                "JUMP"
+            } else if op == op_jump_if_false {
+                "JUMP_IF_FALSE"
+            } else if op == op_jump_if_true {
+                "JUMP_IF_TRUE"
+            } else if op == op_jump_if_false_pop {
+                "JUMP_IF_FALSE_P"
+            } else if op == op_loop {
+                "LOOP"
+            } else {
+                "CHAN_NEXT"
+            }
+            let sign = if op == op_loop { -1 } else { 1 }
+            let v = op_u16(code, ip + 1)
+            println(pre + pad_right(name, 16) + " " + pad_zero(ip, 4) + " -> " +
+                pad_zero(ip + 3 + sign * v, 4))
+            ip + 3
+        } else if op == op_closure {
+            let v = op_u16(code, ip + 1)
+            let sub = match consts[v] {
+                CFn(fh2) => fh2,
+                _ => 0,
+            }
+            println(pre + pad_right("CLOSURE", 16) + " " + str(v) + " (" + repr_cval(consts[v]) + ")")
+            let mut next = ip + 3
+            let mut i = 0
+            while i < f_nupvals[sub] {
+                let kind = if code[next] == 1 { "local" } else { "upval" }
+                println(pad_zero(next, 4) + "    |    capture " + kind + " " + str(op_u16(code, next + 1)))
+                next = next + 3
+                i = i + 1
+            }
+            next
+        } else if op == op_select {
+            let n_arms = code[ip + 1]
+            let has_default = code[ip + 2] != 0
+            let mut p = ip + 3
+            println(pre + pad_right("SELECT", 16) + " arms=" + str(n_arms) + " default=" + str(has_default))
+            let mut i = 0
+            while i < n_arms {
+                let kind = if code[p] == 1 { "send" } else { "recv" }
+                println(pad_zero(p, 4) + "    |    arm " + str(i) + " " + kind + " -> " +
+                    pad_zero(p + 3 + op_u16(code, p + 1), 4))
+                p = p + 3
+                i = i + 1
+            }
+            if has_default {
+                println(pad_zero(p, 4) + "    |    default -> " + pad_zero(p + 2 + op_u16(code, p), 4))
+                p = p + 2
+            }
+            p
+        } else {
+            let name = if op == op_unit {
+                "UNIT"
+            } else if op == op_true {
+                "TRUE"
+            } else if op == op_false {
+                "FALSE"
+            } else if op == op_pop {
+                "POP"
+            } else if op == op_close_upvalue {
+                "CLOSE_UPVALUE"
+            } else if op == op_eq {
+                "EQ"
+            } else if op == op_neq {
+                "NEQ"
+            } else if op == op_gt {
+                "GT"
+            } else if op == op_gt_eq {
+                "GT_EQ"
+            } else if op == op_lt {
+                "LT"
+            } else if op == op_lt_eq {
+                "LT_EQ"
+            } else if op == op_add {
+                "ADD"
+            } else if op == op_sub {
+                "SUB"
+            } else if op == op_mul {
+                "MUL"
+            } else if op == op_div {
+                "DIV"
+            } else if op == op_mod {
+                "MOD"
+            } else if op == op_neg {
+                "NEG"
+            } else if op == op_not {
+                "NOT"
+            } else if op == op_return {
+                "RETURN"
+            } else if op == op_index_get {
+                "INDEX_GET"
+            } else if op == op_index_set {
+                "INDEX_SET"
+            } else if op == op_len {
+                "LEN"
+            } else if op == op_no_match {
+                "NO_MATCH"
+            } else if op == op_try {
+                "TRY"
+            } else if op == op_send {
+                "SEND"
+            } else if op == op_recv {
+                "RECV"
+            } else {
+                "UNKNOWN " + str(op)
+            }
+            println(pre + name)
+            ip + 1
+        }
+    }
+
+    fn dump_fn(fh) {
+        let name = if f_name[fh] == "" { "<anonymous>" } else { f_name[fh] }
+        println("== " + name + " (arity " + str(f_arity[fh]) + ", upvals " + str(f_nupvals[fh]) + ") ==")
+        let mut ip = 0
+        while ip < len(f_code[fh]) {
+            ip = dump_inst(fh, ip)
+        }
+    }
+
+    fn dump_all(fh) {
+        dump_fn(fh)
+        for cv in f_consts[fh] {
+            match cv {
+                CFn(sub) => {
+                    println("")
+                    dump_all(sub)
+                },
+                _ => {},
+            }
+        }
+    }
+
+    dump_all(fh0)
+}

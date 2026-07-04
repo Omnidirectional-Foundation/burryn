@@ -486,6 +486,78 @@ func TestBurcCheckParity(t *testing.T) {
 	}
 }
 
+// ---- dis dump (mirrors burc's `dis` command) ----
+
+// captureStdout runs f with os.Stdout redirected into a buffer (debug.go's
+// disassembler prints straight to stdout).
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		done <- buf.String()
+	}()
+	f()
+	w.Close()
+	os.Stdout = old
+	return <-done
+}
+
+// dumpGoDis mirrors burc's cmd_dis: every diagnostic, then (when error-free)
+// the disassembly of the compiled script.
+func dumpGoDis(t *testing.T, src string) string {
+	toks, lexDiags := lex(src)
+	var b strings.Builder
+	if len(lexDiags) > 0 {
+		dumpDiags(&b, lexDiags)
+		return b.String()
+	}
+	stmts, parseDiags := parse(toks)
+	if len(parseDiags) > 0 {
+		dumpDiags(&b, parseDiags)
+		return b.String()
+	}
+	diags := typecheck(stmts)
+	dumpDiags(&b, diags)
+	for _, d := range diags {
+		if d.IsErr {
+			return b.String()
+		}
+	}
+	gc := newGC()
+	fn, shared, compDiags := compileProgram(gc, src, stmts)
+	if len(compDiags) > 0 {
+		dumpDiags(&b, compDiags)
+		return b.String()
+	}
+	b.WriteString(captureStdout(t, func() { disasmAll(fn, shared) }))
+	return b.String()
+}
+
+func TestBurcDisParity(t *testing.T) {
+	prog := loadBurc(t)
+	for _, file := range burCorpus(t) {
+		t.Run(file, func(t *testing.T) {
+			srcBytes, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := dumpGoDis(t, string(srcBytes))
+			got := prog.run(t, "dis", file)
+			if got != want {
+				t.Errorf("disasm mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
+			}
+		})
+	}
+}
+
 func TestBurcLexParity(t *testing.T) {
 	prog := loadBurc(t)
 	for _, file := range burCorpus(t) {
