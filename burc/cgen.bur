@@ -1,0 +1,709 @@
+// C backend ported from cbackend.go: translates a compiled program into one
+// C translation unit, byte-identical to Go's genProgram output.
+//
+// Object identity: Go dedupes constants by pointer. Here functions, enum
+// types, singletons and constructors dedup by handle; every string constant
+// is its own object (the Go compiler allocates a fresh OString per emit).
+
+// dec_add adds two non-negative decimal strings
+fn dec_add(a, b) {
+    let mut out = []
+    let mut i = str_len(a) - 1
+    let mut j = str_len(b) - 1
+    let mut carry = 0
+    while i >= 0 || j >= 0 || carry > 0 {
+        let da = if i >= 0 { ord(char_at(a, i)) - 48 } else { 0 }
+        let db = if j >= 0 { ord(char_at(b, j)) - 48 } else { 0 }
+        let s = da + db + carry
+        push(out, chr(48 + s % 10))
+        carry = s / 10
+        i = i - 1
+        j = j - 1
+    }
+    // digits were collected least-significant first
+    let mut rev = []
+    let mut k = len(out) - 1
+    while k >= 0 {
+        push(rev, out[k])
+        k = k - 1
+    }
+    join(rev, "")
+}
+
+// dec_uint64 renders v's two's-complement bits as an unsigned decimal,
+// mirroring Go's uint64(v.I): 2^64 + v = 2^63 + (2^63 + v) for negative v
+fn dec_uint64(v) {
+    if v >= 0 {
+        str(v)
+    } else {
+        dec_add("9223372036854775808", str((v + 9223372036854775807) + 1))
+    }
+}
+
+// c_str renders s as a C string literal, octal-escaping anything unsafe so
+// an escape never absorbs a following digit (mirrors cStr)
+fn c_str(s) {
+    let mut parts = ["\""]
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        let o = ord(c)
+        let esc = if c == "\"" {
+            "\\\""
+        } else if c == "\\" {
+            "\\\\"
+        } else if o >= 32 && o < 127 {
+            ""
+        } else {
+            "\\" + str(o / 64 % 8) + str(o / 8 % 8) + str(o % 8)
+        }
+        if esc != "" {
+            push(parts, substr(s, seg, i - seg))
+            push(parts, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(s, seg, str_len(s) - seg))
+    push(parts, "\"")
+    join(parts, "")
+}
+
+// c_float renders f as an exact C double literal, mirroring cFloat:
+// INFINITY/NAN, else Go's shortest %x hex-float built from the bit pattern
+fn c_float(f) {
+    let bits = float_bits(f)
+    let neg = bits < 0
+    let low63 = if neg { (bits + 9223372036854775807) + 1 } else { bits }
+    let exp = low63 / 4503599627370496 // 2^52
+    let mant = low63 % 4503599627370496
+    if exp == 2047 {
+        if mant == 0 {
+            if neg { "-INFINITY" } else { "INFINITY" }
+        } else {
+            "NAN"
+        }
+    } else {
+        let sign = if neg { "-" } else { "" }
+        if exp == 0 && mant == 0 {
+            sign + "0x0p+00"
+        } else {
+            // mantissa: 13 hex nibbles, trailing zeros stripped
+            let mut nibbles = []
+            let mut m = mant
+            let mut i = 0
+            while i < 13 {
+                push(nibbles, m % 16)
+                m = m / 16
+                i = i + 1
+            }
+            let mut hi = 12 // highest-index (least significant) kept nibble
+            let mut first = 0
+            let mut found = false
+            let mut j = 0
+            while j < 13 {
+                if nibbles[j] != 0 && !found {
+                    first = j
+                    found = true
+                }
+                j = j + 1
+            }
+            let mut digits = ""
+            if found {
+                let mut k = 12
+                while k >= first {
+                    digits = digits + hex_digit(nibbles[k])
+                    k = k - 1
+                }
+            }
+            let _ = hi
+            let lead = if exp == 0 { "0x0" } else { "0x1" }
+            let e10 = if exp == 0 { -1022 } else { exp - 1023 }
+            let esign = if e10 < 0 { "-" } else { "+" }
+            let eabs = if e10 < 0 { -e10 } else { e10 }
+            let edig = if eabs < 10 { "0" + str(eabs) } else { str(eabs) }
+            if digits == "" {
+                sign + lead + "p" + esign + edig
+            } else {
+                sign + lead + "." + digits + "p" + esign + edig
+            }
+        }
+    }
+}
+
+// cgen_program renders the C for a compiled script (function handle 0 is the
+// entry). Mirrors genProgram; prints the whole translation unit to stdout.
+fn cgen_program(f_name, f_file, f_arity, f_nupvals, f_code, f_consts,
+    en_qual, en_vnames, en_varities) {
+
+    let mut out = []
+    fn w(s) {
+        push(out, s)
+    }
+
+    // ---- object registration (mirrors cgen.register) ----
+    let mut o_kind = [] // 0 str, 1 fn, 2 enum type, 3 ctor, 4 singleton inst
+    let mut o_str = []
+    let mut o_a = []    // fn handle / enum handle
+    let mut o_b = []    // variant index
+    let mut ids = map() // dedup key -> id (strings never dedup)
+    let mut fconst_ids = []
+    for _f in f_name {
+        push(fconst_ids, [])
+    }
+
+    fn alloc_obj(kind, s, a, b) {
+        push(o_kind, kind)
+        push(o_str, s)
+        push(o_a, a)
+        push(o_b, b)
+        len(o_kind) - 1
+    }
+
+    fn reg_key(cv) {
+        match cv {
+            CFn(fh) => "f:" + str(fh),
+            CEnumType(eh) => "e:" + str(eh),
+            CSingleton(eh, i) => "s:" + str(eh) + ":" + str(i),
+            CCtor(eh, i) => "c:" + str(eh) + ":" + str(i),
+            _ => "",
+        }
+    }
+
+    fn register(cv) {
+        let key = reg_key(cv)
+        if key != "" {
+            match get(ids, key) {
+                Some(id) => { return id },
+                None => {},
+            }
+        }
+        let id = match cv {
+            CStr(s) => alloc_obj(0, s, 0, 0),
+            CFn(fh) => alloc_obj(1, "", fh, 0),
+            CEnumType(eh) => alloc_obj(2, "", eh, 0),
+            CCtor(eh, i) => alloc_obj(3, "", eh, i),
+            CSingleton(eh, i) => alloc_obj(4, "", eh, i),
+            _ => -1,
+        }
+        if key != "" {
+            put(ids, key, id)
+        }
+        match cv {
+            CFn(fh) => {
+                let mut slot_ids = []
+                for c in f_consts[fh] {
+                    let is_obj = match c {
+                        CInt(_) => false,
+                        CFloat(_) => false,
+                        _ => true,
+                    }
+                    push(slot_ids, if is_obj { register(c) } else { -1 })
+                }
+                fconst_ids[fh] = slot_ids
+            },
+            CCtor(eh, _) => {
+                let _ = register(CEnumType(eh))
+            },
+            CSingleton(eh, _) => {
+                let _ = register(CEnumType(eh))
+            },
+            _ => {},
+        }
+        id
+    }
+
+    // pin the built-in enums first so bur_*_enum are always available
+    let opt_id = register(CEnumType(0))
+    let res_id = register(CEnumType(1))
+    let out_id = register(CEnumType(2))
+    let entry = register(CFn(0))
+
+    w("// Generated by the Burryn C backend. Do not edit.\n")
+    w("#include \"burrt.h\"\n\n")
+
+    // funcs in id order: [id, fh] pairs
+    let mut fun_ids = []
+    let mut fun_fhs = []
+    let mut oi = 0
+    while oi < len(o_kind) {
+        if o_kind[oi] == 1 {
+            push(fun_ids, oi)
+            push(fun_fhs, o_a[oi])
+        }
+        oi = oi + 1
+    }
+
+    // ---- forward decls ----
+    for id in fun_ids {
+        w("static void bur_fn_" + str(id) + "(void);\n")
+    }
+    w("\n")
+
+    // ---- object storage ----
+    w("static Obj *bur_K[" + str(len(o_kind)) + "];\n")
+    let mut fi = 0
+    while fi < len(fun_ids) {
+        if len(f_consts[fun_fhs[fi]]) > 0 {
+            w("static Value bur_consts_" + str(fun_ids[fi]) + "[" +
+                str(len(f_consts[fun_fhs[fi]])) + "];\n")
+        }
+        fi = fi + 1
+    }
+    w("\n")
+
+    fn c_value(cv, id) {
+        match cv {
+            CInt(n) => "bur_int((int64_t)UINT64_C(" + dec_uint64(n) + "))",
+            CFloat(fl) => "bur_float(" + c_float(fl) + ")",
+            _ => "bur_obj(bur_K[" + str(id) + "])",
+        }
+    }
+
+    fn const_str(fh, idx) {
+        match f_consts[fh][idx] {
+            CStr(s) => s,
+            _ => "",
+        }
+    }
+
+    fn fn_const(fh, idx) {
+        match f_consts[fh][idx] {
+            CFn(sub) => sub,
+            _ => 0,
+        }
+    }
+
+    fn read_u16(code, at) {
+        code[at] * 256 + code[at + 1]
+    }
+
+    // instruction length; OpClosure is variable (upvalue descriptors)
+    fn inst_len(fh, code, ip) {
+        let op = code[ip]
+        if op == op_const || op == op_get_local || op == op_set_local ||
+            op == op_get_global || op == op_def_global || op == op_set_global ||
+            op == op_get_upval || op == op_set_upval || op == op_jump ||
+            op == op_jump_if_false || op == op_jump_if_true ||
+            op == op_jump_if_false_pop || op == op_loop || op == op_list ||
+            op == op_chan_next {
+            3
+        } else if op == op_pop_n || op == op_call || op == op_spawn ||
+            op == op_end_block || op == op_test_variant || op == op_get_field {
+            2
+        } else if op == op_closure {
+            3 + f_nupvals[fn_const(fh, read_u16(code, ip + 1))] * 3
+        } else if op == op_select {
+            let n_arms = code[ip + 1]
+            let has_default = code[ip + 2] != 0
+            3 + n_arms * 3 + (if has_default { 2 } else { 0 })
+        } else {
+            1
+        }
+    }
+
+    // branch destinations, so a C label is planted at each
+    fn jump_targets(fh) {
+        let code = f_code[fh]
+        let mut targets = map()
+        let mut ip = 0
+        while ip < len(code) {
+            let op = code[ip]
+            if op == op_jump || op == op_jump_if_false || op == op_jump_if_true ||
+                op == op_jump_if_false_pop {
+                put(targets, ip + 3 + read_u16(code, ip + 1), true)
+                ip = ip + 3
+            } else if op == op_loop {
+                put(targets, ip + 3 - read_u16(code, ip + 1), true)
+                ip = ip + 3
+            } else if op == op_chan_next {
+                put(targets, ip + 3 + read_u16(code, ip + 1), true) // loop-exit label
+                ip = ip + 3
+            } else if op == op_select {
+                let mut p = ip + 1
+                let n_arms = code[p]
+                let has_default = code[p + 1] != 0
+                p = p + 2
+                let mut i = 0
+                while i < n_arms {
+                    p = p + 1 // kind byte
+                    put(targets, p + 2 + read_u16(code, p), true)
+                    p = p + 2
+                    i = i + 1
+                }
+                if has_default {
+                    put(targets, p + 2 + read_u16(code, p), true)
+                    p = p + 2
+                }
+                ip = p
+            } else {
+                ip = ip + inst_len(fh, code, ip)
+            }
+        }
+        targets
+    }
+
+    fn is_target(targets, ip) {
+        match get(targets, ip) {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    // ---- per-instruction translation (mirrors emitInst) ----
+    fn emit_inst(id, fh, code, ip) {
+        let op = code[ip]
+        if op == op_const {
+            w("\tbur_push(bur_consts_" + str(id) + "[" + str(read_u16(code, ip + 1)) + "]);\n")
+            ip + 3
+        } else if op == op_unit {
+            w("\tbur_push(bur_unit());\n")
+            ip + 1
+        } else if op == op_true {
+            w("\tbur_push(bur_bool(true));\n")
+            ip + 1
+        } else if op == op_false {
+            w("\tbur_push(bur_bool(false));\n")
+            ip + 1
+        } else if op == op_pop {
+            w("\tbur_pop();\n")
+            ip + 1
+        } else if op == op_pop_n {
+            w("\tbur_cur->top -= " + str(code[ip + 1]) + ";\n")
+            ip + 2
+        } else if op == op_close_upvalue {
+            w("\tbur_close_upvalues(bur_cur->top - 1); bur_pop();\n")
+            ip + 1
+        } else if op == op_end_block {
+            let n = str(code[ip + 1])
+            w("\t{ Value v = bur_pop(); bur_close_upvalues(bur_cur->top - " + n +
+                "); bur_cur->top -= " + n + "; bur_push(v); }\n")
+            ip + 2
+        } else if op == op_get_local {
+            w("\tbur_push(bur_cur->stack[base + " + str(read_u16(code, ip + 1)) + "]);\n")
+            ip + 3
+        } else if op == op_set_local {
+            w("\tbur_cur->stack[base + " + str(read_u16(code, ip + 1)) + "] = bur_peek(0);\n")
+            ip + 3
+        } else if op == op_get_global {
+            let n = const_str(fh, read_u16(code, ip + 1))
+            w("\tbur_push(bur_get_global(" + c_str(n) + ", " + str(str_len(n)) + "));\n")
+            ip + 3
+        } else if op == op_def_global {
+            let n = const_str(fh, read_u16(code, ip + 1))
+            w("\t{ Value v = bur_pop(); bur_globals_put(" + c_str(n) + ", " + str(str_len(n)) + ", v); }\n")
+            ip + 3
+        } else if op == op_set_global {
+            let n = const_str(fh, read_u16(code, ip + 1))
+            w("\tbur_set_global(" + c_str(n) + ", " + str(str_len(n)) + ", bur_peek(0));\n")
+            ip + 3
+        } else if op == op_get_upval {
+            w("\tbur_push(upvalue_get(self->upvals[" + str(read_u16(code, ip + 1)) + "]));\n")
+            ip + 3
+        } else if op == op_set_upval {
+            w("\tupvalue_set(self->upvals[" + str(read_u16(code, ip + 1)) + "], bur_peek(0));\n")
+            ip + 3
+        } else if op == op_eq {
+            w("\t{ Value r = bur_bool(bur_eq(bur_peek(1), bur_peek(0))); bur_cur->top -= 2; bur_push(r); }\n")
+            ip + 1
+        } else if op == op_neq {
+            w("\t{ Value r = bur_bool(!bur_eq(bur_peek(1), bur_peek(0))); bur_cur->top -= 2; bur_push(r); }\n")
+            ip + 1
+        } else if op == op_gt || op == op_gt_eq || op == op_lt || op == op_lt_eq {
+            let kind = if op == op_gt {
+                0
+            } else if op == op_gt_eq {
+                1
+            } else if op == op_lt {
+                2
+            } else {
+                3
+            }
+            w("\t{ Value r = bur_compare(bur_peek(1), bur_peek(0), " + str(kind) +
+                "); bur_cur->top -= 2; bur_push(r); }\n")
+            ip + 1
+        } else if op == op_add {
+            w("\t{ Value r = bur_add(bur_peek(1), bur_peek(0)); bur_cur->top -= 2; bur_push(r); }\n")
+            ip + 1
+        } else if op == op_sub || op == op_mul || op == op_div || op == op_mod {
+            let c = if op == op_sub {
+                "'-'"
+            } else if op == op_mul {
+                "'*'"
+            } else if op == op_div {
+                "'/'"
+            } else {
+                "'%'"
+            }
+            w("\t{ Value r = bur_arith(bur_peek(1), bur_peek(0), " + c +
+                "); bur_cur->top -= 2; bur_push(r); }\n")
+            ip + 1
+        } else if op == op_neg {
+            w("\t{ Value v = bur_pop(); bur_push(bur_neg(v)); }\n")
+            ip + 1
+        } else if op == op_not {
+            w("\t{ Value v = bur_pop(); bur_push(bur_not(v)); }\n")
+            ip + 1
+        } else if op == op_jump {
+            w("\tgoto L" + str(ip + 3 + read_u16(code, ip + 1)) + ";\n")
+            ip + 3
+        } else if op == op_jump_if_false {
+            w("\t{ Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); if (!c.u.b) goto L" +
+                str(ip + 3 + read_u16(code, ip + 1)) + "; }\n")
+            ip + 3
+        } else if op == op_jump_if_true {
+            w("\t{ Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); if (c.u.b) goto L" +
+                str(ip + 3 + read_u16(code, ip + 1)) + "; }\n")
+            ip + 3
+        } else if op == op_jump_if_false_pop {
+            w("\t{ Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); bool t = c.u.b; bur_pop(); if (!t) goto L" +
+                str(ip + 3 + read_u16(code, ip + 1)) + "; }\n")
+            ip + 3
+        } else if op == op_loop {
+            w("\tif (--bur_cur->budget <= 0) bur_preempt();\n") // preemption hook on back-edge
+            w("\tgoto L" + str(ip + 3 - read_u16(code, ip + 1)) + ";\n")
+            ip + 3
+        } else if op == op_call {
+            w("\tbur_call(" + str(code[ip + 1]) + ");\n")
+            ip + 2
+        } else if op == op_closure {
+            let fn_c = read_u16(code, ip + 1)
+            let sub = fn_const(fh, fn_c)
+            let mut p = ip + 3
+            w("\t{ OClosure *cl = bur_new_closure((OFunc *)bur_consts_" + str(id) +
+                "[" + str(fn_c) + "].u.o); bur_push(bur_obj((Obj *)cl));\n")
+            let mut i = 0
+            while i < f_nupvals[sub] {
+                let is_local = code[p] == 1
+                p = p + 1
+                let uidx = read_u16(code, p)
+                p = p + 2
+                if is_local {
+                    w("\t  cl->upvals[" + str(i) + "] = bur_capture_upvalue(base + " + str(uidx) + ");\n")
+                } else {
+                    w("\t  cl->upvals[" + str(i) + "] = self->upvals[" + str(uidx) + "];\n")
+                }
+                i = i + 1
+            }
+            w("\t}\n")
+            p
+        } else if op == op_return {
+            w("\t{ Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }\n")
+            ip + 1
+        } else if op == op_list {
+            let n = str(read_u16(code, ip + 1))
+            w("\t{ OList *l = bur_new_list(&bur_cur->stack[bur_cur->top - " + n + "], " + n +
+                "); bur_cur->top -= " + n + "; bur_push(bur_obj((Obj *)l)); }\n")
+            ip + 3
+        } else if op == op_index_get {
+            w("\t{ Value r = bur_index_get(bur_peek(1), bur_peek(0)); bur_cur->top -= 2; bur_push(r); }\n")
+            ip + 1
+        } else if op == op_index_set {
+            w("\t{ Value val = bur_pop(); Value idx = bur_pop(); Value tgt = bur_pop(); bur_index_set(tgt, idx, val); }\n")
+            ip + 1
+        } else if op == op_len {
+            w("\t{ Value v = bur_pop(); bur_push(bur_int(bur_len(v))); }\n")
+            ip + 1
+        } else if op == op_test_variant {
+            w("\t{ Value et = bur_pop(); Value cand = bur_pop(); bool m = false; if (cand.t == VOBJ && cand.u.o->type == OBJ_ENUMINST) { OEnumInst *in = (OEnumInst *)cand.u.o; m = in->enm == (OEnumType *)et.u.o && in->variant == " +
+                str(code[ip + 1]) + "; } bur_push(bur_bool(m)); }\n")
+            ip + 2
+        } else if op == op_get_field {
+            w("\t{ Value v = bur_pop(); OEnumInst *in = (OEnumInst *)v.u.o; bur_push(in->fields[" +
+                str(code[ip + 1]) + "]); }\n")
+            ip + 2
+        } else if op == op_no_match {
+            w("\t{ Buf nb = {0}; bur_format(&nb, bur_peek(0), true); buf_char(&nb, 0); bur_trap(\"no pattern matched value %s\", nb.data ? nb.data : \"\"); }\n")
+            ip + 1
+        } else if op == op_try {
+            w("\t{ Value v = bur_peek(0);\n")
+            w("\t  OEnumInst *in = (v.t == VOBJ && v.u.o->type == OBJ_ENUMINST) ? (OEnumInst *)v.u.o : NULL;\n")
+            w("\t  if (!in || (in->enm != bur_opt_enum && in->enm != bur_res_enum)) bur_trap(\"'?' needs an Option or Result, got %s\", bur_typename(v));\n")
+            w("\t  if (in->variant == 0) { Value inner = in->fields[0]; bur_pop(); bur_push(inner); }\n")
+            w("\t  else { bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(v); return; } }\n")
+            ip + 1
+        } else if op == op_spawn {
+            w("\tbur_spawn(" + str(code[ip + 1]) + ");\n")
+            ip + 2
+        } else if op == op_send {
+            w("\t{ Value val = bur_pop(); Value ch = bur_pop(); bur_send(ch, val); }\n")
+            ip + 1
+        } else if op == op_recv {
+            // keep the channel at peek(0) so it stays rooted if bur_recv parks
+            w("\t{ Value v = bur_recv(bur_peek(0)); bur_pop(); bur_push(v); }\n")
+            ip + 1
+        } else if op == op_chan_next {
+            w("\t{ Value v; if (bur_chan_next(bur_peek(0), &v)) { bur_pop(); bur_push(v); } else { bur_pop(); goto L" +
+                str(ip + 3 + read_u16(code, ip + 1)) + "; } }\n")
+            ip + 3
+        } else if op == op_select {
+            let mut p = ip + 1
+            let n_arms = code[p]
+            let has_default = code[p + 1] != 0
+            p = p + 2
+            let mut kinds = []
+            let mut tgts = []
+            let mut i = 0
+            while i < n_arms {
+                push(kinds, code[p])
+                p = p + 1
+                push(tgts, p + 2 + read_u16(code, p))
+                p = p + 2
+                i = i + 1
+            }
+            let mut default_target = -1
+            if has_default {
+                default_target = p + 2 + read_u16(code, p)
+                p = p + 2
+            }
+            let mut ks = []
+            for k in kinds {
+                push(ks, str(k))
+            }
+            w("\t{ static const unsigned char selk_" + str(id) + "_" + str(ip) + "[] = {" +
+                join(ks, ", ") + "};\n")
+            w("\t  switch (bur_select(selk_" + str(id) + "_" + str(ip) + ", " + str(n_arms) +
+                ", " + str(has_default) + ")) {\n")
+            i = 0
+            while i < n_arms {
+                w("\t  case " + str(i) + ": goto L" + str(tgts[i]) + ";\n")
+                i = i + 1
+            }
+            if has_default {
+                w("\t  case " + str(n_arms) + ": goto L" + str(default_target) + ";\n")
+            }
+            w("\t  }\n\t}\n")
+            p
+        } else {
+            ip + 1 // unknown opcode: unreachable, the compiler emits none
+        }
+    }
+
+    // ---- function bodies ----
+    let mut bi = 0
+    while bi < len(fun_ids) {
+        let id = fun_ids[bi]
+        let fh = fun_fhs[bi]
+        let code = f_code[fh]
+        let targets = jump_targets(fh)
+        w("static void bur_fn_" + str(id) + "(void) { // " + f_name[fh] + "\n")
+        w("\tint base = bur_cur->top - " + str(f_arity[fh]) + " - 1; (void)base;\n")
+        w("\tOClosure *self = bur_cur_closure; (void)self;\n")
+        w("\tif (--bur_cur->budget <= 0) bur_preempt();\n") // preemption hook on entry
+        let mut ip = 0
+        while ip < len(code) {
+            if is_target(targets, ip) {
+                w("L" + str(ip) + ":;\n")
+            }
+            ip = emit_inst(id, fh, code, ip)
+        }
+        if is_target(targets, len(code)) {
+            w("L" + str(len(code)) + ":;\n")
+        }
+        w("}\n\n")
+        bi = bi + 1
+    }
+
+    // ---- init: phase A allocates shells, phase B populates fields ----
+    w("static void bur_init_objs(void) {\n")
+    oi = 0
+    while oi < len(o_kind) {
+        let names = if o_kind[oi] == 0 {
+            ["OBJ_STRING", "OString"]
+        } else if o_kind[oi] == 1 {
+            ["OBJ_FUNC", "OFunc"]
+        } else if o_kind[oi] == 2 {
+            ["OBJ_ENUMTYPE", "OEnumType"]
+        } else if o_kind[oi] == 3 {
+            ["OBJ_VARIANTCTOR", "OVariantCtor"]
+        } else {
+            ["OBJ_ENUMINST", "OEnumInst"]
+        }
+        w("\tbur_K[" + str(oi) + "] = bur_alloc(sizeof(" + names[1] + "), " + names[0] + ");\n")
+        oi = oi + 1
+    }
+    oi = 0
+    while oi < len(o_kind) {
+        w("\tbur_add_root(bur_K[" + str(oi) + "]);\n")
+        oi = oi + 1
+    }
+    oi = 0
+    while oi < len(o_kind) {
+        if o_kind[oi] == 0 {
+            let s = o_str[oi]
+            let n = str(str_len(s))
+            w("\t{ OString *s = (OString *)bur_K[" + str(oi) + "]; s->len = " + n +
+                "; s->data = (char *)malloc(" + str(str_len(s) + 1) + "); memcpy(s->data, " +
+                c_str(s) + ", " + n + "); s->data[" + n + "] = 0; }\n")
+        } else if o_kind[oi] == 2 {
+            let eh = o_a[oi]
+            let mut vs = []
+            let mut i = 0
+            while i < len(en_vnames[eh]) {
+                push(vs, "{" + c_str(en_vnames[eh][i]) + ", " + str(en_varities[eh][i]) + "}")
+                i = i + 1
+            }
+            w("\t{ static VariantInfo vs[" + str(len(en_vnames[eh])) + "] = {" + join(vs, ", ") +
+                "}; OEnumType *e = (OEnumType *)bur_K[" + str(oi) + "]; e->name = " +
+                c_str(en_qual[eh]) + "; e->variants = vs; e->nvariants = " +
+                str(len(en_vnames[eh])) + "; }\n")
+        } else if o_kind[oi] == 3 {
+            let ekey = "e:" + str(o_a[oi])
+            let eid = match get(ids, ekey) {
+                Some(x) => x,
+                None => 0,
+            }
+            w("\t{ OVariantCtor *c = (OVariantCtor *)bur_K[" + str(oi) +
+                "]; c->enm = (OEnumType *)bur_K[" + str(eid) + "]; c->idx = " + str(o_b[oi]) + "; }\n")
+        } else if o_kind[oi] == 4 {
+            let ekey = "e:" + str(o_a[oi])
+            let eid = match get(ids, ekey) {
+                Some(x) => x,
+                None => 0,
+            }
+            // constant instances are always nullary singletons: no fields
+            w("\t{ OEnumInst *in = (OEnumInst *)bur_K[" + str(oi) +
+                "]; in->enm = (OEnumType *)bur_K[" + str(eid) + "]; in->variant = " +
+                str(o_b[oi]) + "; in->nfields = 0; }\n")
+        } else {
+            let fh = o_a[oi]
+            let nconsts = len(f_consts[fh])
+            let consts = if nconsts > 0 { "bur_consts_" + str(oi) } else { "NULL" }
+            let file = if f_file[fh] != "" { c_str(f_file[fh]) } else { "NULL" }
+            let mut line = "\t{ OFunc *fn = (OFunc *)bur_K[" + str(oi) + "]; fn->name = " +
+                c_str(f_name[fh]) + "; fn->file = " + file + "; fn->arity = " + str(f_arity[fh]) +
+                "; fn->numUpvals = " + str(f_nupvals[fh]) + "; fn->code = bur_fn_" + str(oi) +
+                "; fn->consts = " + consts + "; fn->nconsts = " + str(nconsts) + ";"
+            let mut i = 0
+            while i < nconsts {
+                line = line + " bur_consts_" + str(oi) + "[" + str(i) + "] = " +
+                    c_value(f_consts[fh][i], fconst_ids[fh][i]) + ";"
+                i = i + 1
+            }
+            w(line + " }\n")
+        }
+        oi = oi + 1
+    }
+    // expose the built-in enums to the natives that construct them
+    w("\tbur_opt_enum = (OEnumType *)bur_K[" + str(opt_id) + "];\n")
+    w("\tbur_res_enum = (OEnumType *)bur_K[" + str(res_id) + "];\n")
+    w("\tbur_out_enum = (OEnumType *)bur_K[" + str(out_id) + "];\n")
+    w("}\n\n")
+
+    // ---- main ----
+    w("int main(int argc, char **argv) {\n")
+    w("\tbur_boot(argc, argv);\n")
+    w("\tbur_init_objs();\n")
+    w("\tbur_register_natives();\n")
+    w("\tbur_gc_ready = true;\n")
+    w("\tOClosure *entry = bur_new_closure((OFunc *)bur_K[" + str(entry) + "]);\n")
+    w("\tbur_main_fiber = bur_new_fiber(entry, NULL, 0, BUR_MAIN_STACK_SIZE);\n")
+    w("\tbur_schedule(bur_main_fiber);\n")
+    w("\tbur_scheduler();\n")
+    w("\tfflush(stdout);\n")
+    w("\treturn 0;\n")
+    w("}\n")
+
+    print(join(out, ""))
+}

@@ -1506,6 +1506,7 @@ func (c *Checker) declareBuiltins() {
 	decl("char_at", mono(fn(tStr, tStr, tInt)))
 	decl("trunc", mono(fn(tInt, tFloat)))
 	decl("to_float", mono(fn(tFloat, tInt)))
+	decl("float_bits", mono(fn(tInt, tFloat)))
 	decl("parse_int", mono(fn(&TCon{Name: "Option", Args: []Ty{tInt}}, tStr)))
 	decl("parse_float", mono(fn(&TCon{Name: "Option", Args: []Ty{tFloat}}, tStr)))
 	decl("range", mono(fn(list(tInt), tInt, tInt)))

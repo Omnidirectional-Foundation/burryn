@@ -558,6 +558,61 @@ func TestBurcDisParity(t *testing.T) {
 	}
 }
 
+// ---- emitted C (mirrors burc's `emit-c` command) ----
+
+// dumpGoEmitC mirrors burc's cmd_emit_c: every diagnostic, then (when
+// error-free) genProgram's C translation unit.
+func dumpGoEmitC(src string) string {
+	toks, lexDiags := lex(src)
+	var b strings.Builder
+	if len(lexDiags) > 0 {
+		dumpDiags(&b, lexDiags)
+		return b.String()
+	}
+	stmts, parseDiags := parse(toks)
+	if len(parseDiags) > 0 {
+		dumpDiags(&b, parseDiags)
+		return b.String()
+	}
+	diags := typecheck(stmts)
+	dumpDiags(&b, diags)
+	for _, d := range diags {
+		if d.IsErr {
+			return b.String()
+		}
+	}
+	gc := newGC()
+	fn, shared, compDiags := compileProgram(gc, src, stmts)
+	if len(compDiags) > 0 {
+		dumpDiags(&b, compDiags)
+		return b.String()
+	}
+	csrc, err := genProgram(fn, shared)
+	if err != nil {
+		b.WriteString("cgen error: " + err.Error() + "\n")
+		return b.String()
+	}
+	b.WriteString(csrc)
+	return b.String()
+}
+
+func TestBurcEmitCParity(t *testing.T) {
+	prog := loadBurc(t)
+	for _, file := range burCorpus(t) {
+		t.Run(file, func(t *testing.T) {
+			srcBytes, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := dumpGoEmitC(string(srcBytes))
+			got := prog.run(t, "emit-c", file)
+			if got != want {
+				t.Errorf("emitted C mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
+			}
+		})
+	}
+}
+
 func TestBurcLexParity(t *testing.T) {
 	prog := loadBurc(t)
 	for _, file := range burCorpus(t) {

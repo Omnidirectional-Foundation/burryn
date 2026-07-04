@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -120,6 +121,12 @@ var nativeDefs = []nativeDef{
 			return Unit, fmt.Errorf("to_float() needs an int, got %s", typeOf(args[0]))
 		}
 		return FloatV(float64(args[0].I)), nil
+	}},
+	{"float_bits", 1, func(vm *VM, args []Value) (Value, error) {
+		if args[0].T != VFloat {
+			return Unit, fmt.Errorf("float_bits() needs a float, got %s", typeOf(args[0]))
+		}
+		return IntV(int64(math.Float64bits(args[0].F))), nil
 	}},
 	{"parse_int", 1, func(vm *VM, args []Value) (Value, error) {
 		s, ok := asString(args[0])
