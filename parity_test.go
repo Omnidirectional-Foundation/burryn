@@ -9,13 +9,6 @@ import (
 	"testing"
 )
 
-// concurrentExamples still rely on the fiber scheduler, which the C backend
-// grows in the concurrency core; they are excluded from sequential parity.
-var concurrentExamples = map[string]bool{
-	"sieve": true, "brainfuck": true, "multiplex": true,
-	"pipeline": true, "streaming": true,
-}
-
 // compileScriptToC runs the front end on a script source and returns its
 // generated C, without the process-exiting error handling of the CLI path.
 func compileScriptToC(src string) (string, error) {
@@ -88,9 +81,10 @@ func runBinary(t *testing.T, bin string) (string, int) {
 	return out.String(), code
 }
 
-// TestParityScripts compiles every sequential examples/*.bur through the C
-// backend and asserts its stdout matches the VM's byte for byte (timings
-// scrubbed). Trap text and GC-internal counters are out of the parity
+// TestParityScripts compiles every examples/*.bur through the C backend and
+// asserts its stdout matches the VM's byte for byte (timings scrubbed),
+// including the concurrent examples now that the C backend hosts the fiber
+// scheduler. Trap text and GC-internal counters are out of the parity
 // contract, so examples never rely on them.
 func TestParityScripts(t *testing.T) {
 	if findCC() == "" {
@@ -102,9 +96,6 @@ func TestParityScripts(t *testing.T) {
 	}
 	for _, file := range files {
 		name := strings.TrimSuffix(filepath.Base(file), ".bur")
-		if concurrentExamples[name] {
-			continue
-		}
 		t.Run(name, func(t *testing.T) {
 			srcBytes, err := os.ReadFile(file)
 			if err != nil {
