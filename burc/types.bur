@@ -1,0 +1,1644 @@
+// Hindley-Milner checker ported from types.go.
+//
+// Go's Ty is an interface over TCon/TFunc/TV with mutable TV links; here
+// types live in an arena of parallel mut lists and a type is an int handle:
+//   tk[h] kind: 0 = con, 1 = fn, 2 = var
+//   tn[h] con name, or the var's overloading constraint ("" = none)
+//   ta[h] con args / fn params (list of handles)
+//   tr[h] fn ret handle / var link (-1 = unbound)
+//   tl[h] var level (Rémy-style, for generalization)
+// The pure type machinery lives at module level and threads the arena
+// explicitly; the checker itself is one big function whose helpers close
+// over the arena and the checker state (see typecheck_script below).
+
+fn ty_new_con(mut tk, mut tn, mut ta, mut tr, mut tl, name, cargs) {
+    push(tk, 0)
+    push(tn, name)
+    push(ta, cargs)
+    push(tr, -1)
+    push(tl, 0)
+    len(tk) - 1
+}
+
+fn ty_new_fn(mut tk, mut tn, mut ta, mut tr, mut tl, params, ret) {
+    push(tk, 1)
+    push(tn, "")
+    push(ta, params)
+    push(tr, ret)
+    push(tl, 0)
+    len(tk) - 1
+}
+
+fn ty_new_var(mut tk, mut tn, mut ta, mut tr, mut tl, level, con) {
+    push(tk, 2)
+    push(tn, con)
+    push(ta, [])
+    push(tr, -1)
+    push(tl, level)
+    len(tk) - 1
+}
+
+fn ty_resolve(tk, tr, h) {
+    let mut cur = h
+    while tk[cur] == 2 && tr[cur] != -1 {
+        cur = tr[cur]
+    }
+    cur
+}
+
+fn ty_adjust_level(tk, tn, ta, tr, mut tl, h, level) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        if tl[x] > level {
+            tl[x] = level
+        }
+    } else if tk[x] == 0 {
+        for a in ta[x] {
+            ty_adjust_level(tk, tn, ta, tr, tl, a, level)
+        }
+    } else {
+        for p in ta[x] {
+            ty_adjust_level(tk, tn, ta, tr, tl, p, level)
+        }
+        ty_adjust_level(tk, tn, ta, tr, tl, tr[x], level)
+    }
+}
+
+fn ty_occurs(tk, ta, tr, v, h) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        x == v
+    } else if tk[x] == 0 {
+        let mut found = false
+        for a in ta[x] {
+            if ty_occurs(tk, ta, tr, v, a) {
+                found = true
+            }
+        }
+        found
+    } else {
+        let mut found = false
+        for p in ta[x] {
+            if ty_occurs(tk, ta, tr, v, p) {
+                found = true
+            }
+        }
+        found || ty_occurs(tk, ta, tr, v, tr[x])
+    }
+}
+
+// con_set lists the members of an overloading constraint set
+fn con_set(con) {
+    match con {
+        "num" => ["int", "float"],
+        "addord" => ["int", "float", "str"],
+        "key" => ["int", "str"],
+        "int" => ["int"],
+        "float" => ["float"],
+        "str" => ["str"],
+        _ => [],
+    }
+}
+
+fn con_allows(con, name) {
+    if con == "" {
+        true
+    } else {
+        contains(con_set(con), name)
+    }
+}
+
+fn con_join(con, sep) {
+    join(con_set(con), sep)
+}
+
+// con_merge intersects two overloading constraints; "!" means the
+// intersection is empty (Go returns ok=false).
+fn con_merge(a, b) {
+    if a == "" {
+        b
+    } else if b == "" || a == b {
+        a
+    } else {
+        let mut inter = []
+        for x in con_set(a) {
+            if contains(con_set(b), x) {
+                push(inter, x)
+            }
+        }
+        if len(inter) == 0 {
+            "!"
+        } else {
+            let mut best = "!"
+            for name in ["num", "addord", "key", "int", "float", "str"] {
+                let set = con_set(name)
+                if len(set) == len(inter) {
+                    let mut same = true
+                    for x in inter {
+                        if !contains(set, x) {
+                            same = false
+                        }
+                    }
+                    if same && best == "!" {
+                        best = name
+                    }
+                }
+            }
+            best
+        }
+    }
+}
+
+// ty_pretty renders a type for messages and the bind dump; names is a
+// var-handle -> display-name map filled in first-encounter order, cnt its
+// one-slot size counter (mirrors pretty/prettyWith in types.go).
+fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        let n = match get(names, x) {
+            Some(nm) => nm,
+            None => {
+                let nm = "'" + chr(97 + cnt[0] % 26)
+                put(names, x, nm)
+                cnt[0] = cnt[0] + 1
+                nm
+            },
+        }
+        if tn[x] != "" {
+            n + ":" + tn[x]
+        } else {
+            n
+        }
+    } else if tk[x] == 0 {
+        if tn[x] == "list" {
+            "[" + ty_pretty(tk, tn, ta, tr, ta[x][0], names, cnt) + "]"
+        } else if tn[x] == "chan" {
+            "chan(" + ty_pretty(tk, tn, ta, tr, ta[x][0], names, cnt) + ")"
+        } else if len(ta[x]) == 0 {
+            tn[x]
+        } else {
+            let mut parts = []
+            for a in ta[x] {
+                push(parts, ty_pretty(tk, tn, ta, tr, a, names, cnt))
+            }
+            tn[x] + "(" + join(parts, ", ") + ")"
+        }
+    } else {
+        let mut parts = []
+        for p in ta[x] {
+            push(parts, ty_pretty(tk, tn, ta, tr, p, names, cnt))
+        }
+        "fn(" + join(parts, ", ") + ") -> " + ty_pretty(tk, tn, ta, tr, tr[x], names, cnt)
+    }
+}
+
+fn ty_pretty1(tk, tn, ta, tr, h) {
+    let mut names = map()
+    let mut cnt = [0]
+    ty_pretty(tk, tn, ta, tr, h, names, cnt)
+}
+
+// ty_unify unifies two types in place; "" on success, else the error text
+// (Go returns error). Mirrors unify in types.go.
+fn ty_unify(tk, mut tn, ta, mut tr, mut tl, ah, bh) {
+    let a = ty_resolve(tk, tr, ah)
+    let b = ty_resolve(tk, tr, bh)
+    if a == b {
+        return ""
+    }
+    if tk[a] == 2 {
+        if ty_occurs(tk, ta, tr, a, b) {
+            return "recursive type detected"
+        }
+        if tk[b] == 0 && len(ta[b]) == 0 {
+            if !con_allows(tn[a], tn[b]) {
+                return "`" + tn[b] + "` is not valid here: this operator needs " + con_join(tn[a], " or ")
+            }
+        }
+        if tk[b] == 0 && len(ta[b]) > 0 && tn[a] != "" {
+            return "`" + ty_pretty1(tk, tn, ta, tr, b) + "` is not valid here: this operator needs " + con_join(tn[a], " or ")
+        }
+        if tk[b] == 1 && tn[a] != "" {
+            return "a function is not valid here: this operator needs " + con_join(tn[a], " or ")
+        }
+        if tk[b] == 2 {
+            let merged = con_merge(tn[a], tn[b])
+            if merged == "!" {
+                return "no type satisfies both " + con_join(tn[a], "|") + " and " + con_join(tn[b], "|")
+            }
+            tn[b] = merged
+        }
+        ty_adjust_level(tk, tn, ta, tr, tl, b, tl[a])
+        tr[a] = b
+        return ""
+    }
+    if tk[b] == 2 {
+        return ty_unify(tk, tn, ta, tr, tl, b, a)
+    }
+    if tk[a] == 0 && tk[b] == 0 {
+        if tn[a] != tn[b] || len(ta[a]) != len(ta[b]) {
+            return "expected `" + ty_pretty1(tk, tn, ta, tr, a) + "`, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
+        }
+        let mut i = 0
+        while i < len(ta[a]) {
+            let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][i])
+            if e != "" {
+                return e
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    if tk[a] == 1 && tk[b] == 1 {
+        if len(ta[a]) != len(ta[b]) {
+            return "expected a function with " + str(len(ta[a])) + " parameter(s), found one with " + str(len(ta[b]))
+        }
+        let mut i = 0
+        while i < len(ta[a]) {
+            let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][i])
+            if e != "" {
+                return e
+            }
+            i = i + 1
+        }
+        return ty_unify(tk, tn, ta, tr, tl, tr[a], tr[b])
+    }
+    "expected `" + ty_pretty1(tk, tn, ta, tr, a) + "`, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
+}
+
+// ty_generalize collects unbound vars deeper than level into vars (the
+// quantified set), first-encounter order, skipping duplicates via seen.
+fn ty_generalize_walk(tk, tn, ta, tr, tl, h, level, mut vars, mut seen) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        let dup = match get(seen, x) {
+            Some(_) => true,
+            None => false,
+        }
+        if tl[x] > level && !dup {
+            put(seen, x, true)
+            push(vars, x)
+        }
+    } else if tk[x] == 0 {
+        for a in ta[x] {
+            ty_generalize_walk(tk, tn, ta, tr, tl, a, level, vars, seen)
+        }
+    } else {
+        for p in ta[x] {
+            ty_generalize_walk(tk, tn, ta, tr, tl, p, level, vars, seen)
+        }
+        ty_generalize_walk(tk, tn, ta, tr, tl, tr[x], level, vars, seen)
+    }
+}
+
+// ty_instantiate_cp copies t replacing quantified vars per subst (a var
+// handle -> fresh handle map); level is the checker level for fresh vars.
+fn ty_instantiate_cp(mut tk, mut tn, mut ta, mut tr, mut tl, h, subst) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        match get(subst, x) {
+            Some(n) => n,
+            None => x,
+        }
+    } else if tk[x] == 0 {
+        let mut cargs = []
+        for a in ta[x] {
+            push(cargs, ty_instantiate_cp(tk, tn, ta, tr, tl, a, subst))
+        }
+        ty_new_con(tk, tn, ta, tr, tl, tn[x], cargs)
+    } else {
+        let mut ps = []
+        for p in ta[x] {
+            push(ps, ty_instantiate_cp(tk, tn, ta, tr, tl, p, subst))
+        }
+        let ret = ty_instantiate_cp(tk, tn, ta, tr, tl, tr[x], subst)
+        ty_new_fn(tk, tn, ta, tr, tl, ps, ret)
+    }
+}
+
+// typecheck_script checks a script (the non-package form), mirroring
+// typecheck() in types.go. All checker state lives in the mut locals below;
+// helpers are nested fns closing over it. Mutual-recursion knots
+// (infer_expr <-> infer_stmt) go through mut fn cells assigned after both
+// sides are defined.
+//
+// Returns Checked(diags, bind_lines, chan_fors):
+//   diags       sorted by span start (stable)
+//   bind_lines  "bind <name> :: <type>" for every top-level global, sorted
+//               by name (only meaningful when there are no errors)
+//   chan_fors   span starts of `for` statements that iterate a channel
+//               (Go sets ForStmt.IterIsChan on the AST; nodes here are
+//               immutable, so the compiler reads this side channel)
+fn typecheck_script(stmts) {
+    // ---- state ----
+    let mut tk = []
+    let mut tn = []
+    let mut ta = []
+    let mut tr = []
+    let mut tl = []
+    let mut diags = []
+    let mut b_scheme = []
+    let mut b_mut = []
+    let mut b_used = []
+    let mut b_isfn = []
+    let mut b_special = []
+    let mut b_kind = []
+    let mut b_span = []
+    let mut s_vars = []
+    let mut s_t = []
+    let mut e_qual = []
+    let mut e_params = []
+    let mut e_variants = []
+    let mut enum_by_name = map()
+    let mut v_name = []
+    let mut v_fields = []
+    let mut scopes = []
+    let mut level = 0
+    let mut ret_tys = []
+    let mut chan_fors = []
+
+    // ---- type helpers ----
+    fn fresh(con) {
+        ty_new_var(tk, tn, ta, tr, tl, level, con)
+    }
+    fn con0(name) {
+        ty_new_con(tk, tn, ta, tr, tl, name, [])
+    }
+    fn con1(name, a) {
+        ty_new_con(tk, tn, ta, tr, tl, name, [a])
+    }
+    fn con2(name, a, b) {
+        ty_new_con(tk, tn, ta, tr, tl, name, [a, b])
+    }
+    fn tfn(params, ret) {
+        ty_new_fn(tk, tn, ta, tr, tl, params, ret)
+    }
+    let h_int = con0("int")
+    let h_float = con0("float")
+    let h_bool = con0("bool")
+    let h_str = con0("str")
+    let h_unit = con0("unit")
+
+    fn new_scheme(vars, t) {
+        push(s_vars, vars)
+        push(s_t, t)
+        len(s_t) - 1
+    }
+    fn mono(t) {
+        new_scheme([], t)
+    }
+    fn instantiate(sh) {
+        if len(s_vars[sh]) == 0 {
+            s_t[sh]
+        } else {
+            let mut subst = map()
+            for v in s_vars[sh] {
+                put(subst, v, fresh(tn[v]))
+            }
+            ty_instantiate_cp(tk, tn, ta, tr, tl, s_t[sh], subst)
+        }
+    }
+    fn generalize(t) {
+        let mut vars = []
+        let mut seen = map()
+        ty_generalize_walk(tk, tn, ta, tr, tl, t, level, vars, seen)
+        new_scheme(vars, t)
+    }
+
+    // ---- diagnostics ----
+    fn cerr(sp, code, help, msg) {
+        match sp {
+            Sp(s, e) => push(diags, Diag(true, code, msg, help, s, e)),
+        }
+    }
+    fn cwarn(sp, code, help, msg) {
+        match sp {
+            Sp(s, e) => push(diags, Diag(false, code, msg, help, s, e)),
+        }
+    }
+    fn err_pub_script(sp) {
+        cerr(sp, "E0449",
+            "`pub` exports items from a package (a directory with bur.mod); remove it here",
+            "`pub` is not allowed here")
+    }
+    fn unify_at(a, b, sp, context) {
+        let e = ty_unify(tk, tn, ta, tr, tl, a, b)
+        if e != "" {
+            cerr(sp, "E0308", "", "mismatched types " + context + ": " + e)
+        }
+    }
+    fn pretty_of(h) {
+        ty_pretty1(tk, tn, ta, tr, h)
+    }
+
+    // ---- scopes and bindings ----
+    fn new_binding(sch, is_mut, kind, sp) {
+        push(b_scheme, sch)
+        push(b_mut, is_mut)
+        push(b_used, false)
+        push(b_isfn, false)
+        push(b_special, "")
+        push(b_kind, kind)
+        push(b_span, sp)
+        len(b_scheme) - 1
+    }
+    fn declare(name, sch, is_mut, kind, sp) {
+        let bh = new_binding(sch, is_mut, kind, sp)
+        put(scopes[len(scopes) - 1], name, bh)
+        bh
+    }
+    fn lookup(name) {
+        let mut i = len(scopes) - 1
+        while i >= 0 {
+            match get(scopes[i], name) {
+                Some(bh) => { return bh },
+                None => {},
+            }
+            i = i - 1
+        }
+        -1
+    }
+    fn push_scope() {
+        push(scopes, map())
+    }
+    fn starts_underscore(name) {
+        str_len(name) > 0 && char_at(name, 0) == "_"
+    }
+    fn pop_scope() {
+        let top = scopes[len(scopes) - 1]
+        for name in keys(top) {
+            match get(top, name) {
+                Some(b) => {
+                    if !b_used[b] && !starts_underscore(name) &&
+                        (b_kind[b] == "local" || b_kind[b] == "param") {
+                        let what = if b_kind[b] == "param" { "parameter" } else { "variable" }
+                        cwarn(b_span[b], "unused_variable",
+                            "if this is intentional, prefix it with an underscore: `_" + name + "`",
+                            "unused " + what + ": `" + name + "`")
+                    }
+                },
+                None => {},
+            }
+        }
+        let _ = pop(scopes)
+    }
+
+    // ---- enums ----
+    fn validate_type_expr(te, pm) {
+        match te {
+            TEName(pkg, name, targs, sp) => {
+                if pkg != "" {
+                    // scripts import nothing: any qualified type is unresolvable
+                    cerr(sp, "E0433", "", "cannot find package `" + pkg + "`")
+                } else if name == "int" || name == "float" || name == "bool" ||
+                    name == "str" || name == "unit" {
+                    if len(targs) > 0 {
+                        cerr(sp, "E0109", "", "`" + name + "` takes no type arguments")
+                    }
+                } else if name == "chan" {
+                    if len(targs) != 1 {
+                        cerr(sp, "E0107", "", "`chan` takes exactly one type argument, e.g. chan(int)")
+                    }
+                } else if name == "map" {
+                    if len(targs) != 2 {
+                        cerr(sp, "E0107", "", "`map` takes two type arguments, e.g. map(str, int)")
+                    }
+                } else {
+                    let is_param = match get(pm, name) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if is_param {
+                        if len(targs) > 0 {
+                            cerr(sp, "E0109", "", "type parameter `" + name + "` takes no arguments")
+                        }
+                    } else {
+                        match get(enum_by_name, name) {
+                            Some(eh) => {
+                                if len(targs) != len(e_params[eh]) {
+                                    cerr(sp, "E0107", "", "enum `" + name + "` takes " +
+                                        str(len(e_params[eh])) + " type argument(s), " + str(len(targs)) + " given")
+                                }
+                            },
+                            None => cerr(sp, "E0412", "", "cannot find type `" + name + "`"),
+                        }
+                    }
+                }
+                for a in targs {
+                    validate_type_expr(a, pm)
+                }
+            },
+            TEList(elem, _) => validate_type_expr(elem, pm),
+            TEFn(ps, ret, _) => {
+                for p in ps {
+                    validate_type_expr(p, pm)
+                }
+                validate_type_expr(ret, pm)
+            },
+            _ => {},
+        }
+    }
+
+    fn register_enum(n) {
+        match n {
+            EnumDecl(name, params, variants, _, sp) => {
+                let dup = match get(enum_by_name, name) {
+                    Some(_) => true,
+                    None => false,
+                }
+                if dup {
+                    cerr(sp, "E0428", "", "enum `" + name + "` is declared more than once")
+                } else {
+                    let mut vhs = []
+                    for vd in variants {
+                        match vd {
+                            EnumVariantDecl(vn, _, vtypes) => {
+                                push(v_name, vn)
+                                push(v_fields, vtypes)
+                                push(vhs, len(v_name) - 1)
+                            },
+                            _ => {},
+                        }
+                    }
+                    push(e_qual, name)
+                    push(e_params, params)
+                    push(e_variants, vhs)
+                    put(enum_by_name, name, len(e_qual) - 1)
+                    // validate field type expressions
+                    let mut pm = map()
+                    for p in params {
+                        put(pm, p, true)
+                    }
+                    for vd in variants {
+                        match vd {
+                            EnumVariantDecl(_, _, vtypes) => {
+                                for te in vtypes {
+                                    validate_type_expr(te, pm)
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+
+    // convert_type_expr lowers a written type to a handle; subst maps type
+    // parameter names to handles (prefix handling is module-only, not here)
+    fn convert_type_expr(te, subst) {
+        match te {
+            TEName(pkg, name, targs, _) => {
+                let hit = if pkg == "" {
+                    match get(subst, name) {
+                        Some(t) => t,
+                        None => -1,
+                    }
+                } else {
+                    -1
+                }
+                if hit >= 0 {
+                    hit
+                } else {
+                    let mut cargs = []
+                    for a in targs {
+                        push(cargs, convert_type_expr(a, subst))
+                    }
+                    let full = if pkg != "" { pkg + "." + name } else { name }
+                    ty_new_con(tk, tn, ta, tr, tl, full, cargs)
+                }
+            },
+            TEList(elem, _) => con1("list", convert_type_expr(elem, subst)),
+            TEFn(ps, ret, _) => {
+                let mut phs = []
+                for p in ps {
+                    push(phs, convert_type_expr(p, subst))
+                }
+                tfn(phs, convert_type_expr(ret, subst))
+            },
+            _ => h_unit,
+        }
+    }
+
+    // instantiate_enum fills subst with fresh vars for the enum's parameters
+    // and returns the enum type handle
+    fn instantiate_enum(eh, mut subst) {
+        let mut cargs = []
+        for p in e_params[eh] {
+            let v = fresh("")
+            put(subst, p, v)
+            push(cargs, v)
+        }
+        ty_new_con(tk, tn, ta, tr, tl, e_qual[eh], cargs)
+    }
+
+    fn variant_type(eh, idx) {
+        let mut subst = map()
+        let enum_ty = instantiate_enum(eh, subst)
+        let vh = e_variants[eh][idx]
+        if len(v_fields[vh]) == 0 {
+            enum_ty
+        } else {
+            let mut fields = []
+            for f in v_fields[vh] {
+                push(fields, convert_type_expr(f, subst))
+            }
+            tfn(fields, enum_ty)
+        }
+    }
+
+    // find_variant_sig resolves a bare variant name; returns [eh, idx]:
+    // eh = -1 not found, eh = -2 ambiguous
+    fn find_variant_sig(name) {
+        let mut found = -1
+        let mut idx = -1
+        let mut amb = false
+        for q in keys(enum_by_name) {
+            match get(enum_by_name, q) {
+                Some(eh) => {
+                    let mut i = 0
+                    while i < len(e_variants[eh]) {
+                        if v_name[e_variants[eh][i]] == name {
+                            if found >= 0 {
+                                amb = true
+                            }
+                            found = eh
+                            idx = i
+                        }
+                        i = i + 1
+                    }
+                },
+                None => {},
+            }
+        }
+        if amb {
+            [-2, -1]
+        } else {
+            [found, idx]
+        }
+    }
+
+    // require_mut_root walks an index chain back to its root binding and
+    // enforces deep mut
+    fn require_mut_root(e0, what) {
+        let mut root = e0
+        let mut walking = true
+        while walking {
+            match root {
+                Index(t, _, _) => { root = t },
+                _ => { walking = false },
+            }
+        }
+        let name = match root {
+            Ident(n, _) => n,
+            _ => "",
+        }
+        if name != "" {
+            let b = lookup(name)
+            if b >= 0 && !b_mut[b] {
+                let help = if b_kind[b] == "param" {
+                    "declare the parameter as mutable: `mut " + name + "`"
+                } else {
+                    "make this binding mutable: `let mut " + name + "`"
+                }
+                cerr(span_of(e0), "E0596", help,
+                    "cannot " + what + ", as `" + name + "` is not declared as mutable")
+            }
+        }
+    }
+
+    // ---- inference (the infer_expr <-> infer_stmt knot goes through cells) ----
+    let mut infer_expr_ref = fn(_e) { 0 }
+    let mut infer_stmt_ref = fn(_s) { }
+
+    // statements of a while/for body: every statement is a statement (a
+    // trailing expression is not a block value here)
+    fn infer_block_stmts(blk) {
+        match blk {
+            Block(ss, _) => {
+                for s in ss {
+                    infer_stmt_ref(s)
+                }
+            },
+            _ => {},
+        }
+    }
+
+    fn infer_block_noscope(blk) {
+        match blk {
+            Block(ss, _) => {
+                let n = len(ss)
+                let mut i = 0
+                let mut t = h_unit
+                while i < n {
+                    let s = ss[i]
+                    let is_last_expr = if i == n - 1 {
+                        match s {
+                            ExprStmt(_, _) => true,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                    if is_last_expr {
+                        match s {
+                            ExprStmt(e, _) => { t = infer_expr_ref(e) },
+                            _ => {},
+                        }
+                    } else {
+                        infer_stmt_ref(s)
+                    }
+                    i = i + 1
+                }
+                t
+            },
+            _ => h_unit,
+        }
+    }
+
+    fn infer_block_expr(blk) {
+        push_scope()
+        let t = infer_block_noscope(blk)
+        pop_scope()
+        t
+    }
+
+    fn infer_let_init(init) {
+        let is_fnlit = match init {
+            FnLit(_, _, _, _, _, _) => true,
+            _ => false,
+        }
+        if is_fnlit {
+            level = level + 1
+            let t = infer_expr_ref(init)
+            level = level - 1
+            t
+        } else {
+            infer_expr_ref(init)
+        }
+    }
+
+    fn infer_call(callee, cargs, csp) {
+        let callee_name = match callee {
+            Ident(n, _) => n,
+            _ => "",
+        }
+        if (callee_name == "push" || callee_name == "pop" || callee_name == "put" ||
+            callee_name == "delete") && len(cargs) > 0 {
+            let b = lookup(callee_name)
+            if b >= 0 && b_kind[b] == "native" {
+                require_mut_root(cargs[0], "mutate this list with `" + callee_name + "()`")
+            }
+        }
+        // special-cased natives
+        let mut special = ""
+        let mut special_b = -1
+        if callee_name != "" {
+            let b = lookup(callee_name)
+            if b >= 0 && b_special[b] != "" {
+                special = b_special[b]
+                special_b = b
+            }
+        }
+        if special == "printf" { // print/println: variadic, any types
+            b_used[special_b] = true
+            for a in cargs {
+                let _ = infer_expr_ref(a)
+            }
+            h_unit
+        } else if special == "chan" {
+            b_used[special_b] = true
+            if len(cargs) > 1 {
+                cerr(csp, "E0061", "", "chan() takes at most one argument (the capacity)")
+            }
+            for a in cargs {
+                let at = infer_expr_ref(a)
+                unify_at(at, h_int, span_of(a), "as the channel capacity")
+            }
+            con1("chan", fresh(""))
+        } else {
+            let ct = infer_expr_ref(callee)
+            let mut ahs = []
+            for a in cargs {
+                push(ahs, infer_expr_ref(a))
+            }
+            // better arity errors when the callee type is already concrete
+            let rf = ty_resolve(tk, tr, ct)
+            if tk[rf] == 1 && len(ta[rf]) != len(ahs) {
+                cerr(csp, "E0061", "", "this call takes " + str(len(ta[rf])) +
+                    " argument(s) but " + str(len(ahs)) + " were supplied")
+                tr[rf]
+            } else {
+                let ret = fresh("")
+                unify_at(ct, tfn(ahs, ret), csp, "in this call")
+                ret
+            }
+        }
+    }
+
+    fn infer_try(inner, tsp) {
+        let t = infer_expr_ref(inner)
+        if len(ret_tys) == 0 {
+            cerr(tsp, "E0277", "", "`?` can only be used inside a function")
+            return fresh("")
+        }
+        let ret = ret_tys[len(ret_tys) - 1]
+        let r = ty_resolve(tk, tr, t)
+        if tk[r] == 0 && tn[r] == "Result" {
+            let e = fresh("")
+            let ok = fresh("")
+            unify_at(t, con2("Result", ok, e), tsp, "with `?`")
+            let b = fresh("")
+            unify_at(ret, con2("Result", b, e), tsp,
+                "with `?` (the enclosing function must return a Result with the same error type)")
+            ok
+        } else if tk[r] == 0 && tn[r] == "Option" {
+            let v = fresh("")
+            unify_at(t, con1("Option", v), tsp, "with `?`")
+            let b = fresh("")
+            unify_at(ret, con1("Option", b), tsp,
+                "with `?` (the enclosing function must return an Option)")
+            v
+        } else {
+            cerr(tsp, "E0277", "", "`?` needs an `Option` or `Result`, found `" + pretty_of(t) + "`")
+            fresh("")
+        }
+    }
+
+    fn infer_match(scrut, arms, msp) {
+        let scrut_t = infer_expr_ref(scrut)
+        let res_t = fresh("")
+        let mut covered = map() // variant names / "true"/"false"
+        let mut has_catch_all = false
+
+        for arm in arms {
+            match arm {
+                MatchArm(pat, body, _) => {
+                    push_scope()
+                    match pat {
+                        PatWildcard(_) => { has_catch_all = true },
+                        PatLiteral(v, psp) => {
+                            let lt = match v {
+                                IntLit(_, _) => h_int,
+                                FloatLit(_, _) => h_float,
+                                StrLit(_, _) => h_str,
+                                BoolLit(bv, _) => {
+                                    put(covered, str(bv), true)
+                                    h_bool
+                                },
+                                _ => fresh(""),
+                            }
+                            unify_at(scrut_t, lt, psp, "between this pattern and the matched value")
+                        },
+                        PatBinding(name, psp) => {
+                            let fv = find_variant_sig(name)
+                            if fv[0] == -2 {
+                                cerr(psp, "E0659", "qualify it, e.g. `SomeEnum." + name + "`",
+                                    "`" + name + "` is a variant of several enums")
+                            } else if fv[0] >= 0 && len(v_fields[e_variants[fv[0]][fv[1]]]) == 0 {
+                                let mut subst = map()
+                                let enum_ty = instantiate_enum(fv[0], subst)
+                                unify_at(scrut_t, enum_ty, psp, "between this pattern and the matched value")
+                                put(covered, name, true)
+                            } else if fv[0] >= 0 {
+                                cerr(psp, "E0532", "", "variant `" + name + "` has " +
+                                    str(len(v_fields[e_variants[fv[0]][fv[1]]])) +
+                                    " field(s); bind them: `" + name + "(...)`")
+                            } else {
+                                has_catch_all = true
+                                let _ = declare(name, mono(scrut_t), false, "local", psp)
+                            }
+                        },
+                        PatVariant(ppkg, penum, pvar, binds, psp) => {
+                            let mut eh = -1
+                            let mut idx = -1
+                            if ppkg != "" {
+                                // scripts import nothing: qualified patterns are unresolvable
+                                cerr(psp, "E0433", "", "cannot find package `" + ppkg + "`")
+                            } else if penum != "" {
+                                match get(enum_by_name, penum) {
+                                    Some(h) => {
+                                        let mut i = 0
+                                        while i < len(e_variants[h]) {
+                                            if v_name[e_variants[h][i]] == pvar {
+                                                idx = i
+                                            }
+                                            i = i + 1
+                                        }
+                                        if idx < 0 {
+                                            cerr(psp, "E0599", "", "enum `" + penum + "` has no variant `" + pvar + "`")
+                                        } else {
+                                            eh = h
+                                        }
+                                    },
+                                    None => cerr(psp, "E0412", "", "cannot find enum `" + penum + "`"),
+                                }
+                            } else {
+                                let fv = find_variant_sig(pvar)
+                                if fv[0] == -2 {
+                                    cerr(psp, "E0659", "qualify it, e.g. `SomeEnum." + pvar + "`",
+                                        "`" + pvar + "` is a variant of several enums")
+                                } else if fv[0] < 0 {
+                                    cerr(psp, "E0425", "", "cannot find variant `" + pvar + "`")
+                                } else {
+                                    eh = fv[0]
+                                    idx = fv[1]
+                                }
+                            }
+                            if eh >= 0 && idx >= 0 {
+                                let mut subst = map()
+                                let enum_ty = instantiate_enum(eh, subst)
+                                unify_at(scrut_t, enum_ty, psp, "between this pattern and the matched value")
+                                let fields = v_fields[e_variants[eh][idx]]
+                                if len(binds) != len(fields) {
+                                    cerr(psp, "E0023", "", "variant `" + pvar + "` has " +
+                                        str(len(fields)) + " field(s), pattern binds " + str(len(binds)))
+                                } else {
+                                    let mut i = 0
+                                    while i < len(binds) {
+                                        let ft = convert_type_expr(fields[i], subst)
+                                        match binds[i] {
+                                            PatBinding(bn, bsp) => {
+                                                let _ = declare(bn, mono(ft), false, "local", bsp)
+                                            },
+                                            _ => {},
+                                        }
+                                        i = i + 1
+                                    }
+                                }
+                                put(covered, pvar, true)
+                            }
+                        },
+                        _ => {},
+                    }
+                    let bt = infer_expr_ref(body)
+                    unify_at(res_t, bt, span_of(body),
+                        "between the arms of this `match` (all arms must produce one type)")
+                    pop_scope()
+                },
+                _ => {},
+            }
+        }
+
+        // exhaustiveness
+        if !has_catch_all {
+            let s = ty_resolve(tk, tr, scrut_t)
+            if tk[s] == 0 {
+                let eh = match get(enum_by_name, tn[s]) {
+                    Some(h) => h,
+                    None => -1,
+                }
+                if eh >= 0 {
+                    let mut missing = []
+                    for vh in e_variants[eh] {
+                        let hit = match get(covered, v_name[vh]) {
+                            Some(_) => true,
+                            None => false,
+                        }
+                        if !hit {
+                            push(missing, "`" + v_name[vh] + "`")
+                        }
+                    }
+                    if len(missing) > 0 {
+                        cerr(msp, "E0004", "add the missing arms, or a `_ => ...` catch-all",
+                            "non-exhaustive `match`: variant(s) " + join(missing, ", ") + " not covered")
+                    }
+                } else if tn[s] == "bool" {
+                    let t_hit = match get(covered, "true") { Some(_) => true, None => false }
+                    let f_hit = match get(covered, "false") { Some(_) => true, None => false }
+                    if !t_hit || !f_hit {
+                        cerr(msp, "E0004", "cover both `true` and `false`, or add `_ => ...`",
+                            "non-exhaustive `match` on bool")
+                    }
+                } else {
+                    cerr(msp, "E0004", "add a final binding or `_ => ...` arm",
+                        "non-exhaustive `match`: `" + pretty_of(scrut_t) + "` cannot be enumerated")
+                }
+            } else {
+                cerr(msp, "E0004", "add a final binding or `_ => ...` arm", "non-exhaustive `match`")
+            }
+        }
+        res_t
+    }
+
+    fn infer_expr(e) {
+        match e {
+            IntLit(_, _) => h_int,
+            FloatLit(_, _) => h_float,
+            StrLit(_, _) => h_str,
+            BoolLit(_, _) => h_bool,
+            Ident(name, isp) => {
+                let b = lookup(name)
+                if b >= 0 {
+                    b_used[b] = true
+                    instantiate(b_scheme[b])
+                } else {
+                    // bare enum variant
+                    let fv = find_variant_sig(name)
+                    if fv[0] == -2 {
+                        cerr(isp, "E0659", "qualify it, e.g. `SomeEnum." + name + "`",
+                            "`" + name + "` is a variant of several enums")
+                        fresh("")
+                    } else if fv[1] >= 0 {
+                        variant_type(fv[0], fv[1])
+                    } else {
+                        cerr(isp, "E0425", "", "cannot find `" + name + "` in this scope")
+                        fresh("")
+                    }
+                }
+            },
+            VariantAccess(en, vr, vsp) => {
+                match get(enum_by_name, en) {
+                    Some(eh) => {
+                        let mut idx = -1
+                        let mut i = 0
+                        while i < len(e_variants[eh]) {
+                            if v_name[e_variants[eh][i]] == vr {
+                                idx = i
+                            }
+                            i = i + 1
+                        }
+                        if idx >= 0 {
+                            variant_type(eh, idx)
+                        } else {
+                            cerr(vsp, "E0599", "", "enum `" + en + "` has no variant `" + vr + "`")
+                            fresh("")
+                        }
+                    },
+                    None => {
+                        cerr(vsp, "E0412", "", "cannot find enum `" + en + "`")
+                        fresh("")
+                    },
+                }
+            },
+            PkgAccess(pkg, _, psp) => {
+                cerr(psp, "E0433", "", "cannot find package `" + pkg + "`")
+                fresh("")
+            },
+            QualVariantAccess(pkg, _, _, qsp) => {
+                cerr(qsp, "E0433", "", "cannot find package `" + pkg + "`")
+                fresh("")
+            },
+            Unary(op, rhs, usp) => {
+                let t = infer_expr(rhs)
+                if op == t_minus {
+                    unify_at(t, fresh("num"), usp, "with unary `-`")
+                    t
+                } else {
+                    unify_at(t, h_bool, usp, "with `!`")
+                    h_bool
+                }
+            },
+            Binary(op, lhs, rhs, bsp) => {
+                let lt = infer_expr(lhs)
+                let rt = infer_expr(rhs)
+                if op == t_plus {
+                    unify_at(lt, rt, bsp, "with `+` (no implicit conversions: use to_float()/trunc())")
+                    unify_at(lt, fresh("addord"), bsp, "with `+`")
+                    lt
+                } else if op == t_minus || op == t_star || op == t_slash {
+                    unify_at(lt, rt, bsp, "with this operator (no implicit conversions: use to_float()/trunc())")
+                    unify_at(lt, fresh("num"), bsp, "with this arithmetic operator")
+                    lt
+                } else if op == t_percent {
+                    unify_at(lt, h_int, bsp, "with `%` (int only)")
+                    unify_at(rt, h_int, bsp, "with `%` (int only)")
+                    h_int
+                } else if op == t_lt || op == t_lt_eq || op == t_gt || op == t_gt_eq {
+                    unify_at(lt, rt, bsp, "in this comparison (no implicit conversions)")
+                    unify_at(lt, fresh("addord"), bsp, "in this comparison")
+                    h_bool
+                } else if op == t_eq_eq || op == t_bang_eq {
+                    unify_at(lt, rt, bsp, "in this equality (both sides must be the same type)")
+                    h_bool
+                } else {
+                    fresh("")
+                }
+            },
+            Logical(_, lhs, rhs, _) => {
+                let lt = infer_expr(lhs)
+                let rt = infer_expr(rhs)
+                unify_at(lt, h_bool, span_of(lhs), "with `&&`/`||`")
+                unify_at(rt, h_bool, span_of(rhs), "with `&&`/`||`")
+                h_bool
+            },
+            Call(callee, cargs, csp) => infer_call(callee, cargs, csp),
+            Index(target, idx, _) => {
+                let el = fresh("")
+                let tt = infer_expr(target)
+                unify_at(tt, con1("list", el), span_of(target),
+                    "when indexing (only lists; for strings use char_at(), for maps use get())")
+                let it = infer_expr(idx)
+                unify_at(it, h_int, span_of(idx), "in this index")
+                el
+            },
+            ListLit(elems, _) => {
+                let el = fresh("")
+                for x in elems {
+                    let t = infer_expr(x)
+                    unify_at(el, t, span_of(x), "in this list (all elements must share one type)")
+                }
+                con1("list", el)
+            },
+            FnLit(params, muts, pspans, body, _, _) => {
+                push_scope()
+                let mut phs = []
+                let mut i = 0
+                while i < len(params) {
+                    let pv = fresh("")
+                    push(phs, pv)
+                    let _ = declare(params[i], mono(pv), muts[i], "param", pspans[i])
+                    i = i + 1
+                }
+                let ret = fresh("")
+                push(ret_tys, ret)
+                let bt = infer_block_expr(body)
+                unify_at(ret, bt, span_of(body), "as this function's result")
+                let _ = pop(ret_tys)
+                pop_scope()
+                tfn(phs, ret)
+            },
+            Block(_, _) => {
+                push_scope()
+                let t = infer_block_noscope(e)
+                pop_scope()
+                t
+            },
+            IfExpr(cond, then, els, _) => {
+                let ct = infer_expr(cond)
+                unify_at(ct, h_bool, span_of(cond), "in this `if` condition")
+                let tt = infer_expr(then)
+                let no_else = match els {
+                    NoNode => true,
+                    _ => false,
+                }
+                if no_else {
+                    unify_at(tt, h_unit, span_of(then),
+                        "in this `if` (without an `else`, the branch must be unit)")
+                    h_unit
+                } else {
+                    let et = infer_expr(els)
+                    unify_at(tt, et, span_of(els), "between `if` and `else` branches")
+                    tt
+                }
+            },
+            MatchExpr(scrut, arms, msp) => infer_match(scrut, arms, msp),
+            TryExpr(inner, tsp) => infer_try(inner, tsp),
+            RecvExpr(ch, rsp) => {
+                let el = fresh("")
+                let ct = infer_expr(ch)
+                unify_at(ct, con1("chan", el), rsp, "with `<-` (need a channel)")
+                el
+            },
+            _ => fresh(""),
+        }
+    }
+    infer_expr_ref = infer_expr
+
+    fn infer_stmt(s) {
+        match s {
+            LetStmt(name, nsp, is_mut, is_pub, init, ssp) => {
+                if is_pub {
+                    err_pub_script(ssp)
+                }
+                let t = infer_let_init(init)
+                let is_fnlit = match init {
+                    FnLit(_, _, _, _, _, _) => true,
+                    _ => false,
+                }
+                let sch = if is_fnlit { generalize(t) } else { mono(t) }
+                let _ = declare(name, sch, is_mut, "local", nsp)
+            },
+            FnDecl(name, nsp, is_pub, lit, ssp) => {
+                if is_pub {
+                    err_pub_script(ssp)
+                }
+                let tv = fresh("")
+                let b = declare(name, mono(tv), false, "local", nsp)
+                b_isfn[b] = true
+                b_used[b] = true // don't lint named helper fns
+                level = level + 1
+                let ft = infer_expr(lit)
+                level = level - 1
+                b_scheme[b] = generalize(ft) // before unify: see top-level FnDecl note
+                unify_at(tv, ft, nsp, "in this function")
+            },
+            EnumDecl(_, _, _, _, ssp) => {
+                cerr(ssp, "E0637", "", "enum declarations are only allowed at top level")
+            },
+            ImportDecl(_, _, _, _, ssp) => {
+                cerr(ssp, "E0432",
+                    "imports go at the top of a file in a module (a directory with bur.mod); single-file scripts cannot import",
+                    "`import` is not allowed here")
+            },
+            ExprStmt(e, ssp) => {
+                let t = infer_expr(e)
+                let r = ty_resolve(tk, tr, t)
+                if tk[r] == 0 && (tn[r] == "Result" || tn[r] == "Option") {
+                    cerr(ssp, "unused_must_use",
+                        "handle it with `match`/`?`, or discard explicitly with `let _ = ...`",
+                        "unused `" + tn[r] + "` value must be handled")
+                }
+            },
+            AssignStmt(target, val, _) => {
+                match target {
+                    Ident(name, isp) => {
+                        let b = lookup(name)
+                        if b < 0 {
+                            cerr(isp, "E0425", "declare it first: `let mut " + name + " = ...`",
+                                "cannot assign to undeclared variable `" + name + "`")
+                            let _ = infer_expr(val)
+                        } else {
+                            if !b_mut[b] {
+                                let help = if b_kind[b] == "param" {
+                                    "declare the parameter as mutable: `mut " + name + "`"
+                                } else {
+                                    "make this binding mutable: `let mut " + name + "`"
+                                }
+                                cerr(isp, "E0384", help,
+                                    "cannot assign twice to immutable variable `" + name + "`")
+                            }
+                            let vt = infer_expr(val)
+                            unify_at(instantiate(b_scheme[b]), vt, span_of(val), "in this assignment")
+                        }
+                    },
+                    Index(itarget, iidx, _) => {
+                        require_mut_root(target, "assign to this element")
+                        let el = fresh("")
+                        let tt = infer_expr(itarget)
+                        unify_at(tt, con1("list", el), span_of(itarget), "when indexing")
+                        let it = infer_expr(iidx)
+                        unify_at(it, h_int, span_of(iidx), "in this index")
+                        let vt = infer_expr(val)
+                        unify_at(el, vt, span_of(val), "in this assignment")
+                    },
+                    _ => {},
+                }
+            },
+            WhileStmt(cond, body, _) => {
+                let ct = infer_expr(cond)
+                unify_at(ct, h_bool, span_of(cond), "in this `while` condition")
+                push_scope()
+                infer_block_stmts(body)
+                pop_scope()
+            },
+            ForStmt(v, vsp, iter, _, body, fsp) => {
+                let el = fresh("")
+                let it = infer_expr(iter)
+                // a channel iterable receives until closed; anything else must
+                // be a list (the channel type must be statically evident here)
+                let r = ty_resolve(tk, tr, it)
+                if tk[r] == 0 && tn[r] == "chan" {
+                    unify_at(el, ta[r][0], span_of(iter), "in this `for` loop (receive from a channel)")
+                    match fsp {
+                        Sp(fstart, _) => push(chan_fors, fstart),
+                    }
+                } else {
+                    unify_at(it, con1("list", el), span_of(iter),
+                        "in this `for` loop (iterate over a list or channel)")
+                }
+                push_scope()
+                let _ = declare(v, mono(el), false, "local", vsp)
+                infer_block_stmts(body)
+                pop_scope()
+            },
+            ReturnStmt(val, ssp) => {
+                let has_val = match val {
+                    NoNode => false,
+                    _ => true,
+                }
+                let t = if has_val { infer_expr(val) } else { h_unit }
+                if len(ret_tys) == 0 {
+                    cerr(ssp, "E0572", "", "`return` outside of a function")
+                } else {
+                    unify_at(ret_tys[len(ret_tys) - 1], t, ssp, "in this `return`")
+                }
+            },
+            SpawnStmt(call, _) => {
+                let _ = infer_expr(call)
+            },
+            SelectStmt(arms, has_default, dflt, _, _) => {
+                for arm in arms {
+                    match arm {
+                        SelectArm(is_send, bind, bind_sp, ch, val, body, _) => {
+                            let el = fresh("")
+                            let ct = infer_expr(ch)
+                            unify_at(ct, con1("chan", el), span_of(ch),
+                                "in this `select` arm (need a channel)")
+                            if is_send {
+                                let vt = infer_expr(val)
+                                unify_at(el, vt, span_of(val), "in this `select` send")
+                                let _ = infer_expr(body)
+                            } else {
+                                push_scope()
+                                if bind != "" && bind != "_" {
+                                    let _ = declare(bind, mono(el), false, "local", bind_sp)
+                                }
+                                let _ = infer_expr(body)
+                                pop_scope()
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+                if has_default {
+                    let _ = infer_expr(dflt)
+                }
+            },
+            SendStmt(ch, val, _) => {
+                let el = fresh("")
+                let ct = infer_expr(ch)
+                unify_at(ct, con1("chan", el), span_of(ch), "on the left of `<-` (need a channel)")
+                let vt = infer_expr(val)
+                unify_at(el, vt, span_of(val), "in this send")
+            },
+            _ => {}, // break/continue: loop nesting validated by the compiler
+        }
+    }
+    infer_stmt_ref = infer_stmt
+
+    // ---- builtins (mirrors declareBuiltins in types.go) ----
+    push_scope() // scope 0
+
+    fn te(name) {
+        TEName("", name, [], Sp(0, 0))
+    }
+    fn builtin_enum(name, params, vnames, vfieldss) {
+        let mut vhs = []
+        let mut i = 0
+        while i < len(vnames) {
+            push(v_name, vnames[i])
+            push(v_fields, vfieldss[i])
+            push(vhs, len(v_name) - 1)
+            i = i + 1
+        }
+        push(e_qual, name)
+        push(e_params, params)
+        push(e_variants, vhs)
+        put(enum_by_name, name, len(e_qual) - 1)
+    }
+    builtin_enum("Option", ["a"], ["Some", "None"], [[te("a")], []])
+    builtin_enum("Result", ["a", "e"], ["Ok", "Err"], [[te("a")], [te("e")]])
+    // Output(code, stdout, stderr): the single-variant result of exec()
+    builtin_enum("Output", [], ["Output"], [[te("int"), te("str"), te("str")]])
+
+    fn qvar(con) {
+        ty_new_var(tk, tn, ta, tr, tl, 1, con)
+    }
+    fn decl_native(name, sch) {
+        let _ = declare(name, sch, false, "native", Sp(0, 0))
+    }
+
+    let va1 = qvar("")
+    decl_native("len", new_scheme([va1], tfn([con1("list", va1)], h_int)))
+    let va2 = qvar("")
+    decl_native("push", new_scheme([va2], tfn([con1("list", va2), va2], h_unit)))
+    let va3 = qvar("")
+    decl_native("pop", new_scheme([va3], tfn([con1("list", va3)], va3)))
+    let mk1 = qvar("key")
+    let mv1 = qvar("")
+    decl_native("map", new_scheme([mk1, mv1], tfn([], con2("map", mk1, mv1))))
+    let mk2 = qvar("key")
+    let mv2 = qvar("")
+    decl_native("get", new_scheme([mk2, mv2], tfn([con2("map", mk2, mv2), mk2], con1("Option", mv2))))
+    let mk3 = qvar("key")
+    let mv3 = qvar("")
+    decl_native("put", new_scheme([mk3, mv3], tfn([con2("map", mk3, mv3), mk3, mv3], h_unit)))
+    let mk4 = qvar("key")
+    let mv4 = qvar("")
+    decl_native("delete", new_scheme([mk4, mv4], tfn([con2("map", mk4, mv4), mk4], h_unit)))
+    let mk5 = qvar("key")
+    let mv5 = qvar("")
+    decl_native("keys", new_scheme([mk5, mv5], tfn([con2("map", mk5, mv5)], con1("list", mk5))))
+    let va4 = qvar("")
+    decl_native("str", new_scheme([va4], tfn([va4], h_str)))
+    let va5 = qvar("")
+    decl_native("type_of", new_scheme([va5], tfn([va5], h_str)))
+    decl_native("str_len", mono(tfn([h_str], h_int)))
+    decl_native("char_at", mono(tfn([h_str, h_int], h_str)))
+    decl_native("trunc", mono(tfn([h_float], h_int)))
+    decl_native("to_float", mono(tfn([h_int], h_float)))
+    decl_native("parse_int", mono(tfn([h_str], con1("Option", h_int))))
+    decl_native("parse_float", mono(tfn([h_str], con1("Option", h_float))))
+    decl_native("range", mono(tfn([h_int, h_int], con1("list", h_int))))
+    decl_native("split", mono(tfn([h_str, h_str], con1("list", h_str))))
+    decl_native("join", mono(tfn([con1("list", h_str), h_str], h_str)))
+    decl_native("substr", mono(tfn([h_str, h_int, h_int], h_str)))
+    decl_native("str_contains", mono(tfn([h_str, h_str], h_bool)))
+    decl_native("str_index_of", mono(tfn([h_str, h_str], con1("Option", h_int))))
+    decl_native("trim", mono(tfn([h_str], h_str)))
+    let va6 = qvar("")
+    decl_native("slice", new_scheme([va6], tfn([con1("list", va6), h_int, h_int], con1("list", va6))))
+    let va7 = qvar("")
+    decl_native("concat", new_scheme([va7], tfn([con1("list", va7), con1("list", va7)], con1("list", va7))))
+    let va8 = qvar("")
+    decl_native("contains", new_scheme([va8], tfn([con1("list", va8), va8], h_bool)))
+    decl_native("read_file", mono(tfn([h_str], con2("Result", h_str, h_str))))
+    decl_native("write_file", mono(tfn([h_str, h_str], con2("Result", h_unit, h_str))))
+    decl_native("file_exists", mono(tfn([h_str], h_bool)))
+    decl_native("read_dir", mono(tfn([h_str], con2("Result", con1("list", h_str), h_str))))
+    decl_native("exec", mono(tfn([h_str, con1("list", h_str)], con2("Result", con0("Output"), h_str))))
+    decl_native("args", mono(tfn([], con1("list", h_str))))
+    // exit never returns, so it unifies with any expected type
+    let va9 = qvar("")
+    decl_native("exit", new_scheme([va9], tfn([h_int], va9)))
+    decl_native("clock", mono(tfn([], h_float)))
+    decl_native("assert", mono(tfn([h_bool, h_str], h_unit)))
+    decl_native("gc", mono(tfn([], h_int)))
+    decl_native("heap_objects", mono(tfn([], h_int)))
+    decl_native("gc_cycles", mono(tfn([], h_int)))
+    decl_native("chr", mono(tfn([h_int], h_str)))
+    decl_native("ord", mono(tfn([h_str], h_int)))
+    decl_native("yield", mono(tfn([], h_unit)))
+    let va10 = qvar("")
+    decl_native("close", new_scheme([va10], tfn([con1("chan", va10)], h_unit)))
+    let va11 = qvar("")
+    decl_native("recv", new_scheme([va11], tfn([con1("chan", va11)], con1("Option", va11))))
+
+    let bp1 = declare("print", mono(tfn([], h_unit)), false, "native", Sp(0, 0))
+    b_special[bp1] = "printf"
+    let bp2 = declare("println", mono(tfn([], h_unit)), false, "native", Sp(0, 0))
+    b_special[bp2] = "printf"
+    let bc1 = declare("chan", mono(tfn([], con1("chan", h_unit))), false, "native", Sp(0, 0))
+    b_special[bc1] = "chan"
+
+    // ---- pass 1: register enums, pre-declare every top-level name ----
+    for s in stmts {
+        match s {
+            EnumDecl(_, _, _, _, _) => register_enum(s),
+            _ => {},
+        }
+    }
+    let mut pre = map()
+    for s in stmts {
+        match s {
+            FnDecl(name, nsp, _, _, _) => {
+                let tv = fresh("")
+                put(pre, name, tv)
+                let b = declare(name, mono(tv), false, "global", nsp)
+                b_isfn[b] = true
+            },
+            LetStmt(name, nsp, is_mut, _, _, _) => {
+                let tv = fresh("")
+                put(pre, name, tv)
+                let _ = declare(name, mono(tv), is_mut, "global", nsp)
+            },
+            _ => {},
+        }
+    }
+
+    // ---- pass 2: infer in order ----
+    for s in stmts {
+        match s {
+            FnDecl(name, nsp, is_pub, lit, _) => {
+                if is_pub {
+                    err_pub_script(span_of(s))
+                }
+                level = level + 1
+                let ft = infer_expr(lit)
+                level = level - 1
+                // generalize BEFORE linking the level-0 placeholder: unify
+                // would pin every inner var to level 0 and kill polymorphism
+                let b = lookup(name)
+                b_scheme[b] = generalize(ft)
+                let pt = match get(pre, name) {
+                    Some(t) => t,
+                    None => ft,
+                }
+                unify_at(pt, ft, nsp, "in this function")
+            },
+            LetStmt(name, nsp, _, is_pub, init, _) => {
+                if is_pub {
+                    err_pub_script(span_of(s))
+                }
+                let t = infer_let_init(init)
+                let pt = match get(pre, name) {
+                    Some(x) => x,
+                    None => t,
+                }
+                unify_at(pt, t, nsp, "in this binding")
+            },
+            EnumDecl(_, _, _, is_pub, _) => {
+                if is_pub {
+                    err_pub_script(span_of(s))
+                }
+                // already registered
+            },
+            _ => infer_stmt(s),
+        }
+    }
+
+    // ---- lint unused top-level bindings (skip _-prefixed) ----
+    for name in keys(scopes[0]) {
+        match get(scopes[0], name) {
+            Some(b) => {
+                if b_kind[b] == "global" && !b_used[b] && !starts_underscore(name) {
+                    let what = if b_isfn[b] { "function" } else { "variable" }
+                    cwarn(b_span[b], "unused_variable",
+                        "if this is intentional, prefix it with an underscore: `_" + name + "`",
+                        "unused " + what + ": `" + name + "`")
+                }
+            },
+            None => {},
+        }
+    }
+
+    // ---- bind dump lines (only meaningful without errors) ----
+    let mut has_err = false
+    for d in diags {
+        match d {
+            Diag(ie, _, _, _, _, _) => {
+                if ie {
+                    has_err = true
+                }
+            },
+        }
+    }
+    let mut bind_lines = []
+    if !has_err {
+        let mut names = []
+        for name in keys(scopes[0]) {
+            match get(scopes[0], name) {
+                Some(b) => {
+                    if b_kind[b] == "global" {
+                        push(names, name)
+                    }
+                },
+                None => {},
+            }
+        }
+        for name in sort_strs(names) {
+            match get(scopes[0], name) {
+                Some(b) => push(bind_lines, "bind " + name + " :: " + pretty_of(s_t[b_scheme[b]])),
+                None => {},
+            }
+        }
+    }
+
+    Checked(sort_diags(diags), bind_lines, chan_fors)
+}
+
+// ---- small sorts (no stdlib sort yet; stable pick-first-minimum) ----
+
+fn diag_start(d) {
+    match d {
+        Diag(_, _, _, _, s, _) => s,
+    }
+}
+
+fn sort_diags(ds) {
+    let n = len(ds)
+    let mut taken = []
+    for _d in ds {
+        push(taken, false)
+    }
+    let mut out = []
+    let mut c = 0
+    while c < n {
+        let mut best = -1
+        let mut i = 0
+        while i < n {
+            if !taken[i] {
+                if best < 0 {
+                    best = i
+                } else if diag_start(ds[i]) < diag_start(ds[best]) {
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        taken[best] = true
+        push(out, ds[best])
+        c = c + 1
+    }
+    out
+}
+
+fn sort_strs(xs) {
+    let n = len(xs)
+    let mut taken = []
+    for _x in xs {
+        push(taken, false)
+    }
+    let mut out = []
+    let mut c = 0
+    while c < n {
+        let mut best = -1
+        let mut i = 0
+        while i < n {
+            if !taken[i] {
+                if best < 0 {
+                    best = i
+                } else if xs[i] < xs[best] {
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        taken[best] = true
+        push(out, xs[best])
+        c = c + 1
+    }
+    out
+}
