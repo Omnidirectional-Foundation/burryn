@@ -115,7 +115,7 @@ func (p *burcProgram) run(t *testing.T, argv ...string) string {
 func burCorpus(t *testing.T) []string {
 	t.Helper()
 	var files []string
-	for _, pat := range []string{"examples/*.bur", "examples/*/*.bur", "examples/*/*/*.bur", "burc/*.bur"} {
+	for _, pat := range []string{"examples/*.bur", "examples/*/*.bur", "examples/*/*/*.bur", "burc/*.bur", "testdata/parse/*.bur"} {
 		fs, err := filepath.Glob(pat)
 		if err != nil {
 			t.Fatal(err)
@@ -138,6 +138,235 @@ func firstDiff(got, want string) string {
 	return fmt.Sprintf("line counts differ: burc %d, go %d", len(gl), len(wl))
 }
 
+// ---- AST dump (mirrors burc/dump.bur's dump_node) ----
+
+func spanStr(sp Span) string { return fmt.Sprintf("%d:%d", sp.Start, sp.End) }
+
+func strsAtom(xs []string) string {
+	parts := make([]string, len(xs))
+	for i, x := range xs {
+		parts[i] = dumpEscape(x)
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+func boolsAtom(xs []bool) string {
+	parts := make([]string, len(xs))
+	for i, x := range xs {
+		parts[i] = fmt.Sprintf("%t", x)
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+func spansAtom(xs []Span) string {
+	parts := make([]string, len(xs))
+	for i, x := range xs {
+		parts[i] = spanStr(x)
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+// dumpNode renders one node per line — kind, atoms in struct field order,
+// span last — children indented two spaces; nil prints as NoNode. Values are
+// formatted through the VM's display() so both sides share one float format.
+func dumpNode(b *strings.Builder, n any, pre string) {
+	deeper := pre + "  "
+	line := func(format string, args ...any) { fmt.Fprintf(b, "%s"+format+"\n", append([]any{pre}, args...)...) }
+	if n == nil {
+		line("NoNode")
+		return
+	}
+	switch x := n.(type) {
+	case *IntLit:
+		line("IntLit %s %s", display(IntV(x.Val)), spanStr(x.Span))
+	case *FloatLit:
+		line("FloatLit %s %s", display(FloatV(x.Val)), spanStr(x.Span))
+	case *StrLit:
+		line("StrLit %s %s", dumpEscape(x.Val), spanStr(x.Span))
+	case *BoolLit:
+		line("BoolLit %t %s", x.Val, spanStr(x.Span))
+	case *Ident:
+		line("Ident %s %s", dumpEscape(x.Name), spanStr(x.Span))
+	case *Unary:
+		line("Unary %s %s", tokDumpNames[x.Op], spanStr(x.Span))
+		dumpNode(b, x.Rhs, deeper)
+	case *Binary:
+		line("Binary %s %s", tokDumpNames[x.Op], spanStr(x.Span))
+		dumpNode(b, x.Lhs, deeper)
+		dumpNode(b, x.Rhs, deeper)
+	case *Logical:
+		line("Logical %s %s", tokDumpNames[x.Op], spanStr(x.Span))
+		dumpNode(b, x.Lhs, deeper)
+		dumpNode(b, x.Rhs, deeper)
+	case *Call:
+		line("Call %s", spanStr(x.Span))
+		dumpNode(b, x.Callee, deeper)
+		for _, a := range x.Args {
+			dumpNode(b, a, deeper)
+		}
+	case *Index:
+		line("Index %s", spanStr(x.Span))
+		dumpNode(b, x.Target, deeper)
+		dumpNode(b, x.Idx, deeper)
+	case *ListLit:
+		line("ListLit %s", spanStr(x.Span))
+		for _, e := range x.Elems {
+			dumpNode(b, e, deeper)
+		}
+	case *FnLit:
+		line("FnLit %s params=%s muts=%s pspans=%s %s", dumpEscape(x.Name),
+			strsAtom(x.Params), boolsAtom(x.ParamMuts), spansAtom(x.ParamSpans), spanStr(x.Span))
+		dumpNode(b, x.Body, deeper)
+	case *Block:
+		line("Block %s", spanStr(x.Span))
+		for _, s := range x.Stmts {
+			dumpNode(b, s, deeper)
+		}
+	case *IfExpr:
+		line("IfExpr %s", spanStr(x.Span))
+		dumpNode(b, x.Cond, deeper)
+		dumpNode(b, x.Then, deeper)
+		if x.Else == nil {
+			dumpNode(b, nil, deeper)
+		} else {
+			dumpNode(b, x.Else, deeper)
+		}
+	case *MatchExpr:
+		line("MatchExpr %s", spanStr(x.Span))
+		dumpNode(b, x.Scrut, deeper)
+		for _, a := range x.Arms {
+			fmt.Fprintf(b, "%sMatchArm %s\n", deeper, spanStr(a.Span))
+			dumpNode(b, a.Pat, deeper+"  ")
+			dumpNode(b, a.Body, deeper+"  ")
+		}
+	case *VariantAccess:
+		line("VariantAccess %s %s %s", dumpEscape(x.EnumName), dumpEscape(x.Variant), spanStr(x.Span))
+	case *PkgAccess:
+		line("PkgAccess %s %s %s", dumpEscape(x.Pkg), dumpEscape(x.Name), spanStr(x.Span))
+	case *QualVariantAccess:
+		line("QualVariantAccess %s %s %s %s", dumpEscape(x.Pkg), dumpEscape(x.Enum), dumpEscape(x.Variant), spanStr(x.Span))
+	case *TryExpr:
+		line("TryExpr %s", spanStr(x.Span))
+		dumpNode(b, x.Inner, deeper)
+	case *RecvExpr:
+		line("RecvExpr %s", spanStr(x.Span))
+		dumpNode(b, x.Chan, deeper)
+	case *PatWildcard:
+		line("PatWildcard %s", spanStr(x.Span))
+	case *PatLiteral:
+		line("PatLiteral %s", spanStr(x.Span))
+		dumpNode(b, x.Val, deeper)
+	case *PatBinding:
+		line("PatBinding %s %s", dumpEscape(x.Name), spanStr(x.Span))
+	case *PatVariant:
+		line("PatVariant %s %s %s %s", dumpEscape(x.Pkg), dumpEscape(x.EnumName), dumpEscape(x.Variant), spanStr(x.Span))
+		for _, sub := range x.Binds {
+			dumpNode(b, sub, deeper)
+		}
+	case *LetStmt:
+		line("LetStmt %s %s mut=%t pub=%t %s", dumpEscape(x.Name), spanStr(x.NameSpan), x.Mut, x.Pub, spanStr(x.Span))
+		dumpNode(b, x.Init, deeper)
+	case *AssignStmt:
+		line("AssignStmt %s", spanStr(x.Span))
+		dumpNode(b, x.Target, deeper)
+		dumpNode(b, x.Val, deeper)
+	case *ExprStmt:
+		line("ExprStmt %s", spanStr(x.Span))
+		dumpNode(b, x.E, deeper)
+	case *WhileStmt:
+		line("WhileStmt %s", spanStr(x.Span))
+		dumpNode(b, x.Cond, deeper)
+		dumpNode(b, x.Body, deeper)
+	case *ForStmt:
+		line("ForStmt %s %s chan=%t %s", dumpEscape(x.Var), spanStr(x.VarSpan), x.IterIsChan, spanStr(x.Span))
+		dumpNode(b, x.Iter, deeper)
+		dumpNode(b, x.Body, deeper)
+	case *ReturnStmt:
+		line("ReturnStmt %s", spanStr(x.Span))
+		if x.Val == nil {
+			dumpNode(b, nil, deeper)
+		} else {
+			dumpNode(b, x.Val, deeper)
+		}
+	case *FnDecl:
+		line("FnDecl %s %s pub=%t %s", dumpEscape(x.Name), spanStr(x.NameSpan), x.Pub, spanStr(x.Span))
+		dumpNode(b, x.Fn, deeper)
+	case *EnumDecl:
+		line("EnumDecl %s params=%s pub=%t %s", dumpEscape(x.Name), strsAtom(x.Params), x.Pub, spanStr(x.Span))
+		for _, v := range x.Variants {
+			fmt.Fprintf(b, "%sEnumVariantDecl %s %d\n", deeper, dumpEscape(v.Name), v.Arity)
+			for _, ty := range v.Types {
+				dumpNode(b, ty, deeper+"  ")
+			}
+		}
+	case *ImportDecl:
+		line("ImportDecl %s %s %s %s %s", dumpEscape(x.Alias), spanStr(x.AliasSpan),
+			dumpEscape(x.Path), spanStr(x.PathSpan), spanStr(x.Span))
+	case *SpawnStmt:
+		line("SpawnStmt %s", spanStr(x.Span))
+		dumpNode(b, x.CallE, deeper)
+	case *SelectStmt:
+		line("SelectStmt default=%t %s %s", x.HasDefault, spanStr(x.DefaultSpan), spanStr(x.Span))
+		for _, a := range x.Arms {
+			fmt.Fprintf(b, "%sSelectArm send=%t %s %s %s\n", deeper, a.IsSend,
+				dumpEscape(a.Bind), spanStr(a.BindSpan), spanStr(a.Span))
+			dumpNode(b, a.Chan, deeper+"  ")
+			if a.Val == nil {
+				dumpNode(b, nil, deeper+"  ")
+			} else {
+				dumpNode(b, a.Val, deeper+"  ")
+			}
+			dumpNode(b, a.Body, deeper+"  ")
+		}
+		if x.Default == nil {
+			dumpNode(b, nil, deeper)
+		} else {
+			dumpNode(b, x.Default, deeper)
+		}
+	case *SendStmt:
+		line("SendStmt %s", spanStr(x.Span))
+		dumpNode(b, x.Chan, deeper)
+		dumpNode(b, x.Val, deeper)
+	case *BreakStmt:
+		line("BreakStmt %s", spanStr(x.Span))
+	case *ContinueStmt:
+		line("ContinueStmt %s", spanStr(x.Span))
+	case *TEName:
+		line("TEName %s %s %s", dumpEscape(x.Pkg), dumpEscape(x.Name), spanStr(x.Span))
+		for _, a := range x.Args {
+			dumpNode(b, a, deeper)
+		}
+	case *TEList:
+		line("TEList %s", spanStr(x.Span))
+		dumpNode(b, x.Elem, deeper)
+	case *TEFn:
+		line("TEFn %s", spanStr(x.Span))
+		for _, p := range x.Params {
+			dumpNode(b, p, deeper)
+		}
+		dumpNode(b, x.Ret, deeper)
+	default:
+		panic(fmt.Sprintf("dumpNode: unhandled node %T", n))
+	}
+}
+
+// dumpGoParse mirrors burc's `parse` command: on lex errors dump only those
+// (the pipeline stops before parsing), otherwise the AST plus parse diags.
+func dumpGoParse(src string) string {
+	toks, lexDiags := lex(src)
+	var b strings.Builder
+	if len(lexDiags) > 0 {
+		dumpDiags(&b, lexDiags)
+		return b.String()
+	}
+	stmts, parseDiags := parse(toks)
+	for _, s := range stmts {
+		dumpNode(&b, s, "")
+	}
+	dumpDiags(&b, parseDiags)
+	return b.String()
+}
+
 func TestBurcLexParity(t *testing.T) {
 	prog := loadBurc(t)
 	for _, file := range burCorpus(t) {
@@ -150,6 +379,23 @@ func TestBurcLexParity(t *testing.T) {
 			got := prog.run(t, "lex", file)
 			if got != want {
 				t.Errorf("token dump mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
+			}
+		})
+	}
+}
+
+func TestBurcParseParity(t *testing.T) {
+	prog := loadBurc(t)
+	for _, file := range burCorpus(t) {
+		t.Run(file, func(t *testing.T) {
+			srcBytes, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := dumpGoParse(string(srcBytes))
+			got := prog.run(t, "parse", file)
+			if got != want {
+				t.Errorf("AST dump mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
 			}
 		})
 	}

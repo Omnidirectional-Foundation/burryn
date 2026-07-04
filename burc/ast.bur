@@ -1,0 +1,127 @@
+// AST for the bootstrap compiler, mirroring ast.go.
+//
+// Go models Expr/Stmt/Pattern/TypeExpr as separate interfaces; enums here
+// cannot reference enums registered later, so every node kind lives in one
+// Node enum (self-references are fine). Field order mirrors the Go structs,
+// with the span last. NoNode stands in for Go's nil (missing else branch,
+// bare return, absent select default).
+
+// Span: half-open byte range [start, end) into the source
+enum SpanT {
+    Sp(int, int),
+}
+
+enum Node {
+    // ---- expressions ----
+    IntLit(int, SpanT),
+    FloatLit(float, SpanT),
+    StrLit(str, SpanT),
+    BoolLit(bool, SpanT),
+    Ident(str, SpanT),
+    Unary(int, Node, SpanT),                    // op (t_minus/t_bang), rhs
+    Binary(int, Node, Node, SpanT),             // op, lhs, rhs
+    Logical(int, Node, Node, SpanT),            // op (t_and_and/t_or_or), lhs, rhs
+    Call(Node, [Node], SpanT),                  // callee, args
+    Index(Node, Node, SpanT),                   // target, idx
+    ListLit([Node], SpanT),
+    FnLit([str], [bool], [SpanT], Node, str, SpanT), // params, muts, pspans, body, name
+    Block([Node], SpanT),
+    IfExpr(Node, Node, Node, SpanT),            // cond, then, else (or NoNode)
+    MatchExpr(Node, [Node], SpanT),             // scrutinee, arms
+    MatchArm(Node, Node, SpanT),                // pattern, body
+    VariantAccess(str, str, SpanT),             // enum name, variant
+    PkgAccess(str, str, SpanT),                 // package import path, name
+    QualVariantAccess(str, str, str, SpanT),    // pkg, enum, variant
+    TryExpr(Node, SpanT),
+    RecvExpr(Node, SpanT),
+
+    // ---- patterns ----
+    PatWildcard(SpanT),
+    PatLiteral(Node, SpanT),
+    PatBinding(str, SpanT),
+    PatVariant(str, str, str, [Node], SpanT),   // pkg, enum, variant, binds
+
+    // ---- statements ----
+    LetStmt(str, SpanT, bool, bool, Node, SpanT),     // name, name span, mut, pub, init
+    AssignStmt(Node, Node, SpanT),                    // target, value
+    ExprStmt(Node, SpanT),
+    WhileStmt(Node, Node, SpanT),                     // cond, body
+    ForStmt(str, SpanT, Node, bool, Node, SpanT),     // var, var span, iter, iter-is-chan, body
+    ReturnStmt(Node, SpanT),                          // value or NoNode
+    FnDecl(str, SpanT, bool, Node, SpanT),            // name, name span, pub, fn literal
+    EnumDecl(str, [str], [Node], bool, SpanT),        // name, type params, variants, pub
+    EnumVariantDecl(str, int, [Node]),                // name, arity, field types
+    ImportDecl(str, SpanT, str, SpanT, SpanT),        // alias, alias span, path, path span
+    SpawnStmt(Node, SpanT),                           // the call
+    SelectStmt([Node], bool, Node, SpanT, SpanT),     // arms, has-default, default (or NoNode), default span
+    SelectArm(bool, str, SpanT, Node, Node, Node, SpanT), // is-send, bind, bind span, chan, val (or NoNode), body
+    SendStmt(Node, Node, SpanT),                      // chan, value
+    BreakStmt(SpanT),
+    ContinueStmt(SpanT),
+
+    // ---- type expressions ----
+    TEName(str, str, [Node], SpanT),            // pkg, name, args
+    TEList(Node, SpanT),
+    TEFn([Node], Node, SpanT),                  // params, ret
+
+    NoNode,
+}
+
+// sp_union returns the smallest span covering both a and b
+fn sp_union(a, b) {
+    match a {
+        Sp(s1, e1) => match b {
+            Sp(s2, e2) => Sp(if s2 < s1 { s2 } else { s1 }, if e2 > e1 { e2 } else { e1 }),
+        },
+    }
+}
+
+fn span_of(n) {
+    match n {
+        IntLit(_, sp) => sp,
+        FloatLit(_, sp) => sp,
+        StrLit(_, sp) => sp,
+        BoolLit(_, sp) => sp,
+        Ident(_, sp) => sp,
+        Unary(_, _, sp) => sp,
+        Binary(_, _, _, sp) => sp,
+        Logical(_, _, _, sp) => sp,
+        Call(_, _, sp) => sp,
+        Index(_, _, sp) => sp,
+        ListLit(_, sp) => sp,
+        FnLit(_, _, _, _, _, sp) => sp,
+        Block(_, sp) => sp,
+        IfExpr(_, _, _, sp) => sp,
+        MatchExpr(_, _, sp) => sp,
+        MatchArm(_, _, sp) => sp,
+        VariantAccess(_, _, sp) => sp,
+        PkgAccess(_, _, sp) => sp,
+        QualVariantAccess(_, _, _, sp) => sp,
+        TryExpr(_, sp) => sp,
+        RecvExpr(_, sp) => sp,
+        PatWildcard(sp) => sp,
+        PatLiteral(_, sp) => sp,
+        PatBinding(_, sp) => sp,
+        PatVariant(_, _, _, _, sp) => sp,
+        LetStmt(_, _, _, _, _, sp) => sp,
+        AssignStmt(_, _, sp) => sp,
+        ExprStmt(_, sp) => sp,
+        WhileStmt(_, _, sp) => sp,
+        ForStmt(_, _, _, _, _, sp) => sp,
+        ReturnStmt(_, sp) => sp,
+        FnDecl(_, _, _, _, sp) => sp,
+        EnumDecl(_, _, _, _, sp) => sp,
+        EnumVariantDecl(_, _, _) => Sp(0, 0), // Go's EnumVariantDecl carries no span
+        ImportDecl(_, _, _, _, sp) => sp,
+        SpawnStmt(_, sp) => sp,
+        SelectStmt(_, _, _, _, sp) => sp,
+        SelectArm(_, _, _, _, _, _, sp) => sp,
+        SendStmt(_, _, sp) => sp,
+        BreakStmt(sp) => sp,
+        ContinueStmt(sp) => sp,
+        TEName(_, _, _, sp) => sp,
+        TEList(_, sp) => sp,
+        TEFn(_, _, sp) => sp,
+        NoNode => Sp(0, 0),
+    }
+}

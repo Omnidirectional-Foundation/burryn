@@ -1,0 +1,1126 @@
+// Recursive-descent parser ported from parser.go. Go raises parse failures
+// as panics and recovers per statement; Burryn has no exceptions, so every
+// parse function returns Result and errors bounce out through explicit
+// matches: `let x = match f(..) { Ok(v) => v, Err(d) => { return Err(d); .. } }`.
+// (`?` cannot be used here: inside a mutually-recursive group the callee's
+// type is still an unresolved variable, and zero-annotation `?` must see a
+// concrete Option/Result to know what to propagate.) A tail call passes its
+// Result through unchanged.
+//
+// pos is a one-slot mut list holding the token cursor.
+
+fn parse(toks) {
+    let mut pos = [0]
+    let mut stmts = []
+    let mut diags = []
+    p_skip_semis(toks, pos)
+    // maxParseDiags = 20: stop error recovery once hopelessly broken
+    while !p_check(toks, pos, t_eof) && len(diags) < 20 {
+        match p_statement(toks, pos) {
+            Ok(s) => push(stmts, s),
+            Err(d) => {
+                push(diags, d)
+                p_synchronize(toks, pos)
+            },
+        }
+        p_skip_semis(toks, pos)
+    }
+    Parsed(stmts, diags)
+}
+
+// perr builds the Err(diag) that stands in for parser.go's panic-fail
+fn perr(code, help, msg, sp) {
+    match sp {
+        Sp(s, e) => Err(Diag(true, code, msg, help, s, e)),
+    }
+}
+
+// synchronize skips tokens until the next statement boundary: a semicolon at
+// the current brace depth (closers of blocks we bailed out of are swallowed
+// as residue) or a token that starts a statement.
+fn p_synchronize(toks, mut pos) {
+    let mut depth = 0
+    let mut going = true
+    while going && !p_check(toks, pos, t_eof) {
+        let t = tok_type(p_advance(toks, pos))
+        if t == t_lbrace {
+            depth = depth + 1
+        } else if t == t_rbrace {
+            if depth > 0 {
+                depth = depth - 1
+            }
+        } else if t == t_semi {
+            if depth == 0 && !p_check(toks, pos, t_rbrace) {
+                going = false
+            }
+        }
+        if going && depth == 0 && p_starts_stmt(tok_type(p_peek(toks, pos))) {
+            going = false
+        }
+    }
+}
+
+fn p_starts_stmt(t) {
+    t == t_let || t == t_fn || t == t_enum || t == t_while || t == t_for ||
+        t == t_return || t == t_spawn || t == t_select || t == t_break ||
+        t == t_continue || t == t_pub || t == t_import
+}
+
+fn p_peek(toks, pos) {
+    toks[pos[0]]
+}
+
+fn p_check(toks, pos, t) {
+    tok_type(p_peek(toks, pos)) == t
+}
+
+fn p_advance(toks, mut pos) {
+    let t = toks[pos[0]]
+    if tok_type(t) != t_eof {
+        pos[0] = pos[0] + 1
+    }
+    t
+}
+
+fn p_match(toks, mut pos, t) {
+    if p_check(toks, pos, t) {
+        p_advance(toks, pos)
+        true
+    } else {
+        false
+    }
+}
+
+fn p_expect(toks, mut pos, t, what) {
+    if p_check(toks, pos, t) {
+        Ok(p_advance(toks, pos))
+    } else {
+        let tok = p_peek(toks, pos)
+        perr("E1101", "", "expected " + what + ", got \"" + tok_lex(tok) + "\"", sp_of_tok(tok))
+    }
+}
+
+fn p_skip_semis(toks, mut pos) {
+    while p_check(toks, pos, t_semi) {
+        p_advance(toks, pos)
+    }
+}
+
+// terminate a statement: semi, or lookahead at a closer/EOF
+fn p_end_stmt(toks, mut pos) {
+    if p_check(toks, pos, t_semi) {
+        p_advance(toks, pos)
+        Ok(true)
+    } else if p_check(toks, pos, t_rbrace) || p_check(toks, pos, t_eof) {
+        Ok(true)
+    } else {
+        let tok = p_peek(toks, pos)
+        perr("E1102", "separate statements with a newline or ';'",
+            "expected end of statement, got \"" + tok_lex(tok) + "\"", sp_of_tok(tok))
+    }
+}
+
+// ---- statements ----
+
+fn p_statement(toks, mut pos) {
+    if p_check(toks, pos, t_let) {
+        p_let_stmt(toks, pos)
+    } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
+        p_fn_decl(toks, pos)
+    } else if p_check(toks, pos, t_enum) {
+        p_enum_decl(toks, pos)
+    } else if p_check(toks, pos, t_pub) {
+        p_pub_decl(toks, pos)
+    } else if p_check(toks, pos, t_import) {
+        p_import_decl(toks, pos)
+    } else if p_check(toks, pos, t_while) {
+        p_while_stmt(toks, pos)
+    } else if p_check(toks, pos, t_return) {
+        let tok = p_advance(toks, pos)
+        let mut sp = sp_of_tok(tok)
+        let mut val = NoNode
+        if !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
+            val = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            sp = sp_union(sp, span_of(val))
+        }
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        Ok(ReturnStmt(val, sp))
+    } else if p_check(toks, pos, t_for) {
+        p_for_stmt(toks, pos)
+    } else if p_check(toks, pos, t_spawn) {
+        p_spawn_stmt(toks, pos)
+    } else if p_check(toks, pos, t_select) {
+        p_select_stmt(toks, pos)
+    } else if p_check(toks, pos, t_break) {
+        let tok = p_advance(toks, pos)
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        Ok(BreakStmt(sp_of_tok(tok)))
+    } else if p_check(toks, pos, t_continue) {
+        let tok = p_advance(toks, pos)
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        Ok(ContinueStmt(sp_of_tok(tok)))
+    } else {
+        // expression statement / assignment / send
+        let e = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        if p_match(toks, pos, t_eq) {
+            let val = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            let ok_target = match e {
+                Ident(_, _) => true,
+                Index(_, _, _) => true,
+                _ => false,
+            }
+            if !ok_target {
+                return perr("E1103", "only a variable or an index expression can be assigned to",
+                    "invalid assignment target", span_of(e))
+            }
+            match p_end_stmt(toks, pos) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+            Ok(AssignStmt(e, val, sp_union(span_of(e), span_of(val))))
+        } else if p_match(toks, pos, t_larrow) {
+            let val = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            match p_end_stmt(toks, pos) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+            Ok(SendStmt(e, val, sp_union(span_of(e), span_of(val))))
+        } else {
+            match p_end_stmt(toks, pos) {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+            Ok(ExprStmt(e, span_of(e)))
+        }
+    }
+}
+
+fn p_let_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos) // let
+    let is_mut = p_match(toks, pos, t_mut)
+    let name = match p_expect(toks, pos, t_ident, "variable name") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    match p_expect(toks, pos, t_eq, "'=' in let binding") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let init = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, init,
+        sp_union(sp_of_tok(tok), span_of(init))))
+}
+
+// p_pub_decl parses `pub` followed by an exportable declaration; nodes are
+// immutable, so the parsed declaration is rebuilt with pub set.
+fn p_pub_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos) // pub
+    if p_check(toks, pos, t_let) {
+        let s = match p_let_stmt(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        match s {
+            LetStmt(name, nsp, is_mut, _, init, sp) =>
+                Ok(LetStmt(name, nsp, is_mut, true, init, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
+        let s = match p_fn_decl(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        match s {
+            FnDecl(name, nsp, _, lit, sp) =>
+                Ok(FnDecl(name, nsp, true, lit, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_enum) {
+        let s = match p_enum_decl(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        match s {
+            EnumDecl(name, params, variants, _, sp) =>
+                Ok(EnumDecl(name, params, variants, true, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else {
+        perr("E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, or `pub let`",
+            "expected `fn`, `enum`, or `let` after `pub`, got \"" + tok_lex(p_peek(toks, pos)) + "\"",
+            sp_of_tok(tok))
+    }
+}
+
+// p_import_decl parses `import ["alias"] "path"`
+fn p_import_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos) // import
+    let mut alias = ""
+    let mut asp = Sp(0, 0)
+    if p_check(toks, pos, t_ident) {
+        let a = p_advance(toks, pos)
+        alias = tok_lex(a)
+        asp = sp_of_tok(a)
+    }
+    let path_tok = match p_expect(toks, pos, t_string, "an import path string") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    Ok(ImportDecl(alias, asp, tok_lex(path_tok), sp_of_tok(path_tok),
+        sp_union(sp_of_tok(tok), sp_of_tok(path_tok))))
+}
+
+fn p_fn_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos) // fn
+    let name = match p_expect(toks, pos, t_ident, "function name") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    let lit = match p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(tok)) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    Ok(FnDecl(tok_lex(name), sp_of_tok(name), false, lit, span_of(lit)))
+}
+
+// params and body, after 'fn [name]'; fn_sp is the span of the `fn` keyword
+fn p_fn_rest(toks, mut pos, name, fn_sp) {
+    match p_expect(toks, pos, t_lparen, "'(' after fn") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let mut params = []
+    let mut muts = []
+    let mut pspans = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rparen) {
+        let is_mut = p_match(toks, pos, t_mut)
+        let ptok = match p_expect(toks, pos, t_ident, "parameter name") {
+            Ok(v) => v,
+            Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+        }
+        push(params, tok_lex(ptok))
+        push(muts, is_mut)
+        push(pspans, sp_of_tok(ptok))
+        if !p_match(toks, pos, t_comma) {
+            break
+        }
+        p_skip_semis(toks, pos)
+    }
+    p_skip_semis(toks, pos)
+    match p_expect(toks, pos, t_rparen, "')' after parameters") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let body = match p_block(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    Ok(FnLit(params, muts, pspans, body, name, sp_union(fn_sp, span_of(body))))
+}
+
+fn p_enum_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos) // enum
+    let name = match p_expect(toks, pos, t_ident, "enum name") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    let mut params = []
+    if p_match(toks, pos, t_lparen) { // generic parameters: enum Box(a) { ... }
+        while !p_check(toks, pos, t_rparen) {
+            let ptok = match p_expect(toks, pos, t_ident, "type parameter") {
+                Ok(v) => v,
+                Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+            }
+            push(params, tok_lex(ptok))
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+        }
+        match p_expect(toks, pos, t_rparen, "')' after type parameters") {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+    }
+    match p_expect(toks, pos, t_lbrace, "'{' after enum name") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let mut variants = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) {
+        let vname = match p_expect(toks, pos, t_ident, "variant name") {
+            Ok(v) => v,
+            Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+        }
+        let mut vtypes = []
+        if p_match(toks, pos, t_lparen) {
+            while !p_check(toks, pos, t_rparen) {
+                let vt = match p_type_expr(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); NoNode },
+                }
+                push(vtypes, vt)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+            }
+            match p_expect(toks, pos, t_rparen, "')' after variant field types") {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+        }
+        push(variants, EnumVariantDecl(tok_lex(vname), len(vtypes), vtypes))
+        if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
+            return perr("E1104", "", "expected ',' or newline between enum variants",
+                sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}' after enum variants") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    Ok(EnumDecl(tok_lex(name), params, variants, false,
+        sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+}
+
+// typeExpr := "[" typeExpr "]" | "fn" "(" list ")" "->" typeExpr | IDENT ["(" list ")"]
+fn p_type_expr(toks, mut pos) {
+    let tok = p_peek(toks, pos)
+    let t = tok_type(tok)
+    if t == t_lbracket {
+        p_advance(toks, pos)
+        let el = match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        let rb = match p_expect(toks, pos, t_rbracket, "']' in list type") {
+            Ok(v) => v,
+            Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+        }
+        Ok(TEList(el, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+    } else if t == t_fn {
+        p_advance(toks, pos)
+        match p_expect(toks, pos, t_lparen, "'(' in fn type") {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let mut ps = []
+        while !p_check(toks, pos, t_rparen) {
+            let pt = match p_type_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            push(ps, pt)
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+        }
+        match p_expect(toks, pos, t_rparen, "')' in fn type") {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        match p_expect(toks, pos, t_thin_arrow, "'->' in fn type") {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        let ret = match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        Ok(TEFn(ps, ret, sp_union(sp_of_tok(tok), span_of(ret))))
+    } else if t == t_ident {
+        p_advance(toks, pos)
+        let mut pkg = ""
+        let mut name = tok_lex(tok)
+        let mut sp = sp_of_tok(tok)
+        if p_match(toks, pos, t_dot) { // qualified type: pkg.Name
+            let n = match p_expect(toks, pos, t_ident, "a type name after '.'") {
+                Ok(v) => v,
+                Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+            }
+            pkg = tok_lex(tok)
+            name = tok_lex(n)
+            sp = sp_union(sp, sp_of_tok(n))
+        }
+        let mut targs = []
+        if p_match(toks, pos, t_lparen) {
+            while !p_check(toks, pos, t_rparen) {
+                let ta = match p_type_expr(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); NoNode },
+                }
+                push(targs, ta)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+            }
+            let rp = match p_expect(toks, pos, t_rparen, "')' in type arguments") {
+                Ok(v) => v,
+                Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+            }
+            sp = sp_union(sp, sp_of_tok(rp))
+        }
+        Ok(TEName(pkg, name, targs, sp))
+    } else {
+        perr("E1105", "", "expected a type, got \"" + tok_lex(tok) + "\"", sp_of_tok(tok))
+    }
+}
+
+fn p_while_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let cond = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    let body = match p_block(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    Ok(WhileStmt(cond, body, sp_union(sp_of_tok(tok), span_of(body))))
+}
+
+fn p_for_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let v = match p_expect(toks, pos, t_ident, "loop variable") {
+        Ok(x) => x,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    match p_expect(toks, pos, t_in, "'in' in for loop") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let iter = match p_expression(toks, pos) {
+        Ok(x) => x,
+        Err(d) => { return Err(d); NoNode },
+    }
+    let body = match p_block(toks, pos) {
+        Ok(x) => x,
+        Err(d) => { return Err(d); NoNode },
+    }
+    Ok(ForStmt(tok_lex(v), sp_of_tok(v), iter, false, body,
+        sp_union(sp_of_tok(tok), span_of(body))))
+}
+
+fn p_spawn_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let e = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    let is_call = match e {
+        Call(_, _, _) => true,
+        _ => false,
+    }
+    if !is_call {
+        return perr("E1106", "", "spawn expects a function call, e.g. `spawn worker(ch)`",
+            sp_of_tok(tok))
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    Ok(SpawnStmt(e, sp_union(sp_of_tok(tok), span_of(e))))
+}
+
+// p_select_stmt parses `select { arm, arm, default => body }`. Each arm is a
+// receive (`v = <-ch => body` / `<-ch => body`), a send (`ch <- v => body`),
+// or `default => body` (at most one).
+fn p_select_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos) // select
+    match p_expect(toks, pos, t_lbrace, "'{' after select") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let mut arms = []
+    let mut has_default = false
+    let mut dflt = NoNode
+    let mut dsp = Sp(0, 0)
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
+        if p_check(toks, pos, t_ident) && tok_lex(p_peek(toks, pos)) == "default" {
+            let d = p_advance(toks, pos)
+            if has_default {
+                return perr("E1115", "", "`select` may have at most one `default` arm", sp_of_tok(d))
+            }
+            match p_expect(toks, pos, t_arrow, "'=>' after default") {
+                Ok(_) => {},
+                Err(dg) => { return Err(dg) },
+            }
+            p_skip_semis(toks, pos)
+            has_default = true
+            dsp = sp_of_tok(d)
+            dflt = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(dg) => { return Err(dg); NoNode },
+            }
+        } else {
+            let arm = match p_select_arm(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            push(arms, arm)
+        }
+        if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
+            return perr("E1104", "", "expected ',' or newline between select arms",
+                sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}' after select arms") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    let sp = sp_union(sp_of_tok(tok), sp_of_tok(rb))
+    if len(arms) == 0 && !has_default {
+        return perr("E1116", "", "`select` needs at least one communication arm", sp)
+    }
+    Ok(SelectStmt(arms, has_default, dflt, dsp, sp))
+}
+
+fn p_select_arm(toks, mut pos) {
+    let mut is_send = false
+    let mut bind = ""
+    let mut bind_sp = Sp(0, 0)
+    let mut ch = NoNode
+    let mut val = NoNode
+    let mut asp = Sp(0, 0)
+    if p_check(toks, pos, t_larrow) { // <-ch => body  (receive, value discarded)
+        let start = p_advance(toks, pos)
+        ch = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        asp = sp_of_tok(start)
+    } else {
+        let e = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        asp = span_of(e)
+        if p_match(toks, pos, t_eq) { // v = <-ch => body  (receive, bound)
+            match e {
+                Ident(n, isp) => {
+                    bind = n
+                    bind_sp = isp
+                },
+                _ => {
+                    return perr("E1117", "", "only a name can bind a received value: `name = <-ch`",
+                        span_of(e))
+                },
+            }
+            match p_expect(toks, pos, t_larrow, "'<-' after `=` in a select receive arm") {
+                Ok(_) => {},
+                Err(d) => { return Err(d) },
+            }
+            ch = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+        } else if p_match(toks, pos, t_larrow) { // ch <- v => body  (send)
+            is_send = true
+            ch = e
+            val = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+        } else {
+            return perr("E1118", "a select arm is a receive (`v = <-ch`), a send (`ch <- v`), or `default`",
+                "expected `=`, `<-`, or `=>` in this select arm", sp_of_tok(p_peek(toks, pos)))
+        }
+    }
+    match p_expect(toks, pos, t_arrow, "'=>' after a select arm") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    p_skip_semis(toks, pos)
+    let body = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    Ok(SelectArm(is_send, bind, bind_sp, ch, val, body, sp_union(asp, span_of(body))))
+}
+
+fn p_block(toks, mut pos) {
+    let lb = match p_expect(toks, pos, t_lbrace, "'{'") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    let mut stmts = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
+        let s = match p_statement(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        push(stmts, s)
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}'") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    Ok(Block(stmts, sp_union(sp_of_tok(lb), sp_of_tok(rb))))
+}
+
+// ---- expressions (precedence climbing) ----
+
+fn p_expression(toks, mut pos) {
+    p_or_expr(toks, pos)
+}
+
+fn p_or_expr(toks, mut pos) {
+    let mut e = match p_and_expr(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    while p_check(toks, pos, t_or_or) {
+        p_advance(toks, pos)
+        let rhs = match p_and_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        e = Logical(t_or_or, e, rhs, sp_union(span_of(e), span_of(rhs)))
+    }
+    Ok(e)
+}
+
+fn p_and_expr(toks, mut pos) {
+    let mut e = match p_equality(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    while p_check(toks, pos, t_and_and) {
+        p_advance(toks, pos)
+        let rhs = match p_equality(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        e = Logical(t_and_and, e, rhs, sp_union(span_of(e), span_of(rhs)))
+    }
+    Ok(e)
+}
+
+fn p_equality(toks, mut pos) {
+    let mut e = match p_comparison(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    while p_check(toks, pos, t_eq_eq) || p_check(toks, pos, t_bang_eq) {
+        let op = p_advance(toks, pos)
+        let rhs = match p_comparison(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
+    }
+    Ok(e)
+}
+
+fn p_comparison(toks, mut pos) {
+    let mut e = match p_term(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    while p_check(toks, pos, t_lt) || p_check(toks, pos, t_lt_eq) ||
+        p_check(toks, pos, t_gt) || p_check(toks, pos, t_gt_eq) {
+        let op = p_advance(toks, pos)
+        let rhs = match p_term(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
+    }
+    Ok(e)
+}
+
+fn p_term(toks, mut pos) {
+    let mut e = match p_factor(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    while p_check(toks, pos, t_plus) || p_check(toks, pos, t_minus) {
+        let op = p_advance(toks, pos)
+        let rhs = match p_factor(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
+    }
+    Ok(e)
+}
+
+fn p_factor(toks, mut pos) {
+    let mut e = match p_unary(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    while p_check(toks, pos, t_star) || p_check(toks, pos, t_slash) || p_check(toks, pos, t_percent) {
+        let op = p_advance(toks, pos)
+        let rhs = match p_unary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
+    }
+    Ok(e)
+}
+
+fn p_unary(toks, mut pos) {
+    if p_check(toks, pos, t_bang) || p_check(toks, pos, t_minus) {
+        let op = p_advance(toks, pos)
+        let rhs = match p_unary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        Ok(Unary(tok_type(op), rhs, sp_union(sp_of_tok(op), span_of(rhs))))
+    } else if p_check(toks, pos, t_larrow) { // <-ch  (receive)
+        let op = p_advance(toks, pos)
+        let rhs = match p_unary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        Ok(RecvExpr(rhs, sp_union(sp_of_tok(op), span_of(rhs))))
+    } else {
+        p_postfix(toks, pos)
+    }
+}
+
+fn p_postfix(toks, mut pos) {
+    let mut e = match p_primary(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    let mut going = true
+    while going {
+        if p_check(toks, pos, t_lparen) {
+            p_advance(toks, pos)
+            let mut cargs = []
+            p_skip_semis(toks, pos)
+            while !p_check(toks, pos, t_rparen) {
+                let a = match p_expression(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); NoNode },
+                }
+                push(cargs, a)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+                p_skip_semis(toks, pos)
+            }
+            p_skip_semis(toks, pos)
+            let rp = match p_expect(toks, pos, t_rparen, "')' after arguments") {
+                Ok(v) => v,
+                Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+            }
+            e = Call(e, cargs, sp_union(span_of(e), sp_of_tok(rp)))
+        } else if p_check(toks, pos, t_lbracket) {
+            p_advance(toks, pos)
+            let idx = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            let rb = match p_expect(toks, pos, t_rbracket, "']' after index") {
+                Ok(v) => v,
+                Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+            }
+            e = Index(e, idx, sp_union(span_of(e), sp_of_tok(rb)))
+        } else if p_check(toks, pos, t_question) {
+            let q = p_advance(toks, pos)
+            e = TryExpr(e, sp_union(span_of(e), sp_of_tok(q)))
+        } else if p_check(toks, pos, t_dot) {
+            let d = p_advance(toks, pos)
+            e = match e {
+                Ident(name, hsp) => {
+                    let v = match p_expect(toks, pos, t_ident, "a name after '.'") {
+                        Ok(x) => x,
+                        Err(dg) => { return Err(dg); Tok(0, "", 0, 0) },
+                    }
+                    VariantAccess(name, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
+                },
+                VariantAccess(en, vr, hsp) => { // third segment: pkg.Enum.Variant
+                    let v = match p_expect(toks, pos, t_ident, "a name after '.'") {
+                        Ok(x) => x,
+                        Err(dg) => { return Err(dg); Tok(0, "", 0, 0) },
+                    }
+                    QualVariantAccess(en, vr, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
+                },
+                _ => {
+                    return perr("E1107", "",
+                        "'.' is only used for enum variants (Enum.Variant) and package members (pkg.name)",
+                        sp_of_tok(d))
+                    NoNode
+                },
+            }
+        } else {
+            going = false
+        }
+    }
+    Ok(e)
+}
+
+fn p_primary(toks, mut pos) {
+    let tok = p_peek(toks, pos)
+    let t = tok_type(tok)
+    if t == t_int {
+        p_advance(toks, pos)
+        match parse_int(tok_lex(tok)) {
+            Some(n) => Ok(IntLit(n, sp_of_tok(tok))),
+            None => perr("E1108", "i64 holds -9223372036854775808..9223372036854775807",
+                "bad integer literal \"" + tok_lex(tok) + "\"", sp_of_tok(tok)),
+        }
+    } else if t == t_float {
+        p_advance(toks, pos)
+        match parse_float(tok_lex(tok)) {
+            Some(f) => Ok(FloatLit(f, sp_of_tok(tok))),
+            None => perr("E1108", "", "bad float literal \"" + tok_lex(tok) + "\"", sp_of_tok(tok)),
+        }
+    } else if t == t_string {
+        p_advance(toks, pos)
+        Ok(StrLit(tok_lex(tok), sp_of_tok(tok)))
+    } else if t == t_true {
+        p_advance(toks, pos)
+        Ok(BoolLit(true, sp_of_tok(tok)))
+    } else if t == t_false {
+        p_advance(toks, pos)
+        Ok(BoolLit(false, sp_of_tok(tok)))
+    } else if t == t_ident {
+        p_advance(toks, pos)
+        Ok(Ident(tok_lex(tok), sp_of_tok(tok)))
+    } else if t == t_lparen {
+        p_advance(toks, pos)
+        let e = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        match p_expect(toks, pos, t_rparen, "')'") {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        Ok(e)
+    } else if t == t_lbracket {
+        p_advance(toks, pos)
+        let mut elems = []
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rbracket) {
+            let el = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+            push(elems, el)
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        p_skip_semis(toks, pos)
+        let rb = match p_expect(toks, pos, t_rbracket, "']' after list elements") {
+            Ok(v) => v,
+            Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+        }
+        Ok(ListLit(elems, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+    } else if t == t_fn {
+        p_advance(toks, pos)
+        p_fn_rest(toks, pos, "", sp_of_tok(tok))
+    } else if t == t_if {
+        p_if_expr(toks, pos)
+    } else if t == t_match {
+        p_match_expr(toks, pos)
+    } else if t == t_lbrace {
+        p_block(toks, pos)
+    } else {
+        perr("E1109", "", "unexpected token \"" + tok_lex(tok) + "\"", sp_of_tok(tok))
+    }
+}
+
+fn p_if_expr(toks, mut pos) {
+    let tok = p_advance(toks, pos) // if
+    let cond = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    let then = match p_block(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    let mut sp = sp_union(sp_of_tok(tok), span_of(then))
+    let mut els = NoNode
+    if p_match(toks, pos, t_else) {
+        els = if p_check(toks, pos, t_if) {
+            match p_if_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+        } else {
+            match p_block(toks, pos) {
+                Ok(v) => v,
+                Err(d) => { return Err(d); NoNode },
+            }
+        }
+        sp = sp_union(sp, span_of(els))
+    }
+    Ok(IfExpr(cond, then, els, sp))
+}
+
+fn p_match_expr(toks, mut pos) {
+    let tok = p_advance(toks, pos) // match
+    let scrut = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => { return Err(d); NoNode },
+    }
+    match p_expect(toks, pos, t_lbrace, "'{' after match scrutinee") {
+        Ok(_) => {},
+        Err(d) => { return Err(d) },
+    }
+    let mut arms = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
+        let pat = match p_pattern(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        match p_expect(toks, pos, t_arrow, "'=>' after pattern") {
+            Ok(_) => {},
+            Err(d) => { return Err(d) },
+        }
+        p_skip_semis(toks, pos)
+        let body = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        push(arms, MatchArm(pat, body, sp_union(span_of(pat), span_of(body))))
+        if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
+            return perr("E1104", "", "expected ',' or newline between match arms",
+                sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}' after match arms") {
+        Ok(v) => v,
+        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+    }
+    let sp = sp_union(sp_of_tok(tok), sp_of_tok(rb))
+    if len(arms) == 0 {
+        return perr("E1110", "", "match must have at least one arm", sp)
+    }
+    Ok(MatchExpr(scrut, arms, sp))
+}
+
+fn p_pattern(toks, mut pos) {
+    let tok = p_peek(toks, pos)
+    let t = tok_type(tok)
+    if t == t_int || t == t_float || t == t_string || t == t_true || t == t_false {
+        let lit = match p_primary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        Ok(PatLiteral(lit, span_of(lit)))
+    } else if t == t_minus { // negative number literal
+        p_advance(toks, pos)
+        let lit = match p_primary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => { return Err(d); NoNode },
+        }
+        match lit {
+            IntLit(n, lsp) => Ok(PatLiteral(IntLit(-n, lsp), sp_union(sp_of_tok(tok), lsp))),
+            FloatLit(f, lsp) => Ok(PatLiteral(FloatLit(-f, lsp), sp_union(sp_of_tok(tok), lsp))),
+            _ => perr("E1111", "", "'-' in pattern must precede a number", sp_of_tok(tok)),
+        }
+    } else if t == t_ident {
+        p_advance(toks, pos)
+        if tok_lex(tok) == "_" {
+            Ok(PatWildcard(sp_of_tok(tok)))
+        } else {
+            let mut pkg = ""
+            let mut enum_name = ""
+            let mut variant = tok_lex(tok)
+            let mut sp = sp_of_tok(tok)
+            if p_match(toks, pos, t_dot) {
+                enum_name = tok_lex(tok)
+                let vtok = match p_expect(toks, pos, t_ident, "variant name after '.'") {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+                }
+                variant = tok_lex(vtok)
+                sp = sp_union(sp, sp_of_tok(vtok))
+                if p_match(toks, pos, t_dot) { // third segment: pkg.Enum.Variant
+                    pkg = enum_name
+                    enum_name = variant
+                    let vtok2 = match p_expect(toks, pos, t_ident, "variant name after '.'") {
+                        Ok(v) => v,
+                        Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+                    }
+                    variant = tok_lex(vtok2)
+                    sp = sp_union(sp, sp_of_tok(vtok2))
+                }
+            }
+            if p_match(toks, pos, t_lparen) {
+                let mut binds = []
+                while !p_check(toks, pos, t_rparen) {
+                    let sub = match p_pattern(toks, pos) {
+                        Ok(v) => v,
+                        Err(d) => { return Err(d); NoNode },
+                    }
+                    let ok_sub = match sub {
+                        PatBinding(_, _) => true,
+                        PatWildcard(_) => true,
+                        _ => false,
+                    }
+                    if !ok_sub {
+                        return perr("E1112", "", "variant fields may only bind names or use '_'",
+                            span_of(sub))
+                    }
+                    push(binds, sub)
+                    if !p_match(toks, pos, t_comma) {
+                        break
+                    }
+                }
+                let rp = match p_expect(toks, pos, t_rparen, "')' after variant pattern") {
+                    Ok(v) => v,
+                    Err(d) => { return Err(d); Tok(0, "", 0, 0) },
+                }
+                Ok(PatVariant(pkg, enum_name, variant, binds, sp_union(sp, sp_of_tok(rp))))
+            } else if enum_name != "" {
+                Ok(PatVariant(pkg, enum_name, variant, [], sp))
+            } else {
+                // bare name: binding, or a nullary variant like None — compiler decides
+                Ok(PatBinding(variant, sp))
+            }
+        }
+    } else {
+        perr("E1113", "", "invalid pattern \"" + tok_lex(tok) + "\"", sp_of_tok(tok))
+    }
+}

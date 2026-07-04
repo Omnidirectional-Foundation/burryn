@@ -39,6 +39,232 @@ fn dump_token(t) {
     }
 }
 
+fn dump_sp(sp) {
+    match sp {
+        Sp(s, e) => str(s) + ":" + str(e),
+    }
+}
+
+fn dump_strs(xs) {
+    let mut parts = []
+    for x in xs {
+        push(parts, dump_escape(x))
+    }
+    "[" + join(parts, " ") + "]"
+}
+
+fn dump_bools(xs) {
+    let mut parts = []
+    for x in xs {
+        push(parts, str(x))
+    }
+    "[" + join(parts, " ") + "]"
+}
+
+fn dump_sps(xs) {
+    let mut parts = []
+    for x in xs {
+        push(parts, dump_sp(x))
+    }
+    "[" + join(parts, " ") + "]"
+}
+
+// dump_node prints one node per line — kind, atoms in struct field order,
+// span last — with children indented two spaces. bootstrap_test.go renders
+// the Go AST identically.
+fn dump_node(n, pre) {
+    let deeper = pre + "  "
+    match n {
+        IntLit(v, sp) => println(pre + "IntLit " + str(v) + " " + dump_sp(sp)),
+        FloatLit(v, sp) => println(pre + "FloatLit " + str(v) + " " + dump_sp(sp)),
+        StrLit(v, sp) => println(pre + "StrLit " + dump_escape(v) + " " + dump_sp(sp)),
+        BoolLit(v, sp) => println(pre + "BoolLit " + str(v) + " " + dump_sp(sp)),
+        Ident(name, sp) => println(pre + "Ident " + dump_escape(name) + " " + dump_sp(sp)),
+        Unary(op, rhs, sp) => {
+            println(pre + "Unary " + tok_names[op] + " " + dump_sp(sp))
+            dump_node(rhs, deeper)
+        },
+        Binary(op, lhs, rhs, sp) => {
+            println(pre + "Binary " + tok_names[op] + " " + dump_sp(sp))
+            dump_node(lhs, deeper)
+            dump_node(rhs, deeper)
+        },
+        Logical(op, lhs, rhs, sp) => {
+            println(pre + "Logical " + tok_names[op] + " " + dump_sp(sp))
+            dump_node(lhs, deeper)
+            dump_node(rhs, deeper)
+        },
+        Call(callee, cargs, sp) => {
+            println(pre + "Call " + dump_sp(sp))
+            dump_node(callee, deeper)
+            for a in cargs {
+                dump_node(a, deeper)
+            }
+        },
+        Index(target, idx, sp) => {
+            println(pre + "Index " + dump_sp(sp))
+            dump_node(target, deeper)
+            dump_node(idx, deeper)
+        },
+        ListLit(elems, sp) => {
+            println(pre + "ListLit " + dump_sp(sp))
+            for e in elems {
+                dump_node(e, deeper)
+            }
+        },
+        FnLit(params, muts, pspans, body, name, sp) => {
+            println(pre + "FnLit " + dump_escape(name) + " params=" + dump_strs(params) +
+                " muts=" + dump_bools(muts) + " pspans=" + dump_sps(pspans) + " " + dump_sp(sp))
+            dump_node(body, deeper)
+        },
+        Block(stmts, sp) => {
+            println(pre + "Block " + dump_sp(sp))
+            for s in stmts {
+                dump_node(s, deeper)
+            }
+        },
+        IfExpr(cond, then, els, sp) => {
+            println(pre + "IfExpr " + dump_sp(sp))
+            dump_node(cond, deeper)
+            dump_node(then, deeper)
+            dump_node(els, deeper)
+        },
+        MatchExpr(scrut, arms, sp) => {
+            println(pre + "MatchExpr " + dump_sp(sp))
+            dump_node(scrut, deeper)
+            for a in arms {
+                dump_node(a, deeper)
+            }
+        },
+        MatchArm(pat, body, sp) => {
+            println(pre + "MatchArm " + dump_sp(sp))
+            dump_node(pat, deeper)
+            dump_node(body, deeper)
+        },
+        VariantAccess(en, vr, sp) =>
+            println(pre + "VariantAccess " + dump_escape(en) + " " + dump_escape(vr) + " " + dump_sp(sp)),
+        PkgAccess(pkg, name, sp) =>
+            println(pre + "PkgAccess " + dump_escape(pkg) + " " + dump_escape(name) + " " + dump_sp(sp)),
+        QualVariantAccess(pkg, en, vr, sp) =>
+            println(pre + "QualVariantAccess " + dump_escape(pkg) + " " + dump_escape(en) + " " +
+                dump_escape(vr) + " " + dump_sp(sp)),
+        TryExpr(inner, sp) => {
+            println(pre + "TryExpr " + dump_sp(sp))
+            dump_node(inner, deeper)
+        },
+        RecvExpr(ch, sp) => {
+            println(pre + "RecvExpr " + dump_sp(sp))
+            dump_node(ch, deeper)
+        },
+        PatWildcard(sp) => println(pre + "PatWildcard " + dump_sp(sp)),
+        PatLiteral(v, sp) => {
+            println(pre + "PatLiteral " + dump_sp(sp))
+            dump_node(v, deeper)
+        },
+        PatBinding(name, sp) => println(pre + "PatBinding " + dump_escape(name) + " " + dump_sp(sp)),
+        PatVariant(pkg, en, vr, binds, sp) => {
+            println(pre + "PatVariant " + dump_escape(pkg) + " " + dump_escape(en) + " " +
+                dump_escape(vr) + " " + dump_sp(sp))
+            for b in binds {
+                dump_node(b, deeper)
+            }
+        },
+        LetStmt(name, nsp, is_mut, is_pub, init, sp) => {
+            println(pre + "LetStmt " + dump_escape(name) + " " + dump_sp(nsp) + " mut=" + str(is_mut) +
+                " pub=" + str(is_pub) + " " + dump_sp(sp))
+            dump_node(init, deeper)
+        },
+        AssignStmt(target, val, sp) => {
+            println(pre + "AssignStmt " + dump_sp(sp))
+            dump_node(target, deeper)
+            dump_node(val, deeper)
+        },
+        ExprStmt(e, sp) => {
+            println(pre + "ExprStmt " + dump_sp(sp))
+            dump_node(e, deeper)
+        },
+        WhileStmt(cond, body, sp) => {
+            println(pre + "WhileStmt " + dump_sp(sp))
+            dump_node(cond, deeper)
+            dump_node(body, deeper)
+        },
+        ForStmt(v, vsp, iter, is_chan, body, sp) => {
+            println(pre + "ForStmt " + dump_escape(v) + " " + dump_sp(vsp) + " chan=" + str(is_chan) +
+                " " + dump_sp(sp))
+            dump_node(iter, deeper)
+            dump_node(body, deeper)
+        },
+        ReturnStmt(val, sp) => {
+            println(pre + "ReturnStmt " + dump_sp(sp))
+            dump_node(val, deeper)
+        },
+        FnDecl(name, nsp, is_pub, lit, sp) => {
+            println(pre + "FnDecl " + dump_escape(name) + " " + dump_sp(nsp) + " pub=" + str(is_pub) +
+                " " + dump_sp(sp))
+            dump_node(lit, deeper)
+        },
+        EnumDecl(name, params, variants, is_pub, sp) => {
+            println(pre + "EnumDecl " + dump_escape(name) + " params=" + dump_strs(params) +
+                " pub=" + str(is_pub) + " " + dump_sp(sp))
+            for v in variants {
+                dump_node(v, deeper)
+            }
+        },
+        EnumVariantDecl(name, arity, vtypes) => {
+            println(pre + "EnumVariantDecl " + dump_escape(name) + " " + str(arity))
+            for ty in vtypes {
+                dump_node(ty, deeper)
+            }
+        },
+        ImportDecl(alias, asp, path, psp, sp) =>
+            println(pre + "ImportDecl " + dump_escape(alias) + " " + dump_sp(asp) + " " +
+                dump_escape(path) + " " + dump_sp(psp) + " " + dump_sp(sp)),
+        SpawnStmt(call, sp) => {
+            println(pre + "SpawnStmt " + dump_sp(sp))
+            dump_node(call, deeper)
+        },
+        SelectStmt(arms, has_default, dflt, dsp, sp) => {
+            println(pre + "SelectStmt default=" + str(has_default) + " " + dump_sp(dsp) + " " + dump_sp(sp))
+            for a in arms {
+                dump_node(a, deeper)
+            }
+            dump_node(dflt, deeper)
+        },
+        SelectArm(is_send, bind, bsp, ch, val, body, sp) => {
+            println(pre + "SelectArm send=" + str(is_send) + " " + dump_escape(bind) + " " +
+                dump_sp(bsp) + " " + dump_sp(sp))
+            dump_node(ch, deeper)
+            dump_node(val, deeper)
+            dump_node(body, deeper)
+        },
+        SendStmt(ch, val, sp) => {
+            println(pre + "SendStmt " + dump_sp(sp))
+            dump_node(ch, deeper)
+            dump_node(val, deeper)
+        },
+        BreakStmt(sp) => println(pre + "BreakStmt " + dump_sp(sp)),
+        ContinueStmt(sp) => println(pre + "ContinueStmt " + dump_sp(sp)),
+        TEName(pkg, name, targs, sp) => {
+            println(pre + "TEName " + dump_escape(pkg) + " " + dump_escape(name) + " " + dump_sp(sp))
+            for a in targs {
+                dump_node(a, deeper)
+            }
+        },
+        TEList(elem, sp) => {
+            println(pre + "TEList " + dump_sp(sp))
+            dump_node(elem, deeper)
+        },
+        TEFn(params, ret, sp) => {
+            println(pre + "TEFn " + dump_sp(sp))
+            for p in params {
+                dump_node(p, deeper)
+            }
+            dump_node(ret, deeper)
+        },
+        NoNode => println(pre + "NoNode"),
+    }
+}
+
 // diag text stays outside the parity contract; dump kind, code and span only
 fn dump_diag(d) {
     match d {
