@@ -1,0 +1,255 @@
+// Lexer with Go-style automatic semicolon insertion, ported from lexer.go:
+// a newline terminates a statement when the previous token could legally end
+// one. Scanning continues past errors so several can be reported at once.
+//
+// State st is a 4-slot int list:
+//   st[0] start of the token being scanned
+//   st[1] scan position (byte offset)
+//   st[2] last token type emitted (-1 before any)
+//   st[3] whether any token was emitted yet (0/1)
+
+fn lex(raw) {
+    // tolerate a UTF-8 BOM
+    let src = if str_len(raw) >= 3 && substr(raw, 0, 3) == chr(65279) {
+        substr(raw, 3, str_len(raw) - 3)
+    } else {
+        raw
+    }
+    let mut st = [0, 0, -1, 0]
+    let mut toks = []
+    let mut diags = []
+    while st[1] < str_len(src) {
+        st[0] = st[1]
+        lex_scan(src, st, toks, diags)
+    }
+    st[0] = st[1] // spans of the synthetic trailing tokens sit at EOF
+    lex_maybe_semi(st, toks) // final newline may be missing
+    lex_emit(st, toks, t_eof, "")
+    Lexed(toks, diags)
+}
+
+fn lex_fail(mut diags, s, e, code, help, msg) {
+    push(diags, Diag(true, code, msg, help, s, e))
+}
+
+fn lex_peek(src, st) {
+    if st[1] >= str_len(src) {
+        ""
+    } else {
+        char_at(src, st[1])
+    }
+}
+
+fn lex_peek2(src, st) {
+    if st[1] + 1 >= str_len(src) {
+        ""
+    } else {
+        char_at(src, st[1] + 1)
+    }
+}
+
+fn lex_advance(src, mut st) {
+    let c = char_at(src, st[1])
+    st[1] = st[1] + 1
+    c
+}
+
+fn lex_bump(mut st) {
+    st[1] = st[1] + 1
+}
+
+fn lex_match(src, mut st, c) {
+    if lex_peek(src, st) == c {
+        st[1] = st[1] + 1
+        true
+    } else {
+        false
+    }
+}
+
+fn lex_emit(mut st, mut toks, t, lexeme) {
+    push(toks, Tok(t, lexeme, st[0], st[1]))
+    st[2] = t
+    st[3] = 1
+}
+
+fn lex_maybe_semi(mut st, mut toks) {
+    if st[3] == 1 && lex_can_end_stmt(st[2]) {
+        lex_emit(st, toks, t_semi, "\n")
+    }
+}
+
+fn lex_scan(src, mut st, mut toks, mut diags) {
+    let c = lex_advance(src, st)
+    if c == " " || c == "\t" || c == chr(13) { // chr(13) = \r: Burryn has no \r escape yet
+    } else if c == "\n" {
+        lex_maybe_semi(st, toks)
+    } else if c == "/" {
+        if lex_match(src, st, "/") {
+            while st[1] < str_len(src) && lex_peek(src, st) != "\n" {
+                lex_bump(st)
+            }
+        } else {
+            lex_emit(st, toks, t_slash, "/")
+        }
+    } else if c == "(" {
+        lex_emit(st, toks, t_lparen, "(")
+    } else if c == ")" {
+        lex_emit(st, toks, t_rparen, ")")
+    } else if c == "{" {
+        lex_emit(st, toks, t_lbrace, "{")
+    } else if c == "}" {
+        lex_emit(st, toks, t_rbrace, "}")
+    } else if c == "[" {
+        lex_emit(st, toks, t_lbracket, "[")
+    } else if c == "]" {
+        lex_emit(st, toks, t_rbracket, "]")
+    } else if c == "," {
+        lex_emit(st, toks, t_comma, ",")
+    } else if c == "." {
+        lex_emit(st, toks, t_dot, ".")
+    } else if c == "-" {
+        if lex_match(src, st, ">") {
+            lex_emit(st, toks, t_thin_arrow, "->")
+        } else {
+            lex_emit(st, toks, t_minus, "-")
+        }
+    } else if c == "+" {
+        lex_emit(st, toks, t_plus, "+")
+    } else if c == "*" {
+        lex_emit(st, toks, t_star, "*")
+    } else if c == "%" {
+        lex_emit(st, toks, t_percent, "%")
+    } else if c == ";" {
+        lex_emit(st, toks, t_semi, ";")
+    } else if c == "?" {
+        lex_emit(st, toks, t_question, "?")
+    } else if c == ":" {
+        lex_emit(st, toks, t_colon, ":")
+    } else if c == "!" {
+        if lex_match(src, st, "=") {
+            lex_emit(st, toks, t_bang_eq, "!=")
+        } else {
+            lex_emit(st, toks, t_bang, "!")
+        }
+    } else if c == "=" {
+        if lex_match(src, st, "=") {
+            lex_emit(st, toks, t_eq_eq, "==")
+        } else if lex_match(src, st, ">") {
+            lex_emit(st, toks, t_arrow, "=>")
+        } else {
+            lex_emit(st, toks, t_eq, "=")
+        }
+    } else if c == ">" {
+        if lex_match(src, st, "=") {
+            lex_emit(st, toks, t_gt_eq, ">=")
+        } else {
+            lex_emit(st, toks, t_gt, ">")
+        }
+    } else if c == "<" {
+        if lex_match(src, st, "=") {
+            lex_emit(st, toks, t_lt_eq, "<=")
+        } else if lex_match(src, st, "-") {
+            lex_emit(st, toks, t_larrow, "<-")
+        } else {
+            lex_emit(st, toks, t_lt, "<")
+        }
+    } else if c == "&" {
+        if lex_match(src, st, "&") {
+            lex_emit(st, toks, t_and_and, "&&")
+        } else {
+            lex_fail(diags, st[0], st[1], "E1001",
+                "Burryn has no bitwise operators; logical and is `&&`",
+                "unexpected '&'")
+        }
+    } else if c == "|" {
+        if lex_match(src, st, "|") {
+            lex_emit(st, toks, t_or_or, "||")
+        } else {
+            lex_fail(diags, st[0], st[1], "E1001",
+                "Burryn has no bitwise operators; logical or is `||`",
+                "unexpected '|'")
+        }
+    } else if c == "\"" {
+        lex_string(src, st, toks, diags)
+    } else if lex_is_digit(c) {
+        lex_number(src, st, toks)
+    } else if lex_is_alpha(c) {
+        lex_ident(src, st, toks)
+    } else {
+        lex_fail(diags, st[0], st[1], "E1001", "",
+            "unexpected character \"" + c + "\"")
+    }
+}
+
+// lex_string collects the literal as raw byte segments between escapes, so
+// multi-byte characters pass through untouched.
+fn lex_string(src, mut st, mut toks, mut diags) {
+    let mut parts = []
+    let mut seg = st[1]
+    while st[1] < str_len(src) && lex_peek(src, st) != "\"" {
+        let c = lex_advance(src, st)
+        if c == "\\" && st[1] < str_len(src) {
+            push(parts, substr(src, seg, st[1] - 1 - seg))
+            let e = lex_advance(src, st)
+            if e == "n" {
+                push(parts, "\n")
+            } else if e == "t" {
+                push(parts, "\t")
+            } else if e == "\"" {
+                push(parts, "\"")
+            } else if e == "\\" {
+                push(parts, "\\")
+            } else {
+                lex_fail(diags, st[1] - 2, st[1], "E1003",
+                    "supported escapes: \\n \\t \\\" \\\\", "bad escape \\" + e)
+                push(parts, e) // keep scanning the rest of the string
+            }
+            seg = st[1]
+        }
+    }
+    if st[1] >= str_len(src) {
+        lex_fail(diags, st[0], st[0] + 1, "E1002",
+            "add a closing '\"'", "unterminated string")
+    } else {
+        push(parts, substr(src, seg, st[1] - seg))
+        st[1] = st[1] + 1 // closing quote
+        lex_emit(st, toks, t_string, join(parts, ""))
+    }
+}
+
+fn lex_number(src, mut st, mut toks) {
+    while lex_is_digit(lex_peek(src, st)) {
+        lex_bump(st)
+    }
+    let mut is_float = false
+    if lex_peek(src, st) == "." && lex_is_digit(lex_peek2(src, st)) {
+        is_float = true
+        lex_bump(st)
+        while lex_is_digit(lex_peek(src, st)) {
+            lex_bump(st)
+        }
+    }
+    let word = substr(src, st[0], st[1] - st[0])
+    if is_float {
+        lex_emit(st, toks, t_float, word)
+    } else {
+        lex_emit(st, toks, t_int, word)
+    }
+}
+
+fn lex_ident(src, mut st, mut toks) {
+    while lex_is_alpha(lex_peek(src, st)) || lex_is_digit(lex_peek(src, st)) {
+        lex_bump(st)
+    }
+    let word = substr(src, st[0], st[1] - st[0])
+    lex_emit(st, toks, lex_keyword(word), word)
+}
+
+fn lex_is_digit(c) {
+    c >= "0" && c <= "9"
+}
+
+fn lex_is_alpha(c) {
+    c == "_" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+}
