@@ -105,7 +105,11 @@ func (g *GC) collect() int {
 		case *OClosure:
 			markObj(t.Fn)
 			for _, uv := range t.Upvals {
-				markObj(uv)
+				// OpClosure fills Upvals one capture at a time; a collection
+				// triggered mid-fill sees nil tail slots
+				if uv != nil {
+					markObj(uv)
+				}
 			}
 		case *OUpvalue:
 			if !t.open {
