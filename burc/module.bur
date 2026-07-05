@@ -1,6 +1,9 @@
-// Package-directory loader: the no-import single-package subset of
-// module.go that burc needs to compile itself. bur.mod must sit in the
-// directory itself (Go also walks upward; burc does not need that).
+// Package-directory loader mirroring module.go for module-local imports.
+// bur.mod must sit in the entry directory itself (Go also walks upward;
+// burc does not need that). Unlike Go, aliases are not rewritten into the
+// AST: the loader validates imports and scans usage, enum field types get
+// their package qualifiers resolved in place, and the checker and compiler
+// resolve value/variant aliases on the fly from each file's ImportDecls.
 
 fn str_ends_with(s, suffix) {
     let n = str_len(s)
@@ -133,110 +136,265 @@ fn parse_bur_mod(file, src, mut diags, mut dfiles) {
     path
 }
 
-// load_dir loads one package directory: bur.mod plus every .bur file, with
-// the package-file shape checks (only declarations, const lets, no dups).
-// Imports are not supported by this bootstrap loader.
-fn load_dir(dir0) {
-    let dir = if str_ends_with(dir0, "/") {
-        substr(dir0, 0, str_len(dir0) - 1)
+// import_alias mirrors module.go importAlias: the explicit alias, else the
+// last path segment
+fn import_alias(alias, path) {
+    if alias != "" {
+        alias
     } else {
-        dir0
-    }
-    let mut diags = []
-    let mut dfiles = []
-    let mod_file = dir + "/bur.mod"
-    let mod_src = match read_file(mod_file) {
-        Ok(s) => s,
-        Err(msg) => {
-            push(diags, Diag(true, "E0432", "cannot read " + mod_file + ": " + msg,
-                "create one with a module directive, e.g. `module example.com/you/hello`", 0, 0))
-            push(dfiles, "")
-            return LoadFailed(diags, dfiles)
-            ""
-        },
-    }
-    let pkg_path = parse_bur_mod(mod_file, mod_src, diags, dfiles)
-    if len(diags) > 0 {
-        return LoadFailed(diags, dfiles)
-    }
-
-    let entries = match read_dir(dir) {
-        Ok(es) => es,
-        Err(msg) => {
-            push(diags, Diag(true, "E0433",
-                "cannot find package \"" + pkg_path + "\": " + msg, "", 0, 0))
-            push(dfiles, "")
-            return LoadFailed(diags, dfiles)
-            []
-        },
-    }
-    let mut files_stmts = []
-    let mut file_paths = []
-    let mut bur_files = 0
-    for name in entries {
-        if str_ends_with(name, ".bur") {
-            bur_files = bur_files + 1
-            let disp = dir + "/" + name
-            let src = match read_file(disp) {
-                Ok(s) => s,
-                Err(msg) => {
-                    push(diags, Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
-                    push(dfiles, "")
-                    ""
-                },
+        let mut cut = 0
+        let mut i = 0
+        while i < str_len(path) {
+            if char_at(path, i) == "/" {
+                cut = i + 1
             }
-            if src != "" {
-                match lex(src) {
-                    Lexed(toks, ldiags) => {
-                        if len(ldiags) > 0 {
-                            for d in ldiags {
-                                push(diags, d)
-                                push(dfiles, disp)
-                            }
-                        } else {
-                            match parse(toks) {
-                                Parsed(stmts, pdiags) => {
-                                    if len(pdiags) > 0 {
-                                        for d in pdiags {
-                                            push(diags, d)
-                                            push(dfiles, disp)
-                                        }
-                                    } else {
-                                        let mut kept = []
-                                        for s in stmts {
-                                            match s {
-                                                ImportDecl(_, _, _, _, isp) => {
-                                                    match isp {
-                                                        Sp(is0, ie0) => {
-                                                            push(diags, Diag(true, "E0432",
-                                                                "imports are not supported by the bootstrap loader",
-                                                                "burc compiles single, import-free packages",
-                                                                is0, ie0))
-                                                            push(dfiles, disp)
-                                                        },
-                                                    }
-                                                },
-                                                _ => push(kept, s),
-                                            }
-                                        }
-                                        push(files_stmts, kept)
-                                        push(file_paths, disp)
-                                    }
-                                },
-                            }
+            i = i + 1
+        }
+        substr(path, cut, str_len(path) - cut)
+    }
+}
+
+// aliases_of builds alias -> import path from one file's ImportDecl nodes,
+// which the loader has already validated; the checker and compiler consume
+// this to resolve qualified names on the fly
+fn aliases_of(imports) {
+    let mut am = map()
+    for imp in imports {
+        match imp {
+            ImportDecl(alias, _, path, _, _) => put(am, import_alias(alias, path), path),
+            _ => {},
+        }
+    }
+    am
+}
+
+// ---- alias usage scan ----
+// Mirrors module.go fileResolver's traversal, which marks an alias used
+// wherever it would rewrite a node; fileResolver does not descend into
+// SelectStmt, so neither does this scan.
+
+fn mark_pattern(p, aliases, mut used) {
+    match p {
+        PatVariant(ppkg, _, _, binds, _) => {
+            if ppkg != "" {
+                match get(aliases, ppkg) {
+                    Some(_) => put(used, ppkg, true),
+                    None => {},
+                }
+            }
+            for sub in binds {
+                mark_pattern(sub, aliases, used)
+            }
+        },
+        _ => {},
+    }
+}
+
+fn mark_te(te, aliases, mut used) {
+    match te {
+        TEName(pkg, _, targs, _) => {
+            if pkg != "" {
+                match get(aliases, pkg) {
+                    Some(_) => put(used, pkg, true),
+                    None => {},
+                }
+            }
+            for a in targs {
+                mark_te(a, aliases, used)
+            }
+        },
+        TEList(elem, _) => mark_te(elem, aliases, used),
+        TEFn(ps, ret, _) => {
+            for p2 in ps {
+                mark_te(p2, aliases, used)
+            }
+            mark_te(ret, aliases, used)
+        },
+        _ => {},
+    }
+}
+
+fn mark_expr(e, aliases, mut used) {
+    match e {
+        VariantAccess(en, _, _) => {
+            match get(aliases, en) {
+                Some(_) => put(used, en, true),
+                None => {},
+            }
+        },
+        QualVariantAccess(pkg, _, _, _) => {
+            match get(aliases, pkg) {
+                Some(_) => put(used, pkg, true),
+                None => {},
+            }
+        },
+        Unary(_, rhs, _) => mark_expr(rhs, aliases, used),
+        Binary(_, lhs, rhs, _) => {
+            mark_expr(lhs, aliases, used)
+            mark_expr(rhs, aliases, used)
+        },
+        Logical(_, lhs, rhs, _) => {
+            mark_expr(lhs, aliases, used)
+            mark_expr(rhs, aliases, used)
+        },
+        Call(callee, cargs, _) => {
+            mark_expr(callee, aliases, used)
+            for a in cargs {
+                mark_expr(a, aliases, used)
+            }
+        },
+        Index(target, idx, _) => {
+            mark_expr(target, aliases, used)
+            mark_expr(idx, aliases, used)
+        },
+        ListLit(elems, _) => {
+            for el in elems {
+                mark_expr(el, aliases, used)
+            }
+        },
+        FnLit(_, _, _, body, _, _) => mark_expr(body, aliases, used),
+        Block(stmts, _) => {
+            for s in stmts {
+                mark_stmt(s, aliases, used)
+            }
+        },
+        IfExpr(cond, then, els, _) => {
+            mark_expr(cond, aliases, used)
+            mark_expr(then, aliases, used)
+            mark_expr(els, aliases, used) // NoNode falls through below
+        },
+        MatchExpr(scrut, arms, _) => {
+            mark_expr(scrut, aliases, used)
+            for arm in arms {
+                match arm {
+                    MatchArm(pat, body, _) => {
+                        mark_pattern(pat, aliases, used)
+                        mark_expr(body, aliases, used)
+                    },
+                    _ => {},
+                }
+            }
+        },
+        TryExpr(inner, _) => mark_expr(inner, aliases, used),
+        RecvExpr(chexpr, _) => mark_expr(chexpr, aliases, used),
+        _ => {},
+    }
+}
+
+fn mark_stmt(s, aliases, mut used) {
+    match s {
+        LetStmt(_, _, _, _, init, _) => mark_expr(init, aliases, used),
+        AssignStmt(target, val, _) => {
+            mark_expr(target, aliases, used)
+            mark_expr(val, aliases, used)
+        },
+        ExprStmt(e, _) => mark_expr(e, aliases, used),
+        WhileStmt(cond, body, _) => {
+            mark_expr(cond, aliases, used)
+            mark_expr(body, aliases, used)
+        },
+        ForStmt(_, _, iter, _, body, _) => {
+            mark_expr(iter, aliases, used)
+            mark_expr(body, aliases, used)
+        },
+        ReturnStmt(v, _) => mark_expr(v, aliases, used),
+        FnDecl(_, _, _, lit, _) => mark_expr(lit, aliases, used),
+        EnumDecl(_, _, variants, _, _) => {
+            for vd in variants {
+                match vd {
+                    EnumVariantDecl(_, _, vtypes) => {
+                        for te in vtypes {
+                            mark_te(te, aliases, used)
                         }
+                    },
+                    _ => {},
+                }
+            }
+        },
+        SpawnStmt(call, _) => mark_expr(call, aliases, used),
+        SendStmt(chexpr, val, _) => {
+            mark_expr(chexpr, aliases, used)
+            mark_expr(val, aliases, used)
+        },
+        _ => {},
+    }
+}
+
+// resolve_te rewrites package qualifiers in a written type from file alias
+// to import path (module.go fileResolver.typeExpr), so conversion at any
+// later use site no longer needs the defining file's imports
+fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
+    match te {
+        TEName(pkg, name, targs, sp) => {
+            let mut rargs = []
+            for a in targs {
+                push(rargs, resolve_te(a, aliases, mod_path, disp, diags, dfiles))
+            }
+            let rpkg = if pkg == "" {
+                ""
+            } else {
+                match get(aliases, pkg) {
+                    Some(path) => path,
+                    None => {
+                        match sp {
+                            Sp(s0, e0) => {
+                                push(diags, Diag(true, "E0433",
+                                    "cannot find package `" + pkg + "`",
+                                    "import it first: `import \"" + mod_path + "/" + pkg + "\"`",
+                                    s0, e0))
+                                push(dfiles, disp)
+                            },
+                        }
+                        pkg
                     },
                 }
             }
+            TEName(rpkg, name, rargs, sp)
+        },
+        TEList(elem, sp) => TEList(resolve_te(elem, aliases, mod_path, disp, diags, dfiles), sp),
+        TEFn(ps, ret, sp) => {
+            let mut rps = []
+            for p2 in ps {
+                push(rps, resolve_te(p2, aliases, mod_path, disp, diags, dfiles))
+            }
+            TEFn(rps, resolve_te(ret, aliases, mod_path, disp, diags, dfiles), sp)
+        },
+        _ => te,
+    }
+}
+
+// resolve_file_tes rebuilds a file's EnumDecls with alias-resolved field
+// types; every other statement passes through untouched
+fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
+    let mut out = []
+    for s in stmts {
+        match s {
+            EnumDecl(name, params, variants, is_pub, sp) => {
+                let mut rvars = []
+                for vd in variants {
+                    match vd {
+                        EnumVariantDecl(vn, ar, vtypes) => {
+                            let mut rts = []
+                            for te in vtypes {
+                                push(rts, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                            }
+                            push(rvars, EnumVariantDecl(vn, ar, rts))
+                        },
+                        _ => push(rvars, vd),
+                    }
+                }
+                push(out, EnumDecl(name, params, rvars, is_pub, sp))
+            },
+            _ => push(out, s),
         }
     }
-    if bur_files == 0 {
-        push(diags, Diag(true, "E0433",
-            "no .bur files in package \"" + pkg_path + "\" (" + dir + ")", "", 0, 0))
-        push(dfiles, "")
-    }
+    out
+}
 
-    // package-file shape: only declarations, const-expression lets, no dups
+// check_pkg_shape enforces the package-file shape across all files: only
+// declarations at top level, const-expression lets, no duplicate names
+// (module.go checkPackageDecls)
+fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
     let mut declared = map() // name -> file it was first declared in
     let mut fi = 0
     while fi < len(files_stmts) {
@@ -303,8 +461,349 @@ fn load_dir(dir0) {
         }
         fi = fi + 1
     }
-    if len(diags) > 0 {
-        return LoadFailed(diags, dfiles)
+}
+
+// load_module loads the module rooted at dir0 (bur.mod must live there):
+// the entry package plus, depth-first, every module-local package it
+// imports. Packages come back in dependency order, entry last (module.go
+// loadPackage).
+fn load_module(dir0) {
+    let dir = if str_ends_with(dir0, "/") {
+        substr(dir0, 0, str_len(dir0) - 1)
+    } else {
+        dir0
     }
-    Loaded(pkg_path, files_stmts, file_paths)
+    let mut diags = []
+    let mut dfiles = []
+    let mod_file = dir + "/bur.mod"
+    let mod_src = match read_file(mod_file) {
+        Ok(s) => s,
+        Err(msg) => {
+            push(diags, Diag(true, "E0432", "cannot read " + mod_file + ": " + msg,
+                "create one with a module directive, e.g. `module example.com/you/hello`", 0, 0))
+            push(dfiles, "")
+            return ModFailed(diags, dfiles)
+            ""
+        },
+    }
+    let mod_path = parse_bur_mod(mod_file, mod_src, diags, dfiles)
+    if len(diags) > 0 {
+        return ModFailed(diags, dfiles)
+    }
+
+    let mut state = map() // import path -> 1 loading, 2 done
+    let mut out_paths = []
+    let mut out_files = []
+    let mut out_fpaths = []
+    let mut out_imports = []
+
+    fn load_pkg(path, from_file, from_sp, stack) {
+        let st = match get(state, path) {
+            Some(x) => x,
+            None => 0,
+        }
+        if st == 2 {
+            return
+        }
+        if st == 1 {
+            // report the cycle from its first occurrence on the stack
+            let mut start = 0
+            let mut found = false
+            let mut i = 0
+            while i < len(stack) {
+                if stack[i] == path && !found {
+                    start = i
+                    found = true
+                }
+                i = i + 1
+            }
+            let mut cyc = []
+            i = start
+            while i < len(stack) {
+                push(cyc, stack[i])
+                i = i + 1
+            }
+            push(cyc, path)
+            match from_sp {
+                Sp(s0, e0) => {
+                    push(diags, Diag(true, "E0391", "import cycle: " + join(cyc, " -> "), "", s0, e0))
+                    push(dfiles, from_file)
+                },
+            }
+            return
+        }
+        put(state, path, 1)
+        let stack2 = concat(stack, [path])
+
+        if path != mod_path && !str_has_prefix(path, mod_path + "/") {
+            match from_sp {
+                Sp(s0, e0) => {
+                    push(diags, Diag(true, "E0432", "cannot resolve import \"" + path + "\"",
+                        "only packages inside module `" + mod_path +
+                        "` can be imported for now; external dependencies arrive with MVS resolution",
+                        s0, e0))
+                    push(dfiles, from_file)
+                },
+            }
+            put(state, path, 2)
+            return
+        }
+        let pdir = if path == mod_path {
+            dir
+        } else {
+            dir + "/" + substr(path, str_len(mod_path) + 1, str_len(path) - str_len(mod_path) - 1)
+        }
+        let entries = match read_dir(pdir) {
+            Ok(es) => es,
+            Err(msg) => {
+                match from_sp {
+                    Sp(s0, e0) => {
+                        push(diags, Diag(true, "E0433",
+                            "cannot find package \"" + path + "\": " + msg, "", s0, e0))
+                        push(dfiles, from_file)
+                    },
+                }
+                put(state, path, 2)
+                return
+                []
+            },
+        }
+
+        // parse every .bur file, splitting leading imports from declarations
+        let mut files_stmts = []
+        let mut file_paths = []
+        let mut file_imports = []
+        let mut bur_files = 0
+        for name in entries {
+            if str_ends_with(name, ".bur") {
+                bur_files = bur_files + 1
+                let disp = pdir + "/" + name
+                let src = match read_file(disp) {
+                    Ok(s) => s,
+                    Err(msg) => {
+                        push(diags, Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
+                        push(dfiles, "")
+                        ""
+                    },
+                }
+                if src != "" {
+                    match lex(src) {
+                        Lexed(toks, ldiags) => {
+                            if len(ldiags) > 0 {
+                                for d in ldiags {
+                                    push(diags, d)
+                                    push(dfiles, disp)
+                                }
+                            } else {
+                                match parse(toks) {
+                                    Parsed(stmts, pdiags) => {
+                                        if len(pdiags) > 0 {
+                                            for d in pdiags {
+                                                push(diags, d)
+                                                push(dfiles, disp)
+                                            }
+                                        } else {
+                                            let mut kept = []
+                                            let mut imps = []
+                                            let mut imports_done = false
+                                            for s in stmts {
+                                                match s {
+                                                    ImportDecl(_, _, _, _, isp) => {
+                                                        if imports_done {
+                                                            match isp {
+                                                                Sp(is0, ie0) => {
+                                                                    push(diags, Diag(true, "E0432",
+                                                                        "`import` must come before any declarations",
+                                                                        "move it to the top of the file, above the declarations",
+                                                                        is0, ie0))
+                                                                    push(dfiles, disp)
+                                                                },
+                                                            }
+                                                        } else {
+                                                            push(imps, s)
+                                                        }
+                                                    },
+                                                    _ => {
+                                                        imports_done = true
+                                                        push(kept, s)
+                                                    },
+                                                }
+                                            }
+                                            push(files_stmts, kept)
+                                            push(file_paths, disp)
+                                            push(file_imports, imps)
+                                        }
+                                    },
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        if bur_files == 0 {
+            match from_sp {
+                Sp(s0, e0) => {
+                    push(diags, Diag(true, "E0433",
+                        "no .bur files in package \"" + path + "\" (" + pdir + ")", "", s0, e0))
+                    push(dfiles, from_file)
+                },
+            }
+            put(state, path, 2)
+            return
+        }
+
+        check_pkg_shape(path, files_stmts, file_paths, diags, dfiles)
+
+        // package-level names share the qualifier position with aliases
+        let mut decl_names = map()
+        let mut di = 0
+        while di < len(files_stmts) {
+            for s in files_stmts[di] {
+                match s {
+                    FnDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    EnumDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    LetStmt(n, _, _, _, _, _) => put(decl_names, n, true),
+                    _ => {},
+                }
+            }
+            di = di + 1
+        }
+
+        // per file: validate imports (dropping bad ones so later stages never
+        // see them), scan alias usage, resolve enum field types, warn unused
+        let mut fi = 0
+        while fi < len(files_stmts) {
+            let disp = file_paths[fi]
+            let mut kept_imps = []
+            let mut seen = map()
+            for imp in file_imports[fi] {
+                match imp {
+                    ImportDecl(alias0, asp, ipath, psp, isp) => {
+                        let alias = import_alias(alias0, ipath)
+                        let asp2 = if alias0 == "" { psp } else { asp }
+                        if !valid_import_path(ipath) {
+                            match psp {
+                                Sp(s0, e0) => {
+                                    push(diags, Diag(true, "E0432",
+                                        "invalid import path \"" + ipath + "\"", "", s0, e0))
+                                    push(dfiles, disp)
+                                },
+                            }
+                        } else if alias == "_" || alias == "Option" || alias == "Result" {
+                            match asp2 {
+                                Sp(s0, e0) => {
+                                    push(diags, Diag(true, "E0252",
+                                        "cannot use `" + alias + "` as an import name",
+                                        "rename the import: `import other \"" + ipath + "\"`",
+                                        s0, e0))
+                                    push(dfiles, disp)
+                                },
+                            }
+                        } else {
+                            let dup = match get(seen, alias) {
+                                Some(_) => true,
+                                None => false,
+                            }
+                            let clash = match get(decl_names, alias) {
+                                Some(_) => true,
+                                None => false,
+                            }
+                            if dup {
+                                match asp2 {
+                                    Sp(s0, e0) => {
+                                        push(diags, Diag(true, "E0252",
+                                            "`" + alias + "` is imported more than once in this file",
+                                            "rename one of them: `import other \"" + ipath + "\"`",
+                                            s0, e0))
+                                        push(dfiles, disp)
+                                    },
+                                }
+                            } else if clash {
+                                match isp {
+                                    Sp(s0, e0) => {
+                                        push(diags, Diag(true, "E0252",
+                                            "import `" + alias + "` conflicts with a declaration in this package",
+                                            "rename the import with an alias: `import other \"...\"`",
+                                            s0, e0))
+                                        push(dfiles, disp)
+                                    },
+                                }
+                            } else {
+                                put(seen, alias, true)
+                                push(kept_imps, imp)
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            file_imports[fi] = kept_imps
+            let aliases = aliases_of(kept_imps)
+            let mut used = map()
+            for s in files_stmts[fi] {
+                mark_stmt(s, aliases, used)
+            }
+            files_stmts[fi] = resolve_file_tes(files_stmts[fi], aliases, mod_path, disp, diags, dfiles)
+            for imp in kept_imps {
+                match imp {
+                    ImportDecl(alias0, _, ipath, _, isp) => {
+                        let alias = import_alias(alias0, ipath)
+                        let is_used = match get(used, alias) {
+                            Some(_) => true,
+                            None => false,
+                        }
+                        if !is_used {
+                            match isp {
+                                Sp(s0, e0) => {
+                                    push(diags, Diag(false, "unused_import",
+                                        "unused import: `" + alias + "`", "remove the import",
+                                        s0, e0))
+                                    push(dfiles, disp)
+                                },
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+
+        // load dependencies depth-first, then append self: dependency order
+        fi = 0
+        while fi < len(file_imports) {
+            for imp in file_imports[fi] {
+                match imp {
+                    ImportDecl(_, _, ipath, psp, _) => load_pkg(ipath, file_paths[fi], psp, stack2),
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+
+        put(state, path, 2)
+        push(out_paths, path)
+        push(out_files, files_stmts)
+        push(out_fpaths, file_paths)
+        push(out_imports, file_imports)
+    }
+
+    load_pkg(mod_path, "", Sp(0, 0), [])
+
+    let mut has_err = false
+    for d in diags {
+        match d {
+            Diag(ie, _, _, _, _, _) => {
+                if ie {
+                    has_err = true
+                }
+            },
+        }
+    }
+    if has_err {
+        ModFailed(diags, dfiles)
+    } else {
+        ModLoaded(diags, dfiles, out_paths, out_files, out_fpaths, out_imports)
+    }
 }

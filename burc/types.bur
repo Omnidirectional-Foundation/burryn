@@ -330,13 +330,14 @@ fn ty_instantiate_cp(mut tk, mut tn, mut ta, mut tr, mut tl, h, subst) {
 //               (Go sets ForStmt.IterIsChan on the AST; nodes here are
 //               immutable, so the compiler reads this side channel)
 fn typecheck_script(stmts) {
-    typecheck_program([stmts], [""], false, "")
+    typecheck_program([[stmts]], [[""]], false, [""], [[[]]])
 }
 
-// typecheck_program checks either a script (is_pkg false: one entry in
-// files_stmts, file "") or a whole package (mirrors checkPackage +
-// typecheckModule for the no-import single-package subset burc needs).
-fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
+// typecheck_program checks either a script (is_pkg false: one pseudo
+// package with one file "") or a whole module (mirrors typecheckModule +
+// checkPackage): packages arrive in dependency order, entry last, each as
+// statements per file, display paths per file, and ImportDecls per file.
+fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports) {
     // ---- state ----
     let mut tk = []
     let mut tn = []
@@ -366,8 +367,13 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
     let mut cur_file = ""
     let mut diag_files = []
     let mut e_prefix = []
+    let mut e_pub = []
     let mut b_pub = []
     let mut b_file = []
+    let mut cur_pkg = ""       // import path of the package being checked
+    let mut cur_aliases = map() // current file's import aliases (alias -> path)
+    let mut pkg_vals = map()   // "path.name" -> binding handle, for importers
+    let mut pkg_seen = map()   // import path -> checked
 
     // ---- type helpers ----
     fn fresh(con) {
@@ -419,10 +425,10 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
 
     // qual_name maps a bare enum name to its globally unique constructor name
     fn qual_name(name) {
-        if pkg_path == "" {
+        if cur_pkg == "" {
             name
         } else {
-            pkg_path + "." + name
+            cur_pkg + "." + name
         }
     }
 
@@ -527,12 +533,93 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
         }
     }
 
+    // alias_path resolves an import alias of the current file; "" = no alias
+    fn alias_path(name) {
+        match get(cur_aliases, name) {
+            Some(p) => p,
+            None => "",
+        }
+    }
+
+    // lookup_pkg_enum resolves an already-alias-resolved pkg path plus enum
+    // name to an enum handle, reporting resolution and visibility errors;
+    // -1 means an error was already emitted (mirrors Checker.lookupPkgEnum)
+    fn lookup_pkg_enum(pkg, name, sp) {
+        let known = match get(pkg_seen, pkg) {
+            Some(_) => true,
+            None => false,
+        }
+        if !known {
+            cerr(sp, "E0433", "", "cannot find package `" + pkg + "`")
+            -1
+        } else {
+            match get(enum_by_name, pkg + "." + name) {
+                Some(eh) => {
+                    if !e_pub[eh] {
+                        cerr(sp, "E0603", "mark it `pub enum " + name + "` to export it",
+                            "enum `" + name + "` is private to package `" + pkg + "`")
+                        -1
+                    } else {
+                        eh
+                    }
+                },
+                None => {
+                    cerr(sp, "E0412", "", "cannot find enum `" + name + "` in package `" + pkg + "`")
+                    -1
+                },
+            }
+        }
+    }
+
+    // infer_pkg_access types pkg.name where pkg is an import path (mirrors
+    // the Checker's PkgAccess case)
+    fn infer_pkg_access(pkg, name, sp) {
+        let known = match get(pkg_seen, pkg) {
+            Some(_) => true,
+            None => false,
+        }
+        if !known {
+            cerr(sp, "E0433", "", "cannot find package `" + pkg + "`")
+            fresh("")
+        } else {
+            match get(pkg_vals, pkg + "." + name) {
+                Some(b) => {
+                    if !b_pub[b] {
+                        cerr(sp, "E0603", "mark it `pub` in package `" + pkg + "` to export it",
+                            "`" + name + "` is private to package `" + pkg + "`")
+                    }
+                    b_used[b] = true
+                    instantiate(b_scheme[b])
+                },
+                None => {
+                    let is_enum = match get(enum_by_name, pkg + "." + name) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if is_enum {
+                        cerr(sp, "E0423", "name a variant: `" + pkg + "." + name + ".SomeVariant`",
+                            "enum `" + name + "` cannot be used as a value")
+                    } else {
+                        cerr(sp, "E0425", "", "cannot find `" + name + "` in package `" + pkg + "`")
+                    }
+                    fresh("")
+                },
+            }
+        }
+    }
+
     fn validate_type_expr(te, pm) {
         match te {
             TEName(pkg, name, targs, sp) => {
                 if pkg != "" {
-                    // scripts import nothing: any qualified type is unresolvable
-                    cerr(sp, "E0433", "", "cannot find package `" + pkg + "`")
+                    // the loader already rewrote pkg from alias to import path
+                    let eh = lookup_pkg_enum(pkg, name, sp)
+                    if eh >= 0 {
+                        if len(targs) != len(e_params[eh]) {
+                            cerr(sp, "E0107", "", "enum `" + name + "` takes " +
+                                str(len(e_params[eh])) + " type argument(s), " + str(len(targs)) + " given")
+                        }
+                    }
                 } else if name == "int" || name == "float" || name == "bool" ||
                     name == "str" || name == "unit" {
                     if len(targs) > 0 {
@@ -585,7 +672,7 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
 
     fn register_enum(n) {
         match n {
-            EnumDecl(name, params, variants, _, sp) => {
+            EnumDecl(name, params, variants, is_pub, sp) => {
                 let qual = qual_name(name)
                 let dup = match get(enum_by_name, qual) {
                     Some(_) => true,
@@ -608,7 +695,8 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
                     push(e_qual, qual)
                     push(e_params, params)
                     push(e_variants, vhs)
-                    push(e_prefix, pkg_path)
+                    push(e_prefix, cur_pkg)
+                    push(e_pub, is_pub)
                     put(enum_by_name, qual, len(e_qual) - 1)
                     // validate field type expressions
                     let mut pm = map()
@@ -715,7 +803,7 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
         for q in keys(enum_by_name) {
             match get(enum_by_name, q) {
                 Some(eh) => {
-                    if e_prefix[eh] == pkg_path || e_prefix[eh] == "" {
+                    if e_prefix[eh] == cur_pkg || e_prefix[eh] == "" {
                         let mut i = 0
                         while i < len(e_variants[eh]) {
                             if v_name[e_variants[eh][i]] == name {
@@ -750,12 +838,35 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
                 _ => { walking = false },
             }
         }
+        // an alias-headed access is a package binding (Go sees PkgAccess here)
         let name = match root {
             Ident(n, _) => n,
+            VariantAccess(en, vn, _) => if alias_path(en) != "" { vn } else { "" },
+            PkgAccess(_, pn, _) => pn,
             _ => "",
         }
+        let b = match root {
+            Ident(n, _) => lookup(n),
+            VariantAccess(en, vn, _) => {
+                let ap = alias_path(en)
+                if ap != "" {
+                    match get(pkg_vals, ap + "." + vn) {
+                        Some(bh) => bh,
+                        None => -1,
+                    }
+                } else {
+                    -1
+                }
+            },
+            PkgAccess(pp, pn, _) => {
+                match get(pkg_vals, pp + "." + pn) {
+                    Some(bh) => bh,
+                    None => -1,
+                }
+            },
+            _ => -1,
+        }
         if name != "" {
-            let b = lookup(name)
             if b >= 0 && !b_mut[b] {
                 let help = if b_kind[b] == "param" {
                     "declare the parameter as mutable: `mut " + name + "`"
@@ -974,8 +1085,26 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
                             let mut eh = -1
                             let mut idx = -1
                             if ppkg != "" {
-                                // scripts import nothing: qualified patterns are unresolvable
-                                cerr(psp, "E0433", "", "cannot find package `" + ppkg + "`")
+                                let apath = alias_path(ppkg)
+                                if apath == "" {
+                                    cerr(psp, "E0433", "", "cannot find package `" + ppkg + "`")
+                                } else {
+                                    let h = lookup_pkg_enum(apath, penum, psp)
+                                    if h >= 0 {
+                                        let mut i = 0
+                                        while i < len(e_variants[h]) {
+                                            if v_name[e_variants[h][i]] == pvar {
+                                                idx = i
+                                            }
+                                            i = i + 1
+                                        }
+                                        if idx < 0 {
+                                            cerr(psp, "E0599", "", "enum `" + penum + "` has no variant `" + pvar + "`")
+                                        } else {
+                                            eh = h
+                                        }
+                                    }
+                                }
                             } else if penum != "" {
                                 let sh = enum_sig(penum)
                                 match if sh >= 0 { Some(sh) } else { None } {
@@ -1110,9 +1239,48 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
                 }
             },
             VariantAccess(en, vr, vsp) => {
-                let seh = enum_sig(en)
-                match if seh >= 0 { Some(seh) } else { None } {
-                    Some(eh) => {
+                // an import alias as the head makes this a package access
+                // (module.go rewrites the AST; burc resolves on the fly)
+                let apath = alias_path(en)
+                if apath != "" {
+                    infer_pkg_access(apath, vr, vsp)
+                } else {
+                    let seh = enum_sig(en)
+                    match if seh >= 0 { Some(seh) } else { None } {
+                        Some(eh) => {
+                            let mut idx = -1
+                            let mut i = 0
+                            while i < len(e_variants[eh]) {
+                                if v_name[e_variants[eh][i]] == vr {
+                                    idx = i
+                                }
+                                i = i + 1
+                            }
+                            if idx >= 0 {
+                                variant_type(eh, idx)
+                            } else {
+                                cerr(vsp, "E0599", "", "enum `" + en + "` has no variant `" + vr + "`")
+                                fresh("")
+                            }
+                        },
+                        None => {
+                            cerr(vsp, "E0412", "", "cannot find enum `" + en + "`")
+                            fresh("")
+                        },
+                    }
+                }
+            },
+            PkgAccess(pkg, name, psp) => infer_pkg_access(pkg, name, psp),
+            QualVariantAccess(pkg, en, vr, qsp) => {
+                let apath = alias_path(pkg)
+                if apath == "" {
+                    cerr(qsp, "E0433", "", "cannot find package `" + pkg + "`")
+                    fresh("")
+                } else {
+                    let eh = lookup_pkg_enum(apath, en, qsp)
+                    if eh < 0 {
+                        fresh("")
+                    } else {
                         let mut idx = -1
                         let mut i = 0
                         while i < len(e_variants[eh]) {
@@ -1124,23 +1292,11 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
                         if idx >= 0 {
                             variant_type(eh, idx)
                         } else {
-                            cerr(vsp, "E0599", "", "enum `" + en + "` has no variant `" + vr + "`")
+                            cerr(qsp, "E0599", "", "enum `" + en + "` has no variant `" + vr + "`")
                             fresh("")
                         }
-                    },
-                    None => {
-                        cerr(vsp, "E0412", "", "cannot find enum `" + en + "`")
-                        fresh("")
-                    },
+                    }
                 }
-            },
-            PkgAccess(pkg, _, psp) => {
-                cerr(psp, "E0433", "", "cannot find package `" + pkg + "`")
-                fresh("")
-            },
-            QualVariantAccess(pkg, _, _, qsp) => {
-                cerr(qsp, "E0433", "", "cannot find package `" + pkg + "`")
-                fresh("")
             },
             Unary(op, rhs, usp) => {
                 let t = infer_expr(rhs)
@@ -1439,6 +1595,7 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
         push(e_params, params)
         push(e_variants, vhs)
         push(e_prefix, "")
+        push(e_pub, true)
         put(enum_by_name, name, len(e_qual) - 1)
     }
     builtin_enum("Option", ["a"], ["Some", "None"], [[te("a")], []])
@@ -1530,128 +1687,168 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
     let bc1 = declare("chan", mono(tfn([], con1("chan", h_unit))), false, "native", Sp(0, 0))
     b_special[bc1] = "chan"
 
-    // ---- passes (script: one anonymous file; package: every file) ----
-    let n_files = len(files_stmts)
-
-    // pass 1: register enums from every file
-    let mut fi = 0
-    while fi < n_files {
-        cur_file = file_paths[fi]
-        for s in files_stmts[fi] {
-            match s {
-                EnumDecl(_, _, _, _, _) => register_enum(s),
-                _ => {},
-            }
+    // ---- passes: check each package in dependency order (entry last),
+    // each in its own scope over the shared builtins (typecheckModule +
+    // checkPackage; a script is one anonymous pseudo package) ----
+    let n_pkgs = len(pkgs_stmts)
+    // flat file order across all packages, for stable diagnostic sorting
+    let mut flat_files = []
+    let mut pi = 0
+    while pi < n_pkgs {
+        for f in pkgs_fpaths[pi] {
+            push(flat_files, f)
         }
-        fi = fi + 1
+        pi = pi + 1
     }
-    // pass 1.5: pre-declare every top-level value name (monomorphic)
-    let mut pre = map()
-    fi = 0
-    while fi < n_files {
-        cur_file = file_paths[fi]
-        for s in files_stmts[fi] {
-            match s {
-                FnDecl(name, nsp, is_pub, _, _) => {
-                    let tv = fresh("")
-                    put(pre, name, tv)
-                    let b = declare(name, mono(tv), false, "global", nsp)
-                    b_isfn[b] = true
-                    b_pub[b] = is_pub
-                },
-                LetStmt(name, nsp, is_mut, is_pub, _, _) => {
-                    let tv = fresh("")
-                    put(pre, name, tv)
-                    let b = declare(name, mono(tv), is_mut, "global", nsp)
-                    b_pub[b] = is_pub
-                },
-                _ => {},
-            }
-        }
-        fi = fi + 1
-    }
+    // entry-package globals for the bind dump, captured before the scope pop
+    let mut bind_names = []
+    let mut bind_by = map()
 
-    // pass 2: infer file by file, in load order
-    fi = 0
-    while fi < n_files {
-        cur_file = file_paths[fi]
-        for s in files_stmts[fi] {
-            match s {
-                FnDecl(name, nsp, is_pub, lit, _) => {
-                    if is_pub && !is_pkg {
-                        err_pub_script(span_of(s))
-                    }
-                    level = level + 1
-                    let ft = infer_expr(lit)
-                    level = level - 1
-                    // generalize BEFORE linking the level-0 placeholder: unify
-                    // would pin every inner var to level 0 and kill polymorphism
-                    let b = lookup(name)
-                    b_scheme[b] = generalize(ft)
-                    let pt = match get(pre, name) {
-                        Some(t) => t,
-                        None => ft,
-                    }
-                    unify_at(pt, ft, nsp, "in this function")
-                },
-                LetStmt(name, nsp, _, is_pub, init, _) => {
-                    if is_pub && !is_pkg {
-                        err_pub_script(span_of(s))
-                    }
-                    let t = infer_let_init(init)
-                    let pt = match get(pre, name) {
-                        Some(x) => x,
-                        None => t,
-                    }
-                    unify_at(pt, t, nsp, "in this binding")
-                },
-                EnumDecl(_, _, _, is_pub, _) => {
-                    if is_pub && !is_pkg {
-                        err_pub_script(span_of(s))
-                    }
-                    // already registered
-                },
-                _ => infer_stmt(s),
-            }
-        }
-        fi = fi + 1
-    }
+    pi = 0
+    while pi < n_pkgs {
+        cur_pkg = pkg_paths[pi]
+        let files_stmts = pkgs_stmts[pi]
+        let file_paths = pkgs_fpaths[pi]
+        let file_imports = pkgs_imports[pi]
+        let is_entry = pi == n_pkgs - 1
+        let n_files = len(files_stmts)
+        push_scope() // the package scope
 
-    // package entry: validate main (mirrors checkPackage's isEntry block)
-    if is_pkg {
-        let mb = match get(scopes[0], "main") {
-            Some(b) => if b_isfn[b] { b } else { -1 },
-            None => -1,
-        }
-        if mb >= 0 {
-            b_used[mb] = true
-            let e = ty_unify(tk, tn, ta, tr, tl, instantiate(b_scheme[mb]), tfn([], fresh("")))
-            if e != "" {
-                cur_file = b_file[mb]
-                cerr(b_span[mb], "E0580", "declare it as `fn main() { ... }`",
-                    "`main` must take no parameters")
-            }
-        } else {
-            cur_file = file_paths[0]
-            cerr(Sp(0, 0), "E0601", "declare `fn main() { ... }` in the package you run",
-                "no `main` function in package \"" + pkg_path + "\"")
-        }
-    }
-
-    // ---- lint unused top-level bindings (pub ones are the package's API) ----
-    for name in keys(scopes[0]) {
-        match get(scopes[0], name) {
-            Some(b) => {
-                if b_kind[b] == "global" && (!is_pkg || !b_pub[b]) && !b_used[b] && !starts_underscore(name) {
-                    let what = if b_isfn[b] { "function" } else { "variable" }
-                    cur_file = b_file[b]
-                    cwarn(b_span[b], "unused_variable",
-                        "if this is intentional, prefix it with an underscore: `_" + name + "`",
-                        "unused " + what + ": `" + name + "`")
+        // pass 1: register enums from every file
+        let mut fi = 0
+        while fi < n_files {
+            cur_file = file_paths[fi]
+            cur_aliases = aliases_of(file_imports[fi])
+            for s in files_stmts[fi] {
+                match s {
+                    EnumDecl(_, _, _, _, _) => register_enum(s),
+                    _ => {},
                 }
-            },
-            None => {},
+            }
+            fi = fi + 1
         }
+        // pass 1.5: pre-declare every top-level value name (monomorphic)
+        let mut pre = map()
+        fi = 0
+        while fi < n_files {
+            cur_file = file_paths[fi]
+            for s in files_stmts[fi] {
+                match s {
+                    FnDecl(name, nsp, is_pub, _, _) => {
+                        let tv = fresh("")
+                        put(pre, name, tv)
+                        let b = declare(name, mono(tv), false, "global", nsp)
+                        b_isfn[b] = true
+                        b_pub[b] = is_pub
+                    },
+                    LetStmt(name, nsp, is_mut, is_pub, _, _) => {
+                        let tv = fresh("")
+                        put(pre, name, tv)
+                        let b = declare(name, mono(tv), is_mut, "global", nsp)
+                        b_pub[b] = is_pub
+                    },
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+
+        // pass 2: infer file by file, in load order
+        fi = 0
+        while fi < n_files {
+            cur_file = file_paths[fi]
+            cur_aliases = aliases_of(file_imports[fi])
+            for s in files_stmts[fi] {
+                match s {
+                    FnDecl(name, nsp, is_pub, lit, _) => {
+                        if is_pub && !is_pkg {
+                            err_pub_script(span_of(s))
+                        }
+                        level = level + 1
+                        let ft = infer_expr(lit)
+                        level = level - 1
+                        // generalize BEFORE linking the level-0 placeholder: unify
+                        // would pin every inner var to level 0 and kill polymorphism
+                        let b = lookup(name)
+                        b_scheme[b] = generalize(ft)
+                        let pt = match get(pre, name) {
+                            Some(t) => t,
+                            None => ft,
+                        }
+                        unify_at(pt, ft, nsp, "in this function")
+                    },
+                    LetStmt(name, nsp, _, is_pub, init, _) => {
+                        if is_pub && !is_pkg {
+                            err_pub_script(span_of(s))
+                        }
+                        let t = infer_let_init(init)
+                        let pt = match get(pre, name) {
+                            Some(x) => x,
+                            None => t,
+                        }
+                        unify_at(pt, t, nsp, "in this binding")
+                    },
+                    EnumDecl(_, _, _, is_pub, _) => {
+                        if is_pub && !is_pkg {
+                            err_pub_script(span_of(s))
+                        }
+                        // already registered
+                    },
+                    _ => infer_stmt(s),
+                }
+            }
+            fi = fi + 1
+        }
+
+        // entry package: validate main (mirrors checkPackage's isEntry block)
+        if is_pkg && is_entry {
+            let mb = match get(scopes[len(scopes) - 1], "main") {
+                Some(b) => if b_isfn[b] { b } else { -1 },
+                None => -1,
+            }
+            if mb >= 0 {
+                b_used[mb] = true
+                let e = ty_unify(tk, tn, ta, tr, tl, instantiate(b_scheme[mb]), tfn([], fresh("")))
+                if e != "" {
+                    cur_file = b_file[mb]
+                    cerr(b_span[mb], "E0580", "declare it as `fn main() { ... }`",
+                        "`main` must take no parameters")
+                }
+            } else {
+                cur_file = file_paths[0]
+                cerr(Sp(0, 0), "E0601", "declare `fn main() { ... }` in the package you run",
+                    "no `main` function in package \"" + cur_pkg + "\"")
+            }
+        }
+
+        // lint unused non-pub globals (pub ones are the package's API), then
+        // snapshot the scope for importers and pop it
+        let top = scopes[len(scopes) - 1]
+        for name in keys(top) {
+            match get(top, name) {
+                Some(b) => {
+                    if b_kind[b] == "global" {
+                        if (!is_pkg || !b_pub[b]) && !b_used[b] && !starts_underscore(name) {
+                            let what = if b_isfn[b] { "function" } else { "variable" }
+                            cur_file = b_file[b]
+                            cwarn(b_span[b], "unused_variable",
+                                "if this is intentional, prefix it with an underscore: `_" + name + "`",
+                                "unused " + what + ": `" + name + "`")
+                        }
+                        put(pkg_vals, cur_pkg + "." + name, b)
+                        if is_entry {
+                            push(bind_names, name)
+                            put(bind_by, name, b_scheme[b])
+                        }
+                    }
+                },
+                None => {},
+            }
+        }
+        put(pkg_seen, cur_pkg, true)
+        let _ = pop(scopes)
+        cur_aliases = map()
+        pi = pi + 1
     }
 
     // ---- bind dump lines (only meaningful without errors) ----
@@ -1667,20 +1864,9 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
     }
     let mut bind_lines = []
     if !has_err {
-        let mut names = []
-        for name in keys(scopes[0]) {
-            match get(scopes[0], name) {
-                Some(b) => {
-                    if b_kind[b] == "global" {
-                        push(names, name)
-                    }
-                },
-                None => {},
-            }
-        }
-        for name in sort_strs(names) {
-            match get(scopes[0], name) {
-                Some(b) => push(bind_lines, "bind " + name + " :: " + pretty_of(s_t[b_scheme[b]])),
+        for name in sort_strs(bind_names) {
+            match get(bind_by, name) {
+                Some(sch) => push(bind_lines, "bind " + name + " :: " + pretty_of(s_t[sch])),
                 None => {},
             }
         }
@@ -1691,8 +1877,8 @@ fn typecheck_program(files_stmts, file_paths, is_pkg, pkg_path) {
     for f in diag_files {
         let mut r = 0
         let mut k = 0
-        while k < n_files {
-            if file_paths[k] == f {
+        while k < len(flat_files) {
+            if flat_files[k] == f {
                 r = k + 1
             }
             k = k + 1

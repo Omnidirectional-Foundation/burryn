@@ -68,13 +68,14 @@ let native_names = ["print", "println", "eprintln", "len", "map", "get", "put", 
 // chan_fors carries the checker's channel-for span starts (Go sets
 // ForStmt.IterIsChan on the AST instead).
 fn compile_script(stmts, chan_fors) {
-    compile_program([stmts], [""], false, "", chan_fors)
+    compile_program([[stmts]], [[""]], false, [""], [[[]]], chan_fors)
 }
 
-// compile_program compiles a script (is_pkg false) or a single package
-// (mirrors compileModule for the no-import subset): per-file init functions
-// define the package's globals, then the entry package's main runs.
-fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
+// compile_program compiles a script (is_pkg false: one pseudo package with
+// one file "") or a whole module (mirrors compileModule): packages arrive
+// in dependency order, entry last; per-file init functions define each
+// package's globals, then the entry package's main runs.
+fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports, chan_fors) {
     // ---- function arena ----
     let mut f_name = []
     let mut f_file = []
@@ -91,6 +92,8 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
     let mut enum_by = map()
     let mut global_mut = map()
     let mut pkg_decls = map()
+    let mut cur_pkg = ""        // import path of the package being compiled
+    let mut cur_aliases = map() // current file's import aliases (alias -> path)
     // ---- compiler arena ----
     let mut c_enclosing = []
     let mut c_fn = []
@@ -164,10 +167,17 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
     // qualify maps a top-level name of the current package to its globally
     // unique global-table name; mangle_if_decl qualifies only declared names
     fn qualify(name) {
-        if pkg_path == "" {
+        if cur_pkg == "" {
             name
         } else {
-            pkg_path + "." + name
+            cur_pkg + "." + name
+        }
+    }
+    // alias_path resolves an import alias of the current file; "" = no alias
+    fn alias_path(name) {
+        match get(cur_aliases, name) {
+            Some(p) => p,
+            None => "",
         }
     }
     fn mangle_if_decl(name) {
@@ -199,7 +209,7 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
         for q in keys(enum_by) {
             match get(enum_by, q) {
                 Some(eh) => {
-                    if en_prefix[eh] == pkg_path || en_prefix[eh] == "" {
+                    if en_prefix[eh] == cur_pkg || en_prefix[eh] == "" {
                         let mut i = 0
                         while i < len(en_vnames[eh]) {
                             if en_vnames[eh][i] == name {
@@ -463,7 +473,7 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
                 _ => {},
             }
         }
-        Ok(declare_enum(qual, pkg_path, vnames, varities))
+        Ok(declare_enum(qual, cur_pkg, vnames, varities))
     }
 
     // loop bookkeeping
@@ -1113,8 +1123,31 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
                             let mut eh = -1
                             let mut idx = -1
                             if ppkg != "" {
-                                return perr("E2015", "",
-                                    "unknown enum \"" + ppkg + "." + penum + "\"", asp)
+                                let apath = alias_path(ppkg)
+                                let full = if apath != "" {
+                                    apath + "." + penum
+                                } else {
+                                    ppkg + "." + penum
+                                }
+                                // direct qualified lookup (Go reads shared.enums)
+                                eh = match get(enum_by, full) {
+                                    Some(h) => h,
+                                    None => -1,
+                                }
+                                if eh < 0 {
+                                    return perr("E2015", "", "unknown enum \"" + full + "\"", asp)
+                                }
+                                let mut i = 0
+                                while i < len(en_vnames[eh]) {
+                                    if en_vnames[eh][i] == pvar {
+                                        idx = i
+                                    }
+                                    i = i + 1
+                                }
+                                if idx < 0 {
+                                    return perr("E2016", "",
+                                        "enum \"" + full + "\" has no variant \"" + pvar + "\"", asp)
+                                }
                             } else if penum != "" {
                                 eh = local_enum(penum)
                                 if eh < 0 {
@@ -1347,11 +1380,21 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
             IfExpr(cond, then, els, sp) => cp_if(ch, cond, then, els, sp),
             MatchExpr(scrut, arms, sp) => cp_match(ch, scrut, arms, sp),
             VariantAccess(en, vr, sp) => {
-                let eh = local_enum(en)
-                if eh < 0 {
-                    return perr("E2015", "", "unknown enum \"" + en + "\"", sp)
+                // an import alias as the head makes this a package access
+                // (module.go rewrites the AST; burc resolves on the fly)
+                let apath = alias_path(en)
+                if apath != "" {
+                    let idx = add_const(ch, CStr(apath + "." + vr))
+                    emit(ch, op_get_global, sp)
+                    emit_u16(ch, idx, sp)
+                    Ok(true)
+                } else {
+                    let eh = local_enum(en)
+                    if eh < 0 {
+                        return perr("E2015", "", "unknown enum \"" + en + "\"", sp)
+                    }
+                    emit_variant_of(ch, eh, vr, sp)
                 }
-                emit_variant_of(ch, eh, vr, sp)
             },
             PkgAccess(pkg, name, sp) => {
                 let idx = add_const(ch, CStr(pkg + "." + name))
@@ -1360,9 +1403,19 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
                 Ok(true)
             },
             QualVariantAccess(pkg, en, vr, sp) => {
-                let eh = local_enum(pkg + "." + en)
+                let apath = alias_path(pkg)
+                let full = if apath != "" {
+                    apath + "." + en
+                } else {
+                    pkg + "." + en
+                }
+                // direct qualified lookup (Go reads shared.enums directly)
+                let eh = match get(enum_by, full) {
+                    Some(h) => h,
+                    None => -1,
+                }
                 if eh < 0 {
-                    return perr("E2015", "", "unknown enum \"" + pkg + "." + en + "\"", sp)
+                    return perr("E2015", "", "unknown enum \"" + full + "\"", sp)
                 }
                 emit_variant_of(ch, eh, vr, sp)
             },
@@ -1437,7 +1490,7 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
                     Some(h) => h,
                     None => -1,
                 }
-                let eh = if pre >= 0 && pkg_path != "" {
+                let eh = if pre >= 0 && cur_pkg != "" {
                     pre
                 } else {
                     match register_enum_decl(ch, name, variants, sp) {
@@ -1560,70 +1613,84 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
     }
 
     if is_pkg {
-        // ---- module driver (mirrors compileModule, one package, no imports)
+        // ---- module driver (mirrors compileModule): packages in
+        // dependency order, entry last
         let module_fn = new_func("<module>", "", 0) // handle 0
         let c0 = new_compiler(-1, module_fn)
         push_local(c0, "", 0, 0, false, 0) // slot 0: the program itself
-        let n_files = len(files_stmts)
-        let mut fi = 0
-        while fi < n_files {
-            for s in files_stmts[fi] {
-                match s {
-                    FnDecl(name, _, _, _, _) => put(pkg_decls, name, true),
-                    EnumDecl(name, _, _, _, _) => put(pkg_decls, name, true),
-                    LetStmt(name, _, _, _, _, _) => put(pkg_decls, name, true),
-                    _ => {},
+        let n_pkgs = len(pkgs_stmts)
+        let mut pi = 0
+        while pi < n_pkgs {
+            cur_pkg = pkg_paths[pi]
+            let files_stmts = pkgs_stmts[pi]
+            let file_paths = pkgs_fpaths[pi]
+            let file_imports = pkgs_imports[pi]
+            let n_files = len(files_stmts)
+            pkg_decls = map()
+            let mut fi = 0
+            while fi < n_files {
+                for s in files_stmts[fi] {
+                    match s {
+                        FnDecl(name, _, _, _, _) => put(pkg_decls, name, true),
+                        EnumDecl(name, _, _, _, _) => put(pkg_decls, name, true),
+                        LetStmt(name, _, _, _, _, _) => put(pkg_decls, name, true),
+                        _ => {},
+                    }
                 }
+                fi = fi + 1
             }
-            fi = fi + 1
-        }
-        // register every enum of the package before compiling any body, so
-        // variant references resolve across files regardless of order
-        fi = 0
-        while fi < n_files {
-            cur_file = file_paths[fi]
-            for s in files_stmts[fi] {
-                match s {
-                    EnumDecl(name, _, variants, _, sp) => {
-                        match register_enum_decl(c0, name, variants, sp) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return CompileFailed(d, cur_file)
-                            },
-                        }
-                    },
-                    _ => {},
+            // register every enum of the package before compiling any body,
+            // so variant references resolve across files regardless of order
+            fi = 0
+            while fi < n_files {
+                cur_file = file_paths[fi]
+                for s in files_stmts[fi] {
+                    match s {
+                        EnumDecl(name, _, variants, _, sp) => {
+                            match register_enum_decl(c0, name, variants, sp) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return CompileFailed(d, cur_file)
+                                },
+                            }
+                        },
+                        _ => {},
+                    }
                 }
+                fi = fi + 1
             }
-            fi = fi + 1
-        }
-        // per-file init functions, called in order
-        fi = 0
-        while fi < n_files {
-            cur_file = file_paths[fi]
-            let sub_fn = new_func("<init>", cur_file, 0)
-            let sub = new_compiler(-1, sub_fn)
-            push_local(sub, "", 0, 0, false, 0)
-            for s in files_stmts[fi] {
-                match cp_stmt(sub, s) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return CompileFailed(d, cur_file)
-                    },
+            // per-file init functions, called in order
+            fi = 0
+            while fi < n_files {
+                cur_file = file_paths[fi]
+                cur_aliases = aliases_of(file_imports[fi])
+                let sub_fn = new_func("<init>", cur_file, 0)
+                let sub = new_compiler(-1, sub_fn)
+                push_local(sub, "", 0, 0, false, 0)
+                for s in files_stmts[fi] {
+                    match cp_stmt(sub, s) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return CompileFailed(d, cur_file)
+                        },
+                    }
                 }
+                emit(sub, op_unit, Sp(0, 0))
+                emit(sub, op_return, Sp(0, 0))
+                let idx = add_const(c0, CFn(sub_fn))
+                emit(c0, op_closure, Sp(0, 0))
+                emit_u16(c0, idx, Sp(0, 0))
+                emit(c0, op_call, Sp(0, 0))
+                emit(c0, 0, Sp(0, 0))
+                emit(c0, op_pop, Sp(0, 0))
+                fi = fi + 1
             }
-            emit(sub, op_unit, Sp(0, 0))
-            emit(sub, op_return, Sp(0, 0))
-            let idx = add_const(c0, CFn(sub_fn))
-            emit(c0, op_closure, Sp(0, 0))
-            emit_u16(c0, idx, Sp(0, 0))
-            emit(c0, op_call, Sp(0, 0))
-            emit(c0, 0, Sp(0, 0))
-            emit(c0, op_pop, Sp(0, 0))
-            fi = fi + 1
+            cur_aliases = map()
+            pi = pi + 1
         }
         cur_file = ""
-        let idx = add_const(c0, CStr(pkg_path + ".main"))
+        cur_pkg = ""
+        let idx = add_const(c0, CStr(pkg_paths[n_pkgs - 1] + ".main"))
         emit(c0, op_get_global, Sp(0, 0))
         emit_u16(c0, idx, Sp(0, 0))
         emit(c0, op_call, Sp(0, 0))
@@ -1636,7 +1703,7 @@ fn compile_program(files_stmts, file_paths, is_pkg, pkg_path, chan_fors) {
         let script_fn = new_func("<script>", "", 0) // handle 0
         let c0 = new_compiler(-1, script_fn)
         push_local(c0, "", 0, 0, false, 0) // slot 0: the script itself
-        for s in files_stmts[0] {
+        for s in pkgs_stmts[0][0] {
             match cp_stmt(c0, s) {
                 Ok(_) => {},
                 Err(d) => {

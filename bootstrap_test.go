@@ -587,7 +587,7 @@ func dumpGoBuildDir(t *testing.T, dir string) string {
 // TestBurcSelfHost).
 func TestBurcBuildDirParity(t *testing.T) {
 	prog := loadBurc(t)
-	for _, dir := range []string{"testdata/pkg/greeter"} {
+	for _, dir := range []string{"testdata/pkg/greeter", "examples/geometry"} {
 		t.Run(dir, func(t *testing.T) {
 			want := dumpGoBuildDir(t, dir)
 			got := prog.run(t, "build-dir", dir)
