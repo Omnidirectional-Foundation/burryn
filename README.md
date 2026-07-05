@@ -130,7 +130,9 @@ source ──lexer──▶ tokens ──parser──▶ AST ──checker──
                                   scheduler, GC (gc.go)       runtime/burrt*.h
 
 burc/ mirrors the same pipeline in Burryn (token/lexer/parser/types/compiler/
-cgen/module .bur) and reproduces the C output byte for byte.
+cgen/module/vm .bur): it reproduces the C output byte for byte and interprets
+the same bytecode on its own VM (`burc run <file>` / `burc run-dir <dir>`),
+matching the Go VM's output byte for byte — sequential and concurrent alike.
 ```
 
 - **Compiler**: single pass, clox-style locals/upvalues, with a
