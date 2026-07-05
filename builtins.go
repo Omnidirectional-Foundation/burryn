@@ -172,6 +172,17 @@ var nativeDefs = []nativeDef{
 		}
 		return ObjV(vm.gc.newString(string(s[i]))), nil
 	}},
+	{"byte_at", 2, func(vm *VM, args []Value) (Value, error) {
+		s, ok := asString(args[0])
+		if !ok || args[1].T != VInt {
+			return Unit, fmt.Errorf("byte_at() needs (str, int)")
+		}
+		i := args[1].I
+		if i < 0 || i >= int64(len(s)) {
+			return Unit, fmt.Errorf("byte_at index %d out of bounds (len %d)", i, len(s))
+		}
+		return IntV(int64(s[i])), nil
+	}},
 	{"range", 2, func(vm *VM, args []Value) (Value, error) {
 		if args[0].T != VInt || args[1].T != VInt {
 			return Unit, fmt.Errorf("range() needs two ints")
