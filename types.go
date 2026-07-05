@@ -1542,6 +1542,8 @@ func (c *Checker) declareBuiltins() {
 	c.scopes[0]["print"].special = "printf"
 	decl("println", mono(fn(tUnit)))
 	c.scopes[0]["println"].special = "printf"
+	decl("eprintln", mono(fn(tUnit)))
+	c.scopes[0]["eprintln"].special = "printf"
 	decl("chan", mono(fn(&TCon{Name: "chan", Args: []Ty{tUnit}})))
 	c.scopes[0]["chan"].special = "chan"
 }

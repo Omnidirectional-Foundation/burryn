@@ -34,6 +34,17 @@ static void nat_write_joined(Value *args, int argc) {
 }
 static Value nat_print(Value *args, int argc) { nat_write_joined(args, argc); return bur_unit(); }
 static Value nat_println(Value *args, int argc) { nat_write_joined(args, argc); fputc('\n', stdout); return bur_unit(); }
+static Value nat_eprintln(Value *args, int argc) {
+    Buf b = {0};
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) buf_char(&b, ' ');
+        bur_format(&b, args[i], false);
+    }
+    buf_char(&b, '\n');
+    fwrite(b.data, 1, (size_t)b.len, stderr);
+    buf_free(&b);
+    return bur_unit();
+}
 
 // ---- collections ------------------------------------------------------
 
@@ -543,6 +554,7 @@ static void bur_register_native(const char *name, int arity, NativeFn fn) {
 static void bur_register_natives(void) {
     bur_register_native("print", -1, nat_print);
     bur_register_native("println", -1, nat_println);
+    bur_register_native("eprintln", -1, nat_eprintln);
     bur_register_native("len", 1, nat_len);
     bur_register_native("map", 0, nat_map);
     bur_register_native("get", 2, nat_get);
