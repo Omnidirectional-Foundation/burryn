@@ -957,7 +957,9 @@ func (vm *VM) indexGet(target, idx Value, sp Span) (Value, error) {
 		if idx.I < 0 || idx.I >= int64(len(o.S)) {
 			return Unit, &runtimeErr{msg: fmt.Sprintf("string index %d out of bounds (len %d)", idx.I, len(o.S)), span: sp}
 		}
-		return ObjV(vm.gc.newString(string(o.S[idx.I]))), nil
+		// one raw byte, mirroring char_at and the C backend (strings index
+		// by byte); string(o.S[i]) would widen high bytes to a rune
+		return ObjV(vm.gc.newString(o.S[idx.I : idx.I+1])), nil
 	}
 	return Unit, &runtimeErr{msg: fmt.Sprintf("cannot index %s", typeOf(target)), span: sp}
 }

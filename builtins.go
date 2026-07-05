@@ -170,7 +170,9 @@ var nativeDefs = []nativeDef{
 		if i < 0 || i >= int64(len(s)) {
 			return Unit, fmt.Errorf("char_at index %d out of bounds (len %d)", i, len(s))
 		}
-		return ObjV(vm.gc.newString(string(s[i]))), nil
+		// one raw byte, not a decoded rune: strings index by byte (GOALS);
+		// use ord() for a code point. string(s[i]) would widen high bytes.
+		return ObjV(vm.gc.newString(s[i : i+1])), nil
 	}},
 	{"byte_at", 2, func(vm *VM, args []Value) (Value, error) {
 		s, ok := asString(args[0])
@@ -456,7 +458,7 @@ var nativeDefs = []nativeDef{
 	{"ord", 1, func(vm *VM, args []Value) (Value, error) {
 		if args[0].T == VObj {
 			if s, ok := args[0].O.(*OString); ok && len(s.S) > 0 {
-				return IntV(int64([]rune(s.S)[0])), nil
+				return IntV(decodeUTF8(s.S)), nil
 			}
 		}
 		return Unit, fmt.Errorf("ord() needs a non-empty string")
@@ -584,6 +586,31 @@ func (vm *VM) errStr(msg string) Value {
 	res := vm.err(f.peek(0))
 	f.pop()
 	return res
+}
+
+// decodeUTF8 mirrors burrt_natives.h nat_ord byte-for-byte so ord() is
+// identical across the Go VM and the C backend, even on degenerate input.
+func decodeUTF8(s string) int64 {
+	c := s[0]
+	var cp int64
+	var extra int
+	if c < 0x80 {
+		cp = int64(c)
+		extra = 0
+	} else if c&0xE0 == 0xC0 {
+		cp = int64(c & 0x1F)
+		extra = 1
+	} else if c&0xF0 == 0xE0 {
+		cp = int64(c & 0x0F)
+		extra = 2
+	} else {
+		cp = int64(c & 0x07)
+		extra = 3
+	}
+	for k := 1; k <= extra && k < len(s); k++ {
+		cp = (cp << 6) | int64(s[k]&0x3F)
+	}
+	return cp
 }
 
 // output builds Ok(Output(code, stdout, stderr)), keeping each fresh string
