@@ -5,7 +5,7 @@
 fn main() {
     let a = args()
     if len(a) < 2 {
-        println("usage: burc <lex|parse|check|dis|emit-c|run> <file.bur> | burc build-dir <dir>")
+        println("usage: burc <lex|parse|check|dis|emit-c|run> <file.bur> | burc <build-dir|run-dir> <dir>")
         exit(2)
     }
     let cmd = a[0]
@@ -15,6 +15,10 @@ fn main() {
     }
     if cmd == "run" {
         cmd_run(a[1], slice(a, 2, len(a)))
+        return
+    }
+    if cmd == "run-dir" {
+        cmd_run_dir(a[1], slice(a, 2, len(a)))
         return
     }
     let src = match read_file(a[1]) {
@@ -40,22 +44,27 @@ fn main() {
     }
 }
 
-// cmd_build_dir compiles a package directory and prints its C translation
-// unit, mirroring `bur build <dir> --emit c` (no-import subset).
+// cmd_build_dir compiles a module directory and prints its C translation
+// unit, mirroring `bur build <dir> --emit c`.
 fn cmd_build_dir(dir) {
-    match load_dir(dir) {
-        LoadFailed(diags, dfiles) => {
+    match load_module(dir) {
+        ModFailed(diags, dfiles) => {
             let mut i = 0
             while i < len(diags) {
                 println(dump_diag_f(diags[i], dfiles[i]))
                 i = i + 1
             }
         },
-        Loaded(pkg_path, files_stmts, file_paths) => {
-            match typecheck_program(files_stmts, file_paths, true, pkg_path) {
+        ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            let mut i = 0
+            while i < len(ldiags) {
+                println(dump_diag_f(ldiags[i], lfiles[i]))
+                i = i + 1
+            }
+            match typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
                 Checked(cdiags, cfiles, _, chan_fors) => {
                     let mut errs = false
-                    let mut i = 0
+                    i = 0
                     while i < len(cdiags) {
                         println(dump_diag_f(cdiags[i], cfiles[i]))
                         match cdiags[i] {
@@ -68,11 +77,67 @@ fn cmd_build_dir(dir) {
                         i = i + 1
                     }
                     if !errs {
-                        match compile_program(files_stmts, file_paths, true, pkg_path, chan_fors) {
+                        match compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
                             CompileFailed(d, f) => println(dump_diag_f(d, f)),
                             Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
                                 cgen_program(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
                         }
+                    }
+                },
+            }
+        },
+    }
+}
+
+// cmd_run_dir compiles a module directory and interprets it on the
+// Burryn-hosted VM, mirroring `bur run <dir>`: diagnostics go to stderr,
+// a missing bur.mod exits 3, static errors exit 1.
+fn cmd_run_dir(dir0, argv) {
+    let dir = if str_ends_with(dir0, "/") {
+        substr(dir0, 0, str_len(dir0) - 1)
+    } else {
+        dir0
+    }
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(3)
+    }
+    match load_module(dir) {
+        ModFailed(diags, dfiles) => {
+            let mut i = 0
+            while i < len(diags) {
+                eprintln(dump_diag_f(diags[i], dfiles[i]))
+                i = i + 1
+            }
+            exit(1)
+        },
+        ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            match typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                Checked(cdiags, cfiles, _, chan_fors) => {
+                    let mut errs = false
+                    let mut i = 0
+                    while i < len(cdiags) {
+                        match cdiags[i] {
+                            Diag(ie, _, _, _, _, _) => {
+                                if ie {
+                                    eprintln(dump_diag_f(cdiags[i], cfiles[i]))
+                                    errs = true
+                                }
+                            },
+                        }
+                        i = i + 1
+                    }
+                    if errs {
+                        exit(1)
+                    }
+                    match compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        CompileFailed(d, f) => {
+                            eprintln(dump_diag_f(d, f))
+                            exit(1)
+                        },
+                        Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) =>
+                            run_program(fnames, ffile, fa, fu, fc, fspans, fk,
+                                eq, ev, ea, argv),
                     }
                 },
             }
