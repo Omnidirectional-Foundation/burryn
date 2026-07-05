@@ -638,10 +638,15 @@ enforced by tests.
 ---
 
 *v3 里程碑「编译器完全自举」已达成:编译器 `burc/` 用 Burryn 本身写成,能把自己
-编译成 C 并经 cc 落地,且与 Go 工具链的输出逐字节一致。想看一个"真实规模"的 Burryn
-程序,`burc/` 就是最好的读物。语法尚未冻结;冻结与正式 grammar 是 v4 的事。*
+编译成 C 并经 cc 落地,且与 Go 工具链的输出逐字节一致。VM 也已用 Burryn 重写
+(`burc/vm.bur`,`burc run` 解释同一份字节码,顺序与并发示例对 Go VM 输出逐字节
+一致)。想看一个"真实规模"的 Burryn 程序,`burc/` 就是最好的读物。语法尚未冻结;
+冻结与正式 grammar 是 v4 的事。*
 
 *The v3 milestone — a fully self-hosted compiler — is done: `burc/` is written
 in Burryn itself, compiles itself to C (built by cc), byte-identical to the Go
-toolchain's output. For a real-sized Burryn program to read, `burc/` is the best
-material. The grammar is not frozen yet; freezing it is a v4 matter.*
+toolchain's output. The VM has been rewritten in Burryn too (`burc/vm.bur`;
+`burc run` interprets the same bytecode, matching the Go VM byte for byte over
+the sequential and concurrent examples). For a real-sized Burryn program to
+read, `burc/` is the best material. The grammar is not frozen yet; freezing it
+is a v4 matter.*
