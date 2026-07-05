@@ -224,6 +224,14 @@ static Value nat_char_at(Value *args, int argc) {
     if (i < 0 || i >= n) bur_trap("char_at index %" PRId64 " out of bounds (len %" PRId64 ")", i, n);
     return bur_obj((Obj *)bur_new_string_n(s + i, 1));
 }
+static Value nat_byte_at(Value *args, int argc) {
+    (void)argc;
+    const char *s; int64_t n;
+    if (!nat_as_str(args[0], &s, &n) || args[1].t != VINT) bur_trap("byte_at() needs (str, int)");
+    int64_t i = args[1].u.i;
+    if (i < 0 || i >= n) bur_trap("byte_at index %" PRId64 " out of bounds (len %" PRId64 ")", i, n);
+    return bur_int((int64_t)(unsigned char)s[i]);
+}
 static Value nat_split(Value *args, int argc) {
     (void)argc;
     const char *s, *sep; int64_t n, sn;
@@ -571,6 +579,7 @@ static void bur_register_natives(void) {
     bur_register_native("parse_float", 1, nat_parse_float);
     bur_register_native("str_len", 1, nat_str_len);
     bur_register_native("char_at", 2, nat_char_at);
+    bur_register_native("byte_at", 2, nat_byte_at);
     bur_register_native("range", 2, nat_range);
     bur_register_native("split", 2, nat_split);
     bur_register_native("join", 2, nat_join);

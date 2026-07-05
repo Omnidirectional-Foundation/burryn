@@ -1504,6 +1504,7 @@ func (c *Checker) declareBuiltins() {
 	decl("type_of", poly1(func(a *TV) *TFunc { return fn(tStr, a) }))
 	decl("str_len", mono(fn(tInt, tStr)))
 	decl("char_at", mono(fn(tStr, tStr, tInt)))
+	decl("byte_at", mono(fn(tInt, tStr, tInt)))
 	decl("trunc", mono(fn(tInt, tFloat)))
 	decl("to_float", mono(fn(tFloat, tInt)))
 	decl("float_bits", mono(fn(tInt, tFloat)))
