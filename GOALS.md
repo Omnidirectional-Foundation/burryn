@@ -122,9 +122,51 @@
 - 测试:自举 parity + 示例 golden test 覆盖全链路;自举判定为一等验收(`bur build burc` 逐字节重建自身);重构类改动必须先有测试安全网再动手
 - 诊断质量是卖点本体:错误信息按 rustc 标准要求自己(精确 span、指出修法)
 
+## 6.5 S4 生态工具链(自举完成后,owner 2026-07 定)
+
+自举闭环已成(S1/S2/S3),下一批目标是「让别人能日常用」的生态工具链,全部用 Burryn 自写,延续零 Go 依赖。关键路径:**依赖管理 → `bur fmt` → `bur test`**,debugger 作 C 后端增强并行可选。
+
+**S4-1 依赖管理(P0,MVS + fetch + lockfile)**
+
+现状:`bur.mod` 已解析 `module` + `require <path> <version>`(module.bur:117,require 校验但不解析);`valid_import_path` 已在;跨模块 import 现被 E0432 拒(module.bur:538)。骨架在,缺解析 + 拉取 + 定位。
+
+- L1 解析层(无网络):新 `burc/lib/modgraph.bur` 构建依赖图跑 MVS(选满足约束的**最低**版本);新增 `bur.sum` lockfile(`path version hash`);放开 module.bur:538 跨模块限制(命中 require 图则放行);缓存目录 `$BURCACHE` 默认 `~/.burryn/pkg/<path>@<version>/`
+- L2 网络拉取:倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native,延续 S3「simplify, no new natives」);备选补最小 `http_get`/`sha256` native
+- L3 命令面:`bur mod init` / `bur mod tidy` / `bur mod download` / `bur get <path>@<version>`
+- 遵守 §4 红线:MVS 确定性、去中心化、禁 build 期执行任意代码
+
+**S4-2 `bur fmt`(P0,文化基础设施)**
+
+与包管理并列优先——越早冻结格式,后期生态一致性成本越低(§4「唯一官方格式,零配置」)。
+
+- 复用 `lib.parse` 的 AST → 新 `burc/lib/format.bur` 写 pretty-printer;规则对齐 burc/lib 现有风格(换行即分号、块结构、表达式导向、4-space、`match` arm 对齐)
+- 验收铁律:**幂等** `fmt(fmt(x))==fmt(x)` 且 `fmt` 前后 AST 不变
+- 最大未知:lexer 是否保留 comment/trivia(注释保留可行度)——动工前先探
+- 命令:`bur fmt <file|dir>`(原地写回)、`--check`(CI,有 diff 则非 0 退出)、`-`(stdin→stdout,供 LSP format-on-save)
+- 立即跑在 `burc/lib/` 自身统一自举代码风格
+
+**S4-3 `bur test`(P1)**
+
+现状测试 = 自举 parity + golden example,无 first-class 框架。
+
+- 约定 `*_test.bur` + `fn test_*()` 自动发现;断言 API 归 stdlib(`assert_eq`/`assert`/`assert_ok`/`assert_err`,贴合 `Result`/`Option`)
+- 并发特色:利用 fiber/channel 语义,把 VM 死锁检测(现为 exit 4)转成测试失败;支持并发测试模式
+- 报告:pass/fail 计数 + 失败 span 定位(复用 diag 渲染)
+
+**S4-4 debugger(可选,C 后端增强,优先级最低)**
+
+- cgen 生成 C 时插 `#line <n> "<file>"`(cgen 已知每 Node span)→ 原生二进制直接 `gdb`/`lldb` 映射回 `.bur`
+- runtime trap 打印带 source span 的 stack trace(复用 diag + line_starts)
+- 符合「终局只留 C 底座」,属后端增强非新工具
+
+**推进顺序**:先探两个未知(lexer 注释保留 / `exec git clone` 可行性)→ `bur fmt` 先落地(小、无网络、立刻自举验证、解锁 LSP)+ 依赖管理 L1 并行 → 依赖 L2/L3 → `bur test` → debugger。
+
 ## 7. 当前待定项(动工前必须先问 owner)
 
 - 模块系统具体形态(import 语法、包内可见性细节、版本声明文件格式)
 - `select` 语义细节(default 分支?公平性?)
 - 工具链命令命名与 CLI 布局
 - 手写后端的调用约定与 GC 根扫描策略(v4 前定)
+- S4-2 `bur fmt` 前先探:lexer 是否保留 comment/trivia(决定注释保留可行度)
+- S4-1 依赖拉取前先探:`exec` shell-out `git clone` 是否够用(决定是否需新 native)
+- S4 各命令 CLI 布局与命名(`bur mod`/`bur get`/`bur fmt`/`bur test` 子命令形态)
