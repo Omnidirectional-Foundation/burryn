@@ -10,11 +10,10 @@ turns programs into standalone native binaries.
 
 **The compiler is self-hosted.** `burc/` reimplements the whole pipeline —
 lexer, parser, type checker, bytecode compiler, C code generator — in Burryn
-itself (~7000 lines). It compiles itself to C byte-identical to the Go
-toolchain's output, and the resulting native `burc` compiles the same source
-to the same bytes again: a closed bootstrap fixpoint, checked in CI
-(`TestBurcSelfHost`). The Go implementation (~11k lines) stays as the
-reference oracle.
+itself (~7000 lines). `bur` compiles itself to C, `cc` turns that into a
+native binary, and the resulting native `bur` compiles the same source to the
+same bytes again: a closed bootstrap fixpoint. The original Go implementation
+that seeded the bootstrap is archived on the `archive/go-host` branch.
 
 The name: a **burrow** is where a gopher (Go) lives, and it puns on Rust's
 *borrow* checker; a **burr** is what forging leaves on metal; and *burrin*
