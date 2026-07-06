@@ -3,6 +3,7 @@
 <!-- Badges / 徽章 -->
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/compiler-self--hosted-brightgreen.svg)](docs/GOALS.md)
+[![Status](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
@@ -194,6 +195,7 @@ alias the same list.
 | [`SECURITY.md`](SECURITY.md) | reporting vulnerabilities privately |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | community conduct standards |
 | [`CHANGELOG.md`](CHANGELOG.md) | notable changes, latest first |
+| [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) | PR template / 拉取请求模板 |
 
 ## ⚖️ License & Disclaimer / 许可与免责
 
