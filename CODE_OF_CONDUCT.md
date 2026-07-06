@@ -4,7 +4,7 @@ You may communicate in **English or Chinese** — either is fine.
 
 你可以使用**英文或中文**交流，任选其一。
 
-## Our standard / 我们的准则
+## Standards / 准则
 
 This is a small open-source hobby project. The rules are simple:
 

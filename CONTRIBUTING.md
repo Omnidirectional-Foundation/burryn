@@ -1,20 +1,19 @@
 # Contributing to Burryn / 贡献指南
 
-Thanks for your interest in Burryn. You may write issues, PRs, and comments in
-**English or Chinese** — either is fine.
+Issues, PRs, and comments may be written in **English or Chinese** — either is fine.
 
-感谢你对 Burryn 的关注。issue、PR 和评论都可以使用**英文或中文**，任选其一。
+issue、PR 和评论都可以使用**英文或中文**，任选其一。
 
 ---
 
-## ⚠️ Before you start / 开始之前
+## Before you start / 开始之前
 
 > This is a hobby project maintained in spare time. Quality issues and PRs are
 > welcome, but **response is not guaranteed** — review may be slow or may not
-> happen at all. Please factor this in before investing significant effort.
+> happen at all. Factor this in before investing significant effort.
 >
 > 这是一个出于个人兴趣、利用业余时间维护的开源项目。欢迎高质量的 issue 和 PR，
-> 但**不承诺响应时间** — 审阅可能很慢，也可能不进行。在投入大量精力前请先评估。
+> 但**不承诺响应时间** — 审阅可能很慢，也可能不进行。在投入大量精力前先评估。
 
 ---
 
@@ -23,7 +22,7 @@ Thanks for your interest in Burryn. You may write issues, PRs, and comments in
 - This project uses **`main` only**. There are no long-lived feature branches.
 
   本项目**只用 `main` 分支**，没有长期存在的功能分支。
-- Open your PR against `main`. / 请以 `main` 为目标发起 PR。
+- Open PRs against `main`. / 请以 `main` 为目标发起 PR。
 
 ## Commits / 提交规范
 
@@ -77,7 +76,7 @@ Do **not** open public issues for security vulnerabilities. See
 ## Pull request flow / PR 流程
 
 1. Branch from `main`. / 从 `main` 分出分支。
-2. Make your changes with clear, conventional commits. / 用规范的 commit 提交改动。
-3. If you touched the compiler, verify the bootstrap fixpoint. / 若改动了编译器，验证自举定点。
+2. Make changes with clear, conventional commits. / 用规范的 commit 提交改动。
+3. If the compiler was changed, verify the bootstrap fixpoint. / 若改动了编译器，验证自举定点。
 4. Open a PR against `main`. / 向 `main` 开 PR。
-5. Be patient — see the maintenance notice above. / 请耐心等待，参见上方维护说明。
+5. Be patient — see the maintenance notice in the README. / 请耐心等待，参见 README 中的维护说明。
