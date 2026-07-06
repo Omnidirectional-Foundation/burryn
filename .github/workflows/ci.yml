@@ -1,0 +1,85 @@
+# Burryn is self-hosted: `main` contains zero Go, so Go's gofmt/vet/lint
+# do not apply. CI instead proves the bootstrap fixpoint end to end.
+# Burryn 是自举的：`main` 上零 Go 代码，故 Go 的 gofmt/vet/lint 不适用。
+# CI 改为端到端验证自举定点。
+#
+# Chain / 流程:
+#   archive/go-host (Go seed) --build--> bur-seed
+#   bur-seed  build burc      --------> gen1 (first self-hosted burc)
+#   gen1      build burc      --------> gen2 (second generation)
+#   cmp gen1 gen2 (byte-for-byte) ----> fixpoint reached
+# If gen1 != gen2 the compiler is not a fixpoint and CI fails.
+# 若 gen1 != gen2 则编译器未达定点，CI 失败。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-fixpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # main worktree: the self-hosted burc sources + runtime/ live here.
+      # main 工作树：自举的 burc 源码与 runtime/ 都在这里。
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      # Build the Go seed from the archived host on a scratch worktree.
+      # 在临时 worktree 上从归档宿主构建 Go 种子。
+      - name: Build Go seed
+        run: |
+          git worktree add ../go-host archive/go-host
+          # A stale program.c would break `go build` (C source not allowed).
+          # 遗留的 program.c 会让 go build 报错（不允许 C 源文件）。
+          rm -f ../go-host/program.c
+          (cd ../go-host && go build -o "$GITHUB_WORKSPACE/bur-seed" .)
+
+      # Seed compiles burc -> gen1. C is emitted to CWD as program.c,
+      # so run from the main worktree root where runtime/ is visible.
+      # 种子编译 burc -> gen1。C 写到 CWD 的 program.c，
+      # 故必须在能看到 runtime/ 的 main 工作树根运行。
+      - name: Bootstrap gen1
+        run: |
+          rm -f program.c
+          ./bur-seed build burc -o gen1
+          test -x gen1
+
+      - name: Bootstrap gen2
+        run: |
+          rm -f program.c
+          ./gen1 build burc -o gen2
+          test -x gen2
+
+      - name: Verify fixpoint (gen1 == gen2)
+        run: |
+          if ! cmp gen1 gen2; then
+            echo "::error::bootstrap fixpoint broken: gen1 != gen2"
+            exit 1
+          fi
+          echo "fixpoint reached: $(sha256sum gen1 | cut -d' ' -f1)"
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -f program.c
+          git worktree remove --force ../go-host || true
