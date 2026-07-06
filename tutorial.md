@@ -1,5 +1,7 @@
 # Burryn 教程 / The Burryn Tutorial
 
+> 相关文档 / See also:[`README.md`](README.md) 项目概览 · [`docs/GOALS.md`](docs/GOALS.md) 设计定案与里程碑
+>
 > 每节先中文讲解,后英文。代码、关键字与命令保持原样。
 > Each section gives the Chinese explanation first, then English. Code, keywords and commands stay as-is.
 
