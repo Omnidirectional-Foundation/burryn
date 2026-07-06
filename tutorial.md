@@ -501,7 +501,7 @@ import path. Files in the same directory share a top-level scope; `pub` and
 
 `bur.mod`:
 
-```
+```text
 module example.com/hello
 ```
 
