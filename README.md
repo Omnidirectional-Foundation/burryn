@@ -115,24 +115,24 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/textproc.bur` | files, exec, argv: a small text tool |
 | `examples/wordcount.bur` | maps and string functions |
 | `examples/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
-| `burc/` | the self-hosted compiler — the biggest Burryn program there is |
+| `burc/` | the self-hosted compiler and `bur` CLI — the biggest Burryn program there is |
 
 ## Architecture
 
 ```markdown
 source ──lexer──▶ tokens ──parser──▶ AST ──checker──▶ typed ──compiler──▶ bytecode
- (lexer.go)        (auto-semicolons)  (parser.go)  (types.go, HM)   (compiler.go)
+ (lexer.bur)       (auto-semicolons)  (parser.bur) (types.bur, HM)  (compiler.bur)
                                                                         │
                                         ┌───────────────────────────────┤
                                         ▼                               ▼
-                                  BurrynVM (vm.go)            C backend (cbackend.go)
+                                  BurrynVM (vm.bur)           C backend (cgen.bur)
                                   fibers + channels           ──▶ .c ──cc──▶ native
-                                  scheduler, GC (gc.go)       runtime/burrt*.h
+                                  scheduler, GC               runtime/burrt*.h
 
-burc/ mirrors the same pipeline in Burryn (token/lexer/parser/types/compiler/
-cgen/module/vm .bur): it reproduces the C output byte for byte and interprets
-the same bytecode on its own VM (`burc run <file>` / `burc run-dir <dir>`),
-matching the Go VM's output byte for byte — sequential and concurrent alike.
+Burryn is self-hosted: the whole pipeline lives in `burc/lib/` (token/lexer/
+parser/types/compiler/cgen/module/vm .bur), and the `bur` CLI (`burc/main.bur`)
+drives it. `bur` compiles itself to C, `cc` turns that into a native binary,
+and the result rebuilds itself byte for byte.
 ```
 
 - **Compiler**: single pass, clox-style locals/upvalues, with a
@@ -158,8 +158,17 @@ bur dis <file|dir>    disassemble the compiled bytecode
 bur version
 ```
 
-Build: `go build -o bur.exe .` &nbsp;•&nbsp; Test: `go test .` (includes a
-golden test for every example)
+Build (self-hosting): a native `bur` builds itself with
+`bur build burc -o bur`. To bootstrap from scratch, check out the archived Go
+host and let it compile the first `bur`:
+
+```sh
+git checkout archive/go-host
+go build -o bur.exe .          # temporary Go seed
+./bur.exe build burc -o bur    # seed compiles the self-hosted CLI
+git checkout main
+./bur build burc -o bur        # from here on, bur rebuilds itself
+```
 
 ## Honest limitations
 
@@ -168,7 +177,5 @@ parameters, a fully self-hosted compiler) is done; both backends produce
 byte-identical output for the whole language, concurrency included. Still
 missing: records/structs (model product types with single-variant enums),
 `defer`, string interpolation, and third-party dependency fetching (only
-local packages resolve). The self-hosted `burc` handles single, import-free
-packages; multi-package builds still go through the Go toolchain. Deep `mut`
-is a binding-level discipline, not a borrow checker: two `mut` bindings may
-still alias the same list.
+local packages resolve). Deep `mut` is a binding-level discipline, not a
+borrow checker: two `mut` bindings may still alias the same list.
