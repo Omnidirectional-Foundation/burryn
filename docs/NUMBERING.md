@@ -1,6 +1,9 @@
 # NUMBERING.md — 编号历史映射
 
-> 本文档只做历史对照。项目当前唯一有效编号体系是 GOALS.md §5 的统一 `S<n>[.<m>]`。
+> 状态:历史对照(只读) · 当前有效编号定义见 [`GOALS.md`](GOALS.md) §5
+> 相关文档:[`GOALS.md`](GOALS.md) 目标与里程碑 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
+
+> 本文档只做历史对照。项目当前唯一有效编号体系是 [`GOALS.md`](GOALS.md) §5 的统一 `S<n>[.<m>]`。
 > 早期文档、commit message、讨论里出现的旧编号(`v1/v2/v3/v4`、`L1/L2/L3`、旧「S4 工具链」及其 `S4-1..S4-4`)一律作废,查此表回溯。
 
 ## 为什么统一

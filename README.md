@@ -23,7 +23,7 @@ reads like **burin** — the engraver's tool for precise, quiet work.
 bur run examples/sieve.bur
 ```
 
-New to the language? Start with the tutorial: [`docs/tutorial.md`](docs/tutorial.md).
+New to the language? Start with the tutorial: [`tutorial.md`](tutorial.md).
 
 ## What it takes from Rust
 
@@ -171,10 +171,19 @@ git checkout main
 
 ## Honest limitations
 
-The v3 milestone (C backend, modules, maps, `select`/`close`, `mut`
-parameters, a fully self-hosted compiler) is done; both backends produce
-byte-identical output for the whole language, concurrency included. Still
-missing: records/structs (model product types with single-variant enums),
-`defer`, string interpolation, and third-party dependency fetching (only
-local packages resolve). Deep `mut` is a binding-level discipline, not a
-borrow checker: two `mut` bindings may still alias the same list.
+Stages S1–S5 (semantic core, C backend, modules, maps, `select`/`close`,
+`mut` parameters, a fully self-hosted compiler with the Go host removed) are
+done; both backends produce byte-identical output for the whole language,
+concurrency included. Still missing: records/structs (model product types
+with single-variant enums), `defer`, string interpolation, and third-party
+dependency fetching (only local packages resolve). Deep `mut` is a
+binding-level discipline, not a borrow checker: two `mut` bindings may still
+alias the same list.
+
+## Documentation
+
+| doc | audience |
+|-----|----------|
+| [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language |
+| [`docs/GOALS.md`](docs/GOALS.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
+| [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
