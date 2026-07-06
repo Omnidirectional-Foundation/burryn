@@ -141,7 +141,7 @@
 
 - 复用 `lib.parse` 的 AST → 新 `burc/lib/format.bur` 写 pretty-printer;规则对齐 burc/lib 现有风格(换行即分号、块结构、表达式导向、4-space、`match` arm 对齐)
 - 验收铁律:**幂等** `fmt(fmt(x))==fmt(x)` 且 `fmt` 前后 AST 不变
-- 最大未知:lexer 是否保留 comment/trivia(注释保留可行度)——动工前先探
+- 前置已就绪:lexer 现把注释作旁路 trivia 收集(`LexOut.Lexed` 第三字段,见 §6.6 前置),`bur fmt` 可按 span 重插注释
 - 命令:`bur fmt <file|dir>`(原地写回)、`--check`(CI,有 diff 则非 0 退出)、`-`(stdin→stdout,供 LSP format-on-save)
 - 立即跑在 `burc/lib/` 自身统一自举代码风格
 
@@ -159,7 +159,37 @@
 - runtime trap 打印带 source span 的 stack trace(复用 diag + line_starts)
 - 符合「终局只留 C 底座」,属后端增强非新工具
 
-**推进顺序**:先探两个未知(lexer 注释保留 / `exec git clone` 可行性)→ `bur fmt` 先落地(小、无网络、立刻自举验证、解锁 LSP)+ 依赖管理 L1 并行 → 依赖 L2/L3 → `bur test` → debugger。
+**探查结论**:`exec git clone` 可行性已确认(shell-out 可行,无需新 native);lexer 注释保留已完成(见 §6.6 前置)。
+
+**推进顺序**:`bur fmt` 先落地(小、无网络、立刻自举验证、解锁 LSP)+ 依赖管理 L1 并行 → 依赖 L2/L3 → `bur test` → debugger。
+
+## 6.6 轻量语法/语义扩展评估(工程视角)
+
+前置:Burryn 是真 HM(occurs check + level generalize + let-poly),unify 是 con/fn/var 三 kind 扁平 if-链,无 typeclass/constraint solver,运行时字段按整数下标访问,已有 CSP 并发。以下按触及类型系统的深度排序。
+
+| 项 | 成本 | 触及范围 | 备注 |
+|---|---|---|---|
+| 字符串插值 | 低 | 纯 lexer+parser 脱糖为 `join`/`+` | 不碰类型系统;lexer 需在串内切回表达式模式,`{{` 转义 |
+| 管道 `\|>` | 极低 | 纯 parser 脱糖 | — |
+| Match Guard | 低 | compiler 加条件跳转 | — |
+| 命名参数+默认值 | 中 | checker(按名重排实参+arity) + compiler(默认值字节码) | 原评估偏低;不碰 unify 但碰调用点 infer |
+| 编译期常量 | 中 | 新常量折叠阶段 | — |
+| 封闭 Records | 中高 | 改 `ty_unify` 核心(+tk==3 逐字段配对) + 新 TRecord kind + cgen 字段名→下标 | 独立 milestone,不与 S4 并行;原评估明显偏低 |
+
+**落地顺序**:字符串插值(最先,不阻塞任何事)→ 管道 / match guard(顺手)→ 命名参数 → 编译期常量 → 封闭 records(单独立项,因改 unify + 自举风险叠加)。
+
+## 6.7 重型类型系统扩展评估(工程视角)
+
+| 项 | 原评估 | 复评 | 理由 |
+|---|---|---|---|
+| Row Polymorphism | 高 / v4 | v4 首位,紧接封闭 record | 复用现有 var/generalize 加「行 var」,扁平 if-链撑得住;是结构化接口的公共地基,唯一值得投入的重型项 |
+| Effects | v4+ | 明确排除 | 与现有 CSP(fiber/channel/select)竞争控制流转移;CSP 已覆盖 IO/并发大半;类型侧 effect row 还依赖 row poly |
+| Refinement Types | 中 / 长期 backlog | 明确排除 | 无 constraint solver 地基,须从零造子系统;与轻标注工程气质冲突(Rust 未上) |
+| GADTs | 暂不做 | 明确排除 | 通用工程价值最低,动 HM 最微妙处 |
+| Linear(全局) | 永不 | 同意 | — |
+| 局部 Affine(资源) | 未列 | 补进 backlog | file/socket/channel 的 use-after-close 检查,流敏感 lint 级,不碰 GC,能把 close-of-closed-channel 运行时 trap 提前为编译期错 |
+
+**与原路线两大分歧**:(1) Refinement 成本被低估——无求解器地基,实为从零造子系统,明确排除;(2) Effects 价值被高估——CSP 已覆盖其大半实用场景,边际价值与代价不成比例,明确排除。
 
 ## 7. 当前待定项(动工前必须先问 owner)
 
