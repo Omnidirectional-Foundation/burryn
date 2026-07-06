@@ -1,86 +1,586 @@
-// burc CLI. Debug commands drive one pipeline stage each and dump its
-// result for parity testing; run interprets a script on the Burryn-hosted
-// VM; the compile-to-C command arrives with codegen.
+// bur — the Burryn CLI driver. Parses argv and dispatches to run/check/dis/
+// build/version, defaulting a bare `bur <file|dir>` to run. The compiler
+// itself lives in the burryn.dev/burc/lib package; this file only wires the
+// command surface, mirroring the Go host's main.go + build.go.
+
+import "burryn.dev/burc/lib"
+
+let version = "0.2.0"
+
+// exit codes mirror the Go host: static (compile) errors, CLI misuse,
+// unreadable input, and runtime traps each get a distinct status.
+let exit_static = 1
+let exit_usage = 2
+let exit_no_input = 3
+let _exit_runtime = 4
+
+// pipeline modes shared by run_file/run_module.
+let mode_run = 0
+let mode_check = 1
+let mode_dis = 2
 
 fn main() {
     let a = args()
-    if len(a) < 2 {
-        println("usage: burc <lex|parse|check|dis|emit-c|run> <file.bur> | burc <build-dir|run-dir> <dir>")
-        exit(2)
+    if len(a) == 0 {
+        usage()
+        exit(exit_usage)
     }
     let cmd = a[0]
-    if cmd == "build-dir" {
-        cmd_build_dir(a[1])
-        return
-    }
     if cmd == "run" {
-        cmd_run(a[1], slice(a, 2, len(a)))
-        return
-    }
-    if cmd == "run-dir" {
-        cmd_run_dir(a[1], slice(a, 2, len(a)))
-        return
-    }
-    let src = match read_file(a[1]) {
-        Ok(s) => s,
-        Err(msg) => {
-            println("error:", msg)
-            exit(3)
-        },
-    }
-    if cmd == "lex" {
-        cmd_lex(src)
-    } else if cmd == "parse" {
-        cmd_parse(src)
+        if len(a) < 2 {
+            usage()
+            exit(exit_usage)
+        }
+        dispatch(a[1], mode_run, slice(a, 2, len(a)))
     } else if cmd == "check" {
-        cmd_check(src)
+        if len(a) < 2 {
+            usage()
+            exit(exit_usage)
+        }
+        dispatch(a[1], mode_check, [])
     } else if cmd == "dis" {
-        cmd_dis(src)
-    } else if cmd == "emit-c" {
-        cmd_emit_c(src)
+        if len(a) < 2 {
+            usage()
+            exit(exit_usage)
+        }
+        dispatch(a[1], mode_dis, [])
+    } else if cmd == "build" {
+        build_cmd(slice(a, 1, len(a)))
+    } else if cmd == "version" || cmd == "-v" || cmd == "--version" {
+        println("Burryn " + version + " — the ring beneath Meyrin")
+    } else if cmd == "help" || cmd == "-h" || cmd == "--help" {
+        usage()
+    } else if cmd == "dev" {
+        dev_cmd(slice(a, 1, len(a)))
     } else {
-        println("unknown command:", cmd)
-        exit(2)
+        dispatch(cmd, mode_run, slice(a, 1, len(a)))
     }
 }
 
-// cmd_build_dir compiles a module directory and prints its C translation
-// unit, mirroring `bur build <dir> --emit c`.
-fn cmd_build_dir(dir) {
-    match load_module(dir) {
-        ModFailed(diags, dfiles) => {
+fn usage() {
+    println("Burryn " + version + " — a small language forged from Go and Rust")
+    println("")
+    println("usage:")
+    println("  bur run <file.bur>     typecheck and run a script")
+    println("  bur run <dir>          run a module package (needs bur.mod, fn main)")
+    println("  bur <file.bur|dir>     same as run")
+    println("  bur check <file|dir>   typecheck only (rustc-style diagnostics)")
+    println("  bur build <file|dir>   compile to a native binary via C")
+    println("  bur dis <file|dir>     disassemble compiled bytecode")
+    println("  bur version")
+    println("")
+    println("bur build flags:")
+    println("  -o <path>              output path (binary, or C file with --emit c)")
+    println("  --emit c               emit generated C instead of a binary")
+}
+
+// dispatch routes a path to the file or module pipeline based on whether it
+// names a directory (a bur.mod alongside it marks a module package).
+fn dispatch(path, mode, argv) {
+    if is_dir(path) {
+        run_module(path, mode, argv)
+    } else {
+        run_file(path, mode, argv)
+    }
+}
+
+// is_dir treats an existing path with a bur.mod as a module directory.
+fn is_dir(path) {
+    file_exists(strip_trailing_slash(path) + "/bur.mod")
+}
+
+fn strip_trailing_slash(p) {
+    if ends_with(p, "/") {
+        substr(p, 0, str_len(p) - 1)
+    } else {
+        p
+    }
+}
+
+fn ends_with(s, suffix) {
+    let n = str_len(s)
+    let m = str_len(suffix)
+    n >= m && substr(s, n - m, m) == suffix
+}
+
+fn starts_with(s, prefix) {
+    let n = str_len(s)
+    let m = str_len(prefix)
+    n >= m && substr(s, 0, m) == prefix
+}
+
+// diag_is_error reports whether a diagnostic carries the error flag.
+fn diag_is_error(d) {
+    match d {
+        lib.DiagT.Diag(ie, _, _, _, _, _) => ie,
+    }
+}
+
+// run_file executes the script pipeline: lex, parse, typecheck, compile, then
+// run/check/dis per mode. Static diagnostics go to stderr; unreadable input
+// exits 3; static errors exit 1.
+fn run_file(path, mode, argv) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags) => {
+            if emit_errors(ldiags, false) {
+                exit(exit_static)
+            }
+            match lib.parse(toks) {
+                lib.ParseOut.Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, false) {
+                        exit(exit_static)
+                    }
+                    match lib.typecheck_script(stmts) {
+                        lib.CheckOut.Checked(cdiags, _, binds, chan_fors) => {
+                            if mode == mode_check {
+                                run_check(cdiags, binds)
+                                return
+                            }
+                            if emit_errors(cdiags, true) {
+                                exit(exit_static)
+                            }
+                            match lib.compile_script(stmts, chan_fors) {
+                                lib.CompileOut.CompileFailed(d, _) => {
+                                    eprintln(lib.dump_diag(d))
+                                    exit(exit_static)
+                                },
+                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                                    if mode == mode_dis {
+                                        lib.dump_disasm(0, fnames, fa, fu, fc, fspans, fk,
+                                            eq, ev, ea, lib.line_starts(src))
+                                    } else {
+                                        lib.run_program(fnames, ffile, fa, fu, fc, fspans, fk,
+                                            eq, ev, ea, argv)
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// run_module mirrors run_file for a module directory: a missing bur.mod exits
+// 3, load/type/compile errors exit 1.
+fn run_module(dir0, mode, argv) {
+    let dir = strip_trailing_slash(dir0)
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match lib.load_module(dir) {
+        lib.ModOut.ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors) => {
+                    if mode == mode_check {
+                        run_check_f(cdiags, cfiles, binds)
+                        return
+                    }
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        lib.CompileOut.CompileFailed(d, f) => {
+                            eprintln(lib.dump_diag_f(d, f))
+                            exit(exit_static)
+                        },
+                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                            if mode == mode_dis {
+                                lib.dump_disasm(0, fnames, fa, fu, fc, fspans, fk,
+                                    eq, ev, ea, [])
+                            } else {
+                                lib.run_program(fnames, ffile, fa, fu, fc, fspans, fk,
+                                    eq, ev, ea, argv)
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// emit_errors renders diagnostics to stderr; with errors_only it skips
+// warnings. Returns whether any error-level diagnostic was seen.
+fn emit_errors(diags, errors_only) {
+    let mut errs = false
+    for d in diags {
+        let is_err = diag_is_error(d)
+        if is_err {
+            errs = true
+        }
+        if is_err || !errors_only {
+            eprintln(lib.dump_diag(d))
+        }
+    }
+    errs
+}
+
+fn emit_errors_f(diags, files, errors_only) {
+    let mut errs = false
+    let mut i = 0
+    while i < len(diags) {
+        let is_err = diag_is_error(diags[i])
+        if is_err {
+            errs = true
+        }
+        if is_err || !errors_only {
+            eprintln(lib.dump_diag_f(diags[i], files[i]))
+        }
+        i = i + 1
+    }
+    errs
+}
+
+// run_check prints top-level binding types then diagnostics, mirroring the
+// Go host's check output for scripts.
+fn run_check(cdiags, binds) {
+    for line in binds {
+        println(line)
+    }
+    for d in cdiags {
+        println(lib.dump_diag(d))
+    }
+}
+
+fn run_check_f(cdiags, cfiles, binds) {
+    for line in binds {
+        println(line)
+    }
+    let mut i = 0
+    while i < len(cdiags) {
+        println(lib.dump_diag_f(cdiags[i], cfiles[i]))
+        i = i + 1
+    }
+}
+
+// build_cmd parses build flags (-o <path>, --emit c) then compiles the input
+// to C or a native binary. CLI misuse exits 2.
+fn build_cmd(rest) {
+    let mut out = ""
+    let mut emit_c = false
+    let mut input = ""
+    let mut i = 0
+    while i < len(rest) {
+        let arg = rest[i]
+        if arg == "-o" {
+            if i + 1 >= len(rest) {
+                usage()
+                exit(exit_usage)
+            }
+            out = rest[i + 1]
+            i = i + 2
+        } else if arg == "--emit" {
+            if i + 1 >= len(rest) || rest[i + 1] != "c" {
+                usage()
+                exit(exit_usage)
+            }
+            emit_c = true
+            i = i + 2
+        } else if starts_with(arg, "-") {
+            usage()
+            exit(exit_usage)
+        } else {
+            if input != "" {
+                usage()
+                exit(exit_usage)
+            }
+            input = arg
+            i = i + 1
+        }
+    }
+    if input == "" {
+        usage()
+        exit(exit_usage)
+    }
+    build_input(input, emit_c, out)
+}
+
+// build_input compiles a file or module to a C translation unit, then either
+// prints/writes the C (emit_c) or hands it to the native C toolchain.
+fn build_input(input, emit_c, out) {
+    let csrc = compile_to_c(input)
+    if emit_c {
+        if out == "" || out == "-" {
+            print(csrc)
+        } else {
+            match write_file(out, csrc) {
+                Ok(_) => {},
+                Err(msg) => {
+                    eprintln("error: " + msg)
+                    exit(exit_no_input)
+                },
+            }
+        }
+    } else {
+        let dst = if out == "" {
+            default_out_name(input)
+        } else {
+            out
+        }
+        build_native(csrc, dst)
+    }
+}
+
+// compile_to_c runs the front end for a file or module and returns the C
+// source, exiting 1 on static errors and 3 on unreadable input.
+fn compile_to_c(input) {
+    if is_dir(input) {
+        compile_module_to_c(strip_trailing_slash(input))
+    } else {
+        compile_file_to_c(input)
+    }
+}
+
+fn compile_file_to_c(path) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags) => {
+            if emit_errors(ldiags, false) {
+                exit(exit_static)
+            }
+            match lib.parse(toks) {
+                lib.ParseOut.Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, false) {
+                        exit(exit_static)
+                    }
+                    match lib.typecheck_script(stmts) {
+                        lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
+                            if emit_errors(cdiags, true) {
+                                exit(exit_static)
+                            }
+                            match lib.compile_script(stmts, chan_fors) {
+                                lib.CompileOut.CompileFailed(d, _) => {
+                                    eprintln(lib.dump_diag(d))
+                                    exit(exit_static)
+                                },
+                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
+                                    lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+fn compile_module_to_c(dir) {
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match lib.load_module(dir) {
+        lib.ModOut.ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        lib.CompileOut.CompileFailed(d, f) => {
+                            eprintln(lib.dump_diag_f(d, f))
+                            exit(exit_static)
+                        },
+                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
+                            lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                    }
+                },
+            }
+        },
+    }
+}
+
+// default_out_name strips any directory and a trailing .bur to name the
+// binary, mirroring the Go host's defaultOutName.
+fn default_out_name(path) {
+    let p = strip_trailing_slash(path)
+    let base = base_name(p)
+    if ends_with(base, ".bur") {
+        substr(base, 0, str_len(base) - 4)
+    } else {
+        base
+    }
+}
+
+fn base_name(p) {
+    let mut start = 0
+    let mut i = 0
+    while i < str_len(p) {
+        if char_at(p, i) == "/" {
+            start = i + 1
+        }
+        i = i + 1
+    }
+    substr(p, start, str_len(p) - start)
+}
+
+// build_native writes the C translation unit to program.c in the current
+// directory and invokes a C compiler, resolving the runtime headers from the
+// fixed relative runtime/ include path (via -Iruntime). With no getenv/mkdir/
+// exe-path natives, $CC is not honored, no temp dir is created, and the
+// runtime headers are located relative to the current working directory —
+// which the bootstrap loop runs from the repo root.
+fn build_native(csrc, out) {
+    let cfile = "program.c"
+    match write_file(cfile, csrc) {
+        Ok(_) => {},
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    let cc = find_cc()
+    if cc == "" {
+        eprintln("error: no C compiler found (install cc/gcc/clang)")
+        eprintln("hint: run without a toolchain using `bur run`")
+        exit(exit_static)
+    }
+    match exec(cc, ["-O2", "-o", out, cfile, "-Iruntime", "-lm"]) {
+        Ok(o) => match o {
+            Output(code, _, err) => {
+                if code != 0 {
+                    eprint_raw(err)
+                    eprintln("error: C compiler failed")
+                    exit(exit_static)
+                }
+            },
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_static)
+        },
+    }
+}
+
+// eprint_raw writes captured compiler stderr without an added newline when it
+// is empty, mirroring inherited stderr as closely as exec() allows.
+fn eprint_raw(s) {
+    if str_len(s) > 0 {
+        eprintln(s)
+    }
+}
+
+// find_cc probes for a working C compiler by name, since exec() cannot honor
+// $CC (no getenv native). Order mirrors the Go host: cc, gcc, clang.
+fn find_cc() {
+    let candidates = ["cc", "gcc", "clang"]
+    let mut found = ""
+    for name in candidates {
+        if found == "" && cc_works(name) {
+            found = name
+        }
+    }
+    found
+}
+
+fn cc_works(name) {
+    match exec(name, ["--version"]) {
+        Ok(o) => match o {
+            Output(code, _, _) => code == 0,
+        },
+        Err(_) => false,
+    }
+}
+
+// dev_cmd exposes the per-stage pipeline dumps used for parity testing. It is
+// intentionally undocumented in usage(); each subcommand mirrors one stage.
+fn dev_cmd(rest) {
+    if len(rest) < 2 {
+        eprintln("usage: bur dev <lex|parse|check|dis|emit-c> <file.bur>")
+        eprintln("       bur dev <build-dir|run-dir> <dir>")
+        exit(exit_usage)
+    }
+    let sub = rest[0]
+    if sub == "build-dir" {
+        dev_build_dir(rest[1])
+        return
+    }
+    if sub == "run-dir" {
+        run_module(rest[1], mode_run, slice(rest, 2, len(rest)))
+        return
+    }
+    if sub == "run" {
+        run_file(rest[1], mode_run, slice(rest, 2, len(rest)))
+        return
+    }
+    let src = match read_file(rest[1]) {
+        Ok(s) => s,
+        Err(msg) => {
+            println("error:", msg)
+            exit(exit_no_input)
+        },
+    }
+    if sub == "lex" {
+        dev_lex(src)
+    } else if sub == "parse" {
+        dev_parse(src)
+    } else if sub == "check" {
+        dev_check(src)
+    } else if sub == "dis" {
+        dev_dis(src)
+    } else if sub == "emit-c" {
+        dev_emit_c(src)
+    } else {
+        println("unknown dev command:", sub)
+        exit(exit_usage)
+    }
+}
+
+fn dev_build_dir(dir) {
+    match lib.load_module(dir) {
+        lib.ModOut.ModFailed(diags, dfiles) => {
             let mut i = 0
             while i < len(diags) {
-                println(dump_diag_f(diags[i], dfiles[i]))
+                println(lib.dump_diag_f(diags[i], dfiles[i]))
                 i = i + 1
             }
         },
-        ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+        lib.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
             let mut i = 0
             while i < len(ldiags) {
-                println(dump_diag_f(ldiags[i], lfiles[i]))
+                println(lib.dump_diag_f(ldiags[i], lfiles[i]))
                 i = i + 1
             }
-            match typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                Checked(cdiags, cfiles, _, chan_fors) => {
+            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
                     let mut errs = false
                     i = 0
                     while i < len(cdiags) {
-                        println(dump_diag_f(cdiags[i], cfiles[i]))
-                        match cdiags[i] {
-                            Diag(ie, _, _, _, _, _) => {
-                                if ie {
-                                    errs = true
-                                }
-                            },
+                        println(lib.dump_diag_f(cdiags[i], cfiles[i]))
+                        if diag_is_error(cdiags[i]) {
+                            errs = true
                         }
                         i = i + 1
                     }
                     if !errs {
-                        match compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                            CompileFailed(d, f) => println(dump_diag_f(d, f)),
-                            Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
-                                cgen_program(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                        match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                            lib.CompileOut.CompileFailed(d, f) => println(lib.dump_diag_f(d, f)),
+                            lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
+                                print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea)),
                         }
                     }
                 },
@@ -89,147 +589,64 @@ fn cmd_build_dir(dir) {
     }
 }
 
-// cmd_run_dir compiles a module directory and interprets it on the
-// Burryn-hosted VM, mirroring `bur run <dir>`: diagnostics go to stderr,
-// a missing bur.mod exits 3, static errors exit 1.
-fn cmd_run_dir(dir0, argv) {
-    let dir = if str_ends_with(dir0, "/") {
-        substr(dir0, 0, str_len(dir0) - 1)
-    } else {
-        dir0
-    }
-    if !file_exists(dir + "/bur.mod") {
-        eprintln("error: bur.mod not found in " + dir)
-        exit(3)
-    }
-    match load_module(dir) {
-        ModFailed(diags, dfiles) => {
-            let mut i = 0
-            while i < len(diags) {
-                eprintln(dump_diag_f(diags[i], dfiles[i]))
-                i = i + 1
+fn dev_lex(src) {
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, diags) => {
+            for t in toks {
+                println(lib.dump_token(t))
             }
-            exit(1)
-        },
-        ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
-            match typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                Checked(cdiags, cfiles, _, chan_fors) => {
-                    let mut errs = false
-                    let mut i = 0
-                    while i < len(cdiags) {
-                        match cdiags[i] {
-                            Diag(ie, _, _, _, _, _) => {
-                                if ie {
-                                    eprintln(dump_diag_f(cdiags[i], cfiles[i]))
-                                    errs = true
-                                }
-                            },
-                        }
-                        i = i + 1
-                    }
-                    if errs {
-                        exit(1)
-                    }
-                    match compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                        CompileFailed(d, f) => {
-                            eprintln(dump_diag_f(d, f))
-                            exit(1)
-                        },
-                        Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) =>
-                            run_program(fnames, ffile, fa, fu, fc, fspans, fk,
-                                eq, ev, ea, argv),
-                    }
-                },
+            for d in diags {
+                println(lib.dump_diag(d))
             }
         },
     }
 }
 
-// cmd_run compiles a script and interprets it on the Burryn-hosted VM,
-// mirroring `bur run <file.bur>`: static diagnostics go to stderr and exit
-// 1, unreadable input exits 3, the interpreted argv is everything after
-// the script path.
-fn cmd_run(path, argv) {
-    let src = match read_file(path) {
-        Ok(s) => s,
-        Err(msg) => {
-            eprintln("error:", msg)
-            exit(3)
-        },
-    }
-    match lex(src) {
-        Lexed(toks, ldiags) => {
+fn dev_parse(src) {
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    eprintln(dump_diag(d))
-                }
-                exit(1)
-            }
-            match parse(toks) {
-                Parsed(stmts, pdiags) => {
-                    if len(pdiags) > 0 {
-                        for d in pdiags {
-                            eprintln(dump_diag(d))
-                        }
-                        exit(1)
-                    }
-                    match typecheck_script(stmts) {
-                        Checked(cdiags, _, _, chan_fors) => {
-                            let mut errs = false
-                            for d in cdiags {
-                                match d {
-                                    Diag(ie, _, _, _, _, _) => {
-                                        if ie {
-                                            eprintln(dump_diag(d))
-                                            errs = true
-                                        }
-                                    },
-                                }
-                            }
-                            if errs {
-                                exit(1)
-                            }
-                            match compile_script(stmts, chan_fors) {
-                                CompileFailed(d, _) => {
-                                    eprintln(dump_diag(d))
-                                    exit(1)
-                                },
-                                Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) =>
-                                    run_program(fnames, ffile, fa, fu, fc, fspans, fk,
-                                        eq, ev, ea, argv),
-                            }
-                        },
-                    }
-                },
-            }
-        },
-    }
-}
-
-// cmd_check dumps top-level binding types and checker diagnostics; each
-// stage's errors stop the pipeline, mirroring the Go CLI.
-fn cmd_check(src) {
-    match lex(src) {
-        Lexed(toks, ldiags) => {
-            if len(ldiags) > 0 {
-                for d in ldiags {
-                    println(dump_diag(d))
+                    println(lib.dump_diag(d))
                 }
             } else {
-                match parse(toks) {
-                    Parsed(stmts, pdiags) => {
+                match lib.parse(toks) {
+                    lib.ParseOut.Parsed(stmts, pdiags) => {
+                        for s in stmts {
+                            lib.dump_node(s, "")
+                        }
+                        for d in pdiags {
+                            println(lib.dump_diag(d))
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+fn dev_check(src) {
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(lib.dump_diag(d))
+                }
+            } else {
+                match lib.parse(toks) {
+                    lib.ParseOut.Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(dump_diag(d))
+                                println(lib.dump_diag(d))
                             }
                         } else {
-                            match typecheck_script(stmts) {
-                                Checked(cdiags, _, binds, _) => {
+                            match lib.typecheck_script(stmts) {
+                                lib.CheckOut.Checked(cdiags, _, binds, _) => {
                                     for line in binds {
                                         println(line)
                                     }
                                     for d in cdiags {
-                                        println(dump_diag(d))
+                                        println(lib.dump_diag(d))
                                     }
                                 },
                             }
@@ -241,42 +658,36 @@ fn cmd_check(src) {
     }
 }
 
-// cmd_dis dumps every diagnostic, then (when error-free) the disassembly of
-// the compiled script, mirroring `bur dis`.
-fn cmd_dis(src) {
-    match lex(src) {
-        Lexed(toks, ldiags) => {
+fn dev_dis(src) {
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(dump_diag(d))
+                    println(lib.dump_diag(d))
                 }
             } else {
-                match parse(toks) {
-                    Parsed(stmts, pdiags) => {
+                match lib.parse(toks) {
+                    lib.ParseOut.Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(dump_diag(d))
+                                println(lib.dump_diag(d))
                             }
                         } else {
-                            match typecheck_script(stmts) {
-                                Checked(cdiags, _, _, chan_fors) => {
+                            match lib.typecheck_script(stmts) {
+                                lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
                                     let mut errs = false
                                     for d in cdiags {
-                                        println(dump_diag(d))
-                                        match d {
-                                            Diag(ie, _, _, _, _, _) => {
-                                                if ie {
-                                                    errs = true
-                                                }
-                                            },
+                                        println(lib.dump_diag(d))
+                                        if diag_is_error(d) {
+                                            errs = true
                                         }
                                     }
                                     if !errs {
-                                        match compile_script(stmts, chan_fors) {
-                                            CompileFailed(d, _) => println(dump_diag(d)),
-                                            Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) =>
-                                                dump_disasm(0, fnames, fa, fu, fc, fs, fk,
-                                                    eq, ev, ea, line_starts(src)),
+                                        match lib.compile_script(stmts, chan_fors) {
+                                            lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
+                                            lib.CompileOut.Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) =>
+                                                lib.dump_disasm(0, fnames, fa, fu, fc, fs, fk,
+                                                    eq, ev, ea, lib.line_starts(src)),
                                         }
                                     }
                                 },
@@ -289,41 +700,35 @@ fn cmd_dis(src) {
     }
 }
 
-// cmd_emit_c dumps every diagnostic, then (when error-free) the generated C
-// translation unit, mirroring `bur build --emit c`.
-fn cmd_emit_c(src) {
-    match lex(src) {
-        Lexed(toks, ldiags) => {
+fn dev_emit_c(src) {
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(dump_diag(d))
+                    println(lib.dump_diag(d))
                 }
             } else {
-                match parse(toks) {
-                    Parsed(stmts, pdiags) => {
+                match lib.parse(toks) {
+                    lib.ParseOut.Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(dump_diag(d))
+                                println(lib.dump_diag(d))
                             }
                         } else {
-                            match typecheck_script(stmts) {
-                                Checked(cdiags, _, _, chan_fors) => {
+                            match lib.typecheck_script(stmts) {
+                                lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
                                     let mut errs = false
                                     for d in cdiags {
-                                        println(dump_diag(d))
-                                        match d {
-                                            Diag(ie, _, _, _, _, _) => {
-                                                if ie {
-                                                    errs = true
-                                                }
-                                            },
+                                        println(lib.dump_diag(d))
+                                        if diag_is_error(d) {
+                                            errs = true
                                         }
                                     }
                                     if !errs {
-                                        match compile_script(stmts, chan_fors) {
-                                            CompileFailed(d, _) => println(dump_diag(d)),
-                                            Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
-                                                cgen_program(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                                        match lib.compile_script(stmts, chan_fors) {
+                                            lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
+                                            lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
+                                                print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea)),
                                         }
                                     }
                                 },
@@ -331,44 +736,6 @@ fn cmd_emit_c(src) {
                         }
                     },
                 }
-            }
-        },
-    }
-}
-
-// cmd_parse dumps the AST; on lex errors it dumps only those, mirroring the
-// Go pipeline which stops before parsing.
-fn cmd_parse(src) {
-    match lex(src) {
-        Lexed(toks, ldiags) => {
-            if len(ldiags) > 0 {
-                for d in ldiags {
-                    println(dump_diag(d))
-                }
-            } else {
-                match parse(toks) {
-                    Parsed(stmts, pdiags) => {
-                        for s in stmts {
-                            dump_node(s, "")
-                        }
-                        for d in pdiags {
-                            println(dump_diag(d))
-                        }
-                    },
-                }
-            }
-        },
-    }
-}
-
-fn cmd_lex(src) {
-    match lex(src) {
-        Lexed(toks, diags) => {
-            for t in toks {
-                println(dump_token(t))
-            }
-            for d in diags {
-                println(dump_diag(d))
             }
         },
     }
