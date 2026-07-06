@@ -3,6 +3,7 @@
 <!-- Badges / 徽章 -->
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/compiler-self--hosted-brightgreen.svg)](docs/GOALS.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
 
@@ -27,9 +28,7 @@ reads like **burin** — the engraver's tool for precise, quiet work.
 bur run examples/sieve.bur
 ```
 
-New to the language? Start with the tutorial: [`tutorial.md`](tutorial.md).
-
-## What it takes from Rust
+## 🦀 What it takes from Rust / 取自 Rust
 
 - **Immutable by default.** `let x = 1` cannot be reassigned — enforced at
   *compile time*. Mutation requires `let mut`, and it runs deep: a plain
@@ -46,7 +45,7 @@ New to the language? Start with the tutorial: [`tutorial.md`](tutorial.md).
 - **Shadowing.** `let x = x + 1` rebinds, Rust style.
 - **Algebraic data types.** `enum Shape { Circle(r), Rect(w, h), Point }`.
 
-## What it takes from Go
+## 🐹 What it takes from Go / 取自 Go
 
 - **A garbage collector instead of a borrow checker.** Hand-written
   mark-sweep over the VM's own heap; inspect it with `gc()`,
@@ -62,7 +61,7 @@ New to the language? Start with the tutorial: [`tutorial.md`](tutorial.md).
 - **No semicolons.** Newlines end statements (Go-style automatic insertion),
   so `} else` belongs on one line.
 
-## Tour
+## 🚀 Tour / 语言速览
 
 ```rust
 enum Shape { Circle(r), Rect(w, h) }
@@ -101,7 +100,7 @@ let mut sum = 0
 for _i in range(0, 5) { sum = sum + <-ch }
 ```
 
-## Examples
+## 📂 Examples / 示例
 
 | file | shows |
 |------|-------|
@@ -120,7 +119,7 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
 | `burc/` | the self-hosted compiler and `bur` CLI — the biggest Burryn program there is |
 
-## Architecture
+## 🏗 Architecture / 架构
 
 ```markdown
 source ──lexer──▶ tokens ──parser──▶ AST ──checker──▶ typed ──compiler──▶ bytecode
@@ -150,7 +149,7 @@ and the result rebuilds itself byte for byte.
 - **Scheduler**: FIFO ready queue; fibers park on channel wait queues; the
   receiver/sender hands values across directly.
 
-## Commands
+## ⌨️ Commands / 命令
 
 ```sh
 bur run <file|dir>    typecheck and run on the VM
@@ -173,7 +172,7 @@ git checkout main
 ./bur build burc -o bur        # from here on, bur rebuilds itself
 ```
 
-## Honest limitations
+## ⚠️ Honest limitations / 诚实局限
 
 Stages S1–S5 (semantic core, C backend, modules, maps, `select`/`close`,
 `mut` parameters, a fully self-hosted compiler with the Go host removed) are
@@ -184,10 +183,10 @@ dependency fetching (only local packages resolve). Deep `mut` is a
 binding-level discipline, not a borrow checker: two `mut` bindings may still
 alias the same list.
 
-## Documentation
+## 📚 Documentation / 文档
 
-| doc | audience |
-|-----|----------|
+| Document / 文档 | Purpose / 用途 |
+|-----------------|----------------|
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language |
 | [`docs/GOALS.md`](docs/GOALS.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
@@ -196,7 +195,7 @@ alias the same list.
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | community conduct standards |
 | [`CHANGELOG.md`](CHANGELOG.md) | notable changes, latest first |
 
-## License & Disclaimer
+## ⚖️ License & Disclaimer / 许可与免责
 
 This project is licensed under the [Apache License 2.0](LICENSE).
 
