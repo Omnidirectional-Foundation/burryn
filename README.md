@@ -1,5 +1,9 @@
 # Burryn
 
+<!-- Badges / 徽章 -->
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Self-hosted](https://img.shields.io/badge/compiler-self--hosted-brightgreen.svg)](docs/GOALS.md)
+
 > **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
 
 Burryn is a small programming language forged from Go and Rust: hand-written
@@ -187,3 +191,17 @@ alias the same list.
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language |
 | [`docs/GOALS.md`](docs/GOALS.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
+| [`SECURITY.md`](SECURITY.md) | reporting vulnerabilities privately |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | community conduct standards |
+| [`CHANGELOG.md`](CHANGELOG.md) | notable changes, latest first |
+
+## License & Disclaimer
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+This project is developed and maintained by individual contributors on a voluntary, non-commercial basis.
+
+This software is provided **"as is"**, without warranty of any kind. The author(s) accept no liability for any damages arising from the use of this software. See the [LICENSE](LICENSE) file for the full terms, including the disclaimer of warranty and limitation of liability.
+
+Any commercial entity using this software is solely responsible for their own compliance with applicable laws and regulations, including but not limited to the EU Cyber Resilience Act (CRA) and any other regional requirements.
