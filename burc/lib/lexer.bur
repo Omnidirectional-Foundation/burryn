@@ -18,14 +18,15 @@ pub fn lex(raw) {
     let mut st = [0, 0, -1, 0]
     let mut toks = []
     let mut diags = []
+    let mut comments = []
     while st[1] < str_len(src) {
         st[0] = st[1]
-        lex_scan(src, st, toks, diags)
+        lex_scan(src, st, toks, diags, comments)
     }
     st[0] = st[1] // spans of the synthetic trailing tokens sit at EOF
     lex_maybe_semi(st, toks) // final newline may be missing
     lex_emit(st, toks, t_eof, "")
-    Lexed(toks, diags)
+    Lexed(toks, diags, comments)
 }
 
 fn lex_fail(mut diags, s, e, code, help, msg) {
@@ -79,7 +80,7 @@ fn lex_maybe_semi(mut st, mut toks) {
     }
 }
 
-fn lex_scan(src, mut st, mut toks, mut diags) {
+fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     let c = lex_advance(src, st)
     if c == " " || c == "\t" || c == chr(13) { // chr(13) = \r: Burryn has no \r escape yet
     } else if c == "\n" {
@@ -89,6 +90,9 @@ fn lex_scan(src, mut st, mut toks, mut diags) {
             while st[1] < str_len(src) && lex_peek(src, st) != "\n" {
                 lex_bump(st)
             }
+            // record the comment (including its leading //) as trivia; it
+            // never enters toks, so the parser is unaffected
+            push(comments, Tok(t_comment, substr(src, st[0], st[1] - st[0]), st[0], st[1]))
         } else {
             lex_emit(st, toks, t_slash, "/")
         }
