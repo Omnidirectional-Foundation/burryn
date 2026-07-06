@@ -70,7 +70,7 @@
 
 | 后端 | 角色 | 状态 |
 |------|------|------|
-| 字节码栈式 VM | 开发与测试基线 + 自举 oracle/种子;Go 宿主版终将用 Burryn 重写(自举) | Go 版已有,重写待做 |
+| 字节码栈式 VM | 开发与测试基线 + 自举 oracle/种子;已由 Burryn 重写(自举) | 已完成(Go 种子归档于 `archive/go-host`) |
 | **C 后端** | v3 主力:可移植性由目标平台 C 编译器兜底,自举走此路径 | 已有(顺序 + 并发) |
 | 手写 x86-64 + PE | v4:核心目标之一,owner 明确想做;不借第三方工具链 | 未动工 |
 
@@ -83,7 +83,7 @@
 
 - **终局 = 全自举,只留 C 底座**:工具链里非 Burryn 的只剩 C 运行时 + 目标平台 cc;**Go 整棵树最终清零**——编译器前端、VM、CLI driver 全用 Burryn 重写
 - **改写本节旧定**:「VM(Go 宿主)为永久主力 / 零 C 依赖兜底」作废。VM 改由 Burryn 写、经 cc 编成原生;放弃"零 cc 工具链兜底",cc 成**工具链构建**的硬依赖(站 Rust 侧,自觉代价)。注:VM 二进制建好后 `bur run` 运行期仍不需 cc;需 cc 的是构建工具链与 `bur build`。单二进制交付(§1)不变
-- **分阶段**:S1 自举编译器前端(= v3 里程碑)→ S2 Burryn 重写 VM → S3 Burryn 写 CLI + 从 main 删 Go(先推留档分支 `archive/go-host`,重新接生靠 checkout 它)。每段自举判定 + parity 全绿才进下一段
+- **分阶段**:S1 自举编译器前端(= v3 里程碑)→ S2 Burryn 重写 VM → S3 Burryn 写 CLI + 从 main 删 Go(先推留档分支 `archive/go-host`,重新接生靠 checkout 它)。每段自举判定 + parity 全绿才进下一段。**S1/S2/S3 已全部完成**:main 上 Go 整棵树已清零,`bur` 经 cc 逐字节重建自身;Go 种子归档于 `archive/go-host`
 - **不改**:自举判定(输出 C 经 cc 落地 = 自举)、双后端互为测试参照、v4 手写 x86-64 + PE 才是 Go 级零工具链终局
 
 ## 4. 工具链设计(单一二进制,cargo 式一体化)
@@ -119,7 +119,7 @@
 
 - Conventional Commits 1.0.0:`<type>(<scope>): <description>`,subject ≤72 字符,祈使句,无句号无 emoji
 - 分支:`main` 受保护仅 PR 合入(merge commit,不 squash);开发期集成分支 `dev/<topic>`
-- 测试:`go test .` 一条命令覆盖全部,含示例 golden test;重构类改动必须先有测试安全网再动手
+- 测试:自举 parity + 示例 golden test 覆盖全链路;自举判定为一等验收(`bur build burc` 逐字节重建自身);重构类改动必须先有测试安全网再动手
 - 诊断质量是卖点本体:错误信息按 rustc 标准要求自己(精确 span、指出修法)
 
 ## 7. 当前待定项(动工前必须先问 owner)
