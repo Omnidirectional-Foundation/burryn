@@ -1,0 +1,204 @@
+// Minimal pretty-printer for Burryn source.
+// Stage 1: expressions (IntLit, Ident, Binary) and top-level declarations
+// (LetStmt, FnDecl). Comment trivia is accepted but ignored until stage 3.
+
+// format_file formats a single file's top-level statements.
+pub fn format_file(stmts, src, _comments) {
+    let mut buf = []
+    let mut i = 0
+    while i < len(stmts) {
+        fmt_stmt(stmts[i], src, 0, buf)
+        if i + 1 < len(stmts) {
+            push(buf, "\n")
+        }
+        i = i + 1
+    }
+    join(buf, "")
+}
+
+fn fmt_stmt(n, src, indent, mut buf) {
+    match n {
+        LetStmt(name, _, is_mut, is_pub, init, _) => {
+            if is_pub {
+                push(buf, "pub ")
+            }
+            push(buf, "let ")
+            if is_mut {
+                push(buf, "mut ")
+            }
+            push(buf, name)
+            push(buf, " = ")
+            fmt_expr(init, src, indent, buf)
+        },
+        FnDecl(name, _, is_pub, fnlit, _) => {
+            if is_pub {
+                push(buf, "pub ")
+            }
+            fmt_fn_lit(name, fnlit, src, indent, buf)
+        },
+        ReturnStmt(val, _) => {
+            push(buf, "return")
+            match val {
+                NoNode => {},
+                _ => {
+                    push(buf, " ")
+                    fmt_expr(val, src, indent, buf)
+                },
+            }
+        },
+        _ => push(buf, "<!-- unimplemented stmt -->"),
+    }
+}
+
+fn fmt_fn_lit(name, n, src, indent, mut buf) {
+    match n {
+        FnLit(params, muts, _pspans, body, _, _) => {
+            push(buf, "fn ")
+            push(buf, name)
+            push(buf, "(")
+            let mut i = 0
+            while i < len(params) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                if muts[i] {
+                    push(buf, "mut ")
+                }
+                push(buf, params[i])
+                i = i + 1
+            }
+            push(buf, ") ")
+            fmt_expr(body, src, indent, buf)
+        },
+        _ => push(buf, "<!-- fn decl without fn lit -->"),
+    }
+}
+
+fn fmt_expr(n, src, indent, mut buf) {
+    match n {
+        IntLit(_, sp) => push(buf, span_text(src, sp)),
+        FloatLit(_, sp) => push(buf, span_text(src, sp)),
+        StrLit(_, sp) => push(buf, span_text(src, sp)),
+        BoolLit(v, _) => push(buf, if v { "true" } else { "false" }),
+        Ident(_, sp) => push(buf, span_text(src, sp)),
+        Binary(op, lhs, rhs, _) => {
+            fmt_expr(lhs, src, indent, buf)
+            push(buf, " ")
+            push(buf, bin_op_text(op))
+            push(buf, " ")
+            fmt_expr(rhs, src, indent, buf)
+        },
+        Unary(op, rhs, _) => {
+            push(buf, unary_op_text(op))
+            fmt_expr(rhs, src, indent, buf)
+        },
+        Block(stmts, _) => {
+            push(buf, "{\n")
+            let deeper = indent + 4
+            let mut i = 0
+            while i < len(stmts) {
+                push_indent(buf, deeper)
+                fmt_stmt(stmts[i], src, deeper, buf)
+                push(buf, "\n")
+                i = i + 1
+            }
+            push_indent(buf, indent)
+            push(buf, "}")
+        },
+        Call(callee, cargs, _) => {
+            fmt_expr(callee, src, indent, buf)
+            push(buf, "(")
+            let mut i = 0
+            while i < len(cargs) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_expr(cargs[i], src, indent, buf)
+                i = i + 1
+            }
+            push(buf, ")")
+        },
+        _ => push(buf, "<!-- unimplemented expr -->"),
+    }
+}
+
+fn span_text(src, sp) {
+    match sp {
+        Sp(s, e) => substr(src, s, e - s),
+    }
+}
+
+fn push_indent(mut buf, mut n) {
+    while n > 0 {
+        push(buf, " ")
+        n = n - 1
+    }
+}
+
+fn bin_op_text(op) {
+    if op == t_plus {
+        "+"
+    } else {
+        if op == t_minus {
+            "-"
+        } else {
+            if op == t_star {
+                "*"
+            } else {
+                if op == t_slash {
+                    "/"
+                } else {
+                    if op == t_percent {
+                        "%"
+                    } else {
+                        if op == t_eq_eq {
+                            "=="
+                        } else {
+                            if op == t_bang_eq {
+                                "!="
+                            } else {
+                                if op == t_lt {
+                                    "<"
+                                } else {
+                                    if op == t_lt_eq {
+                                        "<="
+                                    } else {
+                                        if op == t_gt {
+                                            ">"
+                                        } else {
+                                            if op == t_gt_eq {
+                                                ">="
+                                            } else {
+                                                if op == t_and_and {
+                                                    "&&"
+                                                } else {
+                                                    if op == t_or_or {
+                                                        "||"
+                                                    } else {
+                                                        "?"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn unary_op_text(op) {
+    if op == t_minus {
+        "-"
+    } else {
+        if op == t_bang {
+            "!"
+        } else {
+            "?"
+        }
+    }
+}
