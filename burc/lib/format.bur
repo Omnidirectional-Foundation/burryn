@@ -1,6 +1,9 @@
 // Minimal pretty-printer for Burryn source.
-// Stage 1: expressions (IntLit, Ident, Binary) and top-level declarations
-// (LetStmt, FnDecl). Comment trivia is accepted but ignored until stage 3.
+// Stage 1: expressions (literals, idents, unary/binary/logical operators,
+// calls, blocks) and top-level declarations (LetStmt, FnDecl, ReturnStmt).
+// Nodes the printer does not handle yet are copied verbatim from the source
+// via their span, so the output always parses back to the same AST.
+// Comment trivia is accepted but ignored until stage 3.
 
 // format_file formats a single file's top-level statements.
 pub fn format_file(stmts, src, _comments) {
@@ -8,9 +11,7 @@ pub fn format_file(stmts, src, _comments) {
     let mut i = 0
     while i < len(stmts) {
         fmt_stmt(stmts[i], src, 0, buf)
-        if i + 1 < len(stmts) {
-            push(buf, "\n")
-        }
+        push(buf, "\n")
         i = i + 1
     }
     join(buf, "")
@@ -46,7 +47,7 @@ fn fmt_stmt(n, src, indent, mut buf) {
                 },
             }
         },
-        _ => push(buf, "<!-- unimplemented stmt -->"),
+        _ => push(buf, span_text(src, span_of(n))),
     }
 }
 
@@ -70,7 +71,7 @@ fn fmt_fn_lit(name, n, src, indent, mut buf) {
             push(buf, ") ")
             fmt_expr(body, src, indent, buf)
         },
-        _ => push(buf, "<!-- fn decl without fn lit -->"),
+        _ => fmt_internal("fn decl without fn literal"),
     }
 }
 
@@ -82,15 +83,24 @@ fn fmt_expr(n, src, indent, mut buf) {
         BoolLit(v, _) => push(buf, if v { "true" } else { "false" }),
         Ident(_, sp) => push(buf, span_text(src, sp)),
         Binary(op, lhs, rhs, _) => {
-            fmt_expr(lhs, src, indent, buf)
+            let level = bin_prec(op)
+            fmt_child(lhs, level, src, indent, buf)
             push(buf, " ")
             push(buf, bin_op_text(op))
             push(buf, " ")
-            fmt_expr(rhs, src, indent, buf)
+            fmt_child(rhs, level + 1, src, indent, buf)
+        },
+        Logical(op, lhs, rhs, _) => {
+            let level = if op == t_and_and { 2 } else { 1 }
+            fmt_child(lhs, level, src, indent, buf)
+            push(buf, " ")
+            push(buf, bin_op_text(op))
+            push(buf, " ")
+            fmt_child(rhs, level + 1, src, indent, buf)
         },
         Unary(op, rhs, _) => {
             push(buf, unary_op_text(op))
-            fmt_expr(rhs, src, indent, buf)
+            fmt_child(rhs, 7, src, indent, buf)
         },
         Block(stmts, _) => {
             push(buf, "{\n")
@@ -106,7 +116,7 @@ fn fmt_expr(n, src, indent, mut buf) {
             push(buf, "}")
         },
         Call(callee, cargs, _) => {
-            fmt_expr(callee, src, indent, buf)
+            fmt_child(callee, 8, src, indent, buf)
             push(buf, "(")
             let mut i = 0
             while i < len(cargs) {
@@ -118,7 +128,60 @@ fn fmt_expr(n, src, indent, mut buf) {
             }
             push(buf, ")")
         },
-        _ => push(buf, "<!-- unimplemented expr -->"),
+        _ => push(buf, span_text(src, span_of(n))),
+    }
+}
+
+// fmt_child prints an operand, parenthesizing when its rank is below the
+// minimum its position requires (left operand of a binary: the operator's
+// own level; right operand: level + 1, since every binary and logical
+// operator is left-associative).
+fn fmt_child(n, need, src, indent, mut buf) {
+    if node_prec(n) < need {
+        push(buf, "(")
+        fmt_expr(n, src, indent, buf)
+        push(buf, ")")
+    } else {
+        fmt_expr(n, src, indent, buf)
+    }
+}
+
+// node_prec ranks how tightly an expression binds, mirroring the parser's
+// precedence-climbing ladder (parser.bur p_or_expr..p_postfix). The parser
+// folds parentheses away, so the printer re-derives the minimal set from
+// these ranks:
+//   0 statement-like expressions (fn/block/if/match): wrapped as any operand
+//   1 ||   2 &&   3 == !=   4 < <= > >=   5 + -   6 * / %
+//   7 unary ! - and <-recv   8 postfix call/index/?   9 atoms
+fn node_prec(n) {
+    match n {
+        Logical(op, _, _, _) => if op == t_and_and { 2 } else { 1 },
+        Binary(op, _, _, _) => bin_prec(op),
+        Unary(_, _, _) => 7,
+        RecvExpr(_, _) => 7,
+        Call(_, _, _) => 8,
+        Index(_, _, _) => 8,
+        TryExpr(_, _) => 8,
+        FnLit(_, _, _, _, _, _) => 0,
+        Block(_, _) => 0,
+        IfExpr(_, _, _, _) => 0,
+        MatchExpr(_, _, _) => 0,
+        _ => 9,
+    }
+}
+
+fn bin_prec(op) {
+    if op == t_eq_eq || op == t_bang_eq {
+        3
+    } else if op == t_lt || op == t_lt_eq || op == t_gt || op == t_gt_eq {
+        4
+    } else if op == t_plus || op == t_minus {
+        5
+    } else if op == t_star || op == t_slash || op == t_percent {
+        6
+    } else {
+        fmt_internal("unknown binary operator token")
+        0
     }
 }
 
@@ -138,67 +201,49 @@ fn push_indent(mut buf, mut n) {
 fn bin_op_text(op) {
     if op == t_plus {
         "+"
+    } else if op == t_minus {
+        "-"
+    } else if op == t_star {
+        "*"
+    } else if op == t_slash {
+        "/"
+    } else if op == t_percent {
+        "%"
+    } else if op == t_eq_eq {
+        "=="
+    } else if op == t_bang_eq {
+        "!="
+    } else if op == t_lt {
+        "<"
+    } else if op == t_lt_eq {
+        "<="
+    } else if op == t_gt {
+        ">"
+    } else if op == t_gt_eq {
+        ">="
+    } else if op == t_and_and {
+        "&&"
+    } else if op == t_or_or {
+        "||"
     } else {
-        if op == t_minus {
-            "-"
-        } else {
-            if op == t_star {
-                "*"
-            } else {
-                if op == t_slash {
-                    "/"
-                } else {
-                    if op == t_percent {
-                        "%"
-                    } else {
-                        if op == t_eq_eq {
-                            "=="
-                        } else {
-                            if op == t_bang_eq {
-                                "!="
-                            } else {
-                                if op == t_lt {
-                                    "<"
-                                } else {
-                                    if op == t_lt_eq {
-                                        "<="
-                                    } else {
-                                        if op == t_gt {
-                                            ">"
-                                        } else {
-                                            if op == t_gt_eq {
-                                                ">="
-                                            } else {
-                                                if op == t_and_and {
-                                                    "&&"
-                                                } else {
-                                                    if op == t_or_or {
-                                                        "||"
-                                                    } else {
-                                                        "?"
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        fmt_internal("unknown operator token")
+        ""
     }
 }
 
 fn unary_op_text(op) {
     if op == t_minus {
         "-"
+    } else if op == t_bang {
+        "!"
     } else {
-        if op == t_bang {
-            "!"
-        } else {
-            "?"
-        }
+        fmt_internal("unknown unary operator token")
+        ""
     }
+}
+
+// fmt_internal reports a formatter bug: these branches are unreachable for
+// any AST the parser produces.
+fn fmt_internal(msg) {
+    assert(false, "internal error: fmt: " + msg)
 }
