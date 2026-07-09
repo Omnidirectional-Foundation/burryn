@@ -20,6 +20,7 @@
 ### 类型系统
 
 - 静态，Hindley-Milner 全程序推导；函数参数/返回值零标注，仅枚举字段声明类型
+- **可选函数签名标注(S7.8，owner 2026-07-10 定)**：「零标注」从「不能标」收窄为「不必标」——不标注的程序语义与推导结果不变；显式标注为 opt-in，用于诊断锚定与包边界 API 冻结，推导须与标注 unify，冲突报错
 - 参数多态函数 + 泛型枚举；运算符用 SML 式受约束类型变量(`num` / `addord`)
 - 禁止一切隐式转换
 - **多态运行时表示：统一装箱(uniform boxing)**。
@@ -35,8 +36,9 @@
 - **整数溢出一律 trap(运行时 panic)**，不区分 debug/release，不静默回绕
 - 内存管理：GC(mark-sweep)。
   明确不做所有权/借用检查
-- **`mut` 为深语义**：`let` 绑定的容器连内容都不可变；push/元素修改要求 `mut`。
-  默认不可变必须名实相符
+- **`mut` 为深语义、绑定级纪律(owner 2026-07-10 修订)**：经由 `let` 绑定名不可修改其值(含容器内容)；push/元素修改要求 `mut`。
+  不可变性挂在**绑定**上而非值上——无借用检查器与 move 语义，别名可绕过(实测 `let mut b = a` 后改 `b` 可见于 `a`)，故**不承诺值级不可变**。
+  补强定案：checker 增加流规则——`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)；动工前先摸底 burc 自身迁移面，波及过大则回退为仅本条措辞修订
 - **参数默认不可变；`fn f(mut xs)` 声明可变参数**——已定，S2.5 实现(stdlib 原地操作与自举编译器的 emit 累积模式需要)。
   调用点无标记，与「无借用检查器 + GC」的定位一致，属 Go 式取舍
 
@@ -53,6 +55,8 @@
 - **执行模型长期承诺单 OS 线程**(并发 ≠ 并行，Node/Lua 路线)。
   纤程调度 + 时间片抢占，不做真并行——无借用检查器时真并行 + 深 mut 会引入数据竞争，且单线程使 GC 与原生运行时简化一个量级。
   此承诺覆盖全部后端
+- **确定性承诺收窄(owner 2026-07-10 定)**：纯计算程序跨后端逐字节确定；含 IO 程序不承诺调度顺序(IO 完成时序来自外部世界，与真 IO 重叠原理上互斥)。
+  提供 opt-in 确定性模式(环境变量 `BUR_DETERMINISTIC=1`，IO 全串行化、timer 唤醒按 deadline + fiber 创建序双键排序)，`bur test`(S6.4)默认启用
 
 ### 错误处理
 
@@ -66,7 +70,7 @@
 ### 语法
 
 - 参考系：Rust(`let`/`mut`、`match`、带字段枚举、`?`、表达式导向、遮蔽)+ Go(`spawn`、channel 语法、自动分号插入)
-- 补充定案：`defer`(资源清理，脚本场景刚需)
+- 补充定案：`defer`(资源清理，脚本场景刚需)——归 **S7.6**，倾向块作用域(表达式导向下比 Go 的函数作用域干净)，实现前细化(owner 2026-07-10 定)
 - 语法当前未冻结；自举后冻结并产出正式 grammar 文件
 
 ### 明确拒绝清单(护住简洁，不接受重新提案)
@@ -91,7 +95,7 @@
 - 自举判定标准：**编译器由本语言写成且能编译自己**；输出 C 再经 gcc/clang 落地，完全算自举
 - 「任何架构都能跑」由 C 后端承担；手写后端只承诺 x86-64，其余架构不做手写
 - 双后端互为测试参照：同一程序在 VM / C 后端 / 手写后端输出必须一致，纳入测试
-- 原生运行时：GC 起步用保守式栈扫描，省掉 stack map；单线程承诺使运行时无需线程同步
+- 原生运行时：GC 为 **shadow stack 精确扫描**(C 后端定案已落地，取代早期「保守式栈扫描」设想，2026-07-10 纠错)；单线程承诺使运行时无需线程同步
 
 ### 全自举终局(owner 2026-07-04 定)
 
@@ -133,19 +137,20 @@
 | 阶段 | 子项 | 状态 |
 |------|------|------|
 | **S1 语义内核** | S1.1 HM 全程序推导(occurs + level generalize + let-poly)；S1.2 穷尽性检查；S1.3 GC(mark-sweep 保守栈扫描)；S1.4 CSP 基础(spawn/channel/死锁检测) | 已完成 |
-| **S2 C 后端与语言完备** | S2.1 C 后端(顺序 + 并发)；S2.2 模块系统；S2.3 map；S2.4 `select` + `close`；S2.5 深 `mut` + `fn(mut xs)`；S2.6 `pub`；S2.7 必要 stdlib(os/exec、fs、json、net) | 已完成 |
+| **S2 C 后端与语言完备** | S2.1 C 后端(顺序 + 并发)；S2.2 模块系统；S2.3 map；S2.4 `select` + `close`；S2.5 深 `mut` + `fn(mut xs)`；S2.6 `pub`；S2.7 必要 stdlib(os/exec、fs——json/net 当时未实现，2026-07-10 纠错移入 S6.6/S7.7) | 已完成 |
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)；S6.2 网络拉取(`git clone` + `sha256sum`)；S6.3 `bur fmt`；S6.4 `bur test`；S6.5 debugger | 进行中 |
-| **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值；S7.5 编译期常量 | 未开工 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 + PE 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records | 未开工 |
+| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)；S6.2 网络拉取(`git clone` + 规范树哈希校验)；S6.3 `bur fmt`；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO(sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批(SCC 序 + 枚举两遍注册 + `?` 相互递归) | 进行中 |
+| **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注 | 未开工 |
+| **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
 - S1–S5 为自举闭环，已全部达成：`bur` 由本语言写成、经 cc 逐字节重建自身，main 上 Go 整棵树已清零
 - 自举判定标准：**编译器由本语言写成且能编译自己**；输出 C 再经 gcc/clang 落地，完全算自举
 - stdlib 按「够自举用 + owner 真实脚本需求」逐个生长(os/exec、fs、json、net 优先)，不追大而全
 - 编译速度是硬指标：任何特性提案先回答「是否显著拖慢编译」
-- 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
+- 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S6.8、S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
+- **S8 内部推进顺序(owner 2026-07-10 定)**：S8.3 row poly → S8.4 封闭 records → S8.1 ELF 后端 → S8.5 PE。类型先行(日常效用高于第二后端)；手写后端是 owner 明确想做的目标，但不挡效用主线
 
 ## 6. 工程规范
 
@@ -168,16 +173,23 @@
 - S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native
 - 命令面(随 S6.1/S6.2 落地)：`bur mod init` / `bur mod tidy` / `bur mod download` / `bur get <path>@<version>`
 - 遵守 §4 红线：MVS 确定性、去中心化、禁 build 期执行任意代码
+- 补充定案(owner 2026-07-10)：
+  - `bur.sum` 行格式 `<path> <version> h1:<base64(树哈希)>`；树哈希 = 规范化目录哈希(路径排序 + 逐文件 sha256 汇总，Go dirhash 式)；版本 ↔ git tag 映射 `v<semver>`
+  - S6.1 离线解析只读 `$BURCACHE`；cache miss 报错并提示 `bur mod download`(自动拉取归 S6.2)
+  - **std 分发形式 = 随工具链捆绑**：保留 import 前缀 `std/`，版本跟工具链走，不经网络拉取；modgraph 解析须把 `std/` 特判为工具链内置，绝不落缓存/网络路径
+  - S6.1 设计文档必答题：包边界推导签名固化(接口缓存，分离编译前提)的形态
 
 **S6.3 `bur fmt`(P0，文化基础设施)**
 
 与包管理并列优先——越早冻结格式，后期生态一致性成本越低(§4「唯一官方格式，零配置」)。
 
 - 复用 `lib.parse` 的 AST → 新 `burc/lib/format.bur` 写 pretty-printer；规则对齐 burc/lib 现有风格(换行即分号、块结构、表达式导向、4-space、`match` arm 对齐)
-- 验收铁律：**幂等** `fmt(fmt(x))==fmt(x)` 且 `fmt` 前后 AST 不变
+- 验收铁律(2026-07-10 补全为三条)：**幂等** `fmt(fmt(x))==fmt(x)`；**AST 不变**(执法机制 = 写回前强制 reparse + 忽略 span 的 `ast_eq` 结构比对)；**注释 trivia 不得丢失**(执法机制 = 注释计数一致检查)。任一失败拒绝写回并报 internal error
+- 格式定案：顶层声明之间恰好一个空行，文件首不留空行；formatter 不做长行折行(折行如需要是独立后续 stage)
 - 前置已就绪：lexer 现把注释作旁路 trivia 收集(`LexOut.Lexed` 第三字段，见 §6.6 前置)，`bur fmt` 可按 span 重插注释
 - 命令：`bur fmt <file|dir>`(原地写回)、`--check`(CI，有 diff 则非 0 退出)、`-`(stdin→stdout，供 LSP format-on-save)
-- 立即跑在 `burc/lib/` 自身统一自举代码风格
+- 注释重插(stage 3)与验证器全绿**之后**才跑在 `burc/lib/` 自身统一风格；在此之前禁止对真实源码原地写回(2026-07-10 修订，早期「立即跑」措辞作废)
+- stage 划分：stage 2 全 AST 节点覆盖 → stage 3 注释重插 → stage 4 `bur fmt` 公开命令 + burc 自格式化
 
 **S6.4 `bur test`(P1)**
 
@@ -186,6 +198,7 @@
 - 约定 `*_test.bur` + `fn test_*()` 自动发现；断言 API 归 stdlib(`assert_eq`/`assert`/`assert_ok`/`assert_err`，贴合 `Result`/`Option`)
 - 并发特色：利用 fiber/channel 语义，把 VM 死锁检测(现为 exit 4)转成测试失败；支持并发测试模式
 - 报告：pass/fail 计数 + 失败 span 定位(复用 diag 渲染)
+- 动工前必答(owner 标注 2026-07-10)：测试隔离模型(子进程 vs 进程内)；默认启用确定性模式(`BUR_DETERMINISTIC=1`，IO 串行化)保证可复现
 
 **S6.5 debugger(可选，C 后端增强，优先级最低)**
 
@@ -193,9 +206,33 @@
 - runtime trap 打印带 source span 的 stack trace(复用 diag + line_starts)
 - 符合「终局只留 C 底座」，属后端增强非新工具
 
+**S6.6 std/json(纯 Burryn，零新 native)**
+
+- 前提：std 分发形式已定(随工具链捆绑，`std/` 保留前缀，见 S6.1 补充定案)
+- json 解析/序列化全用 Burryn 实现，作为 std 首个成员与捆绑机制一起落地
+- 来历：S2.7 曾把 json/net 标为已完成，2026-07-10 核实均未实现，json 移入本项、net 移入 S7.7
+
+**S6.7 runtime IO 工作包(owner 2026-07-10 定，尽快落地)**
+
+- 现状：全部 IO native 同步阻塞整个调度器(实测两个 `exec sleep 0.5` 串行跑 1.008s)；CSP 只能交错纯计算，对运维脚本的 exec/net 并发场景空转
+- 方案 = 最小异步 exec + timer，不做通用 async IO(现无 socket，epoll 无对象；通用化等 S7.7 net 一并议)：
+  - 新增 native：`sleep(ms)`(CLOCK_MONOTONIC)、`exec_start(cmd, args) -> Result<int, str>`(handle 为 int)、`exec_poll(handle) -> Option<Result<Output, str>>`(未完成 None；命令不存在等 fork 后错误经此浮出；收割后 handle 失效，poll 无效 handle 为 trap)。若 decl_native 表达不了嵌套泛型，等价拆为 `exec_done(handle) -> bool` + `exec_take(handle) -> Result<Output, str>`
+  - 三个原语均为公开 native，可供用户手写 fan-out
+  - 既有 `exec` 语义不变，降级为 **fiber 级阻塞**(内部 start/poll/yield 循环；独跑时直接阻塞 poll 自身 fd)，调度器级不再阻塞
+  - 调度器(burrt.h 与 vm.bur **两份**，parity 铁律)增加 idle-wait：无 runnable fiber 时 poll(等待 fd 集，timeout = 最近 timer deadline)；死锁检测把 IO/timer 等待者视为活跃
+  - 确定性模式(`BUR_DETERMINISTIC=1`)：IO 串行化 + timer 唤醒按 deadline + fiber 创建序双键排序
+- 每个新 native 照五处约定走，加完必重跑自举定点
+
+**S6.8 checker 债批(排 S6 尾，生态代码出现前修完)**
+
+- 包级值推导改 SCC 依赖序，根除文件字母序语义(quirk #9)
+- 枚举注册改两遍(先收名字再验字段类型)，根除跨文件枚举只能「向前」引用(quirk #2)
+- `?` 在相互递归函数组内可用(`Result + ?` 是唯一错误机制，必须处处可用)
+- 三项都触及推导核心，同批做、一次验自举定点
+
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序**：`bur fmt`(S6.3)先落地(小、无网络、立刻自举验证、解锁 LSP)+ 依赖解析(S6.1)并行 → 网络拉取(S6.2)→ `bur test`(S6.4)→ debugger(S6.5)。
+**推进顺序(2026-07-10 修订)**：S6.7 runtime IO(尽快，owner 已定)→ `bur fmt` stage 2–4(S6.3)→ 依赖解析(S6.1，可与 fmt 并行)→ 网络拉取(S6.2)→ `bur test`(S6.4)→ S6.6 json → S6.8 checker 债批 → debugger(S6.5)。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
@@ -207,11 +244,11 @@
 | 字符串插值(S7.1) | 低 | 纯 lexer+parser 脱糖为 `join`/`+` | 不碰类型系统；lexer 需在串内切回表达式模式，`{{` 转义 |
 | 管道 `\|>`(S7.2) | 极低 | 纯 parser 脱糖 | — |
 | Match Guard(S7.3) | 低 | compiler 加条件跳转 | — |
-| 命名参数+默认值(S7.4) | 中 | checker(按名重排实参+arity) + compiler(默认值字节码) | 原评估偏低；不碰 unify 但碰调用点 infer |
+| 命名参数+默认值(S7.4) | 中 | checker(按名重排实参+arity) + compiler(默认值字节码) | **已否决(2026-07-10)**：名字是否进 fn 类型参与 unification 无良解(进则函数值传递变脆，不进则语义两张皮)；若重提仅限「直接调用的纯语法糖」形态 |
 | 编译期常量(S7.5) | 中 | 新常量折叠阶段 | — |
 | 封闭 Records(→ **S8.4**) | 中高 | 改 `ty_unify` 核心(+tk==3 逐字段配对) + 新 TRecord kind + cgen 字段名→下标 | 因改 unify + 自举风险，归 S8 与 row poly 同段，不属 S7；原评估明显偏低 |
 
-**S7 落地顺序**：字符串插值(最先，不阻塞任何事)→ 管道 / match guard(顺手)→ 命名参数 → 编译期常量。
+**S7 落地顺序**：字符串插值(最先，不阻塞任何事)→ 管道 / match guard(顺手)→ 编译期常量 → defer(S7.6) → 可选签名标注(S7.8) → net(S7.7，依赖 S6.7 后续讨论)。
 封闭 records 移出 S7，归 **S8.4**(改 unify + 自举风险与 row poly 叠加，同段一次性验 fixpoint)。
 
 ## 6.7 重型类型系统扩展评估(工程视角，对应 S8)
@@ -234,5 +271,12 @@
 - 工具链命令命名与 CLI 布局
 - 手写后端的调用约定与 GC 根扫描策略(S8 前定)
 - S6 各命令 CLI 布局与命名(`bur mod`/`bur get`/`bur fmt`/`bur test` 子命令形态)
+- S6.4 测试隔离模型(子进程 vs 进程内，动工前定)
+- S6.1 接口缓存(包边界签名固化)形态(设计文档必答)
+- S7.6 `defer` 块作用域细节(块表达式的求值时机、fiber 退出语义)
+- S7.8 可选签名标注的语法形态
+- S6.7 后续：net 落地时是否升级为通用 fd 感知调度(epoll/kqueue)
 
 已探查结论(移出待定)：lexer comment/trivia 保留已完成(S6.3 前置就绪，见 §6.6)；`exec` shell-out `git clone` 够用已确认(S6.2 无需新 native，见 §6.5)。
+
+2026-07-10 设计审查定案(全文散见对应章节)：深 mut 降级为绑定级纪律 + checker 流规则；确定性承诺收窄 + `BUR_DETERMINISTIC` 模式；可选签名标注归 S7.8；S7.4 命名参数否决；S8 重排(类型先行、ELF 先于 PE)；std 捆绑分发；`bur.sum` 树哈希；fmt 验收三条铁律；json/net 从 S2.7 纠错移入 S6.6/S7.7；新增 S6.7 runtime IO 与 S6.8 checker 债批。
