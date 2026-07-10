@@ -177,7 +177,8 @@
   - `bur.sum` 行格式 `<path> <version> h1:<base64(树哈希)>`；树哈希 = 规范化目录哈希(路径排序 + 逐文件 sha256 汇总，Go dirhash 式)；版本 ↔ git tag 映射 `v<semver>`
   - S6.1 离线解析只读 `$BURCACHE`；cache miss 报错并提示 `bur mod download`(自动拉取归 S6.2)
   - **std 分发形式 = 随工具链捆绑**：保留 import 前缀 `std/`，版本跟工具链走，不经网络拉取；modgraph 解析须把 `std/` 特判为工具链内置，绝不落缓存/网络路径
-  - S6.1 设计文档必答题：包边界推导签名固化(接口缓存，分离编译前提)的形态
+  - **接口缓存已定(owner 2026-07-10，原必答题)**：对每个 `path@version` 首次编译后，把导出面序列化为接口文件缓存(enum 定义原样复制、fn 导出写成签名)；**接口文件语法 = S7.8 可选标注语法**(标注语法先在此定型，接口文件即自动生成的人类可读声明文件)；缓存 key = (工具链版本, 模块树哈希)，安全性由 bur.sum 锁定的哈希承担
+  - S6.2 执行细节：clone 后进缓存前 strip `.git`(树哈希不含 git 元数据)；tag 缺失的报错指向对应 `require` 行
 
 **S6.3 `bur fmt`(P0，文化基础设施)**
 
@@ -198,7 +199,9 @@
 - 约定 `*_test.bur` + `fn test_*()` 自动发现；断言 API 归 stdlib(`assert_eq`/`assert`/`assert_ok`/`assert_err`，贴合 `Result`/`Option`)
 - 并发特色：利用 fiber/channel 语义，把 VM 死锁检测(现为 exit 4)转成测试失败；支持并发测试模式
 - 报告：pass/fail 计数 + 失败 span 定位(复用 diag 渲染)
-- 动工前必答(owner 标注 2026-07-10)：测试隔离模型(子进程 vs 进程内)；默认启用确定性模式(`BUR_DETERMINISTIC=1`，IO 串行化)保证可复现
+- **隔离模型已定(owner 2026-07-10，原必答题)：子进程隔离**——`bur test` 对每个 `test_*` `exec` 自身跑隐藏命令(`bur dev run-test <dir> <fn>`)收集 exit code 与输出；trap(exit 4)与死锁自然成为 test failure；默认 `BUR_DETERMINISTIC=1`；并行跑测试 = `exec_start` fan-out(S6.7 已解锁)
+- 自身二进制路径经 shell-out `readlink /proc/self/exe` 获取(零新 native；不够用再议 `self_path` native)
+- 断言先用现成 `assert(cond, msg)`；`assert_eq` 等糖归 std/testing，等 S6.6 捆绑机制落地
 
 **S6.5 debugger(可选，C 后端增强，优先级最低)**
 
@@ -209,6 +212,7 @@
 **S6.6 std/json(纯 Burryn，零新 native)**
 
 - 前提：std 分发形式已定(随工具链捆绑，`std/` 保留前缀，见 S6.1 补充定案)
+- **捆绑机制已定(owner 2026-07-10)：内嵌进二进制**——std 源码构建时转为字符串常量编进 burc，`import "std/..."` 从内嵌表取源码；与 §1 单二进制交付一致，无安装布局探测。「禁 build 期执行任意代码」红线针对第三方包，工具链自建生成物不在其列
 - json 解析/序列化全用 Burryn 实现，作为 std 首个成员与捆绑机制一起落地
 - 来历：S2.7 曾把 json/net 标为已完成，2026-07-10 核实均未实现，json 移入本项、net 移入 S7.7
 
@@ -232,7 +236,7 @@
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序(2026-07-10 修订)**：S6.7 runtime IO(尽快，owner 已定)→ `bur fmt` stage 2–4(S6.3)→ 依赖解析(S6.1，可与 fmt 并行)→ 网络拉取(S6.2)→ `bur test`(S6.4)→ S6.6 json → S6.8 checker 债批 → debugger(S6.5)。
+**推进顺序(2026-07-10 二次修订，S6.7/S6.3 已完成)**：**S6.8 checker 债批**(先行——SCC 序动推导核心，接口缓存的设计地基要先摆脱字母序；deep-mut 流规则的迁移面摸底同批)→ S6.2 网络拉取 → S6.6 std/json → S6.4 `bur test` → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
@@ -271,8 +275,6 @@
 - 工具链命令命名与 CLI 布局
 - 手写后端的调用约定与 GC 根扫描策略(S8 前定)
 - S6 各命令 CLI 布局与命名(`bur mod`/`bur get`/`bur fmt`/`bur test` 子命令形态)
-- S6.4 测试隔离模型(子进程 vs 进程内，动工前定)
-- S6.1 接口缓存(包边界签名固化)形态(设计文档必答)
 - S7.6 `defer` 块作用域细节(块表达式的求值时机、fiber 退出语义)
 - S7.8 可选签名标注的语法形态
 - S6.7 后续：net 落地时是否升级为通用 fd 感知调度(epoll/kqueue)
