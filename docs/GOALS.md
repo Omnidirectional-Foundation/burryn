@@ -141,7 +141,7 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取(`git clone` + 规范树哈希校验)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定) | 进行中 |
+| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定) | 进行中 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注 | 未开工 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
@@ -170,7 +170,7 @@
 骨架在，缺解析 + 拉取 + 定位。
 
 - S6.1 解析层(无网络)：新 `burc/lib/modgraph.bur` 构建依赖图跑 MVS(选满足约束的**最低**版本)；新增 `bur.sum` lockfile(`path version hash`)；放开 module.bur:538 跨模块限制(命中 require 图则放行)；缓存目录 `$BURCACHE` 默认 `~/.burryn/pkg/<path>@<version>/`
-- S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native
+- S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native——**已落地(2026-07-10)**：shell-out 方案成立，零新 native；`bur mod init/tidy/download/verify` 与 `bur get` 全部接线；`bur get` 拉取失败回滚 bur.mod；树哈希输出已从 hex 纠正为定案的 `h1:<base64>`。**实现侧默认(GOALS 未定，owner 可否决)**：clone URL = `https://<module path>`(Go 式「模块路径即仓库路径」，不支持子目录模块)，环境变量 `$BURGITBASE` 可换 URL 前缀(镜像/离线测试)；`bur mod download` 在 bur.sum 存在时校验、缺失时写出
 - **CLI 布局已定(owner 2026-07-10，照搬 Go 词汇表)**，随 S6.1/S6.2 落地：
   - `bur mod init <module-path>`：写 `bur.mod`，module path 显式给出、不从目录名猜
   - `bur mod tidy`：离线重算 MVS、重写 `bur.sum`(S6.2 后扩展为按 import 增删 require)
@@ -245,7 +245,7 @@
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序(2026-07-10 二次修订，S6.7/S6.3/S6.8 已完成)**：S6.8 checker 债批(已完成，见上)→ **S6.2 网络拉取** → S6.6 std/json → S6.4 `bur test` → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
+**推进顺序(2026-07-10 二次修订，S6.7/S6.3/S6.8/S6.2 已完成)**：S6.8 checker 债批(已完成)→ S6.2 网络拉取(已完成)→ **S6.6 std/json** → S6.4 `bur test` → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
