@@ -171,7 +171,14 @@
 
 - S6.1 解析层(无网络)：新 `burc/lib/modgraph.bur` 构建依赖图跑 MVS(选满足约束的**最低**版本)；新增 `bur.sum` lockfile(`path version hash`)；放开 module.bur:538 跨模块限制(命中 require 图则放行)；缓存目录 `$BURCACHE` 默认 `~/.burryn/pkg/<path>@<version>/`
 - S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native
-- 命令面(随 S6.1/S6.2 落地)：`bur mod init` / `bur mod tidy` / `bur mod download` / `bur get <path>@<version>`
+- **CLI 布局已定(owner 2026-07-10，照搬 Go 词汇表)**，随 S6.1/S6.2 落地：
+  - `bur mod init <module-path>`：写 `bur.mod`，module path 显式给出、不从目录名猜
+  - `bur mod tidy`：离线重算 MVS、重写 `bur.sum`(S6.2 后扩展为按 import 增删 require)
+  - `bur mod download`：拉取 require 闭包进缓存并校验(S6.2)
+  - `bur mod verify`：对照缓存树与 `bur.sum`(库函数 sum_check 已就位)
+  - `bur get <path>@<version>`：写入/升级 require + download + tidy(S6.2)
+  - `bur test [dir] [--run <substr>] [-v]`：顺序子进程测试，`--run` 子串过滤，`-v` 逐个打印；并行 `-j` 为后续加法
+  - flag 风格沿用现状：长 flag(`--check`/`--emit c` 式) + 单字母短 flag(`-o`/`-v` 式)
 - 遵守 §4 红线：MVS 确定性、去中心化、禁 build 期执行任意代码
 - 补充定案(owner 2026-07-10)：
   - `bur.sum` 行格式 `<path> <version> h1:<base64(树哈希)>`；树哈希 = 规范化目录哈希(路径排序 + 逐文件 sha256 汇总，Go dirhash 式)；版本 ↔ git tag 映射 `v<semver>`
@@ -272,9 +279,7 @@
 
 - 模块系统具体形态(import 语法、包内可见性细节、版本声明文件格式)
 - `select` 语义细节(default 分支？公平性？)
-- 工具链命令命名与 CLI 布局
 - 手写后端的调用约定与 GC 根扫描策略(S8 前定)
-- S6 各命令 CLI 布局与命名(`bur mod`/`bur get`/`bur fmt`/`bur test` 子命令形态)
 - S7.6 `defer` 块作用域细节(块表达式的求值时机、fiber 退出语义)
 - S7.8 可选签名标注的语法形态
 - S6.7 后续：net 落地时是否升级为通用 fd 感知调度(epoll/kqueue)
