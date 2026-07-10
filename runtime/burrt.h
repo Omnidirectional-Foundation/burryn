@@ -175,7 +175,7 @@ typedef struct OChannel OChannel;
 typedef struct OClosure OClosure; // full struct is defined above; alias needed here
 
 typedef enum {
-    FREADY, FBLOCKED_SEND, FBLOCKED_RECV, FBLOCKED_SELECT, FDONE
+    FREADY, FBLOCKED_SEND, FBLOCKED_RECV, FBLOCKED_SELECT, FDONE, FBLOCKED_TIMER
 } FiberStatus;
 
 struct Fiber {
@@ -190,6 +190,7 @@ struct Fiber {
     OClosure *entry;        // closure the fiber runs on first resume
     int call_depth;         // per-fiber call depth, for stack-overflow trapping
     int budget;             // instructions remaining before a forced yield
+    int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
 
     ucontext_t ctx;
     char *cstack;           // heap-allocated native stack backing ctx
@@ -220,6 +221,8 @@ static int64_t bur_nfibers, bur_fiberscap;
 static Fiber **bur_ready;              // FIFO ready queue
 static int64_t bur_ready_head, bur_ready_len, bur_ready_cap;
 static int bur_next_fiber_id;
+static int64_t bur_ntimers;            // fibers currently parked on a timer
+static bool bur_deterministic;         // BUR_DETERMINISTIC=1: serialize IO
 
 #define BUR_TIMESLICE 10000            // instructions per fiber turn (matches vm.go)
 #define BUR_STACK_SIZE (1 << 20)       // 1 MiB per spawned fiber
@@ -1290,13 +1293,48 @@ static void bur_fiber_entry(void) {
     setcontext(&bur_sched_ctx); // hand control back for good
 }
 
+static int64_t bur_now_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+}
+
+// wake every timer whose deadline has passed, in (deadline, fiber id) order;
+// bur_fibers is in creation (= id) order, so a strictly-less scan suffices
+static void bur_wake_due_timers(void) {
+    int64_t now = bur_now_ns();
+    while (bur_ntimers > 0) {
+        Fiber *best = NULL;
+        for (int64_t i = 0; i < bur_nfibers; i++) {
+            Fiber *f = bur_fibers[i];
+            if (f->status == FBLOCKED_TIMER && f->wake_ns <= now &&
+                (!best || f->wake_ns < best->wake_ns)) best = f;
+        }
+        if (!best) return;
+        bur_ntimers--;
+        bur_schedule(best);
+    }
+}
+
 // the scheduler loop: run ready fibers FIFO until the main fiber returns
-// (Go semantics) or nothing is left. All fibers blocked => deadlock.
+// (Go semantics) or nothing is left. All fibers blocked on channels =>
+// deadlock; timer waiters are alive, so an idle scheduler sleeps until the
+// nearest deadline instead.
 static void bur_scheduler(void) {
     for (;;) {
         if (bur_main_fiber->status == FDONE) return;
+        if (bur_ntimers > 0) bur_wake_due_timers();
         Fiber *f = bur_ready_pop();
         if (!f) {
+            if (bur_ntimers > 0) {
+                int64_t nearest = INT64_MAX;
+                for (int64_t i = 0; i < bur_nfibers; i++)
+                    if (bur_fibers[i]->status == FBLOCKED_TIMER && bur_fibers[i]->wake_ns < nearest)
+                        nearest = bur_fibers[i]->wake_ns;
+                struct timespec ts = { nearest / 1000000000, nearest % 1000000000 };
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+                continue;
+            }
             int blocked = 0;
             for (int64_t i = 0; i < bur_nfibers; i++) {
                 FiberStatus s = bur_fibers[i]->status;
@@ -1431,6 +1469,8 @@ static int bur_select(const unsigned char *kinds, int nArms, bool hasDefault) {
 static void bur_boot(int argc, char **argv) {
     bur_argc = argc;
     bur_argv = argv;
+    const char *det = getenv("BUR_DETERMINISTIC");
+    bur_deterministic = det && det[0] == '1' && det[1] == '\0';
     clock_gettime(CLOCK_MONOTONIC, &bur_start_time);
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     // fibers (including the main one) are created by generated main()

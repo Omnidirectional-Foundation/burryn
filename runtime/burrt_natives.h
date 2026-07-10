@@ -544,6 +544,19 @@ static Value nat_yield(Value *args, int argc) {
     bur_switch_to_sched();
     return bur_unit();
 }
+static Value nat_sleep(Value *args, int argc) {
+    (void)argc;
+    int64_t ms = args[0].u.i;
+    if (ms <= 0) { // sleep(0) is a plain yield
+        bur_schedule(bur_cur);
+        bur_switch_to_sched();
+        return bur_unit();
+    }
+    bur_cur->wake_ns = bur_now_ns() + ms * 1000000;
+    bur_ntimers++;
+    bur_park(FBLOCKED_TIMER); // the scheduler wakes us at the deadline
+    return bur_unit();
+}
 
 static Value nat_gc(Value *args, int argc) { (void)args; (void)argc; bur_gc_collect(); return bur_int(bur_gc_last_freed); }
 static Value nat_heap_objects(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_count); }
@@ -600,6 +613,7 @@ static void bur_register_natives(void) {
     bur_register_native("chr", 1, nat_chr);
     bur_register_native("ord", 1, nat_ord);
     bur_register_native("clock", 0, nat_clock);
+    bur_register_native("sleep", 1, nat_sleep);
     bur_register_native("type_of", 1, nat_type_of);
     bur_register_native("assert", 2, nat_assert);
     bur_register_native("gc", 0, nat_gc);
