@@ -141,7 +141,7 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)；S6.2 网络拉取(`git clone` + 规范树哈希校验)；S6.3 `bur fmt`；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO(sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批(SCC 序 + 枚举两遍注册 + `?` 相互递归) | 进行中 |
+| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取(`git clone` + 规范树哈希校验)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批(SCC 序 + 枚举两遍注册 + `?` 相互递归) | 进行中 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注 | 未开工 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 

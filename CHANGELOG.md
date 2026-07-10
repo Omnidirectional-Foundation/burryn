@@ -39,6 +39,27 @@ from the implementation.
   prefix) and the `bur.sum` line format
   `<path> <version> h1:<base64(tree hash)>`.
 
+**Landed S6.7 runtime IO and the complete `bur fmt` (S6.3)** — the same
+window's implementation batch.
+**落地 S6.7 runtime IO 与完整的 `bur fmt`（S6.3）** — 同窗口的实现批次。
+
+- Added the `sleep(ms)` native with timer-aware scheduling in both the C
+  runtime and the VM: idle schedulers sleep to the nearest deadline
+  instead of spinning or deadlocking.
+- Made `exec` fiber-blocking instead of scheduler-blocking, and added the
+  `exec_start`/`exec_poll` natives (two `exec sleep 0.5` fibers now finish
+  in 0.5s, previously 1.0s); `BUR_DETERMINISTIC=1` serializes children for
+  reproducible runs.
+- Finished the formatter: full AST coverage, comment reinsertion from
+  lexer trivia, and a verifier that rejects output unless it reparses to a
+  structurally equal AST (`ast_eq`) with every comment intact.
+- Added the public `bur fmt <file|dir|->` command with `--check` and stdin
+  modes, and formatted the whole `burc/` tree with it once.
+- Gave `EnumVariantDecl` a real span (was `Sp(0, 0)`).
+- Added `burc/lib/modgraph.bur`: offline S6.1 groundwork — bur.mod
+  parsing, semver ordering, MVS over `$BURCACHE`, canonical tree hashes,
+  bur.sum rendering/checking, and the hidden `bur dev mod-graph` command.
+
 ## v0.1 (2026-07-05 ~ 07-06)
 
 **Initial community scaffolding added** — set up the open-source contribution
