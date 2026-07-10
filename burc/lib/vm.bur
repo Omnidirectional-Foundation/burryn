@@ -1935,10 +1935,23 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         }
         if len(ready) == 0 {
             if ntimers > 0 {
-                // all runnable work waits on timers: spin until the nearest
-                // deadline passes (host sleep replaces this spin in the next
-                // generation, once the building binary knows the native)
+                // all runnable work waits on timers: host-sleep until the
+                // nearest deadline, then wake whatever came due
                 while len(ready) == 0 {
+                    let mut nearest = -1.0
+                    let mut ti = 0
+                    while ti < len(fb_status) {
+                        if fb_status[ti] == fs_blocked_timer {
+                            if nearest < 0.0 || fb_wakeat[ti] < nearest {
+                                nearest = fb_wakeat[ti]
+                            }
+                        }
+                        ti = ti + 1
+                    }
+                    let waitms = trunc((nearest - clock()) * 1000.0) + 1
+                    if waitms > 0 {
+                        sleep(waitms)
+                    }
                     wake_due_timers()
                 }
             } else {
