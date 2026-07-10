@@ -316,6 +316,68 @@ fn ty_instantiate_cp(mut tk, mut tn, mut ta, mut tr, mut tl, h, subst) {
     }
 }
 
+// scc_groups computes the strongly connected components of the directed
+// graph adj (node index -> successor node indices) with Tarjan's algorithm.
+// Components come out in completion order, so every component appears after
+// the components it points to (callees first); the order is deterministic
+// for a given adj.
+fn scc_groups(adj) {
+    let n = len(adj)
+    let mut sidx = []
+    let mut slow = []
+    let mut onstk = []
+    let mut i = 0
+    while i < n {
+        push(sidx, -1)
+        push(slow, 0)
+        push(onstk, false)
+        i = i + 1
+    }
+    let mut stk = []
+    let mut counter = 0
+    let mut comps = []
+    fn connect(v) {
+        sidx[v] = counter
+        slow[v] = counter
+        counter = counter + 1
+        push(stk, v)
+        onstk[v] = true
+        for w in adj[v] {
+            if sidx[w] < 0 {
+                connect(w)
+                if slow[w] < slow[v] {
+                    slow[v] = slow[w]
+                }
+            } else if onstk[w] {
+                if sidx[w] < slow[v] {
+                    slow[v] = sidx[w]
+                }
+            }
+        }
+        if slow[v] == sidx[v] {
+            let mut comp = []
+            let mut more = true
+            while more {
+                let w = pop(stk)
+                onstk[w] = false
+                push(comp, w)
+                if w == v {
+                    more = false
+                }
+            }
+            push(comps, comp)
+        }
+    }
+    i = 0
+    while i < n {
+        if sidx[i] < 0 {
+            connect(i)
+        }
+        i = i + 1
+    }
+    comps
+}
+
 // typecheck_script checks a script (the non-package form), mirroring
 // typecheck() in types.go. All checker state lives in the mut locals below;
 // helpers are nested fns closing over it. Mutual-recursion knots
@@ -370,6 +432,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut e_pub = []
     let mut b_pub = []
     let mut b_file = []
+    let mut b_ready = [] // false while a top-level fn awaits its inference group
     let mut cur_pkg = "" // import path of the package being checked
     let mut cur_aliases = map() // current file's import aliases (alias -> path)
     let mut pkg_vals = map() // "path.name" -> binding handle, for importers
@@ -473,6 +536,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         push(b_span, sp)
         push(b_pub, false)
         push(b_file, cur_file)
+        push(b_ready, true)
         len(b_scheme) - 1
     }
     fn declare(name, sch, is_mut, kind, sp) {
@@ -843,6 +907,168 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             [-2, -1]
         } else {
             [found, idx]
+        }
+    }
+
+    // ---- free-name scan (dependency edges for SCC inference order) ----
+    fn scan_bound(sc, name) {
+        let mut i = len(sc) - 1
+        let mut hit = false
+        while i >= 0 {
+            match get(sc[i], name) {
+                Some(_) => {
+                    hit = true
+                    i = -1
+                },
+                None => {
+                    i = i - 1
+                },
+            }
+        }
+        hit
+    }
+    fn scan_bind(mut sc, name) {
+        put(sc[len(sc) - 1], name, true)
+    }
+    // scan_free collects the names decl body n references without binding
+    // them locally, in first-occurrence order; the caller keeps the ones
+    // that resolve to top-level fns of the package. sc is the local scope
+    // stack (innermost last). Binding forms mirror infer_expr/infer_stmt,
+    // including the bare-name pattern that only binds when it is not a
+    // known variant (the checker's catch-all case).
+    fn scan_free(n, mut sc, mut seen, mut out) {
+        match n {
+            Ident(name, _) => {
+                if !scan_bound(sc, name) {
+                    let dup = match get(seen, name) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if !dup {
+                        put(seen, name, true)
+                        push(out, name)
+                    }
+                }
+            },
+            Unary(_, e, _) => scan_free(e, sc, seen, out),
+            TryExpr(e, _) => scan_free(e, sc, seen, out),
+            RecvExpr(e, _) => scan_free(e, sc, seen, out),
+            ExprStmt(e, _) => scan_free(e, sc, seen, out),
+            SpawnStmt(e, _) => scan_free(e, sc, seen, out),
+            ReturnStmt(e, _) => scan_free(e, sc, seen, out),
+            Binary(_, l, r, _) => {
+                scan_free(l, sc, seen, out)
+                scan_free(r, sc, seen, out)
+            },
+            Logical(_, l, r, _) => {
+                scan_free(l, sc, seen, out)
+                scan_free(r, sc, seen, out)
+            },
+            Index(l, r, _) => {
+                scan_free(l, sc, seen, out)
+                scan_free(r, sc, seen, out)
+            },
+            SendStmt(l, r, _) => {
+                scan_free(l, sc, seen, out)
+                scan_free(r, sc, seen, out)
+            },
+            AssignStmt(l, r, _) => {
+                scan_free(l, sc, seen, out)
+                scan_free(r, sc, seen, out)
+            },
+            WhileStmt(l, r, _) => {
+                scan_free(l, sc, seen, out)
+                scan_free(r, sc, seen, out)
+            },
+            Call(callee, cargs, _) => {
+                scan_free(callee, sc, seen, out)
+                for a in cargs {
+                    scan_free(a, sc, seen, out)
+                }
+            },
+            ListLit(elems, _) => {
+                for a in elems {
+                    scan_free(a, sc, seen, out)
+                }
+            },
+            IfExpr(c, t, e, _) => {
+                scan_free(c, sc, seen, out)
+                scan_free(t, sc, seen, out)
+                scan_free(e, sc, seen, out)
+            },
+            FnLit(params, _, _, body, _, _) => {
+                push(sc, map())
+                for p in params {
+                    scan_bind(sc, p)
+                }
+                scan_free(body, sc, seen, out)
+                let _ = pop(sc)
+            },
+            Block(stmts, _) => {
+                push(sc, map())
+                for s in stmts {
+                    scan_free(s, sc, seen, out)
+                }
+                let _ = pop(sc)
+            },
+            LetStmt(name, _, _, _, init, _) => {
+                scan_free(init, sc, seen, out)
+                scan_bind(sc, name)
+            },
+            FnDecl(name, _, _, lit, _) => {
+                scan_bind(sc, name)
+                scan_free(lit, sc, seen, out)
+            },
+            ForStmt(v, _, iter, _, body, _) => {
+                scan_free(iter, sc, seen, out)
+                push(sc, map())
+                scan_bind(sc, v)
+                scan_free(body, sc, seen, out)
+                let _ = pop(sc)
+            },
+            MatchExpr(scrut, arms, _) => {
+                scan_free(scrut, sc, seen, out)
+                for arm in arms {
+                    scan_free(arm, sc, seen, out)
+                }
+            },
+            MatchArm(pat, body, _) => {
+                push(sc, map())
+                scan_free(pat, sc, seen, out)
+                scan_free(body, sc, seen, out)
+                let _ = pop(sc)
+            },
+            PatBinding(name, _) => {
+                let fv = find_variant_sig(name)
+                if fv[0] == -1 {
+                    scan_bind(sc, name)
+                }
+            },
+            PatVariant(_, _, _, binds, _) => {
+                for pb in binds {
+                    match pb {
+                        PatBinding(bn, _) => scan_bind(sc, bn),
+                        _ => {},
+                    }
+                }
+            },
+            SelectStmt(arms, _, dflt, _, _) => {
+                for arm in arms {
+                    scan_free(arm, sc, seen, out)
+                }
+                scan_free(dflt, sc, seen, out)
+            },
+            SelectArm(is_send, bind, _, ch, val, body, _) => {
+                scan_free(ch, sc, seen, out)
+                scan_free(val, sc, seen, out)
+                push(sc, map())
+                if !is_send && bind != "" && bind != "_" {
+                    scan_bind(sc, bind)
+                }
+                scan_free(body, sc, seen, out)
+                let _ = pop(sc)
+            },
+            _ => {},
         }
     }
 
@@ -1251,6 +1477,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             Ident(name, isp) => {
                 let b = lookup(name)
                 if b >= 0 {
+                    // a not-ready hit means the dependency scan missed an
+                    // edge: a compiler bug, not a user error
+                    if b_kind[b] == "global" && b_isfn[b] {
+                        assert(b_ready[b], "internal: `" + name + "` used before its inference group")
+                    }
                     b_used[b] = true
                     instantiate(b_scheme[b])
                 } else {
@@ -1777,19 +2008,36 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             validate_enum_fields(reg_decls[ri])
             ri = ri + 1
         }
-        // pass 1.5: pre-declare every top-level value name (monomorphic)
+        // pass 1.5: pre-declare every top-level value name. Lets keep a
+        // monomorphic level-0 placeholder (pre); fns are declared but stay
+        // not-ready until pass 2a assigns their group placeholder
         let mut pre = map()
+        let mut fnames = [] // distinct top-level fn names, declaration order
+        let mut fname_idx = map()
+        let mut fd_name = [] // per fn decl: index into fnames
+        let mut fd_stmt = []
+        let mut fd_file = []
         fi = 0
         while fi < n_files {
             cur_file = file_paths[fi]
             for s in files_stmts[fi] {
                 match s {
                     FnDecl(name, nsp, is_pub, _, _) => {
-                        let tv = fresh("")
-                        put(pre, name, tv)
-                        let b = declare(name, mono(tv), false, "global", nsp)
+                        let b = declare(name, mono(fresh("")), false, "global", nsp)
                         b_isfn[b] = true
                         b_pub[b] = is_pub
+                        b_ready[b] = false
+                        let ni = match get(fname_idx, name) {
+                            Some(x) => x,
+                            None => {
+                                put(fname_idx, name, len(fnames))
+                                push(fnames, name)
+                                len(fnames) - 1
+                            },
+                        }
+                        push(fd_name, ni)
+                        push(fd_stmt, s)
+                        push(fd_file, fi)
                     },
                     LetStmt(name, nsp, is_mut, is_pub, _, _) => {
                         let tv = fresh("")
@@ -1803,29 +2051,122 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             fi = fi + 1
         }
 
-        // pass 2: infer file by file, in load order
+        // pass 1.7: fn dependency graph (free names resolved against the
+        // package's fn names) and its SCC groups, callees first
+        let mut adj = []
+        let mut ni = 0
+        while ni < len(fnames) {
+            push(adj, [])
+            ni = ni + 1
+        }
+        let mut di = 0
+        while di < len(fd_stmt) {
+            cur_file = file_paths[fd_file[di]]
+            cur_aliases = aliases_of(file_imports[fd_file[di]])
+            match fd_stmt[di] {
+                FnDecl(_, _, _, lit, _) => {
+                    let mut sc = [map()]
+                    let mut seen = map()
+                    let mut free = []
+                    scan_free(lit, sc, seen, free)
+                    for fname in free {
+                        match get(fname_idx, fname) {
+                            Some(ti) => {
+                                if !contains(adj[fd_name[di]], ti) {
+                                    push(adj[fd_name[di]], ti)
+                                }
+                            },
+                            None => {},
+                        }
+                    }
+                },
+                _ => {},
+            }
+            di = di + 1
+        }
+        let groups = scc_groups(adj)
+        let mut gdecls = [] // per group: its decl indices, declaration order
+        let mut name_group = []
+        ni = 0
+        while ni < len(fnames) {
+            push(name_group, -1)
+            ni = ni + 1
+        }
+        let mut gi = 0
+        while gi < len(groups) {
+            push(gdecls, [])
+            for gn in groups[gi] {
+                name_group[gn] = gi
+            }
+            gi = gi + 1
+        }
+        di = 0
+        while di < len(fd_stmt) {
+            push(gdecls[name_group[fd_name[di]]], di)
+            di = di + 1
+        }
+
+        // pass 2a: infer fns group by group in dependency order. Group
+        // placeholders live at the raised level so mutual references stay
+        // un-generalized inside the group; each member generalizes once the
+        // whole group is inferred
+        gi = 0
+        while gi < len(groups) {
+            level = level + 1
+            let mut gtv = map() // member name -> group placeholder
+            for gn in groups[gi] {
+                let name = fnames[gn]
+                let tv = fresh("")
+                let b = lookup(name)
+                b_scheme[b] = mono(tv)
+                b_ready[b] = true
+                put(gtv, name, tv)
+            }
+            let mut gft = [] // inferred type per group decl
+            for gd in gdecls[gi] {
+                cur_file = file_paths[fd_file[gd]]
+                cur_aliases = aliases_of(file_imports[fd_file[gd]])
+                match fd_stmt[gd] {
+                    FnDecl(name, nsp, is_pub, lit, _) => {
+                        if is_pub && !is_pkg {
+                            err_pub_script(span_of(fd_stmt[gd]))
+                        }
+                        let ft = infer_expr(lit)
+                        match get(gtv, name) {
+                            Some(tv) => unify_at(tv, ft, nsp, "in this function"),
+                            None => {},
+                        }
+                        push(gft, ft)
+                    },
+                    _ => push(gft, fresh("")),
+                }
+            }
+            level = level - 1
+            let mut mi = 0
+            while mi < len(gdecls[gi]) {
+                match fd_stmt[gdecls[gi][mi]] {
+                    FnDecl(name, _, _, _, _) => {
+                        let b = lookup(name)
+                        b_scheme[b] = generalize(gft[mi])
+                    },
+                    _ => {},
+                }
+                mi = mi + 1
+            }
+            gi = gi + 1
+        }
+
+        // pass 2b: infer the remaining top-level statements file by file,
+        // in load order (matches the runtime initialization order of
+        // package-level lets and script statements)
         fi = 0
         while fi < n_files {
             cur_file = file_paths[fi]
             cur_aliases = aliases_of(file_imports[fi])
             for s in files_stmts[fi] {
                 match s {
-                    FnDecl(name, nsp, is_pub, lit, _) => {
-                        if is_pub && !is_pkg {
-                            err_pub_script(span_of(s))
-                        }
-                        level = level + 1
-                        let ft = infer_expr(lit)
-                        level = level - 1
-                        // generalize BEFORE linking the level-0 placeholder: unify
-                        // would pin every inner var to level 0 and kill polymorphism
-                        let b = lookup(name)
-                        b_scheme[b] = generalize(ft)
-                        let pt = match get(pre, name) {
-                            Some(t) => t,
-                            None => ft,
-                        }
-                        unify_at(pt, ft, nsp, "in this function")
+                    FnDecl(_, _, _, _, _) => {
+                        // inferred in pass 2a
                     },
                     LetStmt(name, nsp, _, is_pub, init, _) => {
                         if is_pub && !is_pkg {
