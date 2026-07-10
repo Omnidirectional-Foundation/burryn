@@ -59,6 +59,11 @@ window's implementation batch.
 - Added `burc/lib/modgraph.bur`: offline S6.1 groundwork — bur.mod
   parsing, semver ordering, MVS over `$BURCACHE`, canonical tree hashes,
   bur.sum rendering/checking, and the hidden `bur dev mod-graph` command.
+- Settled the remaining S6 design questions: interface files in the
+  future optional-annotation syntax as the module cache (key: toolchain
+  version + tree hash), subprocess isolation for `bur test`, std embedded
+  into the binary, and the S6 order `S6.8 -> S6.2 -> S6.6 -> S6.4 ->
+  S6.1 wiring`.
 
 ## v0.1 (2026-07-05 ~ 07-06)
 
