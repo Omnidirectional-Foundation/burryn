@@ -89,6 +89,21 @@ file-order semantics.
   chain from the archived Go seed, whose checker still infers in file
   order.
 
+**Landed S6.2 network fetch with the `bur mod` and `bur get` commands** —
+dependency management is now end to end: require, fetch, lock, verify.
+**落地 S6.2 网络拉取与 `bur mod` / `bur get` 命令** — 依赖管理全链打通：
+require、拉取、锁定、校验。
+
+- Added `mod_fetch`: a shallow `git clone` of the `v<semver>` tag into
+  `$BURCACHE`, with `.git` stripped before the tree enters the cache; a
+  missing tag reports the offending `require` line. Clone URLs default to
+  `https://<module path>`; `$BURGITBASE` overrides the prefix.
+- Wired `bur mod init <path>`, `bur mod tidy [dir]`, `bur mod download
+  [dir]`, `bur mod verify [dir]`, and `bur get <path>@<version>` (which
+  restores the previous bur.mod if the fetch fails).
+- Corrected the tree-hash encoding from hex to the settled
+  `h1:<base64(sha256)>` format.
+
 ## v0.1 (2026-07-05 ~ 07-06)
 
 **Initial community scaffolding added** — set up the open-source contribution
