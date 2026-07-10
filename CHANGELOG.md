@@ -64,6 +64,10 @@ window's implementation batch.
   version + tree hash), subprocess isolation for `bur test`, std embedded
   into the binary, and the S6 order `S6.8 -> S6.2 -> S6.6 -> S6.4 ->
   S6.1 wiring`.
+- Settled the S6 CLI layout after Go's vocabulary: `bur mod
+  init/tidy/download/verify`, `bur get <path>@<version>`, and
+  `bur test [dir] [--run <substr>] [-v]`; the CLI-naming item leaves the
+  pending list.
 
 ## v0.1 (2026-07-05 ~ 07-06)
 
