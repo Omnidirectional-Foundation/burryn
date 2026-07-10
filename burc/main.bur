@@ -52,6 +52,8 @@ fn main() {
         mod_cmd(slice(a, 1, len(a)))
     } else if cmd == "get" {
         get_cmd(slice(a, 1, len(a)))
+    } else if cmd == "test" {
+        test_cmd(slice(a, 1, len(a)))
     } else if cmd == "version" || cmd == "-v" || cmd == "--version" {
         println("Burryn " + version + " — the ring beneath Meyrin")
     } else if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -79,6 +81,7 @@ fn usage() {
     println("  bur mod download [dir] fetch the require closure into the cache")
     println("  bur mod verify [dir]   check cached trees against bur.sum")
     println("  bur get <path>@<ver>   add or upgrade a require, then download")
+    println("  bur test [dir]         run the test_* fns of *_test.bur files")
     println("  bur version")
     println("")
     println("bur build flags:")
@@ -88,6 +91,10 @@ fn usage() {
     println("bur fmt flags:")
     println("  --check                list files that would change; exit 1 if any")
     println("  -                      read stdin, write the result to stdout")
+    println("")
+    println("bur test flags:")
+    println("  --run <substr>         only run tests whose name contains substr")
+    println("  -v                     print each passing test's output too")
 }
 
 // fmt_cmd implements `bur fmt <file|dir|-> [--check]`: rewrite sources in
@@ -681,6 +688,14 @@ fn dev_cmd(rest) {
         dev_mod_graph(strip_trailing_slash(rest[1]))
         return
     }
+    if sub == "run-test" {
+        if len(rest) < 3 {
+            eprintln("usage: bur dev run-test <dir> <fn>")
+            exit(exit_usage)
+        }
+        run_test_target(strip_trailing_slash(rest[1]), rest[2])
+        return
+    }
     let src = match read_file(rest[1]) {
         Ok(s) => s,
         Err(msg) => {
@@ -802,6 +817,142 @@ fn get_cmd(rest) {
         exit(exit_usage)
     }
     mod_report(lib.mod_get(".", rest[0]))
+}
+
+// self_exe resolves this binary's own path for re-exec (GOALS S6.4: zero
+// new natives). `readlink /proc/self/exe` in a child would resolve the
+// child's own binary, so the shell reads the parent's — $PPID inside the
+// spawned sh is this bur process.
+fn self_exe() {
+    match exec("sh", ["-c", "readlink /proc/$PPID/exe"]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    trim(so)
+                } else {
+                    ""
+                }
+            },
+        },
+        Err(_) => "",
+    }
+}
+
+// test_cmd implements `bur test [dir] [--run <substr>] [-v]`: each test_*
+// fn of the dir's *_test.bur files runs in its own subprocess (`bur dev
+// run-test`) with BUR_DETERMINISTIC=1; a nonzero exit — including trap and
+// deadlock exits — is a failure.
+fn test_cmd(rest) {
+    let mut dir = "."
+    let mut run_filter = ""
+    let mut verbose = false
+    let mut i = 0
+    while i < len(rest) {
+        let a = rest[i]
+        if a == "--run" {
+            if i + 1 >= len(rest) {
+                eprintln("usage: bur test [dir] [--run <substr>] [-v]")
+                exit(exit_usage)
+            }
+            run_filter = rest[i + 1]
+            i = i + 1
+        } else if a == "-v" {
+            verbose = true
+        } else {
+            dir = strip_trailing_slash(a)
+        }
+        i = i + 1
+    }
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    let all = match lib.test_discover(dir) {
+        Ok(ns) => ns,
+        Err(m) => {
+            eprintln("error: " + m)
+            exit(exit_no_input)
+            []
+        },
+    }
+    let mut selected = []
+    for n in all {
+        if run_filter == "" || str_contains(n, run_filter) {
+            push(selected, n)
+        }
+    }
+    if len(selected) == 0 {
+        println("no tests to run")
+        return
+    }
+    let self_path = self_exe()
+    if self_path == "" {
+        eprintln("error: cannot resolve own binary via readlink /proc/self/exe")
+        exit(exit_no_input)
+    }
+    let mut failed = 0
+    for name in selected {
+        match exec("env", ["BUR_DETERMINISTIC=1", self_path, "dev", "run-test", dir, name]) {
+            Ok(o) => match o {
+                Output(code, so, se) => {
+                    if code == 0 {
+                        println("ok   " + name)
+                        if verbose && so != "" {
+                            print(so)
+                        }
+                    } else {
+                        failed = failed + 1
+                        println("FAIL " + name + " (exit " + str(code) + ")")
+                        if so != "" {
+                            print(so)
+                        }
+                        if trim(se) != "" {
+                            println(trim(se))
+                        }
+                    }
+                },
+            },
+            Err(m) => {
+                failed = failed + 1
+                println("FAIL " + name + ": " + m)
+            },
+        }
+    }
+    if failed == 0 {
+        println("PASS  " + str(len(selected)) + " test(s)")
+    } else {
+        println("FAIL  " + str(failed) + " of " + str(len(selected)) + " test(s)")
+        exit(exit_static)
+    }
+}
+
+// run_test_target compiles the module with its test files and a synthetic
+// main that calls one test fn, then runs it (the `bur dev run-test` child)
+fn run_test_target(dir, fnname) {
+    match lib.load_module_test(dir, fnname) {
+        lib.ModOut.ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        lib.CompileOut.CompileFailed(d, f) => {
+                            eprintln(lib.dump_diag_f(d, f))
+                            exit(exit_static)
+                        },
+                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                            lib.run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [])
+                        },
+                    }
+                },
+            }
+        },
+    }
 }
 
 fn dev_build_dir(dir) {

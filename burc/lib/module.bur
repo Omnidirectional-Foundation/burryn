@@ -449,6 +449,13 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
 // imports. Packages come back in dependency order, entry last (module.go
 // loadPackage).
 pub fn load_module(dir0) {
+    load_module_opts(dir0, false)
+}
+
+// load_module_opts is load_module with a switch: with_tests additionally
+// loads the root package's `*_test.bur` files (`bur test`); every other
+// load excludes them, so test files never reach a normal build
+fn load_module_opts(dir0, with_tests) {
     let dir = if str_ends_with(dir0, "/") {
         substr(dir0, 0, str_len(dir0) - 1)
     } else {
@@ -550,8 +557,9 @@ pub fn load_module(dir0) {
         let mut file_paths = []
         let mut file_imports = []
         let mut bur_files = 0
+        let want_tests = with_tests && path == mod_path
         for name in entries {
-            if str_ends_with(name, ".bur") {
+            if str_ends_with(name, ".bur") && (want_tests || !str_ends_with(name, "_test.bur")) {
                 bur_files = bur_files + 1
                 let disp = pdir + "/" + name
                 let src = match read_file(disp) {
@@ -770,4 +778,121 @@ pub fn load_module(dir0) {
     } else {
         ModLoaded(diags, dfiles, out_paths, out_files, out_fpaths, out_imports)
     }
+}
+
+// load_module_test loads dir with its root `*_test.bur` files, drops the
+// package's own `fn main`, and appends a synthetic entry file whose main
+// calls the one target test fn (`bur dev run-test`)
+pub fn load_module_test(dir0, test_fn) {
+    match load_module_opts(dir0, true) {
+        ModFailed(d, f) => ModFailed(d, f),
+        ModLoaded(ld, lf, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            let ei = len(pkgs_stmts) - 1
+            let mut np_stmts = []
+            let mut np_fpaths = []
+            let mut np_imports = []
+            let mut pi = 0
+            while pi < len(pkgs_stmts) {
+                if pi == ei {
+                    let mut fstmts = []
+                    let mut fpaths = []
+                    let mut fimps = []
+                    let mut fi = 0
+                    while fi < len(pkgs_stmts[pi]) {
+                        let mut kept = []
+                        for s in pkgs_stmts[pi][fi] {
+                            match s {
+                                FnDecl(n, _, _, _, _) => {
+                                    if n != "main" {
+                                        push(kept, s)
+                                    }
+                                },
+                                _ => push(kept, s),
+                            }
+                        }
+                        push(fstmts, kept)
+                        push(fpaths, pkgs_fpaths[pi][fi])
+                        push(fimps, pkgs_imports[pi][fi])
+                        fi = fi + 1
+                    }
+                    let z = Sp(0, 0)
+                    let call = ExprStmt(Call(Ident(test_fn, z), [], z), z)
+                    let lit = FnLit([], [], [], Block([call], z), "main", z)
+                    push(fstmts, [FnDecl("main", z, false, lit, z)])
+                    push(fpaths, "<test:" + test_fn + ">")
+                    push(fimps, [])
+                    push(np_stmts, fstmts)
+                    push(np_fpaths, fpaths)
+                    push(np_imports, fimps)
+                } else {
+                    push(np_stmts, pkgs_stmts[pi])
+                    push(np_fpaths, pkgs_fpaths[pi])
+                    push(np_imports, pkgs_imports[pi])
+                }
+                pi = pi + 1
+            }
+            ModLoaded(ld, lf, pkg_paths, np_stmts, np_fpaths, np_imports)
+        },
+    }
+}
+
+// test_discover lists the zero-parameter `fn test_*` names declared in the
+// `*_test.bur` files directly under dir, in file-then-declaration order
+pub fn test_discover(dir) {
+    let entries = match read_dir(dir) {
+        Ok(es) => es,
+        Err(m) => {
+            return Err("cannot read " + dir + ": " + m)
+            []
+        },
+    }
+    let mut tfiles = []
+    for n in entries {
+        if str_ends_with(n, "_test.bur") {
+            push(tfiles, n)
+        }
+    }
+    let mut names = []
+    for fname in sorted_strs(tfiles) {
+        let disp = dir + "/" + fname
+        let src = match read_file(disp) {
+            Ok(s) => s,
+            Err(m) => {
+                return Err("cannot read " + disp + ": " + m)
+                ""
+            },
+        }
+        match lex(src) {
+            Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    return Err(disp + " has lex errors; run `bur check " + dir + "`")
+                }
+                match parse(toks) {
+                    Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            return Err(disp + " has parse errors; run `bur check " + dir + "`")
+                        }
+                        for s in stmts {
+                            match s {
+                                FnDecl(n, _, _, flit, _) => {
+                                    if str_has_prefix(n, "test_") {
+                                        match flit {
+                                            FnLit(ps, _, _, _, _, _) => {
+                                                if len(ps) == 0 {
+                                                    push(names, n)
+                                                }
+                                            },
+                                            _ => {},
+                                        }
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+    Ok(names)
 }
