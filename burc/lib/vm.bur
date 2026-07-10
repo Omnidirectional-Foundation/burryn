@@ -50,6 +50,7 @@ let fs_blocked_send = 1
 let fs_blocked_recv = 2
 let fs_blocked_select = 3
 let fs_done = 4
+let fs_blocked_timer = 5
 
 // instructions per fiber before a forced yield (vm.go timeSlice)
 let vm_time_slice = 10000
@@ -97,9 +98,12 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     let mut fb_fr_cl = []   // call frames: closure handle
     let mut fb_fr_ip = []   // call frames: instruction pointer
     let mut fb_fr_base = [] // call frames: stack base
+    let mut fb_wakeat = []  // absolute clock() deadline while fs_blocked_timer
     let mut ready = []      // FIFO of ready fiber ids
     let mut main_fiber = 0
     let mut park_recv = -1  // set by the recv() native to ask OpCall to park
+    let mut park_sleep = -1.0 // wake deadline set by the sleep() native, or -1
+    let mut ntimers = 0     // fibers currently parked on a timer
     let mut yield_flag = false
     let mut opt_enum = -1
     let mut res_enum = -1
@@ -491,6 +495,31 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         push(ready, f)
     }
 
+    // wake every timer whose deadline has passed, in (deadline, fiber id)
+    // order; fiber ids ascend during the scan, so strictly-less picks suffice
+    fn wake_due_timers() {
+        let now = clock()
+        let mut going = true
+        while going {
+            going = false
+            let mut best = -1
+            let mut i = 0
+            while i < len(fb_status) {
+                if fb_status[i] == fs_blocked_timer && fb_wakeat[i] <= now {
+                    if best < 0 || fb_wakeat[i] < fb_wakeat[best] {
+                        best = i
+                    }
+                }
+                i = i + 1
+            }
+            if best >= 0 {
+                ntimers = ntimers - 1
+                schedule(best)
+                going = true
+            }
+        }
+    }
+
     fn new_fiber(cl, args) {
         push(fb_stack, [VObj(cl)])
         push(fb_status, fs_ready)
@@ -500,6 +529,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         push(fb_fr_cl, [cl])
         push(fb_fr_ip, [0])
         push(fb_fr_base, [0])
+        push(fb_wakeat, -1.0)
         let f = len(fb_stack) - 1
         for a in args {
             push(fb_stack[f], a)
@@ -1067,6 +1097,13 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         } else if nm == "yield" {
             yield_flag = true
             VUnit
+        } else if nm == "sleep" {
+            if int_of(fpeek(f, 0)) > 0 {
+                park_sleep = clock() + to_float(int_of(fpeek(f, 0))) / 1000.0
+            } else {
+                yield_flag = true // sleep(0) is a plain yield
+            }
+            VUnit
         } else {
             trap("unknown native " + nm + " (VM bug)")
             VUnit
@@ -1427,6 +1464,13 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     wake_waiters(ch) // a select send arm can now proceed
                     fb_fr_ip[f][fi] = start_ip // re-run the call (and recv) once woken
                     return false
+                }
+                if park_sleep >= 0.0 { // the sleep() native set a deadline
+                    fb_status[f] = fs_blocked_timer
+                    fb_wakeat[f] = park_sleep
+                    park_sleep = -1.0
+                    ntimers = ntimers + 1
+                    return false // resumes after the call once the timer fires
                 }
                 if yield_flag { // a native (yield) asked us to hand off
                     yield_flag = false
@@ -1886,23 +1930,35 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     vm_on = true
 
     while true {
+        if ntimers > 0 {
+            wake_due_timers()
+        }
         if len(ready) == 0 {
-            // main finished => program over (checked below); otherwise deadlock
-            let mut blocked = 0
-            let mut bi = 0
-            while bi < len(fb_status) {
-                let st = fb_status[bi]
-                if st == fs_blocked_send || st == fs_blocked_recv || st == fs_blocked_select {
-                    blocked = blocked + 1
+            if ntimers > 0 {
+                // all runnable work waits on timers: spin until the nearest
+                // deadline passes (host sleep replaces this spin in the next
+                // generation, once the building binary knows the native)
+                while len(ready) == 0 {
+                    wake_due_timers()
                 }
-                bi = bi + 1
+            } else {
+                // main finished => program over (checked below); otherwise deadlock
+                let mut blocked = 0
+                let mut bi = 0
+                while bi < len(fb_status) {
+                    let st = fb_status[bi]
+                    if st == fs_blocked_send || st == fs_blocked_recv || st == fs_blocked_select {
+                        blocked = blocked + 1
+                    }
+                    bi = bi + 1
+                }
+                if blocked > 0 {
+                    eprintln("fatal: deadlock — all " + str(blocked) +
+                        " remaining fiber(s) are blocked on channels")
+                    exit(4)
+                }
+                return
             }
-            if blocked > 0 {
-                eprintln("fatal: deadlock — all " + str(blocked) +
-                    " remaining fiber(s) are blocked on channels")
-                exit(4)
-            }
-            return
         }
         let fx = ready[0]
         ready = slice(ready, 1, len(ready))
