@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <ucontext.h>
 
 // ---- Value ------------------------------------------------------------
@@ -175,7 +176,8 @@ typedef struct OChannel OChannel;
 typedef struct OClosure OClosure; // full struct is defined above; alias needed here
 
 typedef enum {
-    FREADY, FBLOCKED_SEND, FBLOCKED_RECV, FBLOCKED_SELECT, FDONE, FBLOCKED_TIMER
+    FREADY, FBLOCKED_SEND, FBLOCKED_RECV, FBLOCKED_SELECT, FDONE, FBLOCKED_TIMER,
+    FBLOCKED_IO
 } FiberStatus;
 
 struct Fiber {
@@ -191,6 +193,7 @@ struct Fiber {
     int call_depth;         // per-fiber call depth, for stack-overflow trapping
     int budget;             // instructions remaining before a forced yield
     int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
+    int64_t io_proc;        // process handle awaited while FBLOCKED_IO
 
     ucontext_t ctx;
     char *cstack;           // heap-allocated native stack backing ctx
@@ -222,6 +225,7 @@ static Fiber **bur_ready;              // FIFO ready queue
 static int64_t bur_ready_head, bur_ready_len, bur_ready_cap;
 static int bur_next_fiber_id;
 static int64_t bur_ntimers;            // fibers currently parked on a timer
+static int64_t bur_nio;                // fibers currently parked on process IO
 static bool bur_deterministic;         // BUR_DETERMINISTIC=1: serialize IO
 
 #define BUR_TIMESLICE 10000            // instructions per fiber turn (matches vm.go)
@@ -1299,6 +1303,93 @@ static int64_t bur_now_ns(void) {
     return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
 }
 
+// ---- child processes (exec_start/exec_poll and the exec native) --------
+//
+// A spawned child is a slot here: its pipes are drained non-blockingly by
+// bur_proc_pump, the scheduler's idle poll watches every live fd, and a
+// slot is complete once both pipes hit EOF and the child is reaped.
+
+typedef struct {
+    pid_t pid;
+    int outfd, errfd, failfd;   // parent read ends, -1 once closed
+    Buf ob, eb;                 // collected stdout/stderr
+    int child_err;              // errno from a failed exec, via failfd
+    bool have_err;
+    int code;                   // exit code once reaped
+    bool complete;              // pipes drained + child reaped
+    bool consumed;              // result already handed out
+    bool used;                  // slot allocated
+} BurProc;
+
+static BurProc *bur_procs;
+static int64_t bur_nprocs, bur_procscap;
+
+static bool bur_proc_valid(int64_t h) {
+    return h >= 0 && h < bur_nprocs && bur_procs[h].used && !bur_procs[h].consumed;
+}
+
+// drain whatever the pipes hold without blocking; reap once both hit EOF
+static void bur_proc_pump(BurProc *p) {
+    if (p->complete) return;
+    char chunk[8192]; ssize_t r;
+    if (p->failfd >= 0) {
+        r = read(p->failfd, &p->child_err, sizeof p->child_err);
+        if (r == (ssize_t)sizeof p->child_err) p->have_err = true;
+        if (r == 0 || r > 0) { close(p->failfd); p->failfd = -1; }
+    }
+    if (p->outfd >= 0) {
+        while ((r = read(p->outfd, chunk, sizeof chunk)) > 0) buf_bytes(&p->ob, chunk, (int64_t)r);
+        if (r == 0) { close(p->outfd); p->outfd = -1; }
+    }
+    if (p->errfd >= 0) {
+        while ((r = read(p->errfd, chunk, sizeof chunk)) > 0) buf_bytes(&p->eb, chunk, (int64_t)r);
+        if (r == 0) { close(p->errfd); p->errfd = -1; }
+    }
+    if (p->outfd < 0 && p->errfd < 0) {
+        if (p->failfd >= 0) { // exec succeeded: CLOEXEC closed it; drain the EOF
+            r = read(p->failfd, &p->child_err, sizeof p->child_err);
+            if (r == (ssize_t)sizeof p->child_err) p->have_err = true;
+            close(p->failfd); p->failfd = -1;
+        }
+        int status = 0;
+        waitpid(p->pid, &status, 0); // both pipes are EOF, the child is gone
+        p->code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        p->complete = true;
+    }
+}
+
+// poll every live proc fd (waiting timeout_ms, -1 = forever), pump what is
+// ready, and wake fibers whose awaited proc completed, in fiber id order
+static void bur_poll_io(int timeout_ms) {
+    struct pollfd *pfds = NULL;
+    int64_t *owner = NULL;
+    int n = 0;
+    for (int64_t i = 0; i < bur_nprocs; i++) {
+        BurProc *p = &bur_procs[i];
+        if (!p->used || p->complete) continue;
+        int fds[3] = { p->outfd, p->errfd, p->failfd };
+        for (int k = 0; k < 3; k++) {
+            if (fds[k] < 0) continue;
+            pfds = (struct pollfd *)realloc(pfds, sizeof(struct pollfd) * (size_t)(n + 1));
+            owner = (int64_t *)realloc(owner, sizeof(int64_t) * (size_t)(n + 1));
+            pfds[n].fd = fds[k]; pfds[n].events = POLLIN; pfds[n].revents = 0;
+            owner[n] = i; n++;
+        }
+    }
+    poll(pfds, (nfds_t)n, timeout_ms); // n == 0 degenerates to a plain sleep
+    for (int i = 0; i < n; i++)
+        if (pfds[i].revents) bur_proc_pump(&bur_procs[owner[i]]);
+    free(pfds); free(owner);
+    if (bur_nio == 0) return;
+    for (int64_t i = 0; i < bur_nfibers; i++) { // wake in fiber id order
+        Fiber *f = bur_fibers[i];
+        if (f->status == FBLOCKED_IO && bur_procs[f->io_proc].complete) {
+            bur_nio--;
+            bur_schedule(f);
+        }
+    }
+}
+
 // wake every timer whose deadline has passed, in (deadline, fiber id) order;
 // bur_fibers is in creation (= id) order, so a strictly-less scan suffices
 static void bur_wake_due_timers(void) {
@@ -1324,15 +1415,20 @@ static void bur_scheduler(void) {
     for (;;) {
         if (bur_main_fiber->status == FDONE) return;
         if (bur_ntimers > 0) bur_wake_due_timers();
+        if (bur_nio > 0) bur_poll_io(0); // keep child pipes drained
         Fiber *f = bur_ready_pop();
         if (!f) {
-            if (bur_ntimers > 0) {
-                int64_t nearest = INT64_MAX;
-                for (int64_t i = 0; i < bur_nfibers; i++)
-                    if (bur_fibers[i]->status == FBLOCKED_TIMER && bur_fibers[i]->wake_ns < nearest)
-                        nearest = bur_fibers[i]->wake_ns;
-                struct timespec ts = { nearest / 1000000000, nearest % 1000000000 };
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+            if (bur_ntimers > 0 || bur_nio > 0) {
+                int tmo = -1; // sleep on the io fds until the nearest timer
+                if (bur_ntimers > 0) {
+                    int64_t nearest = INT64_MAX;
+                    for (int64_t i = 0; i < bur_nfibers; i++)
+                        if (bur_fibers[i]->status == FBLOCKED_TIMER && bur_fibers[i]->wake_ns < nearest)
+                            nearest = bur_fibers[i]->wake_ns;
+                    int64_t d = nearest - bur_now_ns();
+                    tmo = d <= 0 ? 0 : (int)(d / 1000000) + 1;
+                }
+                bur_poll_io(tmo);
                 continue;
             }
             int blocked = 0;

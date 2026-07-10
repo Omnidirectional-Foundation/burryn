@@ -99,6 +99,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     let mut fb_fr_ip = []   // call frames: instruction pointer
     let mut fb_fr_base = [] // call frames: stack base
     let mut fb_wakeat = []  // absolute clock() deadline while fs_blocked_timer
+    let mut proc_results = [] // exec_start handles: guest Result per child
+    let mut proc_taken = []   // parallel: result already handed out
     let mut ready = []      // FIFO of ready fiber ids
     let mut main_fiber = 0
     let mut park_recv = -1  // set by the recv() native to ask OpCall to park
@@ -360,6 +362,9 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             }
             mark_val(fb_sendval[fi])
             fi = fi + 1
+        }
+        for pr in proc_results {
+            mark_val(pr)
         }
 
         // trace: enum types, ctors and natives carry no interpreted
@@ -1001,6 +1006,42 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 },
                 Err(m) => make_err(f, VStr(m)),
             }
+        } else if nm == "exec_start" {
+            // guest-level async arrives with the next generation; for now the
+            // child runs to completion here and exec_poll hands the result out
+            let ah = tagged_h(fpeek(f, 0), ot_list)
+            if !is_str(fpeek(f, 1)) || ah < 0 {
+                trap("exec_start() needs (str, [str])")
+            }
+            let mut hargs = []
+            for e in o_vals[ah] {
+                if !is_str(e) {
+                    trap("exec_start() args must be str, got " + type_name(e))
+                }
+                push(hargs, str_of(e))
+            }
+            match exec(str_of(fpeek(f, 1)), hargs) {
+                Ok(o) => match o {
+                    Output(code, so, se) => {
+                        let oi = make_inst(out_enum, 0, [VInt(code), VStr(so), VStr(se)])
+                        push(proc_results, make_ok(f, oi))
+                        push(proc_taken, false)
+                        make_ok(f, VInt(len(proc_results) - 1))
+                    },
+                },
+                Err(m) => {
+                    push(proc_results, make_err(f, VStr(m)))
+                    push(proc_taken, false)
+                    make_ok(f, VInt(len(proc_results) - 1))
+                },
+            }
+        } else if nm == "exec_poll" {
+            let h = int_of(fpeek(f, 0))
+            if h < 0 || h >= len(proc_results) || proc_taken[h] {
+                trap("exec_poll: invalid or consumed handle " + str(h))
+            }
+            proc_taken[h] = true
+            make_some(f, proc_results[h])
         } else if nm == "args" {
             let lh = alloc_obj(ot_list)
             for a in vm_args {
