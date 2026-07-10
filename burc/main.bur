@@ -48,6 +48,10 @@ fn main() {
         build_cmd(slice(a, 1, len(a)))
     } else if cmd == "fmt" {
         fmt_cmd(slice(a, 1, len(a)))
+    } else if cmd == "mod" {
+        mod_cmd(slice(a, 1, len(a)))
+    } else if cmd == "get" {
+        get_cmd(slice(a, 1, len(a)))
     } else if cmd == "version" || cmd == "-v" || cmd == "--version" {
         println("Burryn " + version + " — the ring beneath Meyrin")
     } else if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -70,6 +74,11 @@ fn usage() {
     println("  bur build <file|dir>   compile to a native binary via C")
     println("  bur fmt <file|dir|->   rewrite source in the official format")
     println("  bur dis <file|dir>     disassemble compiled bytecode")
+    println("  bur mod init <path>    write a fresh bur.mod")
+    println("  bur mod tidy [dir]     recompute MVS offline and rewrite bur.sum")
+    println("  bur mod download [dir] fetch the require closure into the cache")
+    println("  bur mod verify [dir]   check cached trees against bur.sum")
+    println("  bur get <path>@<ver>   add or upgrade a require, then download")
     println("  bur version")
     println("")
     println("bur build flags:")
@@ -726,6 +735,73 @@ fn dev_mod_graph(dir) {
             exit(exit_static)
         },
     }
+}
+
+// mod_report prints a mod subcommand's outcome and exits on error
+fn mod_report(r) {
+    match r {
+        Ok(msg) => println(msg),
+        Err(m) => {
+            eprintln("error: " + m)
+            exit(exit_static)
+        },
+    }
+}
+
+// mod_cmd implements `bur mod <init|tidy|download|verify>` (GOALS §6.5
+// S6.1/S6.2). tidy/download/verify take an optional module dir, default "."
+fn mod_cmd(rest) {
+    if len(rest) == 0 {
+        eprintln("usage: bur mod <init|tidy|download|verify> [args]")
+        exit(exit_usage)
+    }
+    let sub = rest[0]
+    let dir = if len(rest) >= 2 {
+        strip_trailing_slash(rest[1])
+    } else {
+        "."
+    }
+    if sub == "init" {
+        if len(rest) != 2 {
+            eprintln("usage: bur mod init <module-path>")
+            exit(exit_usage)
+        }
+        if file_exists("bur.mod") {
+            eprintln("error: bur.mod already exists")
+            exit(exit_static)
+        }
+        match lib.mod_init_text(rest[1]) {
+            Ok(text) => match write_file("bur.mod", text) {
+                Ok(_) => {},
+                Err(m) => {
+                    eprintln("error: " + m)
+                    exit(exit_no_input)
+                },
+            },
+            Err(m) => {
+                eprintln("error: " + m)
+                exit(exit_usage)
+            },
+        }
+    } else if sub == "tidy" {
+        mod_report(lib.mod_tidy(dir))
+    } else if sub == "download" {
+        mod_report(lib.mod_download(dir))
+    } else if sub == "verify" {
+        mod_report(lib.mod_verify(dir))
+    } else {
+        eprintln("unknown mod command: " + sub)
+        exit(exit_usage)
+    }
+}
+
+// get_cmd implements `bur get <path>@<version>` on the module in the CWD
+fn get_cmd(rest) {
+    if len(rest) != 1 {
+        eprintln("usage: bur get <path>@<version>")
+        exit(exit_usage)
+    }
+    mod_report(lib.mod_get(".", rest[0]))
 }
 
 fn dev_build_dir(dir) {
