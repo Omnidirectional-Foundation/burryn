@@ -104,6 +104,23 @@ require、拉取、锁定、校验。
 - Corrected the tree-hash encoding from hex to the settled
   `h1:<base64(sha256)>` format.
 
+**Landed S6.4 `bur test` with subprocess isolation** — the first
+first-class test runner; S6.6 std/json waits on an owner API decision, so
+S6.4 landed first.
+**落地 S6.4 `bur test`（子进程隔离）** — 首个一等测试跑器；S6.6 std/json
+卡在 owner 的 API 决策上，故 S6.4 先行。
+
+- Discovers zero-parameter `fn test_*` in the root package's `*_test.bur`
+  files; those files are now excluded from every normal build, run, and
+  check.
+- Runs each test as its own subprocess (hidden `bur dev run-test`) with
+  `BUR_DETERMINISTIC=1`; traps and deadlocks (exit 4) count as failures.
+- Supports `--run <substr>` filtering and `-v`; main-less library packages
+  are testable via a synthetic entry point.
+- Corrected the self-path detail: a child's `/proc/self/exe` names the
+  child, so the binary resolves itself via `sh -c "readlink
+  /proc/$PPID/exe"`.
+
 ## v0.1 (2026-07-05 ~ 07-06)
 
 **Initial community scaffolding added** — set up the open-source contribution

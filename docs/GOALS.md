@@ -141,7 +141,7 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定) | 进行中 |
+| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败)；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定) | 进行中 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注 | 未开工 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
@@ -199,7 +199,7 @@
 - 注释重插(stage 3)与验证器全绿**之后**才跑在 `burc/lib/` 自身统一风格；在此之前禁止对真实源码原地写回(2026-07-10 修订，早期「立即跑」措辞作废)
 - stage 划分：stage 2 全 AST 节点覆盖 → stage 3 注释重插 → stage 4 `bur fmt` 公开命令 + burc 自格式化
 
-**S6.4 `bur test`(P1)**
+**S6.4 `bur test`(P1)——已完成(2026-07-10，断言糖除外)**
 
 现状测试 = 自举 parity + golden example，无 first-class 框架。
 
@@ -207,8 +207,9 @@
 - 并发特色：利用 fiber/channel 语义，把 VM 死锁检测(现为 exit 4)转成测试失败；支持并发测试模式
 - 报告：pass/fail 计数 + 失败 span 定位(复用 diag 渲染)
 - **隔离模型已定(owner 2026-07-10，原必答题)：子进程隔离**——`bur test` 对每个 `test_*` `exec` 自身跑隐藏命令(`bur dev run-test <dir> <fn>`)收集 exit code 与输出；trap(exit 4)与死锁自然成为 test failure；默认 `BUR_DETERMINISTIC=1`；并行跑测试 = `exec_start` fan-out(S6.7 已解锁)
-- 自身二进制路径经 shell-out `readlink /proc/self/exe` 获取(零新 native；不够用再议 `self_path` native)
+- 自身二进制路径经 shell-out `readlink /proc/self/exe` 获取(零新 native；不够用再议 `self_path` native)——**落地纠正(2026-07-10)**：子进程里 `/proc/self/exe` 指向子进程自身(readlink 二进制)，等价零 native 解 = `sh -c "readlink /proc/$PPID/exe"`($PPID = 发起 exec 的 bur 进程)
 - 断言先用现成 `assert(cond, msg)`；`assert_eq` 等糖归 std/testing，等 S6.6 捆绑机制落地
+- **落地情况(2026-07-10)**：约定 = 根包 `*_test.bur` 的零参 `fn test_*`(带参不发现；子包测试未纳入，随 S6.1 接线再议)；`*_test.bur` 从此被普通 build/run/check 排除；无 `fn main` 的库包可测(测试入口合成)；死锁/trap(exit 4)自然记为 FAIL；并发测试模式与 `-j` 并行未做(exec_start fan-out 已解锁，属后续加法)
 
 **S6.5 debugger(可选，C 后端增强，优先级最低)**
 
@@ -245,7 +246,7 @@
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序(2026-07-10 二次修订，S6.7/S6.3/S6.8/S6.2 已完成)**：S6.8 checker 债批(已完成)→ S6.2 网络拉取(已完成)→ **S6.6 std/json** → S6.4 `bur test` → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
+**推进顺序(2026-07-10 二次修订；S6.7/S6.3/S6.8/S6.2/S6.4 已完成)**：S6.8 → S6.2 → S6.4(提前于 S6.6 落地：S6.6 卡 json API 待定项，见 §7；S6.4 定案完备无阻塞)→ **S6.6 std/json(卡 §7 API 决策)** → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
@@ -285,6 +286,7 @@
 - S7.6 `defer` 块作用域细节(块表达式的求值时机、fiber 退出语义)
 - S7.8 可选签名标注的语法形态
 - S6.7 后续：net 落地时是否升级为通用 fd 感知调度(epoll/kqueue)
+- **S6.6 std/json 公共 API(2026-07-10 补，卡此项动工；实现侧已跳过它先做 S6.4)**：JSON 值的 enum 表示(对象用 map 还是保序平行列表？数字只上 float 还是分 int/float？)、函数命名与签名(parse/render？缩进选项？)、std 源码目录布局(repo 根 `std/json/`？)、内嵌表生成器形态(隐藏命令生成 checked-in 的 `burc/lib/std_embed.bur`？)
 
 已探查结论(移出待定)：lexer comment/trivia 保留已完成(S6.3 前置就绪，见 §6.6)；`exec` shell-out `git clone` 够用已确认(S6.2 无需新 native，见 §6.5)。
 
