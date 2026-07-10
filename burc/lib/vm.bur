@@ -60,61 +60,59 @@ let vm_time_slice = 10000
 // (name/file/arity/upvals/code/spans/consts, entry = handle 0), the enum
 // arena (qualified name, variant names, variant arities) and the
 // interpreted program's argv.
-pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
-    f_consts, en_qual, en_vnames, en_varities, vm_args) {
-
+pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args) {
     let max_int = 9223372036854775807
     let min_int = -9223372036854775807 - 1
 
     // ---- interpreted heap arena (parallel lists, one slot per handle) ----
     let mut o_tag = []
     let mut o_mark = []
-    let mut o_vals = []  // list elems / enum inst fields / channel buffer
-    let mut o_keys = []  // map keys, parallel to o_vals entries
-    let mut o_idxi = []  // map: int key -> entry position
-    let mut o_idxs = []  // map: str key -> entry position
-    let mut o_i1 = []    // closure:fn / upval:fiber / inst:enum / chan:cap / native:id / enumtype:enum / ctor:enum
-    let mut o_i2 = []    // upval:slot / inst:variant / ctor:variant
-    let mut o_b1 = []    // upval:open / chan:closed
-    let mut o_v1 = []    // upval: closed-over value
-    let mut o_h1 = []    // closure: upvalue handles / chan: sendq fiber ids
-    let mut o_h2 = []    // chan: recvq fiber ids
-    let mut o_h3 = []    // chan: select waiter fiber ids
+    let mut o_vals = [] // list elems / enum inst fields / channel buffer
+    let mut o_keys = [] // map keys, parallel to o_vals entries
+    let mut o_idxi = [] // map: int key -> entry position
+    let mut o_idxs = [] // map: str key -> entry position
+    let mut o_i1 = [] // closure:fn / upval:fiber / inst:enum / chan:cap / native:id / enumtype:enum / ctor:enum
+    let mut o_i2 = [] // upval:slot / inst:variant / ctor:variant
+    let mut o_b1 = [] // upval:open / chan:closed
+    let mut o_v1 = [] // upval: closed-over value
+    let mut o_h1 = [] // closure: upvalue handles / chan: sendq fiber ids
+    let mut o_h2 = [] // chan: recvq fiber ids
+    let mut o_h3 = [] // chan: select waiter fiber ids
     let mut free_slots = []
-    let mut pinned = []  // permanent roots: enum types, ctors, singletons, natives
+    let mut pinned = [] // permanent roots: enum types, ctors, singletons, natives
     let mut obj_count = 0
     let mut gc_threshold = 256
     let mut gc_total_alloc = 0
     let mut gc_cycles_n = 0
     let mut vm_on = false // collections only run once the fibers exist
-    let mut gray = []     // collect()'s worklist
+    let mut gray = [] // collect()'s worklist
 
     // ---- globals and fibers ----
     let mut globals = map() // name -> Val
-    let mut fb_stack = []   // [[Val]]; list length is the live stack top
+    let mut fb_stack = [] // [[Val]]; list length is the live stack top
     let mut fb_status = []
     let mut fb_sendval = [] // pending value while blocked on send
     let mut fb_selectch = [] // channels this fiber waits on in a select
-    let mut fb_openuv = []  // open upvalue handles
-    let mut fb_fr_cl = []   // call frames: closure handle
-    let mut fb_fr_ip = []   // call frames: instruction pointer
+    let mut fb_openuv = [] // open upvalue handles
+    let mut fb_fr_cl = [] // call frames: closure handle
+    let mut fb_fr_ip = [] // call frames: instruction pointer
     let mut fb_fr_base = [] // call frames: stack base
-    let mut fb_wakeat = []  // absolute clock() deadline while fs_blocked_timer
-    let mut fb_ioproc = []  // host exec handle awaited while fs_blocked_io
-    let mut fb_iohas = []   // scheduler delivered an exec result
-    let mut fb_iores = []   // the delivered guest Result value
-    let mut ready = []      // FIFO of ready fiber ids
+    let mut fb_wakeat = [] // absolute clock() deadline while fs_blocked_timer
+    let mut fb_ioproc = [] // host exec handle awaited while fs_blocked_io
+    let mut fb_iohas = [] // scheduler delivered an exec result
+    let mut fb_iores = [] // the delivered guest Result value
+    let mut ready = [] // FIFO of ready fiber ids
     let mut main_fiber = 0
-    let mut park_recv = -1  // set by the recv() native to ask OpCall to park
+    let mut park_recv = -1 // set by the recv() native to ask OpCall to park
     let mut park_sleep = -1.0 // wake deadline set by the sleep() native, or -1
-    let mut park_io = -1    // host exec handle set by the exec() native
-    let mut ntimers = 0     // fibers currently parked on a timer
-    let mut nio = 0         // fibers currently parked on child-process IO
+    let mut park_io = -1 // host exec handle set by the exec() native
+    let mut ntimers = 0 // fibers currently parked on a timer
+    let mut nio = 0 // fibers currently parked on child-process IO
     let mut yield_flag = false
     let mut opt_enum = -1
     let mut res_enum = -1
     let mut out_enum = -1
-    let mut k_vals = []     // converted constant tables, parallel to f_consts
+    let mut k_vals = [] // converted constant tables, parallel to f_consts
 
     // a trap always ends the program: report and exit like `bur run`
     fn trap(msg) {
@@ -127,18 +125,69 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     }
 
     // ---- Val inspectors ----
-    fn is_str(v) { match v { VStr(_) => true, _ => false } }
-    fn str_of(v) { match v { VStr(s) => s, _ => "" } }
-    fn is_int(v) { match v { VInt(_) => true, _ => false } }
-    fn int_of(v) { match v { VInt(n) => n, _ => 0 } }
-    fn is_bool(v) { match v { VBool(_) => true, _ => false } }
-    fn bool_of(v) { match v { VBool(b) => b, _ => false } }
-    fn is_num(v) { match v { VInt(_) => true, VFloat(_) => true, _ => false } }
-    fn num_f(v) { match v { VInt(n) => to_float(n), VFloat(x) => x, _ => 0.0 } }
-    fn obj_h(v) { match v { VObj(h) => h, _ => -1 } }
+    fn is_str(v) {
+        match v {
+            VStr(_) => true,
+            _ => false,
+        }
+    }
+    fn str_of(v) {
+        match v {
+            VStr(s) => s,
+            _ => "",
+        }
+    }
+    fn is_int(v) {
+        match v {
+            VInt(_) => true,
+            _ => false,
+        }
+    }
+    fn int_of(v) {
+        match v {
+            VInt(n) => n,
+            _ => 0,
+        }
+    }
+    fn is_bool(v) {
+        match v {
+            VBool(_) => true,
+            _ => false,
+        }
+    }
+    fn bool_of(v) {
+        match v {
+            VBool(b) => b,
+            _ => false,
+        }
+    }
+    fn is_num(v) {
+        match v {
+            VInt(_) => true,
+            VFloat(_) => true,
+            _ => false,
+        }
+    }
+    fn num_f(v) {
+        match v {
+            VInt(n) => to_float(n),
+            VFloat(x) => x,
+            _ => 0.0,
+        }
+    }
+    fn obj_h(v) {
+        match v {
+            VObj(h) => h,
+            _ => -1,
+        }
+    }
     fn tagged_h(v, t) {
         match v {
-            VObj(h) => if o_tag[h] == t { h } else { -1 },
+            VObj(h) => if o_tag[h] == t {
+                h
+            } else {
+                -1
+            },
             _ => -1,
         }
     }
@@ -183,7 +232,11 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             VBool(b) => str(b),
             VInt(n) => str(n),
             VFloat(x) => str(x),
-            VStr(s) => if quote { go_quote(s) } else { s },
+            VStr(s) => if quote {
+                go_quote(s)
+            } else {
+                s
+            },
             VObj(h) => {
                 let t = o_tag[h]
                 if t == ot_list {
@@ -196,8 +249,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     let mut parts = []
                     let mut i = 0
                     while i < len(o_keys[h]) {
-                        push(parts, format_val(o_keys[h][i], true) + ": " +
-                            format_val(o_vals[h][i], true))
+                        push(parts, format_val(o_keys[h][i], true) + ": " + format_val(o_vals[h][i], true))
                         i = i + 1
                     }
                     "{" + join(parts, ", ") + "}"
@@ -238,8 +290,14 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     // int/float cross-compare, reference (handle) equality otherwise
     fn eq_val(a, b) {
         match a {
-            VUnit => match b { VUnit => true, _ => false },
-            VBool(x) => match b { VBool(y) => x == y, _ => false },
+            VUnit => match b {
+                VUnit => true,
+                _ => false,
+            },
+            VBool(x) => match b {
+                VBool(y) => x == y,
+                _ => false,
+            },
             VInt(x) => match b {
                 VInt(y) => x == y,
                 VFloat(y) => to_float(x) == y,
@@ -250,7 +308,10 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 VInt(y) => x == to_float(y),
                 _ => false,
             },
-            VStr(x) => match b { VStr(y) => x == y, _ => false },
+            VStr(x) => match b {
+                VStr(y) => x == y,
+                _ => false,
+            },
             VObj(x) => match b {
                 VObj(y) => {
                     let tx = o_tag[x]
@@ -279,8 +340,14 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                             let mut i = 0
                             while i < len(o_keys[x]) {
                                 let pos = match o_keys[x][i] {
-                                    VInt(n) => match get(o_idxi[y], n) { Some(p) => p, None => -1 },
-                                    VStr(s) => match get(o_idxs[y], s) { Some(p) => p, None => -1 },
+                                    VInt(n) => match get(o_idxi[y], n) {
+                                        Some(p) => p,
+                                        None => -1,
+                                    },
+                                    VStr(s) => match get(o_idxs[y], s) {
+                                        Some(p) => p,
+                                        None => -1,
+                                    },
                                     _ => -1,
                                 }
                                 if pos < 0 {
@@ -460,10 +527,18 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     }
 
     // ---- fiber stack ----
-    fn fpush(f, v) { push(fb_stack[f], v) }
-    fn fpop(f) { pop(fb_stack[f]) }
-    fn fpeek(f, n) { fb_stack[f][len(fb_stack[f]) - 1 - n] }
-    fn ftop(f) { len(fb_stack[f]) }
+    fn fpush(f, v) {
+        push(fb_stack[f], v)
+    }
+    fn fpop(f) {
+        pop(fb_stack[f])
+    }
+    fn fpeek(f, n) {
+        fb_stack[f][len(fb_stack[f]) - 1 - n]
+    }
+    fn ftop(f) {
+        len(fb_stack[f])
+    }
     fn fsettop(f, n) {
         while len(fb_stack[f]) > n {
             let _ = pop(fb_stack[f])
@@ -485,7 +560,9 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         let _ = fpop(f)
         r
     }
-    fn make_none() { make_inst(opt_enum, 1, []) }
+    fn make_none() {
+        make_inst(opt_enum, 1, [])
+    }
     fn make_ok(f, v) {
         fpush(f, v)
         let r = make_inst(res_enum, 0, [fpeek(f, 0)])
@@ -626,7 +703,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 schedule(s)
             }
             RecvGot(v)
-        } else if len(o_h1[ch]) > 0 { // unbuffered rendezvous
+        } else if len(o_h1[ch]) > 0 {
+            // unbuffered rendezvous
             let s = o_h1[ch][0]
             o_h1[ch] = slice(o_h1[ch], 1, len(o_h1[ch]))
             let v = fb_sendval[s]
@@ -688,8 +766,14 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     // map entry position for key k: >=0 found, -1 absent, -2 bad key type
     fn map_find(mh, k) {
         match k {
-            VInt(n) => match get(o_idxi[mh], n) { Some(p) => p, None => -1 },
-            VStr(s) => match get(o_idxs[mh], s) { Some(p) => p, None => -1 },
+            VInt(n) => match get(o_idxi[mh], n) {
+                Some(p) => p,
+                None => -1,
+            },
+            VStr(s) => match get(o_idxs[mh], s) {
+                Some(p) => p,
+                None => -1,
+            },
             _ => -2,
         }
     }
@@ -781,10 +865,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 trap("map keys must be int or str, got " + type_name(k))
             }
             if pos >= 0 {
-                o_keys[mh] = concat(slice(o_keys[mh], 0, pos),
-                    slice(o_keys[mh], pos + 1, len(o_keys[mh])))
-                o_vals[mh] = concat(slice(o_vals[mh], 0, pos),
-                    slice(o_vals[mh], pos + 1, len(o_vals[mh])))
+                o_keys[mh] = concat(slice(o_keys[mh], 0, pos), slice(o_keys[mh], pos + 1, len(o_keys[mh])))
+                o_vals[mh] = concat(slice(o_vals[mh], 0, pos), slice(o_vals[mh], pos + 1, len(o_vals[mh])))
                 match k {
                     VInt(n) => delete(o_idxi[mh], n),
                     VStr(s) => delete(o_idxs[mh], s),
@@ -923,8 +1005,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             let start = int_of(fpeek(f, 1))
             let n = int_of(fpeek(f, 0))
             if start < 0 || n < 0 || start + n > str_len(s) {
-                trap("substr(" + str(start) + ", " + str(n) + ") out of bounds (len " +
-                    str(str_len(s)) + ")")
+                trap("substr(" + str(start) + ", " + str(n) + ") out of bounds (len " + str(str_len(s)) + ")")
             }
             VStr(substr(s, start, n))
         } else if nm == "byte_at" {
@@ -963,8 +1044,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             let start = int_of(fpeek(f, 1))
             let end = int_of(fpeek(f, 0))
             if start < 0 || end < start || end > len(o_vals[src]) {
-                trap("slice(" + str(start) + ", " + str(end) + ") out of bounds (len " +
-                    str(len(o_vals[src])) + ")")
+                trap("slice(" + str(start) + ", " + str(end) + ") out of bounds (len " + str(len(o_vals[src])) + ")")
             }
             // the source stays rooted on the stack across the allocation
             let lh = alloc_obj(ot_list)
@@ -1028,7 +1108,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "exec" {
-            if fb_iohas[f] { // resuming: the scheduler already delivered
+            if fb_iohas[f] {
+                // resuming: the scheduler already delivered
                 fb_iohas[f] = false
                 let r = fb_iores[f]
                 fb_iores[f] = VUnit
@@ -1197,8 +1278,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         if t == ot_closure {
             let fnh = o_i1[h]
             if argc != f_arity[fnh] {
-                trap(format_val(callee, false) + " expects " + str(f_arity[fnh]) +
-                    " argument(s), got " + str(argc))
+                trap(format_val(callee, false) + " expects " + str(f_arity[fnh]) + " argument(s), got " + str(argc))
             }
             if len(fb_fr_cl[f]) >= 2048 {
                 trap("stack overflow (call depth > 2048)")
@@ -1208,7 +1288,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             push(fb_fr_base[f], ftop(f) - argc - 1)
         } else if t == ot_native {
             let res = do_native(f, o_i1[h], argc)
-            if park_recv < 0 && park_io < 0 { // otherwise leave callee+args: OpCall parks and retries
+            if park_recv < 0 && park_io < 0 {
+                // otherwise leave callee+args: OpCall parks and retries
                 let mut i = 0
                 while i <= argc {
                     let _ = fpop(f)
@@ -1220,8 +1301,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             let eh = o_i1[h]
             let vi = o_i2[h]
             if argc != en_varities[eh][vi] {
-                trap(en_qual[eh] + "." + en_vnames[eh][vi] + " expects " +
-                    str(en_varities[eh][vi]) + " field(s), got " + str(argc))
+                trap(en_qual[eh] + "." + en_vnames[eh][vi] + " expects " + str(en_varities[eh][vi]) + " field(s), got " + str(argc))
             }
             // fields copied while still on the stack, so they stay rooted
             let mut fields = []
@@ -1261,8 +1341,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         let a = fpeek(f, 1)
         if is_str(a) && is_str(b) {
             if op != op_add {
-                trap("cannot apply " + go_quote(arith_name(op)) + " to " +
-                    type_name(a) + " and " + type_name(b))
+                trap("cannot apply " + go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
             }
             let s = str_of(a) + str_of(b)
             let _ = fpop(f)
@@ -1338,8 +1417,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 fpush(f, VFloat(x / y))
             }
         } else {
-            trap("cannot apply " + go_quote(arith_name(op)) + " to " +
-                type_name(a) + " and " + type_name(b))
+            trap("cannot apply " + go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
         }
     }
     fn do_compare(f, op) {
@@ -1380,7 +1458,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     fn exec_fiber(f) {
         let mut budget = vm_time_slice
         while true {
-            if budget <= 0 { // preemption point
+            if budget <= 0 {
+                // preemption point
                 schedule(f)
                 return false
             }
@@ -1532,7 +1611,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 let argc = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 call_value(f, argc)
-                if park_recv >= 0 { // the recv() native asked to block on a channel
+                if park_recv >= 0 {
+                    // the recv() native asked to block on a channel
                     let ch = park_recv
                     park_recv = -1
                     fb_status[f] = fs_blocked_recv
@@ -1541,14 +1621,16 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     fb_fr_ip[f][fi] = start_ip // re-run the call (and recv) once woken
                     return false
                 }
-                if park_sleep >= 0.0 { // the sleep() native set a deadline
+                if park_sleep >= 0.0 {
+                    // the sleep() native set a deadline
                     fb_status[f] = fs_blocked_timer
                     fb_wakeat[f] = park_sleep
                     park_sleep = -1.0
                     ntimers = ntimers + 1
                     return false // resumes after the call once the timer fires
                 }
-                if park_io >= 0 { // the exec() native started a child
+                if park_io >= 0 {
+                    // the exec() native started a child
                     fb_status[f] = fs_blocked_io
                     fb_ioproc[f] = park_io
                     park_io = -1
@@ -1556,7 +1638,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     fb_fr_ip[f][fi] = start_ip // re-run exec once delivered
                     return false
                 }
-                if yield_flag { // a native (yield) asked us to hand off
+                if yield_flag {
+                    // a native (yield) asked us to hand off
                     yield_flag = false
                     schedule(f)
                     return false
@@ -1623,8 +1706,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     }
                     let i = int_of(idx)
                     if i < 0 || i >= len(o_vals[lh]) {
-                        trap("list index " + str(i) + " out of bounds (len " +
-                            str(len(o_vals[lh])) + ")")
+                        trap("list index " + str(i) + " out of bounds (len " + str(len(o_vals[lh])) + ")")
                     }
                     fpush(f, o_vals[lh][i])
                 } else if is_str(target) {
@@ -1634,8 +1716,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     let s = str_of(target)
                     let i = int_of(idx)
                     if i < 0 || i >= str_len(s) {
-                        trap("string index " + str(i) + " out of bounds (len " +
-                            str(str_len(s)) + ")")
+                        trap("string index " + str(i) + " out of bounds (len " + str(str_len(s)) + ")")
                     }
                     fpush(f, VStr(char_at(s, i)))
                 } else {
@@ -1654,8 +1735,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 }
                 let i = int_of(idx)
                 if i < 0 || i >= len(o_vals[lh]) {
-                    trap("list index " + str(i) + " out of bounds (len " +
-                        str(len(o_vals[lh])) + ")")
+                    trap("list index " + str(i) + " out of bounds (len " + str(len(o_vals[lh])) + ")")
                 }
                 o_vals[lh][i] = v
             } else if op == op_len {
@@ -1704,10 +1784,12 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 if !is_opt_res {
                     trap("'?' needs an Option or Result, got " + type_name(v))
                 }
-                if o_i2[ih] == 0 { // Some/Ok
+                if o_i2[ih] == 0 {
+                    // Some/Ok
                     let _ = fpop(f)
                     fpush(f, o_vals[ih][0])
-                } else { // early-return the None/Err itself
+                } else {
+                    // early-return the None/Err itself
                     let _ = fpop(f)
                     let base = fb_fr_base[f][fi]
                     close_upvalues(f, base)
@@ -1730,8 +1812,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     trap("spawn needs a function, got " + type_name(callee))
                 }
                 if f_arity[o_i1[ch2]] != argc {
-                    trap(format_val(callee, false) + " expects " + str(f_arity[o_i1[ch2]]) +
-                        " argument(s), got " + str(argc))
+                    trap(format_val(callee, false) + " expects " + str(f_arity[o_i1[ch2]]) + " argument(s), got " + str(argc))
                 }
                 let mut sargs = []
                 let mut i = 0
@@ -1846,7 +1927,11 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     p = p + 3
                     push(arm_send, kind == 1)
                     push(arm_target, p + dist)
-                    slots = slots + if kind == 1 { 2 } else { 1 }
+                    slots = slots + (if kind == 1 {
+                        2
+                    } else {
+                        1
+                    })
                     i = i + 1
                 }
                 let mut default_target = -1
@@ -1878,8 +1963,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 while i < n_arms {
                     let ch = tagged_h(fb_stack[f][chan_pos[i]], ot_channel)
                     if ch < 0 {
-                        trap("select arm needs a channel, got " +
-                            type_name(fb_stack[f][chan_pos[i]]))
+                        trap("select arm needs a channel, got " + type_name(fb_stack[f][chan_pos[i]]))
                     }
                     if arm_send[i] {
                         if chan_send_ready(ch) {
@@ -1916,7 +2000,8 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                                 fsettop(f, base)
                                 fpush(f, v) // left on the stack for a binding arm
                             },
-                            RecvNone => { // implies closed here
+                            RecvNone => {
+                                // implies closed here
                                 fsettop(f, base)
                                 trap("receive on closed channel")
                             },
@@ -2062,8 +2147,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     bi = bi + 1
                 }
                 if blocked > 0 {
-                    eprintln("fatal: deadlock — all " + str(blocked) +
-                        " remaining fiber(s) are blocked on channels")
+                    eprintln("fatal: deadlock — all " + str(blocked) + " remaining fiber(s) are blocked on channels")
                     exit(4)
                 }
                 return
