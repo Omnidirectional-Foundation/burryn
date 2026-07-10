@@ -1,7 +1,9 @@
 // Pretty-printer for Burryn source.
-// Stage 2: full AST coverage — every statement, expression, pattern, and
-// type expression prints from the tree; no span fallbacks remain.
-// Comment trivia is accepted but ignored until stage 3.
+// Stage 3: full AST coverage plus comment reinsertion. Comments ride along
+// as lexer trivia (Tok(t_comment, text, s, e)) and are threaded through the
+// printers with a cursor: own-line comments flush ahead of the next item at
+// the current indent, same-line comments stay pinned to their line, and the
+// verifier rejects output that drops or invents a comment.
 //
 // Layout rules (GOALS §6.5): 4-space indent, no line wrapping, trailing
 // comma per match/select arm and enum variant. Top-level declarations are
@@ -11,15 +13,25 @@
 // bodies a single source blank line is preserved, never more.
 
 // format_verified formats and then enforces the acceptance rules from
-// GOALS §6.5: the output must reparse to a structurally equal AST
-// (ast_eq, spans ignored). Comment-count preservation joins the check
-// once stage 3 reinserts comments. Err here means a formatter bug.
+// GOALS §6.5: the output must reparse to a structurally equal AST (ast_eq,
+// spans ignored) and carry exactly the original comments. Err here means a
+// formatter bug.
 pub fn format_verified(stmts, src, comments) {
     let out = format_file(stmts, src, comments)
     match lex(out) {
-        Lexed(toks2, ldiags2, _) => {
+        Lexed(toks2, ldiags2, comments2) => {
             if len(ldiags2) > 0 {
                 return Err("fmt verifier: output fails to lex")
+            }
+            if len(comments2) != len(comments) {
+                return Err("fmt verifier: comment count changed")
+            }
+            let mut ci = 0
+            while ci < len(comments) {
+                if tok_lex(comments[ci]) != tok_lex(comments2[ci]) {
+                    return Err("fmt verifier: comment text changed")
+                }
+                ci = ci + 1
             }
             match parse(toks2) {
                 Parsed(stmts2, pdiags2) => {
@@ -37,33 +49,95 @@ pub fn format_verified(stmts, src, comments) {
 }
 
 // format_file formats a single file's top-level statements.
-pub fn format_file(stmts, src, _comments) {
+pub fn format_file(stmts, src, comments) {
     let mut out = []
+    let mut cc = [0] // comment cursor, threaded like the parser's pos
     let mut prev_multi = false
     let mut prev_end = 0
     let mut i = 0
     while i < len(stmts) {
+        let s0 = span_start(stmts[i])
+        let mut after_comment = false
+        if cc[0] < len(comments) && tok_start(comments[cc[0]]) < s0 {
+            // a blank line goes before the comment group when the source had
+            // one or the previous declaration was multi-line
+            if prev_end > 0 &&
+                (prev_multi || src_blank_between(src, prev_end, tok_start(comments[cc[0]]))) {
+                push(out, "\n")
+            }
+            prev_end = flush_comments(comments, cc, s0, src, 0, 0, out)
+            after_comment = true
+        }
         let mut buf = []
-        fmt_stmt(stmts[i], src, 0, buf)
+        fmt_stmt(stmts[i], src, comments, cc, 0, buf)
         let seg = join(buf, "")
         let multi = str_contains(seg, "\n")
-        if i > 0 {
-            if multi || prev_multi {
+        if i > 0 || after_comment {
+            if after_comment {
+                // comments bind to what follows: only a source blank between
+                // the group and the declaration survives
+                if src_blank_between(src, prev_end, s0) {
+                    push(out, "\n")
+                }
+            } else if multi || prev_multi {
                 push(out, "\n")
-            } else if src_blank_between(src, prev_end, span_start(stmts[i])) {
+            } else if src_blank_between(src, prev_end, s0) {
                 push(out, "\n")
             }
         }
         push(out, seg)
+        prev_end = span_end(stmts[i])
+        prev_end = try_trailing(comments, cc, prev_end, src, out)
         push(out, "\n")
         prev_multi = multi
-        prev_end = span_end(stmts[i])
         i = i + 1
+    }
+    if cc[0] < len(comments) { // file-tail comments
+        if prev_end > 0 &&
+            (prev_multi || src_blank_between(src, prev_end, tok_start(comments[cc[0]]))) {
+            push(out, "\n")
+        }
+        let _ = flush_comments(comments, cc, str_len(src) + 1, src, 0, 0, out)
     }
     join(out, "")
 }
 
-fn fmt_stmt(n, src, indent, mut buf) {
+// flush_comments emits every unconsumed comment starting before limit as
+// own-line comments at the given indent, preserving one source blank line
+// between them; returns the end offset of the last one for gap tracking
+fn flush_comments(comments, mut cc, limit, src, indent, pe0, mut buf) {
+    let mut pe = pe0
+    while cc[0] < len(comments) && tok_start(comments[cc[0]]) < limit {
+        let c = comments[cc[0]]
+        if pe > 0 && src_blank_between(src, pe, tok_start(c)) {
+            push(buf, "\n")
+        }
+        push_indent(buf, indent)
+        push(buf, tok_lex(c))
+        push(buf, "\n")
+        pe = tok_end(c)
+        cc[0] = cc[0] + 1
+    }
+    pe
+}
+
+// try_trailing pins a comment that sits on the same source line as the code
+// that just ended; returns the new end offset for gap tracking
+fn try_trailing(comments, mut cc, code_end, src, mut buf) {
+    if cc[0] < len(comments) {
+        let c = comments[cc[0]]
+        let s = tok_start(c)
+        if s >= code_end && !src_has_newline(src, code_end, s) {
+            push(buf, " ")
+            push(buf, tok_lex(c))
+            cc[0] = cc[0] + 1
+            return tok_end(c)
+        }
+    }
+    code_end
+}
+
+fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
     match n {
         LetStmt(name, _, is_mut, is_pub, init, _) => {
             if is_pub {
@@ -75,13 +149,13 @@ fn fmt_stmt(n, src, indent, mut buf) {
             }
             push(buf, name)
             push(buf, " = ")
-            fmt_expr(init, src, indent, buf)
+            fmt_expr(init, src, comments, cc, indent, buf)
         },
         FnDecl(name, _, is_pub, fnlit, _) => {
             if is_pub {
                 push(buf, "pub ")
             }
-            fmt_fn_lit(name, fnlit, src, indent, buf)
+            fmt_fn_lit(name, fnlit, src, comments, cc, indent, buf)
         },
         ReturnStmt(val, _) => {
             push(buf, "return")
@@ -89,38 +163,38 @@ fn fmt_stmt(n, src, indent, mut buf) {
                 NoNode => {},
                 _ => {
                     push(buf, " ")
-                    fmt_expr(val, src, indent, buf)
+                    fmt_expr(val, src, comments, cc, indent, buf)
                 },
             }
         },
         AssignStmt(target, val, _) => {
-            fmt_expr(target, src, indent, buf)
+            fmt_expr(target, src, comments, cc, indent, buf)
             push(buf, " = ")
-            fmt_expr(val, src, indent, buf)
+            fmt_expr(val, src, comments, cc, indent, buf)
         },
-        ExprStmt(e, _) => fmt_expr(e, src, indent, buf),
+        ExprStmt(e, _) => fmt_expr(e, src, comments, cc, indent, buf),
         WhileStmt(cond, body, _) => {
             push(buf, "while ")
-            fmt_expr(cond, src, indent, buf)
+            fmt_expr(cond, src, comments, cc, indent, buf)
             push(buf, " ")
-            fmt_expr(body, src, indent, buf)
+            fmt_expr(body, src, comments, cc, indent, buf)
         },
         ForStmt(v, _, iter, _, body, _) => {
             push(buf, "for ")
             push(buf, v)
             push(buf, " in ")
-            fmt_expr(iter, src, indent, buf)
+            fmt_expr(iter, src, comments, cc, indent, buf)
             push(buf, " ")
-            fmt_expr(body, src, indent, buf)
+            fmt_expr(body, src, comments, cc, indent, buf)
         },
         SpawnStmt(call, _) => {
             push(buf, "spawn ")
-            fmt_expr(call, src, indent, buf)
+            fmt_expr(call, src, comments, cc, indent, buf)
         },
         SendStmt(ch, val, _) => {
-            fmt_expr(ch, src, indent, buf)
+            fmt_expr(ch, src, comments, cc, indent, buf)
             push(buf, " <- ")
-            fmt_expr(val, src, indent, buf)
+            fmt_expr(val, src, comments, cc, indent, buf)
         },
         BreakStmt(_) => push(buf, "break"),
         ContinueStmt(_) => push(buf, "continue"),
@@ -132,7 +206,7 @@ fn fmt_stmt(n, src, indent, mut buf) {
             }
             push(buf, span_text(src, psp))
         },
-        EnumDecl(name, tparams, variants, is_pub, _) => {
+        EnumDecl(name, tparams, variants, is_pub, sp) => {
             if is_pub {
                 push(buf, "pub ")
             }
@@ -155,39 +229,51 @@ fn fmt_stmt(n, src, indent, mut buf) {
             let mut i = 0
             let mut pe = 0
             while i < len(variants) {
-                if i > 0 && src_blank_between(src, pe, span_start(variants[i])) {
+                pe = flush_comments(comments, cc, span_start(variants[i]), src, deeper, pe, buf)
+                if pe > 0 && src_blank_between(src, pe, span_start(variants[i])) {
                     push(buf, "\n")
                 }
                 push_indent(buf, deeper)
                 fmt_variant(variants[i], buf)
-                push(buf, ",\n")
-                pe = span_end(variants[i])
+                push(buf, ",")
+                pe = try_trailing(comments, cc, span_end(variants[i]), src, buf)
+                push(buf, "\n")
                 i = i + 1
             }
+            let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
             push_indent(buf, indent)
             push(buf, "}")
         },
-        SelectStmt(arms, has_default, dflt, _, _) => {
+        SelectStmt(arms, has_default, dflt, dsp, sp) => {
             push(buf, "select {\n")
             let deeper = indent + 4
             let mut i = 0
             let mut pe = 0
             while i < len(arms) {
-                if i > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+                pe = flush_comments(comments, cc, span_start(arms[i]), src, deeper, pe, buf)
+                if pe > 0 && src_blank_between(src, pe, span_start(arms[i])) {
                     push(buf, "\n")
                 }
                 push_indent(buf, deeper)
-                fmt_select_arm(arms[i], src, deeper, buf)
-                push(buf, ",\n")
-                pe = span_end(arms[i])
+                fmt_select_arm(arms[i], src, comments, cc, deeper, buf)
+                push(buf, ",")
+                pe = try_trailing(comments, cc, span_end(arms[i]), src, buf)
+                push(buf, "\n")
                 i = i + 1
             }
             if has_default {
+                pe = flush_comments(comments, cc, span_start2(dsp), src, deeper, pe, buf)
+                if pe > 0 && src_blank_between(src, pe, span_start2(dsp)) {
+                    push(buf, "\n")
+                }
                 push_indent(buf, deeper)
                 push(buf, "default => ")
-                fmt_expr(dflt, src, deeper, buf)
-                push(buf, ",\n")
+                fmt_expr(dflt, src, comments, cc, deeper, buf)
+                push(buf, ",")
+                pe = try_trailing(comments, cc, span_end(dflt), src, buf)
+                push(buf, "\n")
             }
+            let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
             push_indent(buf, indent)
             push(buf, "}")
         },
@@ -259,29 +345,29 @@ fn fmt_type(n, mut buf) {
     }
 }
 
-fn fmt_select_arm(n, src, indent, mut buf) {
+fn fmt_select_arm(n, src, comments, mut cc, indent, mut buf) {
     match n {
         SelectArm(is_send, bind, _, ch, val, body, _) => {
             if is_send {
-                fmt_expr(ch, src, indent, buf)
+                fmt_expr(ch, src, comments, cc, indent, buf)
                 push(buf, " <- ")
-                fmt_expr(val, src, indent, buf)
+                fmt_expr(val, src, comments, cc, indent, buf)
             } else {
                 if bind != "" {
                     push(buf, bind)
                     push(buf, " = ")
                 }
                 push(buf, "<-")
-                fmt_expr(ch, src, indent, buf)
+                fmt_expr(ch, src, comments, cc, indent, buf)
             }
             push(buf, " => ")
-            fmt_expr(body, src, indent, buf)
+            fmt_expr(body, src, comments, cc, indent, buf)
         },
         _ => fmt_internal("select arm is not a SelectArm"),
     }
 }
 
-fn fmt_fn_lit(name, n, src, indent, mut buf) {
+fn fmt_fn_lit(name, n, src, comments, mut cc, indent, mut buf) {
     match n {
         FnLit(params, muts, _pspans, body, _, _) => {
             push(buf, "fn")
@@ -302,13 +388,13 @@ fn fmt_fn_lit(name, n, src, indent, mut buf) {
                 i = i + 1
             }
             push(buf, ") ")
-            fmt_expr(body, src, indent, buf)
+            fmt_expr(body, src, comments, cc, indent, buf)
         },
         _ => fmt_internal("fn decl without fn literal"),
     }
 }
 
-fn fmt_expr(n, src, indent, mut buf) {
+fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
     match n {
         IntLit(_, sp) => push(buf, span_text(src, sp)),
         FloatLit(_, sp) => push(buf, span_text(src, sp)),
@@ -317,36 +403,36 @@ fn fmt_expr(n, src, indent, mut buf) {
         Ident(_, sp) => push(buf, span_text(src, sp)),
         Binary(op, lhs, rhs, _) => {
             let level = bin_prec(op)
-            fmt_child(lhs, level, src, indent, buf)
+            fmt_child(lhs, level, src, comments, cc, indent, buf)
             push(buf, " ")
             push(buf, bin_op_text(op))
             push(buf, " ")
-            fmt_child(rhs, level + 1, src, indent, buf)
+            fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
         },
         Logical(op, lhs, rhs, _) => {
             let level = if op == t_and_and { 2 } else { 1 }
-            fmt_child(lhs, level, src, indent, buf)
+            fmt_child(lhs, level, src, comments, cc, indent, buf)
             push(buf, " ")
             push(buf, bin_op_text(op))
             push(buf, " ")
-            fmt_child(rhs, level + 1, src, indent, buf)
+            fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
         },
         Unary(op, rhs, _) => {
             push(buf, unary_op_text(op))
-            fmt_child(rhs, 7, src, indent, buf)
+            fmt_child(rhs, 7, src, comments, cc, indent, buf)
         },
         RecvExpr(e, _) => {
             push(buf, "<-")
-            fmt_child(e, 7, src, indent, buf)
+            fmt_child(e, 7, src, comments, cc, indent, buf)
         },
         TryExpr(e, _) => {
-            fmt_child(e, 8, src, indent, buf)
+            fmt_child(e, 8, src, comments, cc, indent, buf)
             push(buf, "?")
         },
         Index(target, idx, _) => {
-            fmt_child(target, 8, src, indent, buf)
+            fmt_child(target, 8, src, comments, cc, indent, buf)
             push(buf, "[")
-            fmt_expr(idx, src, indent, buf)
+            fmt_expr(idx, src, comments, cc, indent, buf)
             push(buf, "]")
         },
         ListLit(elems, _) => {
@@ -356,14 +442,14 @@ fn fmt_expr(n, src, indent, mut buf) {
                 if i > 0 {
                     push(buf, ", ")
                 }
-                fmt_expr(elems[i], src, indent, buf)
+                fmt_expr(elems[i], src, comments, cc, indent, buf)
                 i = i + 1
             }
             push(buf, "]")
         },
-        FnLit(_, _, _, _, _, _) => fmt_fn_lit("", n, src, indent, buf),
-        Block(stmts, _) => {
-            if len(stmts) == 0 {
+        FnLit(_, _, _, _, _, _) => fmt_fn_lit("", n, src, comments, cc, indent, buf),
+        Block(stmts, sp) => {
+            if len(stmts) == 0 && !comment_inside(comments, cc, span_end2(sp)) {
                 push(buf, "{}")
             } else {
                 push(buf, "{\n")
@@ -371,61 +457,66 @@ fn fmt_expr(n, src, indent, mut buf) {
                 let mut i = 0
                 let mut pe = 0
                 while i < len(stmts) {
-                    if i > 0 && src_blank_between(src, pe, span_start(stmts[i])) {
+                    pe = flush_comments(comments, cc, span_start(stmts[i]), src, deeper, pe, buf)
+                    if pe > 0 && src_blank_between(src, pe, span_start(stmts[i])) {
                         push(buf, "\n")
                     }
                     push_indent(buf, deeper)
-                    fmt_stmt(stmts[i], src, deeper, buf)
+                    fmt_stmt(stmts[i], src, comments, cc, deeper, buf)
+                    pe = try_trailing(comments, cc, span_end(stmts[i]), src, buf)
                     push(buf, "\n")
-                    pe = span_end(stmts[i])
                     i = i + 1
                 }
+                let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
                 push_indent(buf, indent)
                 push(buf, "}")
             }
         },
         IfExpr(cond, then, els, _) => {
             push(buf, "if ")
-            fmt_expr(cond, src, indent, buf)
+            fmt_expr(cond, src, comments, cc, indent, buf)
             push(buf, " ")
-            fmt_expr(then, src, indent, buf)
+            fmt_expr(then, src, comments, cc, indent, buf)
             match els {
                 NoNode => {},
                 _ => {
                     push(buf, " else ")
-                    fmt_expr(els, src, indent, buf) // a nested IfExpr renders as `else if`
+                    fmt_expr(els, src, comments, cc, indent, buf) // a nested IfExpr renders as `else if`
                 },
             }
         },
-        MatchExpr(scrut, arms, _) => {
+        MatchExpr(scrut, arms, sp) => {
             push(buf, "match ")
-            fmt_expr(scrut, src, indent, buf)
+            fmt_expr(scrut, src, comments, cc, indent, buf)
             push(buf, " {\n")
             let deeper = indent + 4
             let mut i = 0
             let mut pe = 0
             while i < len(arms) {
-                if i > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+                pe = flush_comments(comments, cc, span_start(arms[i]), src, deeper, pe, buf)
+                if pe > 0 && src_blank_between(src, pe, span_start(arms[i])) {
                     push(buf, "\n")
                 }
                 push_indent(buf, deeper)
-                fmt_arm(arms[i], src, deeper, buf)
-                push(buf, ",\n")
-                pe = span_end(arms[i])
+                fmt_arm(arms[i], src, comments, cc, deeper, buf)
+                push(buf, ",")
+                pe = try_trailing(comments, cc, span_end(arms[i]), src, buf)
+                push(buf, "\n")
                 i = i + 1
             }
+            let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
             push_indent(buf, indent)
             push(buf, "}")
         },
         Call(callee, cargs, _) => {
-            fmt_child(callee, 8, src, indent, buf)
+            fmt_child(callee, 8, src, comments, cc, indent, buf)
             push(buf, "(")
             let mut i = 0
             while i < len(cargs) {
                 if i > 0 {
                     push(buf, ", ")
                 }
-                fmt_expr(cargs[i], src, indent, buf)
+                fmt_expr(cargs[i], src, comments, cc, indent, buf)
                 i = i + 1
             }
             push(buf, ")")
@@ -451,12 +542,12 @@ fn fmt_expr(n, src, indent, mut buf) {
     }
 }
 
-fn fmt_arm(n, src, indent, mut buf) {
+fn fmt_arm(n, src, comments, mut cc, indent, mut buf) {
     match n {
         MatchArm(pat, body, _) => {
             fmt_pat(pat, src, buf)
             push(buf, " => ")
-            fmt_expr(body, src, indent, buf)
+            fmt_expr(body, src, comments, cc, indent, buf)
         },
         _ => fmt_internal("match arm is not a MatchArm"),
     }
@@ -499,13 +590,13 @@ fn fmt_pat(n, src, mut buf) {
 // minimum its position requires (left operand of a binary: the operator's
 // own level; right operand: level + 1, since every binary and logical
 // operator is left-associative).
-fn fmt_child(n, need, src, indent, mut buf) {
+fn fmt_child(n, need, src, comments, mut cc, indent, mut buf) {
     if node_prec(n) < need {
         push(buf, "(")
-        fmt_expr(n, src, indent, buf)
+        fmt_expr(n, src, comments, cc, indent, buf)
         push(buf, ")")
     } else {
-        fmt_expr(n, src, indent, buf)
+        fmt_expr(n, src, comments, cc, indent, buf)
     }
 }
 
@@ -548,6 +639,24 @@ fn bin_prec(op) {
     }
 }
 
+// comment_inside reports whether the next unconsumed comment sits before
+// byte offset limit (used to keep braces open for comment-only blocks)
+fn comment_inside(comments, cc, limit) {
+    cc[0] < len(comments) && tok_start(comments[cc[0]]) < limit
+}
+
+fn tok_start(t) {
+    match t {
+        Tok(_, _, s, _) => s,
+    }
+}
+
+fn tok_end(t) {
+    match t {
+        Tok(_, _, _, e) => e,
+    }
+}
+
 fn span_start(n) {
     match span_of(n) {
         Sp(s, _) => s,
@@ -556,6 +665,18 @@ fn span_start(n) {
 
 fn span_end(n) {
     match span_of(n) {
+        Sp(_, e) => e,
+    }
+}
+
+fn span_start2(sp) {
+    match sp {
+        Sp(s, _) => s,
+    }
+}
+
+fn span_end2(sp) {
+    match sp {
         Sp(_, e) => e,
     }
 }
@@ -578,6 +699,17 @@ fn src_blank_between(src, a, b) {
         i = i + 1
     }
     nl >= 2
+}
+
+fn src_has_newline(src, a, b) {
+    let mut i = a
+    while i < b {
+        if byte_at(src, i) == 10 {
+            return true
+        }
+        i = i + 1
+    }
+    false
 }
 
 fn push_indent(mut buf, mut n) {
