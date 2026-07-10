@@ -1,0 +1,340 @@
+// S6.1 offline dependency resolution: bur.mod requires, semver ordering,
+// MVS over the local cache, and canonical tree hashes for bur.sum.
+//
+// Scope (GOALS §6.5): resolution reads $BURCACHE only — a cache miss is an
+// error that points at `bur mod download` (network fetching is S6.2).
+// `std/` never resolves here: std ships with the toolchain. Wiring the
+// resolved graph into import loading (module.bur E0432 relaxation) lands
+// together with the interface-cache design decision.
+
+// MI carries one parsed bur.mod: module path, require paths, require
+// versions (parallel lists)
+pub enum ModInfo {
+    MI(str, [str], [str]),
+}
+
+// MP is a resolution result: selected module paths and versions, parallel,
+// sorted by path
+pub enum ModPick {
+    MP([str], [str]),
+}
+
+// modgraph_parse reads a bur.mod text into MI; `//` comments are stripped
+pub fn modgraph_parse(text) {
+    let mut mpath = ""
+    let mut rpaths = []
+    let mut rvers = []
+    for line in split(text, "\n") {
+        let mut t = line
+        match str_index_of(t, "//") {
+            Some(ix) => {
+                t = substr(t, 0, ix)
+            },
+            None => {},
+        }
+        let fields = str_fields(t)
+        if len(fields) > 0 {
+            if fields[0] == "module" {
+                if len(fields) != 2 || !valid_import_path(fields[1]) {
+                    return Err("malformed module directive")
+                }
+                if mpath != "" {
+                    return Err("duplicate module directive")
+                }
+                mpath = fields[1]
+            } else if fields[0] == "require" {
+                if len(fields) != 3 || !valid_import_path(fields[1]) ||
+                    !str_has_prefix(fields[2], "v") {
+                    return Err("malformed require directive")
+                }
+                push(rpaths, fields[1])
+                push(rvers, fields[2])
+            } else {
+                return Err("unknown directive \"" + fields[0] + "\"")
+            }
+        }
+    }
+    if mpath == "" {
+        return Err("missing module directive")
+    }
+    Ok(MI(mpath, rpaths, rvers))
+}
+
+// ver_cmp orders two `v<major>.<minor>.<patch>` strings numerically;
+// missing or malformed components count as 0
+pub fn ver_cmp(a, b) {
+    let pa = ver_parts(a)
+    let pb = ver_parts(b)
+    let mut i = 0
+    while i < 3 {
+        if pa[i] < pb[i] {
+            return -1
+        }
+        if pa[i] > pb[i] {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn ver_parts(v) {
+    let s = if str_has_prefix(v, "v") {
+        substr(v, 1, str_len(v) - 1)
+    } else {
+        v
+    }
+    let bits = split(s, ".")
+    let mut out = []
+    let mut i = 0
+    while i < 3 {
+        if i < len(bits) {
+            match parse_int(bits[i]) {
+                Some(n) => push(out, n),
+                None => push(out, 0),
+            }
+        } else {
+            push(out, 0)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// env_lookup shells out to printenv: there is no env native, and adding one
+// is not this milestone's call
+fn env_lookup(name) {
+    match exec("printenv", [name]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    Some(trim(so))
+                } else {
+                    None
+                }
+            },
+        },
+        Err(_) => None,
+    }
+}
+
+// cache_root yields $BURCACHE, defaulting to ~/.burryn/pkg
+pub fn cache_root() {
+    match env_lookup("BURCACHE") {
+        Some(p) => p,
+        None => match env_lookup("HOME") {
+            Some(h) => h + "/.burryn/pkg",
+            None => "/tmp/burryn-pkg",
+        },
+    }
+}
+
+// mvs_resolve reads dir's bur.mod and walks the require closure through the
+// cache. Every (path, version) pair ever required contributes its own
+// requires (Go's module graph); the selection per path is the highest
+// version seen — the minimal version satisfying every requirement.
+pub fn mvs_resolve(dir) {
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod not found in " + dir + ": " + m)
+            ""
+        },
+    }
+    let mut qp = []
+    let mut qv = []
+    match modgraph_parse(text) {
+        Ok(mi) => match mi {
+            MI(_, rp, rv) => {
+                qp = rp
+                qv = rv
+            },
+        },
+        Err(m) => {
+            return Err(dir + "/bur.mod: " + m)
+        },
+    }
+    let root = cache_root()
+    let mut sel = map()  // path -> highest required version
+    let mut seen = map() // "path@version" -> 1, each pair contributes once
+    let mut qi = 0
+    while qi < len(qp) {
+        let p = qp[qi]
+        let v = qv[qi]
+        qi = qi + 1
+        if p == "std" || str_has_prefix(p, "std/") {
+            return Err("std ships with the toolchain; drop `require " + p + "`")
+        }
+        let key = p + "@" + v
+        match get(seen, key) {
+            Some(_) => {},
+            None => {
+                put(seen, key, 1)
+                let take = match get(sel, p) {
+                    Some(cur) => ver_cmp(v, cur) > 0,
+                    None => true,
+                }
+                if take {
+                    put(sel, p, v)
+                }
+                let mdir = root + "/" + key
+                let mtext = match read_file(mdir + "/bur.mod") {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err("module " + key + " not in cache (" + mdir +
+                            "); fetch it with `bur mod download` once S6.2 lands")
+                        ""
+                    },
+                }
+                match modgraph_parse(mtext) {
+                    Ok(sub) => match sub {
+                        MI(subpath, srp, srv) => {
+                            if subpath != p {
+                                return Err("cache corruption: " + mdir +
+                                    " declares module " + subpath)
+                            }
+                            let mut k = 0
+                            while k < len(srp) {
+                                push(qp, srp[k])
+                                push(qv, srv[k])
+                                k = k + 1
+                            }
+                        },
+                    },
+                    Err(m) => {
+                        return Err("bad bur.mod in " + mdir + ": " + m)
+                    },
+                }
+            },
+        }
+    }
+    let spaths = sorted_strs(keys(sel))
+    let mut svers = []
+    for p in spaths {
+        match get(sel, p) {
+            Some(v) => push(svers, v),
+            None => push(svers, ""),
+        }
+    }
+    Ok(MP(spaths, svers))
+}
+
+fn sorted_strs(xs) {
+    let mut out = []
+    for x in xs {
+        let mut i = 0
+        while i < len(out) && out[i] < x {
+            i = i + 1
+        }
+        out = concat(concat(slice(out, 0, i), [x]), slice(out, i, len(out)))
+    }
+    out
+}
+
+// tree_hash computes the canonical module hash: each file's sha256 plus its
+// sorted relative path, hashed once more (Go dirhash in spirit). Format:
+// `h1:<hex sha256>` over lines `<file sha256>  <relative path>\n`.
+pub fn tree_hash(dir) {
+    let mut files = []
+    collect_files(dir, "", files)
+    let mut manifest = []
+    for rel in sorted_strs(files) {
+        match exec("sha256sum", [dir + "/" + rel]) {
+            Ok(o) => match o {
+                Output(code, so, se) => {
+                    if code != 0 {
+                        return Err("sha256sum " + rel + ": " + trim(se))
+                    }
+                    push(manifest, substr(so, 0, 64) + "  " + rel + "\n")
+                },
+            },
+            Err(m) => {
+                return Err("sha256sum: " + m)
+            },
+        }
+    }
+    // `$0` carries the manifest as an argument: no quoting, no temp file
+    match exec("sh", ["-c", "printf %s \"$0\" | sha256sum", join(manifest, "")]) {
+        Ok(o) => match o {
+            Output(code, so, se) => {
+                if code != 0 {
+                    return Err("sha256sum: " + trim(se))
+                }
+                Ok("h1:" + substr(so, 0, 64))
+            },
+        },
+        Err(m) => Err("sh: " + m),
+    }
+}
+
+// collect_files gathers relative file paths under root, skipping
+// dot-entries; a path read_dir rejects is treated as a file
+fn collect_files(root, rel, mut acc) {
+    let dir = if rel == "" { root } else { root + "/" + rel }
+    match read_dir(dir) {
+        Ok(names) => {
+            for n in names {
+                if !str_has_prefix(n, ".") {
+                    let r = if rel == "" { n } else { rel + "/" + n }
+                    match read_dir(dir + "/" + n) {
+                        Ok(_) => collect_files(root, r, acc),
+                        Err(_) => push(acc, r),
+                    }
+                }
+            }
+        },
+        Err(_) => {},
+    }
+}
+
+// sum_render lays out bur.sum: one `<path> <version> <h1 hash>` line per
+// selected module, already sorted by path
+pub fn sum_render(pick, hashes) {
+    match pick {
+        MP(paths, vers) => {
+            let mut lines = []
+            let mut i = 0
+            while i < len(paths) {
+                push(lines, paths[i] + " " + vers[i] + " " + hashes[i] + "\n")
+                i = i + 1
+            }
+            join(lines, "")
+        },
+    }
+}
+
+// sum_check verifies a bur.sum text against a resolution: every selected
+// module must have an entry whose version and freshly computed tree hash
+// match
+pub fn sum_check(sum_text, pick, root) {
+    let mut want = map()
+    for line in split(sum_text, "\n") {
+        let f = str_fields(line)
+        if len(f) == 3 {
+            put(want, f[0], f[1] + " " + f[2])
+        } else if len(f) != 0 {
+            return Err("malformed bur.sum line: " + line)
+        }
+    }
+    match pick {
+        MP(paths, vers) => {
+            let mut i = 0
+            while i < len(paths) {
+                match get(want, paths[i]) {
+                    Some(e) => {
+                        let got = tree_hash(root + "/" + paths[i] + "@" + vers[i])?
+                        if e != vers[i] + " " + got {
+                            return Err("bur.sum mismatch for " + paths[i] +
+                                ": have " + e + ", computed " + vers[i] + " " + got)
+                        }
+                    },
+                    None => {
+                        return Err("bur.sum: missing entry for " + paths[i])
+                    },
+                }
+                i = i + 1
+            }
+            Ok(len(paths))
+        },
+    }
+}

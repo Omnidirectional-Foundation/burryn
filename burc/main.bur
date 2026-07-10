@@ -674,6 +674,10 @@ fn dev_cmd(rest) {
         run_file(rest[1], mode_run, slice(rest, 2, len(rest)))
         return
     }
+    if sub == "mod-graph" {
+        dev_mod_graph(strip_trailing_slash(rest[1]))
+        return
+    }
     let src = match read_file(rest[1]) {
         Ok(s) => s,
         Err(msg) => {
@@ -696,6 +700,37 @@ fn dev_cmd(rest) {
     } else {
         println("unknown dev command:", sub)
         exit(exit_usage)
+    }
+}
+
+// dev_mod_graph resolves a module's require closure offline (S6.1) and
+// prints the would-be bur.sum: `<path> <version> <h1 tree hash>` lines.
+fn dev_mod_graph(dir) {
+    match lib.mvs_resolve(dir) {
+        Ok(pick) => {
+            let root = lib.cache_root()
+            match pick {
+                lib.ModPick.MP(paths, vers) => {
+                    let mut hashes = []
+                    let mut i = 0
+                    while i < len(paths) {
+                        match lib.tree_hash(root + "/" + paths[i] + "@" + vers[i]) {
+                            Ok(h) => push(hashes, h),
+                            Err(m) => {
+                                eprintln("error: " + m)
+                                exit(exit_static)
+                            },
+                        }
+                        i = i + 1
+                    }
+                    print(lib.sum_render(pick, hashes))
+                },
+            }
+        },
+        Err(m) => {
+            eprintln("error: " + m)
+            exit(exit_static)
+        },
     }
 }
 
