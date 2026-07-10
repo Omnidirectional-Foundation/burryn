@@ -38,7 +38,9 @@
   明确不做所有权/借用检查
 - **`mut` 为深语义、绑定级纪律(owner 2026-07-10 修订)**：经由 `let` 绑定名不可修改其值(含容器内容)；push/元素修改要求 `mut`。
   不可变性挂在**绑定**上而非值上——无借用检查器与 move 语义，别名可绕过(实测 `let mut b = a` 后改 `b` 可见于 `a`)，故**不承诺值级不可变**。
-  补强定案：checker 增加流规则——`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)；动工前先摸底 burc 自身迁移面，波及过大则回退为仅本条措辞修订
+  补强定案(2026-07-11 owner 收窄采纳)：checker 增加流规则——`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)，违者 error。
+  **只对堆类型(list/map 及含其的类型)生效**：int/float/bool/str/unit 为拷贝语义、无别名危害，豁免；if/match 作来源时递归看各臂尾表达式，皆新鲜则整体新鲜；来源类型未解时延迟判定(复用 S6.8 的组尾 flush 机制)。
+  落地顺序：先迁移 burc 自身堆类型违例(约 10 处，摸底数字见 §6.5 S6.8 条目)再启用规则，否则新 checker 编不过自己
 - **参数默认不可变；`fn f(mut xs)` 声明可变参数**——已定，S2.5 实现(stdlib 原地操作与自举编译器的 emit 累积模式需要)。
   调用点无标记，与「无借用检查器 + GC」的定位一致，属 Go 式取舍
 
@@ -170,7 +172,7 @@
 骨架在，缺解析 + 拉取 + 定位。
 
 - S6.1 解析层(无网络)：新 `burc/lib/modgraph.bur` 构建依赖图跑 MVS(选满足约束的**最低**版本)；新增 `bur.sum` lockfile(`path version hash`)；放开 module.bur:538 跨模块限制(命中 require 图则放行)；缓存目录 `$BURCACHE` 默认 `~/.burryn/pkg/<path>@<version>/`
-- S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native——**已落地(2026-07-10)**：shell-out 方案成立，零新 native；`bur mod init/tidy/download/verify` 与 `bur get` 全部接线；`bur get` 拉取失败回滚 bur.mod；树哈希输出已从 hex 纠正为定案的 `h1:<base64>`。**实现侧默认(GOALS 未定，owner 可否决)**：clone URL = `https://<module path>`(Go 式「模块路径即仓库路径」，不支持子目录模块)，环境变量 `$BURGITBASE` 可换 URL 前缀(镜像/离线测试)；`bur mod download` 在 bur.sum 存在时校验、缺失时写出
+- S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native——**已落地(2026-07-10)**：shell-out 方案成立，零新 native；`bur mod init/tidy/download/verify` 与 `bur get` 全部接线；`bur get` 拉取失败回滚 bur.mod；树哈希输出已从 hex 纠正为定案的 `h1:<base64>`。**实现侧默认(2026-07-11 owner 追认为定案)**：clone URL = `https://<module path>`(Go 式「模块路径即仓库路径」，不支持子目录模块，真实需求出现再议 discovery)，环境变量 `$BURGITBASE` 可换 URL 前缀(镜像/离线测试)；`bur mod download` 在 bur.sum 存在时校验、缺失时写出
 - **CLI 布局已定(owner 2026-07-10，照搬 Go 词汇表)**，随 S6.1/S6.2 落地：
   - `bur mod init <module-path>`：写 `bur.mod`，module path 显式给出、不从目录名猜
   - `bur mod tidy`：离线重算 MVS、重写 `bur.sum`(S6.2 后扩展为按 import 增删 require)
@@ -184,7 +186,7 @@
   - `bur.sum` 行格式 `<path> <version> h1:<base64(树哈希)>`；树哈希 = 规范化目录哈希(路径排序 + 逐文件 sha256 汇总，Go dirhash 式)；版本 ↔ git tag 映射 `v<semver>`
   - S6.1 离线解析只读 `$BURCACHE`；cache miss 报错并提示 `bur mod download`(自动拉取归 S6.2)
   - **std 分发形式 = 随工具链捆绑**：保留 import 前缀 `std/`，版本跟工具链走，不经网络拉取；modgraph 解析须把 `std/` 特判为工具链内置，绝不落缓存/网络路径
-  - **接口缓存已定(owner 2026-07-10，原必答题)**：对每个 `path@version` 首次编译后，把导出面序列化为接口文件缓存(enum 定义原样复制、fn 导出写成签名)；**接口文件语法 = S7.8 可选标注语法**(标注语法先在此定型，接口文件即自动生成的人类可读声明文件)；缓存 key = (工具链版本, 模块树哈希)，安全性由 bur.sum 锁定的哈希承担
+  - **接口缓存已定(owner 2026-07-10，原必答题)**：对每个 `path@version` 首次编译后，把导出面序列化为接口文件缓存(enum 定义原样复制、fn 导出写成签名)；**接口文件语法 = S7.8 可选标注语法**(标注语法先在此定型，接口文件即自动生成的人类可读声明文件)；缓存 key = (工具链版本, 模块树哈希)，安全性由 bur.sum 锁定的哈希承担。**S7.8 语法形态已定(owner 2026-07-11，移出 §7 待定)**：参数 `name: type`、返回值 `-> type`，类型表达式复用 enum 字段既有语法(`[T]`、`fn(...) -> T`、`map(K, V)`、小写名即类型参数)，标注可省略、语义不变——S6.1 接口缓存自此解锁
   - S6.2 执行细节：clone 后进缓存前 strip `.git`(树哈希不含 git 元数据)；tag 缺失的报错指向对应 `require` 行
 
 **S6.3 `bur fmt`(P0，文化基础设施)**
@@ -223,6 +225,12 @@
 - **捆绑机制已定(owner 2026-07-10)：内嵌进二进制**——std 源码构建时转为字符串常量编进 burc，`import "std/..."` 从内嵌表取源码；与 §1 单二进制交付一致，无安装布局探测。「禁 build 期执行任意代码」红线针对第三方包，工具链自建生成物不在其列
 - json 解析/序列化全用 Burryn 实现，作为 std 首个成员与捆绑机制一起落地
 - 来历：S2.7 曾把 json/net 标为已完成，2026-07-10 核实均未实现，json 移入本项、net 移入 S7.7
+- **API 定案(owner 2026-07-11，原 §7 四问全部关闭)**：
+  - 值表示 = `pub enum Json { JNull, JBool(bool), JInt(int), JFloat(float), JStr(str), JArr([Json]), JObj([str], [Json]) }`；对象用**保序平行列表**(round-trip 稳定、序列化确定，贴合确定性承诺)，配 `get(keys, vals, k) -> Option<Json>` 式帮手；数字双变体：字面量无小数点无指数且在 i64 范围 → `JInt`，否则 `JFloat`
+  - 函数名走包前缀裸名：`parse(s) -> Result<Json, str>`(错误消息带字节偏移)、`render(v) -> str`(紧凑)、`pretty(v, indent) -> str`
+  - 源码布局 = repo 根 `std/json/`，带 `bur.mod`(`module std/json`)：开发期直接 `bur check`/`bur test` 走本地 loader，发布走内嵌表，同一份源码
+  - 生成器 = 隐藏命令 `bur dev embed-std` 扫 `std/` 生成 `burc/lib/std_embed.bur`(字符串常量表，**checked in**——seed 编 burc 也需要它)；CI 加「重新生成 + cmp」一步防手改漂移
+  - `std/testing`(`assert_eq`/`assert_ok`/`assert_err`)与 json 同批、同机制落地，顺带清 S6.4 的断言糖债
 
 **S6.7 runtime IO 工作包(owner 2026-07-10 定，尽快落地)**
 
@@ -246,7 +254,7 @@
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序(2026-07-10 二次修订；S6.7/S6.3/S6.8/S6.2/S6.4 已完成)**：S6.8 → S6.2 → S6.4(提前于 S6.6 落地：S6.6 卡 json API 待定项，见 §7；S6.4 定案完备无阻塞)→ **S6.6 std/json(卡 §7 API 决策)** → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
+**推进顺序(2026-07-11 三修；S6.7/S6.3/S6.8/S6.2/S6.4 已完成，决策批已关闭全部闸门)**：**deep-mut 流规则批**(§2 定案，先迁移 burc 再上规则)→ **S6.6 std/json + std/testing**(API 已定)→ S6.1 import 接线 + 接口缓存(S7.8 语法已定，解锁)→ debugger(S6.5)→ S7。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
@@ -255,7 +263,7 @@
 
 | 项 | 成本 | 触及范围 | 备注 |
 |---|---|---|---|
-| 字符串插值(S7.1) | 低 | 纯 lexer+parser 脱糖为 `join`/`+` | 不碰类型系统；lexer 需在串内切回表达式模式，`{{` 转义 |
+| 字符串插值(S7.1) | 低 | 纯 lexer+parser 脱糖为 `join`/`+` | 不碰类型系统；lexer 需在串内切回表达式模式，`{{` 转义；`{}` 内须为 str 值，非 str 编译错、提示显式 `str()`(owner 2026-07-11 定，无隐式转换的语言气质) |
 | 管道 `\|>`(S7.2) | 极低 | 纯 parser 脱糖 | — |
 | Match Guard(S7.3) | 低 | compiler 加条件跳转 | — |
 | 命名参数+默认值(S7.4) | 中 | checker(按名重排实参+arity) + compiler(默认值字节码) | **已否决(2026-07-10)**：名字是否进 fn 类型参与 unification 无良解(进则函数值传递变脆，不进则语义两张皮)；若重提仅限「直接调用的纯语法糖」形态 |
@@ -284,10 +292,10 @@
 - `select` 语义细节(default 分支？公平性？)
 - 手写后端的调用约定与 GC 根扫描策略(S8 前定)
 - S7.6 `defer` 块作用域细节(块表达式的求值时机、fiber 退出语义)
-- S7.8 可选签名标注的语法形态
 - S6.7 后续：net 落地时是否升级为通用 fd 感知调度(epoll/kqueue)
-- **S6.6 std/json 公共 API(2026-07-10 补，卡此项动工；实现侧已跳过它先做 S6.4)**：JSON 值的 enum 表示(对象用 map 还是保序平行列表？数字只上 float 还是分 int/float？)、函数命名与签名(parse/render？缩进选项？)、std 源码目录布局(repo 根 `std/json/`？)、内嵌表生成器形态(隐藏命令生成 checked-in 的 `burc/lib/std_embed.bur`？)
 
 已探查结论(移出待定)：lexer comment/trivia 保留已完成(S6.3 前置就绪，见 §6.6)；`exec` shell-out `git clone` 够用已确认(S6.2 无需新 native，见 §6.5)。
 
 2026-07-10 设计审查定案(全文散见对应章节)：深 mut 降级为绑定级纪律 + checker 流规则；确定性承诺收窄 + `BUR_DETERMINISTIC` 模式；可选签名标注归 S7.8；S7.4 命名参数否决；S8 重排(类型先行、ELF 先于 PE)；std 捆绑分发；`bur.sum` 树哈希；fmt 验收三条铁律；json/net 从 S2.7 纠错移入 S6.6/S7.7；新增 S6.7 runtime IO 与 S6.8 checker 债批。
+
+2026-07-11 决策批(五项，全文散见对应章节)：deep-mut 流规则收窄到堆类型后采纳为 error(§2)；S6.2 实现侧默认追认(clone URL 与 download 语义，§6.5)；S6.6 json API 四问关闭(值表示/函数名/目录布局/内嵌生成器，§6.5，std/testing 同批)；S7.8 标注语法定型(`name: type` + `-> type`，复用类型表达式，§6.5 接口缓存条目，S6.1 解锁)；S7.1 插值非 str 为编译错(§6.6 表)。
