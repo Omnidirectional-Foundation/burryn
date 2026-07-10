@@ -46,6 +46,8 @@ fn main() {
         dispatch(a[1], mode_dis, [])
     } else if cmd == "build" {
         build_cmd(slice(a, 1, len(a)))
+    } else if cmd == "fmt" {
+        fmt_cmd(slice(a, 1, len(a)))
     } else if cmd == "version" || cmd == "-v" || cmd == "--version" {
         println("Burryn " + version + " — the ring beneath Meyrin")
     } else if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -66,12 +68,151 @@ fn usage() {
     println("  bur <file.bur|dir>     same as run")
     println("  bur check <file|dir>   typecheck only (rustc-style diagnostics)")
     println("  bur build <file|dir>   compile to a native binary via C")
+    println("  bur fmt <file|dir|->   rewrite source in the official format")
     println("  bur dis <file|dir>     disassemble compiled bytecode")
     println("  bur version")
     println("")
     println("bur build flags:")
     println("  -o <path>              output path (binary, or C file with --emit c)")
     println("  --emit c               emit generated C instead of a binary")
+    println("")
+    println("bur fmt flags:")
+    println("  --check                list files that would change; exit 1 if any")
+    println("  -                      read stdin, write the result to stdout")
+}
+
+// fmt_cmd implements `bur fmt <file|dir|-> [--check]`: rewrite sources in
+// the official format in place, list drifted files with --check, or filter
+// stdin to stdout with `-`. Static errors exit 1; a verifier failure is a
+// formatter bug and exits 4.
+fn fmt_cmd(rest) {
+    let mut check_only = false
+    let mut targets = []
+    for a in rest {
+        if a == "--check" {
+            check_only = true
+        } else {
+            push(targets, a)
+        }
+    }
+    if len(targets) == 0 {
+        usage()
+        exit(exit_usage)
+    }
+    let mut state = [0, 0] // [any file differs (--check), any static error]
+    for t in targets {
+        if t == "-" {
+            fmt_stdin(state)
+        } else if ends_with(t, ".bur") {
+            fmt_one(t, check_only, state)
+        } else {
+            fmt_dir(strip_trailing_slash(t), check_only, state)
+        }
+    }
+    if state[1] > 0 || (check_only && state[0] > 0) {
+        exit(exit_static)
+    }
+}
+
+// fmt_source formats one already-read source; static errors print and yield
+// None, a verifier failure aborts as an internal error.
+fn fmt_source(path, src, mut state) {
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags, comments) => {
+            if len(ldiags) > 0 {
+                eprintln(path + ":")
+                let _ = emit_errors(ldiags, false)
+                state[1] = 1
+                return None
+            }
+            match lib.parse(toks) {
+                lib.ParseOut.Parsed(stmts, pdiags) => {
+                    if len(pdiags) > 0 {
+                        eprintln(path + ":")
+                        let _ = emit_errors(pdiags, false)
+                        state[1] = 1
+                        return None
+                    }
+                    match lib.format_verified(stmts, src, comments) {
+                        Ok(out) => Some(out),
+                        Err(msg) => {
+                            eprintln("internal error: " + msg)
+                            exit(4)
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+fn fmt_one(path, check_only, mut state) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match fmt_source(path, src, state) {
+        Some(out) => {
+            if out != src {
+                if check_only {
+                    println(path)
+                    state[0] = 1
+                } else {
+                    match write_file(path, out) {
+                        Ok(_) => {},
+                        Err(msg) => {
+                            eprintln("error: " + msg)
+                            exit(exit_no_input)
+                        },
+                    }
+                }
+            }
+        },
+        None => {},
+    }
+}
+
+fn fmt_stdin(mut state) {
+    let src = match read_file("/dev/stdin") {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match fmt_source("<stdin>", src, state) {
+        Some(out) => print(out),
+        None => {},
+    }
+}
+
+// fmt_dir walks a directory tree, formatting every .bur file; dot-entries
+// are skipped.
+fn fmt_dir(dir, check_only, mut state) {
+    match read_dir(dir) {
+        Ok(names) => {
+            for n in names {
+                if !starts_with(n, ".") {
+                    let p = dir + "/" + n
+                    if ends_with(n, ".bur") {
+                        fmt_one(p, check_only, state)
+                    } else {
+                        match read_dir(p) {
+                            Ok(_) => fmt_dir(p, check_only, state),
+                            Err(_) => {},
+                        }
+                    }
+                }
+            }
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
 }
 
 // dispatch routes a path to the file or module pipeline based on whether it
