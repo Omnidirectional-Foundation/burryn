@@ -1,9 +1,14 @@
-// Minimal pretty-printer for Burryn source.
-// Stage 1: expressions (literals, idents, unary/binary/logical operators,
-// calls, blocks) and top-level declarations (LetStmt, FnDecl, ReturnStmt).
-// Nodes the printer does not handle yet are copied verbatim from the source
-// via their span, so the output always parses back to the same AST.
+// Pretty-printer for Burryn source.
+// Stage 2: full AST coverage — every statement, expression, pattern, and
+// type expression prints from the tree; no span fallbacks remain.
 // Comment trivia is accepted but ignored until stage 3.
+//
+// Layout rules (GOALS §6.5): 4-space indent, no line wrapping, trailing
+// comma per match/select arm and enum variant. Top-level declarations are
+// separated by exactly one blank line when either neighbor is multi-line;
+// consecutive single-line declarations keep the source's grouping (a blank
+// line survives iff the source had one). Inside blocks, arms, and enum
+// bodies a single source blank line is preserved, never more.
 
 // format_verified formats and then enforces the acceptance rules from
 // GOALS §6.5: the output must reparse to a structurally equal AST
@@ -33,14 +38,29 @@ pub fn format_verified(stmts, src, comments) {
 
 // format_file formats a single file's top-level statements.
 pub fn format_file(stmts, src, _comments) {
-    let mut buf = []
+    let mut out = []
+    let mut prev_multi = false
+    let mut prev_end = 0
     let mut i = 0
     while i < len(stmts) {
+        let mut buf = []
         fmt_stmt(stmts[i], src, 0, buf)
-        push(buf, "\n")
+        let seg = join(buf, "")
+        let multi = str_contains(seg, "\n")
+        if i > 0 {
+            if multi || prev_multi {
+                push(out, "\n")
+            } else if src_blank_between(src, prev_end, span_start(stmts[i])) {
+                push(out, "\n")
+            }
+        }
+        push(out, seg)
+        push(out, "\n")
+        prev_multi = multi
+        prev_end = span_end(stmts[i])
         i = i + 1
     }
-    join(buf, "")
+    join(out, "")
 }
 
 fn fmt_stmt(n, src, indent, mut buf) {
@@ -73,15 +93,202 @@ fn fmt_stmt(n, src, indent, mut buf) {
                 },
             }
         },
-        _ => push(buf, span_text(src, span_of(n))),
+        AssignStmt(target, val, _) => {
+            fmt_expr(target, src, indent, buf)
+            push(buf, " = ")
+            fmt_expr(val, src, indent, buf)
+        },
+        ExprStmt(e, _) => fmt_expr(e, src, indent, buf),
+        WhileStmt(cond, body, _) => {
+            push(buf, "while ")
+            fmt_expr(cond, src, indent, buf)
+            push(buf, " ")
+            fmt_expr(body, src, indent, buf)
+        },
+        ForStmt(v, _, iter, _, body, _) => {
+            push(buf, "for ")
+            push(buf, v)
+            push(buf, " in ")
+            fmt_expr(iter, src, indent, buf)
+            push(buf, " ")
+            fmt_expr(body, src, indent, buf)
+        },
+        SpawnStmt(call, _) => {
+            push(buf, "spawn ")
+            fmt_expr(call, src, indent, buf)
+        },
+        SendStmt(ch, val, _) => {
+            fmt_expr(ch, src, indent, buf)
+            push(buf, " <- ")
+            fmt_expr(val, src, indent, buf)
+        },
+        BreakStmt(_) => push(buf, "break"),
+        ContinueStmt(_) => push(buf, "continue"),
+        ImportDecl(alias, _, _, psp, _) => {
+            push(buf, "import ")
+            if alias != "" {
+                push(buf, alias)
+                push(buf, " ")
+            }
+            push(buf, span_text(src, psp))
+        },
+        EnumDecl(name, tparams, variants, is_pub, _) => {
+            if is_pub {
+                push(buf, "pub ")
+            }
+            push(buf, "enum ")
+            push(buf, name)
+            if len(tparams) > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(tparams) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    push(buf, tparams[i])
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+            push(buf, " {\n")
+            let deeper = indent + 4
+            let mut i = 0
+            let mut pe = 0
+            while i < len(variants) {
+                if i > 0 && src_blank_between(src, pe, span_start(variants[i])) {
+                    push(buf, "\n")
+                }
+                push_indent(buf, deeper)
+                fmt_variant(variants[i], buf)
+                push(buf, ",\n")
+                pe = span_end(variants[i])
+                i = i + 1
+            }
+            push_indent(buf, indent)
+            push(buf, "}")
+        },
+        SelectStmt(arms, has_default, dflt, _, _) => {
+            push(buf, "select {\n")
+            let deeper = indent + 4
+            let mut i = 0
+            let mut pe = 0
+            while i < len(arms) {
+                if i > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+                    push(buf, "\n")
+                }
+                push_indent(buf, deeper)
+                fmt_select_arm(arms[i], src, deeper, buf)
+                push(buf, ",\n")
+                pe = span_end(arms[i])
+                i = i + 1
+            }
+            if has_default {
+                push_indent(buf, deeper)
+                push(buf, "default => ")
+                fmt_expr(dflt, src, deeper, buf)
+                push(buf, ",\n")
+            }
+            push_indent(buf, indent)
+            push(buf, "}")
+        },
+        _ => fmt_internal("unhandled statement node"),
+    }
+}
+
+fn fmt_variant(n, mut buf) {
+    match n {
+        EnumVariantDecl(name, arity, vtypes, _) => {
+            push(buf, name)
+            if arity > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(vtypes) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_type(vtypes[i], buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        _ => fmt_internal("enum variant is not an EnumVariantDecl"),
+    }
+}
+
+fn fmt_type(n, mut buf) {
+    match n {
+        TEName(pkg, name, targs, _) => {
+            if pkg != "" {
+                push(buf, pkg)
+                push(buf, ".")
+            }
+            push(buf, name)
+            if len(targs) > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(targs) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_type(targs[i], buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        TEList(el, _) => {
+            push(buf, "[")
+            fmt_type(el, buf)
+            push(buf, "]")
+        },
+        TEFn(params, ret, _) => {
+            push(buf, "fn(")
+            let mut i = 0
+            while i < len(params) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_type(params[i], buf)
+                i = i + 1
+            }
+            push(buf, ") -> ")
+            fmt_type(ret, buf)
+        },
+        _ => fmt_internal("unhandled type expression node"),
+    }
+}
+
+fn fmt_select_arm(n, src, indent, mut buf) {
+    match n {
+        SelectArm(is_send, bind, _, ch, val, body, _) => {
+            if is_send {
+                fmt_expr(ch, src, indent, buf)
+                push(buf, " <- ")
+                fmt_expr(val, src, indent, buf)
+            } else {
+                if bind != "" {
+                    push(buf, bind)
+                    push(buf, " = ")
+                }
+                push(buf, "<-")
+                fmt_expr(ch, src, indent, buf)
+            }
+            push(buf, " => ")
+            fmt_expr(body, src, indent, buf)
+        },
+        _ => fmt_internal("select arm is not a SelectArm"),
     }
 }
 
 fn fmt_fn_lit(name, n, src, indent, mut buf) {
     match n {
         FnLit(params, muts, _pspans, body, _, _) => {
-            push(buf, "fn ")
-            push(buf, name)
+            push(buf, "fn")
+            if name != "" {
+                push(buf, " ")
+                push(buf, name)
+            }
             push(buf, "(")
             let mut i = 0
             while i < len(params) {
@@ -128,14 +335,83 @@ fn fmt_expr(n, src, indent, mut buf) {
             push(buf, unary_op_text(op))
             fmt_child(rhs, 7, src, indent, buf)
         },
+        RecvExpr(e, _) => {
+            push(buf, "<-")
+            fmt_child(e, 7, src, indent, buf)
+        },
+        TryExpr(e, _) => {
+            fmt_child(e, 8, src, indent, buf)
+            push(buf, "?")
+        },
+        Index(target, idx, _) => {
+            fmt_child(target, 8, src, indent, buf)
+            push(buf, "[")
+            fmt_expr(idx, src, indent, buf)
+            push(buf, "]")
+        },
+        ListLit(elems, _) => {
+            push(buf, "[")
+            let mut i = 0
+            while i < len(elems) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_expr(elems[i], src, indent, buf)
+                i = i + 1
+            }
+            push(buf, "]")
+        },
+        FnLit(_, _, _, _, _, _) => fmt_fn_lit("", n, src, indent, buf),
         Block(stmts, _) => {
-            push(buf, "{\n")
+            if len(stmts) == 0 {
+                push(buf, "{}")
+            } else {
+                push(buf, "{\n")
+                let deeper = indent + 4
+                let mut i = 0
+                let mut pe = 0
+                while i < len(stmts) {
+                    if i > 0 && src_blank_between(src, pe, span_start(stmts[i])) {
+                        push(buf, "\n")
+                    }
+                    push_indent(buf, deeper)
+                    fmt_stmt(stmts[i], src, deeper, buf)
+                    push(buf, "\n")
+                    pe = span_end(stmts[i])
+                    i = i + 1
+                }
+                push_indent(buf, indent)
+                push(buf, "}")
+            }
+        },
+        IfExpr(cond, then, els, _) => {
+            push(buf, "if ")
+            fmt_expr(cond, src, indent, buf)
+            push(buf, " ")
+            fmt_expr(then, src, indent, buf)
+            match els {
+                NoNode => {},
+                _ => {
+                    push(buf, " else ")
+                    fmt_expr(els, src, indent, buf) // a nested IfExpr renders as `else if`
+                },
+            }
+        },
+        MatchExpr(scrut, arms, _) => {
+            push(buf, "match ")
+            fmt_expr(scrut, src, indent, buf)
+            push(buf, " {\n")
             let deeper = indent + 4
             let mut i = 0
-            while i < len(stmts) {
+            let mut pe = 0
+            while i < len(arms) {
+                if i > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+                    push(buf, "\n")
+                }
                 push_indent(buf, deeper)
-                fmt_stmt(stmts[i], src, deeper, buf)
-                push(buf, "\n")
+                fmt_arm(arms[i], src, deeper, buf)
+                push(buf, ",\n")
+                pe = span_end(arms[i])
                 i = i + 1
             }
             push_indent(buf, indent)
@@ -154,7 +430,68 @@ fn fmt_expr(n, src, indent, mut buf) {
             }
             push(buf, ")")
         },
-        _ => push(buf, span_text(src, span_of(n))),
+        VariantAccess(en, v, _) => {
+            push(buf, en)
+            push(buf, ".")
+            push(buf, v)
+        },
+        PkgAccess(pkg, name, _) => {
+            push(buf, pkg)
+            push(buf, ".")
+            push(buf, name)
+        },
+        QualVariantAccess(pkg, en, v, _) => {
+            push(buf, pkg)
+            push(buf, ".")
+            push(buf, en)
+            push(buf, ".")
+            push(buf, v)
+        },
+        _ => fmt_internal("unhandled expression node"),
+    }
+}
+
+fn fmt_arm(n, src, indent, mut buf) {
+    match n {
+        MatchArm(pat, body, _) => {
+            fmt_pat(pat, src, buf)
+            push(buf, " => ")
+            fmt_expr(body, src, indent, buf)
+        },
+        _ => fmt_internal("match arm is not a MatchArm"),
+    }
+}
+
+fn fmt_pat(n, src, mut buf) {
+    match n {
+        PatWildcard(_) => push(buf, "_"),
+        // the pattern's own span covers a leading '-', the literal's does not
+        PatLiteral(_, sp) => push(buf, span_text(src, sp)),
+        PatBinding(name, _) => push(buf, name),
+        PatVariant(pkg, en, v, binds, _) => {
+            if pkg != "" {
+                push(buf, pkg)
+                push(buf, ".")
+            }
+            if en != "" {
+                push(buf, en)
+                push(buf, ".")
+            }
+            push(buf, v)
+            if len(binds) > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(binds) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_pat(binds[i], src, buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        _ => fmt_internal("unhandled pattern node"),
     }
 }
 
@@ -211,10 +548,36 @@ fn bin_prec(op) {
     }
 }
 
+fn span_start(n) {
+    match span_of(n) {
+        Sp(s, _) => s,
+    }
+}
+
+fn span_end(n) {
+    match span_of(n) {
+        Sp(_, e) => e,
+    }
+}
+
 fn span_text(src, sp) {
     match sp {
         Sp(s, e) => substr(src, s, e - s),
     }
+}
+
+// src_blank_between reports whether the source holds a blank line between
+// byte offsets a and b (two or more newlines)
+fn src_blank_between(src, a, b) {
+    let mut i = a
+    let mut nl = 0
+    while i < b {
+        if byte_at(src, i) == 10 {
+            nl = nl + 1
+        }
+        i = i + 1
+    }
+    nl >= 2
 }
 
 fn push_indent(mut buf, mut n) {
