@@ -141,7 +141,7 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取(`git clone` + 规范树哈希校验)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批(SCC 序 + 枚举两遍注册 + `?` 相互递归) | 进行中 |
+| **S6 生态工具链** | S6.1 依赖解析(MVS + `bur.sum` + 放开 module.bur:538)——离线解析库与树哈希已落地(2026-07-10)，import 接线待接口缓存设计；S6.2 网络拉取(`git clone` + 规范树哈希校验)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test`；S6.5 debugger；S6.6 std/json(捆绑式 std 首成员)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定) | 进行中 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注 | 未开工 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
@@ -234,16 +234,18 @@
   - 确定性模式(`BUR_DETERMINISTIC=1`)：IO 串行化 + timer 唤醒按 deadline + fiber 创建序双键排序
 - 每个新 native 照五处约定走，加完必重跑自举定点
 
-**S6.8 checker 债批(排 S6 尾，生态代码出现前修完)**
+**S6.8 checker 债批——已完成(2026-07-10)**
 
-- 包级值推导改 SCC 依赖序，根除文件字母序语义(quirk #9)
-- 枚举注册改两遍(先收名字再验字段类型)，根除跨文件枚举只能「向前」引用(quirk #2)
-- `?` 在相互递归函数组内可用(`Result + ?` 是唯一错误机制，必须处处可用)
-- 三项都触及推导核心，同批做、一次验自举定点
+- 包级值推导改 SCC 依赖序，根除文件字母序语义(quirk #9)——已落地：作用域感知自由名扫描 + Tarjan，组内共享推导 level、组尾统一 generalize；自递归/相互递归函数也不再被 pin 成单态
+- 枚举注册改两遍(先收名字再验字段类型)，根除跨文件枚举只能「向前」引用(quirk #2)——已落地
+- `?` 在相互递归函数组内可用(`Result + ?` 是唯一错误机制，必须处处可用)——已落地：操作数类型未解时延迟到推导组尾再判 Option/Result，仍未解才报 E0277
+- 三项都触及推导核心，同批做、一次验自举定点——已验(gen1 == gen2 逐字节)
+- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至 owner 重新定基 seed；新能力仅面向用户代码与未来生态代码
+- deep-mut 流规则(§2)迁移面摸底结果：burc 全树 ~1,230 个受检点、违例 32 处(`let mut` 来源 22 + mut 形参实参 10)，其中堆类型(list/map)相关 ≤17 处，其余为 int/str 标量(拷贝语义、无别名危害)；examples 零违例。采纳/收窄/回退由 owner 决断
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序(2026-07-10 二次修订，S6.7/S6.3 已完成)**：**S6.8 checker 债批**(先行——SCC 序动推导核心，接口缓存的设计地基要先摆脱字母序；deep-mut 流规则的迁移面摸底同批)→ S6.2 网络拉取 → S6.6 std/json → S6.4 `bur test` → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
+**推进顺序(2026-07-10 二次修订，S6.7/S6.3/S6.8 已完成)**：S6.8 checker 债批(已完成，见上)→ **S6.2 网络拉取** → S6.6 std/json → S6.4 `bur test` → S6.1 import 接线 + 接口缓存 → debugger(S6.5)。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 

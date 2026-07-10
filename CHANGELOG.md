@@ -69,6 +69,26 @@ window's implementation batch.
   `bur test [dir] [--run <substr>] [-v]`; the CLI-naming item leaves the
   pending list.
 
+**Landed S6.8, the checker-debt batch** — the checker sheds its
+file-order semantics.
+**落地 S6.8 checker 债批** — checker 摆脱文件字母序语义。
+
+- Enum registration is now two passes per package (collect every name,
+  then validate field types), so enum fields may reference enums from any
+  file in any order.
+- Package-level fns are inferred in SCC dependency order (Tarjan over a
+  scope-aware free-name scan): a fn defined in a later file — and a self-
+  or mutually-recursive fn — now stays polymorphic at every use site.
+- `?` now works inside mutually-recursive fn groups: an operand whose
+  type is still unresolved defers the Option/Result decision to the end
+  of the inference group; E0277 is reported only if it never resolves.
+- Surveyed the burc tree for the planned deep-`mut` flow rule (GOALS §2):
+  32 violating sites out of ~1,230 checked; adopting or narrowing the
+  rule stays an owner decision.
+- burc's own sources keep the old file-order discipline: CI rebuilds the
+  chain from the archived Go seed, whose checker still infers in file
+  order.
+
 ## v0.1 (2026-07-05 ~ 07-06)
 
 **Initial community scaffolding added** — set up the open-source contribution
