@@ -86,6 +86,185 @@ fn sp_union(a, b) {
     }
 }
 
+// ast_eq: structural equality over Node ignoring every span, the fmt
+// verifier's "AST unchanged" check (GOALS §6.5 S6.3). Field order follows
+// the enum declaration above; spans and span lists are skipped.
+fn ast_eq(a, b) {
+    match a {
+        IntLit(x, _) => match b { IntLit(y, _) => x == y, _ => false },
+        FloatLit(x, _) => match b { FloatLit(y, _) => x == y, _ => false },
+        StrLit(x, _) => match b { StrLit(y, _) => x == y, _ => false },
+        BoolLit(x, _) => match b { BoolLit(y, _) => x == y, _ => false },
+        Ident(x, _) => match b { Ident(y, _) => x == y, _ => false },
+        Unary(op1, r1, _) => match b {
+            Unary(op2, r2, _) => op1 == op2 && ast_eq(r1, r2),
+            _ => false,
+        },
+        Binary(op1, l1, r1, _) => match b {
+            Binary(op2, l2, r2, _) => op1 == op2 && ast_eq(l1, l2) && ast_eq(r1, r2),
+            _ => false,
+        },
+        Logical(op1, l1, r1, _) => match b {
+            Logical(op2, l2, r2, _) => op1 == op2 && ast_eq(l1, l2) && ast_eq(r1, r2),
+            _ => false,
+        },
+        Call(c1, a1, _) => match b {
+            Call(c2, a2, _) => ast_eq(c1, c2) && ast_eq_list(a1, a2),
+            _ => false,
+        },
+        Index(t1, i1, _) => match b {
+            Index(t2, i2, _) => ast_eq(t1, t2) && ast_eq(i1, i2),
+            _ => false,
+        },
+        ListLit(e1, _) => match b { ListLit(e2, _) => ast_eq_list(e1, e2), _ => false },
+        FnLit(p1, m1, _, b1, n1, _) => match b {
+            FnLit(p2, m2, _, b2, n2, _) =>
+                ast_eq_strs(p1, p2) && ast_eq_bools(m1, m2) && ast_eq(b1, b2) && n1 == n2,
+            _ => false,
+        },
+        Block(s1, _) => match b { Block(s2, _) => ast_eq_list(s1, s2), _ => false },
+        IfExpr(c1, t1, e1, _) => match b {
+            IfExpr(c2, t2, e2, _) => ast_eq(c1, c2) && ast_eq(t1, t2) && ast_eq(e1, e2),
+            _ => false,
+        },
+        MatchExpr(s1, a1, _) => match b {
+            MatchExpr(s2, a2, _) => ast_eq(s1, s2) && ast_eq_list(a1, a2),
+            _ => false,
+        },
+        MatchArm(p1, b1, _) => match b {
+            MatchArm(p2, b2, _) => ast_eq(p1, p2) && ast_eq(b1, b2),
+            _ => false,
+        },
+        VariantAccess(e1, v1, _) => match b {
+            VariantAccess(e2, v2, _) => e1 == e2 && v1 == v2,
+            _ => false,
+        },
+        PkgAccess(p1, n1, _) => match b {
+            PkgAccess(p2, n2, _) => p1 == p2 && n1 == n2,
+            _ => false,
+        },
+        QualVariantAccess(p1, e1, v1, _) => match b {
+            QualVariantAccess(p2, e2, v2, _) => p1 == p2 && e1 == e2 && v1 == v2,
+            _ => false,
+        },
+        TryExpr(e1, _) => match b { TryExpr(e2, _) => ast_eq(e1, e2), _ => false },
+        RecvExpr(e1, _) => match b { RecvExpr(e2, _) => ast_eq(e1, e2), _ => false },
+        PatWildcard(_) => match b { PatWildcard(_) => true, _ => false },
+        PatLiteral(l1, _) => match b { PatLiteral(l2, _) => ast_eq(l1, l2), _ => false },
+        PatBinding(n1, _) => match b { PatBinding(n2, _) => n1 == n2, _ => false },
+        PatVariant(p1, e1, v1, b1, _) => match b {
+            PatVariant(p2, e2, v2, b2, _) =>
+                p1 == p2 && e1 == e2 && v1 == v2 && ast_eq_list(b1, b2),
+            _ => false,
+        },
+        LetStmt(n1, _, m1, pb1, i1, _) => match b {
+            LetStmt(n2, _, m2, pb2, i2, _) =>
+                n1 == n2 && m1 == m2 && pb1 == pb2 && ast_eq(i1, i2),
+            _ => false,
+        },
+        AssignStmt(t1, v1, _) => match b {
+            AssignStmt(t2, v2, _) => ast_eq(t1, t2) && ast_eq(v1, v2),
+            _ => false,
+        },
+        ExprStmt(e1, _) => match b { ExprStmt(e2, _) => ast_eq(e1, e2), _ => false },
+        WhileStmt(c1, b1, _) => match b {
+            WhileStmt(c2, b2, _) => ast_eq(c1, c2) && ast_eq(b1, b2),
+            _ => false,
+        },
+        ForStmt(v1, _, i1, ch1, b1, _) => match b {
+            ForStmt(v2, _, i2, ch2, b2, _) =>
+                v1 == v2 && ast_eq(i1, i2) && ch1 == ch2 && ast_eq(b1, b2),
+            _ => false,
+        },
+        ReturnStmt(v1, _) => match b { ReturnStmt(v2, _) => ast_eq(v1, v2), _ => false },
+        FnDecl(n1, _, p1, f1, _) => match b {
+            FnDecl(n2, _, p2, f2, _) => n1 == n2 && p1 == p2 && ast_eq(f1, f2),
+            _ => false,
+        },
+        EnumDecl(n1, tp1, v1, p1, _) => match b {
+            EnumDecl(n2, tp2, v2, p2, _) =>
+                n1 == n2 && ast_eq_strs(tp1, tp2) && ast_eq_list(v1, v2) && p1 == p2,
+            _ => false,
+        },
+        EnumVariantDecl(n1, a1, f1) => match b {
+            EnumVariantDecl(n2, a2, f2) => n1 == n2 && a1 == a2 && ast_eq_list(f1, f2),
+            _ => false,
+        },
+        ImportDecl(a1, _, p1, _, _) => match b {
+            ImportDecl(a2, _, p2, _, _) => a1 == a2 && p1 == p2,
+            _ => false,
+        },
+        SpawnStmt(c1, _) => match b { SpawnStmt(c2, _) => ast_eq(c1, c2), _ => false },
+        SelectStmt(a1, h1, d1, _, _) => match b {
+            SelectStmt(a2, h2, d2, _, _) => ast_eq_list(a1, a2) && h1 == h2 && ast_eq(d1, d2),
+            _ => false,
+        },
+        SelectArm(s1, bn1, _, c1, v1, b1, _) => match b {
+            SelectArm(s2, bn2, _, c2, v2, b2, _) =>
+                s1 == s2 && bn1 == bn2 && ast_eq(c1, c2) && ast_eq(v1, v2) && ast_eq(b1, b2),
+            _ => false,
+        },
+        SendStmt(c1, v1, _) => match b {
+            SendStmt(c2, v2, _) => ast_eq(c1, c2) && ast_eq(v1, v2),
+            _ => false,
+        },
+        BreakStmt(_) => match b { BreakStmt(_) => true, _ => false },
+        ContinueStmt(_) => match b { ContinueStmt(_) => true, _ => false },
+        TEName(p1, n1, a1, _) => match b {
+            TEName(p2, n2, a2, _) => p1 == p2 && n1 == n2 && ast_eq_list(a1, a2),
+            _ => false,
+        },
+        TEList(e1, _) => match b { TEList(e2, _) => ast_eq(e1, e2), _ => false },
+        TEFn(p1, r1, _) => match b {
+            TEFn(p2, r2, _) => ast_eq_list(p1, p2) && ast_eq(r1, r2),
+            _ => false,
+        },
+        NoNode => match b { NoNode => true, _ => false },
+    }
+}
+
+fn ast_eq_list(xs, ys) {
+    if len(xs) != len(ys) {
+        return false
+    }
+    let mut i = 0
+    while i < len(xs) {
+        if !ast_eq(xs[i], ys[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn ast_eq_strs(xs, ys) {
+    if len(xs) != len(ys) {
+        return false
+    }
+    let mut i = 0
+    while i < len(xs) {
+        if xs[i] != ys[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn ast_eq_bools(xs, ys) {
+    if len(xs) != len(ys) {
+        return false
+    }
+    let mut i = 0
+    while i < len(xs) {
+        if xs[i] != ys[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
 fn span_of(n) {
     match n {
         IntLit(_, sp) => sp,
