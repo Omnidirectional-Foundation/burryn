@@ -673,6 +673,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // register_enum records the enum's name and variants; "" on a duplicate
+    // (the caller skips field validation then). Field types are validated
+    // separately by validate_enum_fields once every enum in the package is
+    // registered, so fields may reference enums from any file in any order.
     fn register_enum(n) {
         match n {
             EnumDecl(name, params, variants, is_pub, sp) => {
@@ -683,6 +687,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 if dup {
                     cerr(sp, "E0428", "", "enum `" + name + "` is declared more than once")
+                    false
                 } else {
                     let mut vhs = []
                     for vd in variants {
@@ -701,20 +706,28 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     push(e_prefix, cur_pkg)
                     push(e_pub, is_pub)
                     put(enum_by_name, qual, len(e_qual) - 1)
-                    // validate field type expressions
-                    let mut pm = map()
-                    for p in params {
-                        put(pm, p, true)
-                    }
-                    for vd in variants {
-                        match vd {
-                            EnumVariantDecl(_, _, vtypes, _) => {
-                                for te in vtypes {
-                                    validate_type_expr(te, pm)
-                                }
-                            },
-                            _ => {},
-                        }
+                    true
+                }
+            },
+            _ => false,
+        }
+    }
+
+    fn validate_enum_fields(n) {
+        match n {
+            EnumDecl(_, params, variants, _, _) => {
+                let mut pm = map()
+                for p in params {
+                    put(pm, p, true)
+                }
+                for vd in variants {
+                    match vd {
+                        EnumVariantDecl(_, _, vtypes, _) => {
+                            for te in vtypes {
+                                validate_type_expr(te, pm)
+                            }
+                        },
+                        _ => {},
                     }
                 }
             },
@@ -1735,18 +1748,34 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         let n_files = len(files_stmts)
         push_scope() // the package scope
 
-        // pass 1: register enums from every file
+        // pass 1: register enums from every file (names and variants only),
+        // then validate field types in a second sweep so an enum may
+        // reference enums registered later, in any file of the package
+        let mut reg_decls = []
+        let mut reg_files = []
         let mut fi = 0
         while fi < n_files {
             cur_file = file_paths[fi]
             cur_aliases = aliases_of(file_imports[fi])
             for s in files_stmts[fi] {
                 match s {
-                    EnumDecl(_, _, _, _, _) => register_enum(s),
+                    EnumDecl(_, _, _, _, _) => {
+                        if register_enum(s) {
+                            push(reg_decls, s)
+                            push(reg_files, fi)
+                        }
+                    },
                     _ => {},
                 }
             }
             fi = fi + 1
+        }
+        let mut ri = 0
+        while ri < len(reg_decls) {
+            cur_file = file_paths[reg_files[ri]]
+            cur_aliases = aliases_of(file_imports[reg_files[ri]])
+            validate_enum_fields(reg_decls[ri])
+            ri = ri + 1
         }
         // pass 1.5: pre-declare every top-level value name (monomorphic)
         let mut pre = map()
