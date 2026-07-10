@@ -51,6 +51,7 @@ let fs_blocked_recv = 2
 let fs_blocked_select = 3
 let fs_done = 4
 let fs_blocked_timer = 5
+let fs_blocked_io = 6
 
 // instructions per fiber before a forced yield (vm.go timeSlice)
 let vm_time_slice = 10000
@@ -99,13 +100,16 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
     let mut fb_fr_ip = []   // call frames: instruction pointer
     let mut fb_fr_base = [] // call frames: stack base
     let mut fb_wakeat = []  // absolute clock() deadline while fs_blocked_timer
-    let mut proc_results = [] // exec_start handles: guest Result per child
-    let mut proc_taken = []   // parallel: result already handed out
+    let mut fb_ioproc = []  // host exec handle awaited while fs_blocked_io
+    let mut fb_iohas = []   // scheduler delivered an exec result
+    let mut fb_iores = []   // the delivered guest Result value
     let mut ready = []      // FIFO of ready fiber ids
     let mut main_fiber = 0
     let mut park_recv = -1  // set by the recv() native to ask OpCall to park
     let mut park_sleep = -1.0 // wake deadline set by the sleep() native, or -1
+    let mut park_io = -1    // host exec handle set by the exec() native
     let mut ntimers = 0     // fibers currently parked on a timer
+    let mut nio = 0         // fibers currently parked on child-process IO
     let mut yield_flag = false
     let mut opt_enum = -1
     let mut res_enum = -1
@@ -363,7 +367,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             mark_val(fb_sendval[fi])
             fi = fi + 1
         }
-        for pr in proc_results {
+        for pr in fb_iores {
             mark_val(pr)
         }
 
@@ -500,6 +504,41 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         push(ready, f)
     }
 
+    // convert a host exec Result<Output, str> into a guest value, rooting
+    // fresh objects on fiber f's stack
+    fn conv_exec_result(f, r) {
+        match r {
+            Ok(o) => match o {
+                Output(code, so, se) => {
+                    let oi = make_inst(out_enum, 0, [VInt(code), VStr(so), VStr(se)])
+                    make_ok(f, oi)
+                },
+            },
+            Err(m) => make_err(f, VStr(m)),
+        }
+    }
+
+    // poll every io-parked fiber's child; deliver finished results and wake
+    // the owners, in fiber id order
+    fn deliver_io() {
+        let mut i = 0
+        while i < len(fb_status) {
+            if fb_status[i] == fs_blocked_io {
+                match exec_poll(fb_ioproc[i]) {
+                    Some(r) => {
+                        fb_iores[i] = conv_exec_result(i, r)
+                        fb_iohas[i] = true
+                        fb_ioproc[i] = -1
+                        nio = nio - 1
+                        schedule(i)
+                    },
+                    None => {},
+                }
+            }
+            i = i + 1
+        }
+    }
+
     // wake every timer whose deadline has passed, in (deadline, fiber id)
     // order; fiber ids ascend during the scan, so strictly-less picks suffice
     fn wake_due_timers() {
@@ -535,6 +574,9 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         push(fb_fr_ip, [0])
         push(fb_fr_base, [0])
         push(fb_wakeat, -1.0)
+        push(fb_ioproc, -1)
+        push(fb_iohas, false)
+        push(fb_iores, VUnit)
         let f = len(fb_stack) - 1
         for a in args {
             push(fb_stack[f], a)
@@ -986,29 +1028,35 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "exec" {
-            let ah = tagged_h(fpeek(f, 0), ot_list)
-            if !is_str(fpeek(f, 1)) || ah < 0 {
-                trap("exec() needs (str, [str])")
-            }
-            let mut hargs = []
-            for e in o_vals[ah] {
-                if !is_str(e) {
-                    trap("exec() args must be str, got " + type_name(e))
+            if fb_iohas[f] { // resuming: the scheduler already delivered
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                let ah = tagged_h(fpeek(f, 0), ot_list)
+                if !is_str(fpeek(f, 1)) || ah < 0 {
+                    trap("exec() needs (str, [str])")
                 }
-                push(hargs, str_of(e))
-            }
-            match exec(str_of(fpeek(f, 1)), hargs) {
-                Ok(o) => match o {
-                    Output(code, so, se) => {
-                        let oi = make_inst(out_enum, 0, [VInt(code), VStr(so), VStr(se)])
-                        make_ok(f, oi) // make_ok roots the fresh Output
+                let mut hargs = []
+                for e in o_vals[ah] {
+                    if !is_str(e) {
+                        trap("exec() args must be str, got " + type_name(e))
+                    }
+                    push(hargs, str_of(e))
+                }
+                match exec_start(str_of(fpeek(f, 1)), hargs) {
+                    Ok(h) => match exec_poll(h) {
+                        Some(r) => conv_exec_result(f, r),
+                        None => {
+                            park_io = h // OpCall parks this fiber and retries
+                            VUnit
+                        },
                     },
-                },
-                Err(m) => make_err(f, VStr(m)),
+                    Err(m) => make_err(f, VStr(m)),
+                }
             }
         } else if nm == "exec_start" {
-            // guest-level async arrives with the next generation; for now the
-            // child runs to completion here and exec_poll hands the result out
             let ah = tagged_h(fpeek(f, 0), ot_list)
             if !is_str(fpeek(f, 1)) || ah < 0 {
                 trap("exec_start() needs (str, [str])")
@@ -1020,28 +1068,15 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                 }
                 push(hargs, str_of(e))
             }
-            match exec(str_of(fpeek(f, 1)), hargs) {
-                Ok(o) => match o {
-                    Output(code, so, se) => {
-                        let oi = make_inst(out_enum, 0, [VInt(code), VStr(so), VStr(se)])
-                        push(proc_results, make_ok(f, oi))
-                        push(proc_taken, false)
-                        make_ok(f, VInt(len(proc_results) - 1))
-                    },
-                },
-                Err(m) => {
-                    push(proc_results, make_err(f, VStr(m)))
-                    push(proc_taken, false)
-                    make_ok(f, VInt(len(proc_results) - 1))
-                },
+            match exec_start(str_of(fpeek(f, 1)), hargs) {
+                Ok(h) => make_ok(f, VInt(h)),
+                Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "exec_poll" {
-            let h = int_of(fpeek(f, 0))
-            if h < 0 || h >= len(proc_results) || proc_taken[h] {
-                trap("exec_poll: invalid or consumed handle " + str(h))
+            match exec_poll(int_of(fpeek(f, 0))) {
+                Some(r) => make_some(f, conv_exec_result(f, r)),
+                None => make_none(),
             }
-            proc_taken[h] = true
-            make_some(f, proc_results[h])
         } else if nm == "args" {
             let lh = alloc_obj(ot_list)
             for a in vm_args {
@@ -1173,7 +1208,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
             push(fb_fr_base[f], ftop(f) - argc - 1)
         } else if t == ot_native {
             let res = do_native(f, o_i1[h], argc)
-            if park_recv < 0 { // otherwise leave callee+args: OpCall parks and retries
+            if park_recv < 0 && park_io < 0 { // otherwise leave callee+args: OpCall parks and retries
                 let mut i = 0
                 while i <= argc {
                     let _ = fpop(f)
@@ -1512,6 +1547,14 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
                     park_sleep = -1.0
                     ntimers = ntimers + 1
                     return false // resumes after the call once the timer fires
+                }
+                if park_io >= 0 { // the exec() native started a child
+                    fb_status[f] = fs_blocked_io
+                    fb_ioproc[f] = park_io
+                    park_io = -1
+                    nio = nio + 1
+                    fb_fr_ip[f][fi] = start_ip // re-run exec once delivered
+                    return false
                 }
                 if yield_flag { // a native (yield) asked us to hand off
                     yield_flag = false
@@ -1974,8 +2017,20 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans,
         if ntimers > 0 {
             wake_due_timers()
         }
+        if nio > 0 {
+            deliver_io()
+        }
         if len(ready) == 0 {
-            if ntimers > 0 {
+            if nio > 0 {
+                // children still running: tick until one finishes or a timer fires
+                while len(ready) == 0 {
+                    sleep(1)
+                    deliver_io()
+                    if ntimers > 0 {
+                        wake_due_timers()
+                    }
+                }
+            } else if ntimers > 0 {
                 // all runnable work waits on timers: host-sleep until the
                 // nearest deadline, then wake whatever came due
                 while len(ready) == 0 {
