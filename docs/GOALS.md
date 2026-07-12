@@ -212,13 +212,14 @@
 - **隔离模型已定(owner 2026-07-10，原必答题)：子进程隔离**——`bur test` 对每个 `test_*` `exec` 自身跑隐藏命令(`bur dev run-test <dir> <fn>`)收集 exit code 与输出；trap(exit 4)与死锁自然成为 test failure；默认 `BUR_DETERMINISTIC=1`；并行跑测试 = `exec_start` fan-out(S6.7 已解锁)
 - 自身二进制路径经 shell-out `readlink /proc/self/exe` 获取(零新 native；不够用再议 `self_path` native)——**落地纠正(2026-07-10)**：子进程里 `/proc/self/exe` 指向子进程自身(readlink 二进制)，等价零 native 解 = `sh -c "readlink /proc/$PPID/exe"`($PPID = 发起 exec 的 bur 进程)
 - 断言先用现成 `assert(cond, msg)`；`assert_eq` 等糖归 std/testing，等 S6.6 捆绑机制落地
-- **落地情况(2026-07-10)**：约定 = 根包 `*_test.bur` 的零参 `fn test_*`(带参不发现；子包测试未纳入，随 S6.1 接线再议)；`*_test.bur` 从此被普通 build/run/check 排除；无 `fn main` 的库包可测(测试入口合成)；死锁/trap(exit 4)自然记为 FAIL；并发测试模式与 `-j` 并行未做(exec_start fan-out 已解锁，属后续加法)
+- **落地情况(2026-07-10)**：约定 = 根包 `*_test.bur` 的零参 `fn test_*`(带参不发现；子包测试未纳入——owner 2026-07-12 定：随 S6.1 接线批顺手纳入)；`*_test.bur` 从此被普通 build/run/check 排除；无 `fn main` 的库包可测(测试入口合成)；死锁/trap(exit 4)自然记为 FAIL；并发测试模式与 `-j` 并行未做(exec_start fan-out 已解锁——owner 2026-07-12 定：归 backlog，真实测试变慢再做)
 
-**S6.5 debugger(可选，C 后端增强，优先级最低)**
+**S6.5 诊断/DX 批(owner 2026-07-12 扩容：debugger + 诊断深度)**
 
 - cgen 生成 C 时插 `#line <n> "<file>"`(cgen 已知每 Node span)→ 原生二进制直接 `gdb`/`lldb` 映射回 `.bur`
 - runtime trap 打印带 source span 的 stack trace(复用 diag + line_starts)
 - 符合「终局只留 C 底座」，属后端增强非新工具
+- 扩容(owner 2026-07-12)：诊断深度 backlog 里最值钱的**多 span 标注 + 结构化修复建议**并入本批同做；`--explain`、JSON/彩色输出、compile 首错即停等其余项仍按需不排期
 
 **S6.6 std/json(纯 Burryn，零新 native)**
 
@@ -250,12 +251,12 @@
 - 枚举注册改两遍(先收名字再验字段类型)，根除跨文件枚举只能「向前」引用(quirk #2)——已落地
 - `?` 在相互递归函数组内可用(`Result + ?` 是唯一错误机制，必须处处可用)——已落地：操作数类型未解时延迟到推导组尾再判 Option/Result，仍未解才报 E0277
 - 三项都触及推导核心，同批做、一次验自举定点——已验(gen1 == gen2 逐字节)
-- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至 owner 重新定基 seed；新能力仅面向用户代码与未来生态代码
+- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至重新定基 seed。**定基时机已定(owner 2026-07-12)：v0.3 发布时**(v0.3 判据 = S6 全部收尾，含 deep-mut 批、S6.6、S6.1 接线、S6.5 诊断/DX 批)；定基机制(预编译二进制或 tag 基准 commit)随那一批定；定基后 burc 源码解禁三条旧纪律，S7 从新 seed 起步
 - deep-mut 流规则(§2)迁移面摸底结果：burc 全树 ~1,230 个受检点、违例 32 处(`let mut` 来源 22 + mut 形参实参 10)，其中堆类型(list/map)相关 ≤17 处，其余为 int/str 标量(拷贝语义、无别名危害)；examples 零违例。采纳/收窄/回退由 owner 决断
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**推进顺序(2026-07-11 三修；S6.7/S6.3/S6.8/S6.2/S6.4 已完成，决策批已关闭全部闸门)**：**deep-mut 流规则批**(§2 定案，先迁移 burc 再上规则)→ **S6.6 std/json + std/testing**(API 已定)→ S6.1 import 接线 + 接口缓存(S7.8 语法已定，解锁)→ debugger(S6.5)→ S7。
+**推进顺序(2026-07-11 三修；S6.7/S6.3/S6.8/S6.2/S6.4 已完成，决策批已关闭全部闸门)**：**deep-mut 流规则批**(§2 定案，先迁移 burc 再上规则)→ **S6.6 std/json + std/testing**(API 已定)→ S6.1 import 接线 + 接口缓存(S7.8 语法已定，解锁；含子包测试发现与 `bur mod tidy` 按 import 增删 require)→ 诊断/DX 批(S6.5)→ **S6 收尾 = v0.3 发布 + seed 定基** → S7。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
@@ -268,11 +269,15 @@
 | 管道 `\|>`(S7.2) | 极低 | 纯 parser 脱糖 | — |
 | Match Guard(S7.3) | 低 | compiler 加条件跳转 | — |
 | 命名参数+默认值(S7.4) | 中 | checker(按名重排实参+arity) + compiler(默认值字节码) | **已否决(2026-07-10)**：名字是否进 fn 类型参与 unification 无良解(进则函数值传递变脆，不进则语义两张皮)；若重提仅限「直接调用的纯语法糖」形态 |
-| 编译期常量(S7.5) | 中 | 新常量折叠阶段 | — |
+| 编译期常量(S7.5) | 中 | `const` 声明 + 常量折叠阶段 | 形态已定(owner 2026-07-12)：`const N = <可折叠式>`，包级(可 `pub`)与块级均可；初始化式限编译期可折叠——字面量、const 引用、算术/比较/bool 运算、str 拼接；折叠中溢出 = 编译错(语义与运行期 trap 一致、只是提前)；类型照常推导不另标注；const 名不可 mut、不可重赋值 |
 | 封闭 Records(→ **S8.4**) | 中高 | 改 `ty_unify` 核心(+tk==3 逐字段配对) + 新 TRecord kind + cgen 字段名→下标 | 因改 unify + 自举风险，归 S8 与 row poly 同段，不属 S7；原评估明显偏低 |
 
-**S7 落地顺序**：字符串插值(最先，不阻塞任何事)→ 管道 / match guard(顺手)→ 编译期常量 → defer(S7.6) → 可选签名标注(S7.8) → net(S7.7，依赖 S6.7 后续讨论)。
+**S7 落地顺序**：字符串插值(最先，不阻塞任何事)→ 管道 / match guard(顺手)→ 编译期常量 → defer(S7.6) → 可选签名标注(S7.8) → net(S7.7)。
 封闭 records 移出 S7，归 **S8.4**(改 unify + 自举风险与 row poly 叠加，同段一次性验 fixpoint)。
+
+S7.6 `defer` 语义已定(owner 2026-07-12，移出 §7 待定)：`defer { ... }` 挂**包围函数**，函数退出时 LIFO 执行；块是闭包、捕获按闭包语义(无参数求值时机问题)；fiber 正常 return 执行 defer；trap/死锁 = 进程级 abort，defer 不执行。
+
+S7.7 调度器升级已定(owner 2026-07-12，移出 §7 待定)：net natives 落地时把 idle-wait 抽成**通用 fd 注册接口**(socket/exec/timer 同一入口)，底层维持 poll；epoll/kqueue 只在 fd 规模成为瓶颈时换实现、接口不变；两份调度器(burrt.h + vm.bur)parity 铁律照旧。
 
 ## 6.7 重型类型系统扩展评估(工程视角，对应 S8)
 
@@ -287,18 +292,18 @@
 
 **与原路线两大分歧**：(1) Refinement 成本被低估——无求解器地基，实为从零造子系统，明确排除；(2) Effects 价值被高估——CSP 已覆盖其大半实用场景，边际价值与代价不成比例，明确排除。
 
+**S8.1 大方向已定(owner 2026-07-12，作默认假设，S8 开工探查批可推翻)**：调用约定 = System V AMD64 ABI；GC 根扫描 = 沿用 C 后端的 shadow stack 精确 GC 语义(cgen 的根栈纪律照搬到手写代码生成)。该方向不阻塞 S6/S7 任何批次。
+
 ## 7. 当前待定项(动工前必须先问 owner)
 
-- 模块系统具体形态(import 语法、包内可见性细节、版本声明文件格式)
-- `select` 语义细节(default 分支？公平性？)
-- 手写后端的调用约定与 GC 根扫描策略(S8 前定)
-- S7.6 `defer` 块作用域细节(块表达式的求值时机、fiber 退出语义)
-- S6.7 后续：net 落地时是否升级为通用 fd 感知调度(epoll/kqueue)
+(暂无——2026-07-12 第二轮决策批清空本列表。新出现的待定设计决策须登记于此并先问 owner，规矩不变。)
 
-已探查结论(移出待定)：lexer comment/trivia 保留已完成(S6.3 前置就绪，见 §6.6)；`exec` shell-out `git clone` 够用已确认(S6.2 无需新 native，见 §6.5)。
+已探查结论(移出待定)：lexer comment/trivia 保留已完成(S6.3 前置就绪，见 §6.6)；`exec` shell-out `git clone` 够用已确认(S6.2 无需新 native，见 §6.5)；模块系统具体形态已全部落地、无悬空(import 语法 S2.2、`pub` 可见性 S2.6、`bur.mod`/semver S6.1–S6.2)；`select` 语义已实现即规格(default 分支已在 parser 且至多一个，公平性 = 按声明顺序取首个就绪的确定序，见 tutorial.md §11)；S8 调用约定与 GC 根扫描已定大方向(见 §6.7)。
 
 2026-07-10 设计审查定案(全文散见对应章节)：深 mut 降级为绑定级纪律 + checker 流规则；确定性承诺收窄 + `BUR_DETERMINISTIC` 模式；可选签名标注归 S7.8；S7.4 命名参数否决；S8 重排(类型先行、ELF 先于 PE)；std 捆绑分发；`bur.sum` 树哈希；fmt 验收三条铁律；json/net 从 S2.7 纠错移入 S6.6/S7.7；新增 S6.7 runtime IO 与 S6.8 checker 债批。
 
 2026-07-11 决策批(五项，全文散见对应章节)：deep-mut 流规则收窄到堆类型后采纳为 error(§2)；S6.2 实现侧默认追认(clone URL 与 download 语义，§6.5)；S6.6 json API 四问关闭(值表示/函数名/目录布局/内嵌生成器，§6.5，std/testing 同批)；S7.8 标注语法定型(`name: type` + `-> type`，复用类型表达式，§6.5 接口缓存条目，S6.1 解锁)；S7.1 插值非 str 为编译错(§6.6 表)。
 
 2026-07-12 决策批(五问，全文见 §2)：deep-mut 流规则实现侧——再赋值 RHS 一并检查；mut 形参实参走旁路表(只查静态可知被调方)；多态残余判 error；错误码 E0597；chan 整体豁免(不论元素类型，CSP 别名是语义本体)。另记：§2 摸底数字测于 S6.2/S6.4 落地前，开工须重新插桩摸底。
+
+2026-07-12 决策批(第二轮，路线清仓，全文散见对应章节)：v0.3 判据 = S6 全部收尾，seed 定基随 v0.3 发布(§6.5 S6.8 条目)；无 cc 兜底维持现状、议题关闭(VM 兜底 + 优雅降级，不引入 tcc)；bur test 子包发现归 S6.1 批、`-j` 并行归 backlog(§6.5 S6.4 条目)；诊断深度的多 span + 结构化建议并入 S6.5 成诊断/DX 批(§6.5 S6.5 条目)；S7.6 defer = 函数级 + 闭包块 + trap 不跑(§6.6)；S7.7 = 通用 fd 注册接口、poll 实现(§6.6)；S7.5 = `const` 声明(包级 + 块级，初始化限可折叠式，§6.6 表)；S8.1 大方向 = System V AMD64 ABI + shadow stack 精确 GC(§6.7，探查批可推翻)；§7 待定项清空(模块系统与 select 两条系已落地的过时项，移入已探查结论)。
