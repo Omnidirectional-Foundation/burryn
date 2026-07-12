@@ -251,7 +251,7 @@
 - 枚举注册改两遍(先收名字再验字段类型)，根除跨文件枚举只能「向前」引用(quirk #2)——已落地
 - `?` 在相互递归函数组内可用(`Result + ?` 是唯一错误机制，必须处处可用)——已落地：操作数类型未解时延迟到推导组尾再判 Option/Result，仍未解才报 E0277
 - 三项都触及推导核心，同批做、一次验自举定点——已验(gen1 == gen2 逐字节)
-- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至重新定基 seed。**定基时机已定(owner 2026-07-12)：v0.3 发布时**(v0.3 判据 = S6 全部收尾，含 deep-mut 批、S6.6、S6.1 接线、S6.5 诊断/DX 批)；定基机制(预编译二进制或 tag 基准 commit)随那一批定；定基后 burc 源码解禁三条旧纪律，S7 从新 seed 起步
+- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至重新定基 seed。**定基时机已定(owner 2026-07-12)：S6 全部收尾的发布版**(含 deep-mut 批、S6.6、S6.1 接线、S6.5 诊断/DX 批；owner 以 v0.3 称之，若 changelog 两天窗口节奏使实际版本号顺延，判据挂「S6 收尾发布」不挂具体数字)；定基机制(预编译二进制或 tag 基准 commit)随那一批定；定基后 burc 源码解禁三条旧纪律，S7 从新 seed 起步
 - deep-mut 流规则(§2)迁移面摸底结果：burc 全树 ~1,230 个受检点、违例 32 处(`let mut` 来源 22 + mut 形参实参 10)，其中堆类型(list/map)相关 ≤17 处，其余为 int/str 标量(拷贝语义、无别名危害)；examples 零违例。采纳/收窄/回退由 owner 决断
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
