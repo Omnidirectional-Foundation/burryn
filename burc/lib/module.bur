@@ -478,6 +478,29 @@ fn load_module_opts(dir0, with_tests) {
         return ModFailed(diags, dfiles)
     }
 
+    // Resolve the require closure once. External package paths are mapped to
+    // immutable cache roots from this selected MVS result; local and bundled
+    // std packages stay outside this table.
+    let mut dep_paths = []
+    let mut dep_vers = []
+    match mvs_resolve(dir) {
+        Ok(pick) => match pick {
+            MP(paths, vers) => {
+                let mut i = 0
+                while i < len(paths) {
+                    push(dep_paths, paths[i])
+                    push(dep_vers, vers[i])
+                    i = i + 1
+                }
+            },
+        },
+        Err(msg) => {
+            push(diags, Diag(true, "E0432", "cannot resolve module dependencies: " + msg, "fetch the required modules with `bur mod download`", 0, 0))
+            push(dfiles, mod_file)
+            return ModFailed(diags, dfiles)
+        },
+    }
+
     let mut state = map() // import path -> 1 loading, 2 done
     let mut out_paths = []
     let mut out_files = []
@@ -526,10 +549,23 @@ fn load_module_opts(dir0, with_tests) {
         // import from another module is resolved from the bundled table.
         let is_std = path != mod_path && (path == "std" || str_has_prefix(path, "std/"))
 
-        if !is_std && path != mod_path && !str_has_prefix(path, mod_path + "/") {
+        let is_local = path == mod_path || str_has_prefix(path, mod_path + "/")
+        let mut dep_ix = -1
+        let mut dep_len = -1
+        let mut xi = 0
+        while xi < len(dep_paths) {
+            let prefix = dep_paths[xi]
+            if (path == prefix || str_has_prefix(path, prefix + "/")) && str_len(prefix) > dep_len {
+                dep_ix = xi
+                dep_len = str_len(prefix)
+            }
+            xi = xi + 1
+        }
+        let is_external = !is_std && !is_local && dep_ix >= 0
+        if !is_std && !is_local && !is_external {
             match from_sp {
                 Sp(s0, e0) => {
-                    push(diags, Diag(true, "E0432", "cannot resolve import \"" + path + "\"", "only packages inside module `" + mod_path + "` can be imported for now; external dependencies arrive with MVS resolution", s0, e0))
+                    push(diags, Diag(true, "E0432", "cannot resolve import \"" + path + "\"", "add its module with `bur get <module>@<version>` or a `require` directive", s0, e0))
                     push(dfiles, from_file)
                 },
             }
@@ -556,6 +592,13 @@ fn load_module_opts(dir0, with_tests) {
         }
         let pdir = if is_std {
             "<std:" + path + ">"
+        } else if is_external {
+            let root = cache_root() + "/" + dep_paths[dep_ix] + "@" + dep_vers[dep_ix]
+            if path == dep_paths[dep_ix] {
+                root
+            } else {
+                root + "/" + substr(path, dep_len + 1, str_len(path) - dep_len - 1)
+            }
         } else if path == mod_path {
             dir
         } else {
