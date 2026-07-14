@@ -112,12 +112,10 @@ fn dm_heap_walk(tk, tn, ta, tr, h) {
 // is_fresh_source: syntactic freshness classification per GOALS §2.
 // Fresh = literals / list+map literals / enum constructors / call returns
 // / FnLit / if+match (recursively each arm tail) / block (tail expr or
-// trailing return). Ident is treated as fresh here as a compromise: the
-// scope-based binding lookup can't reliably distinguish pattern-bound
-// vars (truly fresh) from let-bound non-mut vars (aliases) during the
-// init's match-arm descent. TODO tighten with explicit pattern-name
-// tracking once the lookup issue is root-caused.
-fn is_fresh_source(e, lookup, b_mut, b_kind) {
+// trailing return). Ident: pattern-bound (lookup hit in pattern_names)
+// = fresh; let-bound mut = fresh; let-bound non-mut = not fresh (aliases
+// the immutable source, deep-mut flow violation).
+fn is_fresh_source(e, lookup, b_mut, b_kind, mut pattern_names) {
     match e {
         IntLit(_, _) => true,
         FloatLit(_, _) => true,
@@ -128,14 +126,22 @@ fn is_fresh_source(e, lookup, b_mut, b_kind) {
         VariantAccess(_, _, _) => true,
         QualVariantAccess(_, _, _, _) => true,
         Call(_, _, _) => true,
-        Ident(_, _) => true,
-        IfExpr(_, then_b, else_b, _) => is_fresh_source(then_b, lookup, b_mut, b_kind) || is_fresh_source(else_b, lookup, b_mut, b_kind),
+        Ident(name, _) => {
+            match get(pattern_names, name) {
+                Some(_) => true,
+                None => {
+                    let b = lookup(name)
+                    b >= 0 && b_mut[b]
+                },
+            }
+        },
+        IfExpr(_, then_b, else_b, _) => is_fresh_source(then_b, lookup, b_mut, b_kind, pattern_names) || is_fresh_source(else_b, lookup, b_mut, b_kind, pattern_names),
         MatchExpr(_, arms, _) => {
             let mut all_fresh = true
             for arm in arms {
                 match arm {
                     MatchArm(_, body, _) => {
-                        if !is_fresh_source(body, lookup, b_mut, b_kind) {
+                        if !is_fresh_source(body, lookup, b_mut, b_kind, pattern_names) {
                             all_fresh = false
                         }
                     },
@@ -149,7 +155,7 @@ fn is_fresh_source(e, lookup, b_mut, b_kind) {
                 false
             } else {
                 match stmts[len(stmts) - 1] {
-                    ExprStmt(inner, _) => is_fresh_source(inner, lookup, b_mut, b_kind),
+                    ExprStmt(inner, _) => is_fresh_source(inner, lookup, b_mut, b_kind, pattern_names),
                     ReturnStmt(_, _) => true,
                     _ => false,
                 }
@@ -487,6 +493,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut b_kind = []
     let mut b_span = []
     let mut b_muts = map()
+    let mut pattern_names = map()
     let mut s_vars = []
     let mut s_t = []
     let mut e_qual = []
@@ -1360,7 +1367,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                     let ab = lookup(aname)
                                     ab >= 0 && b_mut[ab]
                                 },
-                                _ => is_fresh_source(cargs[ci], lookup, b_mut, b_kind),
+                                _ => is_fresh_source(cargs[ci], lookup, b_mut, b_kind, pattern_names),
                             }
                             if !fresh {
                                 cerr(span_of(cargs[ci]), "E0597", "pass a fresh heap source (literal, call return, or enum ctor); a non-mut binding aliases its value and mutations inside `" + callee_name + "` would be visible through the source", "cannot pass a non-fresh heap source as mutable argument to `" + callee_name + "`")
@@ -1514,6 +1521,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                             } else {
                                 has_catch_all = true
                                 let _ = declare(name, mono(scrut_t), false, "pattern", psp)
+                                put(pattern_names, name, 1)
                             }
                         },
                         PatVariant(ppkg, penum, pvar, binds, psp) => {
@@ -1588,6 +1596,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                         match binds[i] {
                                             PatBinding(bn, bsp) => {
                                                 let _ = declare(bn, mono(ft), false, "pattern", bsp)
+                                                put(pattern_names, bn, 1)
                                             },
                                             _ => {},
                                         }
@@ -1890,7 +1899,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                 let ib = lookup(iname)
                                 ib >= 0 && b_mut[ib]
                             },
-                            _ => is_fresh_source(init, lookup, b_mut, b_kind),
+                            _ => is_fresh_source(init, lookup, b_mut, b_kind, pattern_names),
                         }
                         if !fresh {
                             cerr(nsp, "E0597", "initialize with a fresh heap source (literal, call return, or enum ctor); a non-mut binding aliases its value and mutations through `" + name + "` would be visible through the source", "cannot initialize mutable binding `" + name + "` with a non-fresh heap source")
@@ -1957,7 +1966,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                             let vb = lookup(vname)
                                             vb >= 0 && b_mut[vb]
                                         },
-                                        _ => is_fresh_source(val, lookup, b_mut, b_kind),
+                                        _ => is_fresh_source(val, lookup, b_mut, b_kind, pattern_names),
                                     }
                                     if !fresh {
                                         cerr(isp, "E0597", "assign a fresh heap source (literal, call return, or enum ctor); a non-mut binding aliases its value and mutations through `" + name + "` would be visible through the source", "cannot assign a non-fresh heap source to mutable binding `" + name + "`")
@@ -2002,6 +2011,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 push_scope()
                 let _ = declare(v, mono(el), false, "pattern", vsp)
+                put(pattern_names, v, 1)
                 infer_block_stmts(body)
                 pop_scope()
             },
@@ -2039,6 +2049,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                 push_scope()
                                 if bind != "" && bind != "_" {
                                     let _ = declare(bind, mono(el), false, "pattern", bind_sp)
+                                    put(pattern_names, bind, 1)
                                 }
                                 let _ = infer_expr(body)
                                 pop_scope()
@@ -2425,7 +2436,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                         let ib = lookup(iname)
                                         ib >= 0 && b_mut[ib]
                                     },
-                                    _ => is_fresh_source(init, lookup, b_mut, b_kind),
+                                    _ => is_fresh_source(init, lookup, b_mut, b_kind, pattern_names),
                                 }
                                 if !fresh {
                                     cerr(nsp, "E0597", "initialize with a fresh heap source (literal, call return, or enum ctor); a non-mut binding aliases its value and mutations through `" + name + "` would be visible through the source", "cannot initialize mutable binding `" + name + "` with a non-fresh heap source")
