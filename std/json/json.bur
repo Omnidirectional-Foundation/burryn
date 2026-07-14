@@ -1,13 +1,7 @@
-// std/json: JSON value representation (S6.6).
-//
-// API (GOALS §6.5 S6.6 定案):
-//   pub enum Json { JNull, JBool(bool), JInt(int), JFloat(float), JStr(str),
-//                   JArr([Json]), JObj([str], [Json]) }
-//   pub fn parse(s) -> Result<Json, str>
-//   pub fn render(v) -> str
-//   pub fn pretty(v, indent) -> str
-//
-// Skeleton: declarations only; bodies are filled in next commit.
+// std/json: deterministic JSON parsing and rendering (S6.6).
+// JSON strings and parser offsets are measured in UTF-8 bytes, matching the
+// language's native string indexing rules.
+
 pub enum Json {
     JNull,
     JBool(bool),
@@ -16,4 +10,470 @@ pub enum Json {
     JStr(str),
     JArr([Json]),
     JObj([str], [Json]),
+}
+
+enum Parsed {
+    PValue(Json, int),
+}
+
+enum ParsedStr {
+    PString(str, int),
+}
+
+fn json_err(pos, msg) {
+    "json: byte " + str(pos) + ": " + msg
+}
+
+fn skip_ws(s, mut pos) {
+    while pos < str_len(s) {
+        let b = byte_at(s, pos)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            pos = pos + 1
+        } else {
+            return pos
+        }
+    }
+    pos
+}
+
+fn has_at(s, pos, want) {
+    let n = str_len(want)
+    pos >= 0 && pos + n <= str_len(s) && substr(s, pos, n) == want
+}
+
+fn hex_value(b) {
+    if b >= 48 && b <= 57 {
+        b - 48
+    } else if b >= 65 && b <= 70 {
+        b - 65 + 10
+    } else if b >= 97 && b <= 102 {
+        b - 97 + 10
+    } else {
+        -1
+    }
+}
+
+fn hex4(s, pos) {
+    if pos + 4 > str_len(s) {
+        None
+    } else {
+        let a = hex_value(byte_at(s, pos))
+        let b = hex_value(byte_at(s, pos + 1))
+        let c = hex_value(byte_at(s, pos + 2))
+        let d = hex_value(byte_at(s, pos + 3))
+        if a < 0 || b < 0 || c < 0 || d < 0 {
+            None
+        } else {
+            Some(a * 4096 + b * 256 + c * 16 + d)
+        }
+    }
+}
+
+fn parse_string(s, mut pos) {
+    let mut out = ""
+    pos = pos + 1 // opening quote
+    while pos < str_len(s) {
+        let b = byte_at(s, pos)
+        if b == 34 {
+            return Ok(PString(out, pos + 1))
+        }
+        if b < 32 {
+            return Err(json_err(pos, "unescaped control byte in string"))
+        }
+        if b != 92 {
+            out = out + substr(s, pos, 1)
+            pos = pos + 1
+        } else {
+            if pos + 1 >= str_len(s) {
+                return Err(json_err(pos, "unfinished string escape"))
+            }
+            let esc = byte_at(s, pos + 1)
+            if esc == 34 {
+                out = out + "\""
+                pos = pos + 2
+            } else if esc == 92 {
+                out = out + "\\"
+                pos = pos + 2
+            } else if esc == 47 {
+                out = out + "/"
+                pos = pos + 2
+            } else if esc == 98 {
+                out = out + chr(8)
+                pos = pos + 2
+            } else if esc == 102 {
+                out = out + chr(12)
+                pos = pos + 2
+            } else if esc == 110 {
+                out = out + "\n"
+                pos = pos + 2
+            } else if esc == 114 {
+                out = out + chr(13)
+                pos = pos + 2
+            } else if esc == 116 {
+                out = out + "\t"
+                pos = pos + 2
+            } else if esc == 117 {
+                match hex4(s, pos + 2) {
+                    None => {
+                        return Err(json_err(pos, "invalid unicode escape"))
+                    },
+                    Some(code) => {
+                        if code >= 55296 && code <= 56319 {
+                            let next = pos + 6
+                            if next + 2 > str_len(s) || byte_at(s, next) != 92 || byte_at(s, next + 1) != 117 {
+                                return Err(json_err(pos, "high surrogate needs a low surrogate"))
+                            }
+                            match hex4(s, next + 2) {
+                                Some(low) => {
+                                    if low < 56320 || low > 57343 {
+                                        return Err(json_err(next, "high surrogate needs a low surrogate"))
+                                    }
+                                    out = out + chr(65536 + (code - 55296) * 1024 + low - 56320)
+                                    pos = next + 6
+                                },
+                                None => {
+                                    return Err(json_err(next, "invalid unicode escape"))
+                                },
+                            }
+                        } else if code >= 56320 && code <= 57343 {
+                            return Err(json_err(pos, "low surrogate has no high surrogate"))
+                        } else {
+                            out = out + chr(code)
+                            pos = pos + 6
+                        }
+                    },
+                }
+            } else {
+                return Err(json_err(pos, "invalid string escape"))
+            }
+        }
+    }
+    Err(json_err(pos, "unterminated string"))
+}
+
+fn is_digit(b) {
+    b >= 48 && b <= 57
+}
+
+fn parse_number(s, mut pos) {
+    let start = pos
+    if byte_at(s, pos) == 45 {
+        pos = pos + 1
+        if pos >= str_len(s) {
+            return Err(json_err(pos, "expected digit after minus"))
+        }
+    }
+    if byte_at(s, pos) == 48 {
+        pos = pos + 1
+        if pos < str_len(s) && is_digit(byte_at(s, pos)) {
+            return Err(json_err(pos, "leading zero in number"))
+        }
+    } else if is_digit(byte_at(s, pos)) {
+        while pos < str_len(s) && is_digit(byte_at(s, pos)) {
+            pos = pos + 1
+        }
+    } else {
+        return Err(json_err(pos, "expected digit"))
+    }
+    let mut is_float = false
+    if pos < str_len(s) && byte_at(s, pos) == 46 {
+        is_float = true
+        pos = pos + 1
+        let frac_start = pos
+        while pos < str_len(s) && is_digit(byte_at(s, pos)) {
+            pos = pos + 1
+        }
+        if pos == frac_start {
+            return Err(json_err(pos, "expected digit after decimal point"))
+        }
+    }
+    if pos < str_len(s) && (byte_at(s, pos) == 69 || byte_at(s, pos) == 101) {
+        is_float = true
+        pos = pos + 1
+        if pos < str_len(s) && (byte_at(s, pos) == 43 || byte_at(s, pos) == 45) {
+            pos = pos + 1
+        }
+        let exp_start = pos
+        while pos < str_len(s) && is_digit(byte_at(s, pos)) {
+            pos = pos + 1
+        }
+        if pos == exp_start {
+            return Err(json_err(pos, "expected exponent digits"))
+        }
+    }
+    let raw = substr(s, start, pos - start)
+    if !is_float {
+        match parse_int(raw) {
+            Some(n) => {
+                return Ok(PValue(JInt(n), pos))
+            },
+            None => {},
+        }
+    }
+    match parse_float(raw) {
+        Some(f) => {
+            if f - f != 0.0 {
+                Err(json_err(start, "number is outside the finite f64 range"))
+            } else {
+                Ok(PValue(JFloat(f), pos))
+            }
+        },
+        None => Err(json_err(start, "invalid number")),
+    }
+}
+
+fn parse_array(s, mut pos) {
+    let mut vals = []
+    pos = skip_ws(s, pos + 1)
+    if pos < str_len(s) && byte_at(s, pos) == 93 {
+        return Ok(PValue(JArr(vals), pos + 1))
+    }
+    while true {
+        let parsed = parse_value(s, pos)?
+        match parsed {
+            PValue(value, next) => {
+                push(vals, value)
+                pos = skip_ws(s, next)
+            },
+        }
+        if pos >= str_len(s) {
+            return Err(json_err(pos, "unterminated array"))
+        }
+        if byte_at(s, pos) == 93 {
+            return Ok(PValue(JArr(vals), pos + 1))
+        }
+        if byte_at(s, pos) != 44 {
+            return Err(json_err(pos, "expected comma or closing bracket"))
+        }
+        pos = skip_ws(s, pos + 1)
+        if pos < str_len(s) && byte_at(s, pos) == 93 {
+            return Err(json_err(pos, "trailing comma in array"))
+        }
+    }
+    Err("")
+}
+
+fn parse_object(s, mut pos) {
+    let mut keys = []
+    let mut vals = []
+    pos = skip_ws(s, pos + 1)
+    if pos < str_len(s) && byte_at(s, pos) == 125 {
+        return Ok(PValue(JObj(keys, vals), pos + 1))
+    }
+    while true {
+        if pos >= str_len(s) || byte_at(s, pos) != 34 {
+            return Err(json_err(pos, "expected object key string"))
+        }
+        let parsed_key = parse_string(s, pos)?
+        let key = match parsed_key {
+            PString(text, next) => {
+                pos = skip_ws(s, next)
+                text
+            },
+        }
+        if pos >= str_len(s) || byte_at(s, pos) != 58 {
+            return Err(json_err(pos, "expected colon after object key"))
+        }
+        pos = skip_ws(s, pos + 1)
+        let parsed_value = parse_value(s, pos)?
+        match parsed_value {
+            PValue(value, next) => {
+                push(keys, key)
+                push(vals, value)
+                pos = skip_ws(s, next)
+            },
+        }
+        if pos >= str_len(s) {
+            return Err(json_err(pos, "unterminated object"))
+        }
+        if byte_at(s, pos) == 125 {
+            return Ok(PValue(JObj(keys, vals), pos + 1))
+        }
+        if byte_at(s, pos) != 44 {
+            return Err(json_err(pos, "expected comma or closing brace"))
+        }
+        pos = skip_ws(s, pos + 1)
+        if pos < str_len(s) && byte_at(s, pos) == 125 {
+            return Err(json_err(pos, "trailing comma in object"))
+        }
+    }
+    Err("")
+}
+
+fn parse_value(s, pos0) {
+    let pos = skip_ws(s, pos0)
+    if pos >= str_len(s) {
+        return Err(json_err(pos, "expected JSON value"))
+    }
+    let b = byte_at(s, pos)
+    if b == 34 {
+        let parsed = parse_string(s, pos)?
+        match parsed {
+            PString(text, next) => Ok(PValue(JStr(text), next)),
+        }
+    } else if b == 91 {
+        parse_array(s, pos)
+    } else if b == 123 {
+        parse_object(s, pos)
+    } else if has_at(s, pos, "true") {
+        Ok(PValue(JBool(true), pos + 4))
+    } else if has_at(s, pos, "false") {
+        Ok(PValue(JBool(false), pos + 5))
+    } else if has_at(s, pos, "null") {
+        Ok(PValue(JNull, pos + 4))
+    } else if b == 45 || is_digit(b) {
+        parse_number(s, pos)
+    } else {
+        Err(json_err(pos, "expected JSON value"))
+    }
+}
+
+pub fn parse(s) {
+    let parsed = parse_value(s, 0)?
+    match parsed {
+        PValue(value, pos) => {
+            let end = skip_ws(s, pos)
+            if end == str_len(s) {
+                Ok(value)
+            } else {
+                Err(json_err(end, "unexpected trailing input"))
+            }
+        },
+    }
+}
+
+fn hex_digit(n) {
+    if n < 10 {
+        chr(48 + n)
+    } else {
+        chr(65 + n - 10)
+    }
+}
+
+fn quote(s) {
+    let mut out = "\""
+    let mut i = 0
+    while i < str_len(s) {
+        let b = byte_at(s, i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 8 {
+            out = out + "\\b"
+        } else if b == 12 {
+            out = out + "\\f"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b < 32 {
+            out = out + "\\u00" + hex_digit(b / 16) + hex_digit(b % 16)
+        } else {
+            out = out + substr(s, i, 1)
+        }
+        i = i + 1
+    }
+    out + "\""
+}
+
+fn spaces(n) {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    out
+}
+
+fn float_text(f) {
+    if f - f != 0.0 {
+        assert(false, "json: cannot render non-finite float")
+        ""
+    } else {
+        str(f)
+    }
+}
+
+fn render_array(vals, indent, depth) {
+    if len(vals) == 0 {
+        "[]"
+    } else if indent <= 0 {
+        let mut parts = []
+        for value in vals {
+            push(parts, render_inner(value, indent, depth + 1))
+        }
+        "[" + join(parts, ",") + "]"
+    } else {
+        let mut parts = []
+        for value in vals {
+            push(parts, spaces((depth + 1) * indent) + render_inner(value, indent, depth + 1))
+        }
+        "[\n" + join(parts, ",\n") + "\n" + spaces(depth * indent) + "]"
+    }
+}
+
+fn render_object(keys, vals, indent, depth) {
+    if len(keys) != len(vals) {
+        assert(false, "json: object keys and values must have equal length")
+        ""
+    } else if len(keys) == 0 {
+        "{}"
+    } else if indent <= 0 {
+        let mut parts = []
+        let mut i = 0
+        while i < len(keys) {
+            push(parts, quote(keys[i]) + ":" + render_inner(vals[i], indent, depth + 1))
+            i = i + 1
+        }
+        "{" + join(parts, ",") + "}"
+    } else {
+        let mut parts = []
+        let mut i = 0
+        while i < len(keys) {
+            push(parts, spaces((depth + 1) * indent) + quote(keys[i]) + ": " + render_inner(vals[i], indent, depth + 1))
+            i = i + 1
+        }
+        "{\n" + join(parts, ",\n") + "\n" + spaces(depth * indent) + "}"
+    }
+}
+
+fn render_inner(v, indent, depth) {
+    match v {
+        JNull => "null",
+        JBool(b) => if b {
+            "true"
+        } else {
+            "false"
+        },
+        JInt(n) => str(n),
+        JFloat(f) => float_text(f),
+        JStr(s) => quote(s),
+        JArr(vals) => render_array(vals, indent, depth),
+        JObj(keys, vals) => render_object(keys, vals, indent, depth),
+    }
+}
+
+pub fn render(v) {
+    render_inner(v, 0, 0)
+}
+
+pub fn pretty(v, indent) {
+    render_inner(v, indent, 0)
+}
+
+// get returns the first matching key, preserving source order and duplicate
+// keys in the underlying parallel-list object representation.
+pub fn get(keys, vals, key) {
+    let mut i = 0
+    while i < len(keys) && i < len(vals) {
+        if keys[i] == key {
+            return Some(vals[i])
+        }
+        i = i + 1
+    }
+    None
 }

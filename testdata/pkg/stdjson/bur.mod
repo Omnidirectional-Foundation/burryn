@@ -1,0 +1,1 @@
+module burryn.dev/stdjson
