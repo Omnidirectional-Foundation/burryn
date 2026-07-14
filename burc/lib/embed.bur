@@ -1,0 +1,305 @@
+// embed.bur: `bur dev embed-std` generator for S6.6. Scans repo-root/std/
+// and emits burc/lib/std_embed.bur — a generated Burryn source file that
+// exposes every std module's files as string literals for the loader to
+// consume via `import "std/..."` (module.bur). The generated file is
+// checked in: the Go seed needs it to compile burc.
+//
+// Burryn's typechecker refuses `Err(...) => { return Err(...) }` in a match
+// whose result is bound to a let or whose value is discarded (only the
+// function-tail match accepts that shape). Each helper below therefore uses
+// one of two idioms:
+//
+//   * tail-match: the function body IS the match; Ok arm is a complex block,
+//     Err arm is a direct `Err("prefix: " + msg)` expression.
+//   * non-tail match for fallible lookups: arms are both direct expressions
+//     (no block, no return). Unwrap-with-fallback uses this idiom.
+
+// embed_std scans `<root>/std/` for std modules (each a sub-directory with
+// its own bur.mod) and writes the generated source to
+// `<root>/burc/lib/std_embed.bur`. Returns Ok("") on success, Err(msg) on
+// any I/O or parse failure.
+pub fn embed_std(root) {
+    let std_dir = root + "/std"
+    let out_path = root + "/burc/lib/std_embed.bur"
+    let sep = chr(31) // composite-key separator: ASCII unit separator
+    match read_dir(std_dir) {
+        Ok(entries) => {
+            let collected = collect_std_modules(std_dir, entries)
+            match collected {
+                Ok(triples) => {
+                    let paths = triples[0]
+                    let file_rels = triples[1]
+                    let contents = triples[2]
+                    let generated = render_embed(paths, file_rels, contents, sep)
+                    match write_file(out_path, generated) {
+                        Ok(_) => Ok(""),
+                        Err(msg) => Err("cannot write " + out_path + ": " + msg),
+                    }
+                },
+                Err(msg) => Err(msg),
+            }
+        },
+        Err(msg) => Err("cannot read " + std_dir + ": " + msg),
+    }
+}
+
+// collect_std_modules iterates over repo-root/std/ entries, skipping hidden
+// ones, and gathers (paths, file_rels, contents) triples for each module.
+fn collect_std_modules(std_dir, entries) {
+    let mut paths = []
+    let mut file_rels = []
+    let mut contents = []
+    for e in entries {
+        if str_has_prefix(e, ".") {
+            // skip hidden entries
+        } else {
+            let mod_dir = std_dir + "/" + e
+            let is_dir = match read_dir(mod_dir) {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+            if !is_dir {
+                // skip non-directories
+            } else {
+                let mod_file = mod_dir + "/bur.mod"
+                match read_file(mod_file) {
+                    Ok(mod_text) => {
+                        let mod_path = parse_module_path(mod_text)
+                        if mod_path == "" {
+                            return Err(mod_file + ": no `module` directive")
+                        }
+                        match scan_std_module_files(mod_dir) {
+                            Ok(rels) => {
+                                for rel in rels {
+                                    let full = if rel == "bur.mod" {
+                                        mod_file
+                                    } else {
+                                        mod_dir + "/" + rel
+                                    }
+                                    match read_file(full) {
+                                        Ok(text) => {
+                                            push(paths, mod_path)
+                                            push(file_rels, rel)
+                                            push(contents, text)
+                                        },
+                                        Err(msg) => {
+                                            return Err("cannot read " + full + ": " + msg)
+                                        },
+                                    }
+                                }
+                            },
+                            Err(msg) => {
+                                return Err(msg)
+                            },
+                        }
+                    },
+                    Err(msg) => {
+                        return Err("cannot read " + mod_file + ": " + msg)
+                    },
+                }
+            }
+        }
+    }
+    Ok([paths, file_rels, contents])
+}
+
+// scan_std_module_files recursively walks `<mod_dir>` for `.bur` files,
+// prepending a synthetic `bur.mod` entry (which sorts first). Returns the
+// sorted rel list, or Err(msg) if any directory read fails.
+fn scan_std_module_files(mod_dir) {
+    let mut rels = []
+    match walk_bur_files(mod_dir, "", rels) {
+        Ok(_) => Ok(sort_strs_ins(rels)),
+        Err(msg) => Err(msg),
+    }
+}
+
+// walk_bur_files recursively collects relative paths of `.bur` files under
+// `base/rel`, plus a synthetic `bur.mod` entry at the module root
+// (rel == ""). The `bur.mod` entry sorts first by construction.
+fn walk_bur_files(base, rel, mut acc) {
+    let here = if rel == "" {
+        base
+    } else {
+        base + "/" + rel
+    }
+    match read_dir(here) {
+        Ok(entries) => {
+            if rel == "" {
+                push(acc, "bur.mod")
+            }
+            for e in entries {
+                if str_has_prefix(e, ".") {
+                    // skip hidden
+                } else {
+                    let child_rel = if rel == "" {
+                        e
+                    } else {
+                        rel + "/" + e
+                    }
+                    let full = here + "/" + e
+                    let is_dir = match read_dir(full) {
+                        Ok(_) => true,
+                        Err(_) => false,
+                    }
+                    if !is_dir {
+                        if is_bur_file(e) {
+                            push(acc, child_rel)
+                        }
+                    } else {
+                        match walk_bur_files(base, child_rel, acc) {
+                            Ok(_) => {},
+                            Err(msg) => {
+                                return Err(msg)
+                            },
+                        }
+                    }
+                }
+            }
+            Ok("")
+        },
+        Err(msg) => Err("cannot read dir " + here + ": " + msg),
+    }
+}
+
+// is_bur_file returns true iff name ends with ".bur" (no str_has_suffix in
+// the stdlib, so we slice manually).
+fn is_bur_file(name) {
+    let n = str_len(name)
+    if n < 4 {
+        false
+    } else {
+        substr(name, n - 4, 4) == ".bur"
+    }
+}
+
+// parse_module_path pulls the module path out of a bur.mod body by scanning
+// for the first line whose first token is `module`.
+fn parse_module_path(text) {
+    let mut out = ""
+    for line in split(text, chr(10)) {
+        let t = trim(line)
+        if str_has_prefix(t, "module ") && out == "" {
+            out = trim(substr(t, 7, str_len(t) - 7))
+        }
+    }
+    out
+}
+
+// sort_strs_ins is an insertion sort over a string list. Stable,
+// deterministic, fine for the handful of std source files.
+fn sort_strs_ins(xs) {
+    let mut out = []
+    let mut i = 0
+    while i < len(xs) {
+        let x = xs[i]
+        let mut j = 0
+        while j < len(out) && out[j] < x {
+            j = j + 1
+        }
+        out = concat(concat(slice(out, 0, j), [x]), slice(out, j, len(out)))
+        i = i + 1
+    }
+    out
+}
+
+// render_embed builds the full text of burc/lib/std_embed.bur.
+fn render_embed(paths, file_rels, contents, sep) {
+    let mut out = "// AUTO-GENERATED by `bur dev embed-std`. Do not edit by hand.\n"
+    out = out + "// Std source table consumed by the module loader (module.bur).\n"
+    out = out + "// Re-generate after any change under repo-root/std/ and cmp to detect drift.\n\n"
+
+    // Per-module file list: import path -> "rel1<sep>rel2<sep>..." (bur.mod
+    // sorts first). Empty string for a module with no source files.
+    out = out + "// std_embed_files: import path -> sep-joined rel file list.\n"
+    out = out + "pub fn std_embed_files() {\n"
+    out = out + "    let mut fs = map()\n"
+    let per_mod = group_by_path(paths, file_rels, sep)
+    let mut i = 0
+    while i < len(per_mod) {
+        let entry = per_mod[i]
+        out = out + "    put(fs, \"" + escape_lit(entry[0]) + "\", \"" + escape_lit(entry[1]) + "\")\n"
+        i = i + 1
+    }
+    out = out + "    fs\n"
+    out = out + "}\n\n"
+
+    // Per-file contents, keyed by `path + sep + rel`.
+    out = out + "// std_embed_contents: (path + chr(31) + rel) -> source text.\n"
+    out = out + "pub fn std_embed_contents() {\n"
+    out = out + "    let mut cs = map()\n"
+    i = 0
+    while i < len(paths) {
+        let key = paths[i] + sep + file_rels[i]
+        out = out + "    put(cs, \"" + escape_lit(key) + "\", \"" + escape_lit(contents[i]) + "\")\n"
+        i = i + 1
+    }
+    out = out + "    cs\n"
+    out = out + "}\n\n"
+
+    // Convenience getter: std_embed_get(path, rel) -> Option<str>.
+    out = out + "// std_embed_get returns the embedded source text for (path, rel),\n"
+    out = out + "// or None if the pair is not in the table.\n"
+    out = out + "pub fn std_embed_get(path, rel) {\n"
+    out = out + "    get(std_embed_contents(), path + chr(31) + rel)\n"
+    out = out + "}\n"
+    out
+}
+
+// group_by_path folds parallel (paths, file_rels) into one entry per unique
+// path: `[path, "rel1<sep>rel2<sep>..."]`. Caller guarantees that file_rels
+// belonging to the same path are already sorted.
+fn group_by_path(paths, file_rels, sep) {
+    let mut out = []
+    let mut cur_path = ""
+    let mut cur_joined = ""
+    let mut i = 0
+    while i < len(paths) {
+        let p = paths[i]
+        let f = file_rels[i]
+        if p != cur_path {
+            if cur_path != "" {
+                push(out, [cur_path, cur_joined])
+            }
+            cur_path = p
+            cur_joined = f
+        } else {
+            cur_joined = cur_joined + sep + f
+        }
+        i = i + 1
+    }
+    if cur_path != "" {
+        push(out, [cur_path, cur_joined])
+    }
+    out
+}
+
+// escape_lit escapes a string for embedding as a Burryn string literal.
+// Handles the four legal escapes (\\, \", \n, \t) and synthesises a
+// `+ chr(13) +` splice for bare CR, which Burryn has no escape for.
+// chr(31) (the composite-key SEP) is spliced in via `+ chr(31) +` so the
+// generated source never contains raw control bytes inside a literal.
+fn escape_lit(s) {
+    let mut out = ""
+    let mut i = 0
+    while i < str_len(s) {
+        let c = substr(s, i, 1)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == chr(10) {
+            out = out + "\\n"
+        } else if c == chr(9) {
+            out = out + "\\t"
+        } else if c == chr(13) {
+            out = out + "\" + chr(13) + \""
+        } else if c == chr(31) {
+            out = out + "\" + chr(31) + \""
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    out
+}
