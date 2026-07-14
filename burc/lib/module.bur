@@ -521,8 +521,12 @@ fn load_module_opts(dir0, with_tests) {
         }
         put(state, path, 1)
         let stack2 = concat(stack, [path])
+        // A std module checked or tested as the root package stays local so
+        // development sees its working tree and *_test.bur files. Only an
+        // import from another module is resolved from the bundled table.
+        let is_std = path != mod_path && (path == "std" || str_has_prefix(path, "std/"))
 
-        if path != mod_path && !str_has_prefix(path, mod_path + "/") {
+        if !is_std && path != mod_path && !str_has_prefix(path, mod_path + "/") {
             match from_sp {
                 Sp(s0, e0) => {
                     push(diags, Diag(true, "E0432", "cannot resolve import \"" + path + "\"", "only packages inside module `" + mod_path + "` can be imported for now; external dependencies arrive with MVS resolution", s0, e0))
@@ -532,24 +536,48 @@ fn load_module_opts(dir0, with_tests) {
             put(state, path, 2)
             return
         }
-        let pdir = if path == mod_path {
+        let std_rels = if is_std {
+            match get(std_embed_files(), path) {
+                Some(rels) => rels,
+                None => {
+                    match from_sp {
+                        Sp(s0, e0) => {
+                            push(diags, Diag(true, "E0433", "cannot find bundled standard package \"" + path + "\"", "check the `std/` import path shipped with this Burryn version", s0, e0))
+                            push(dfiles, from_file)
+                        },
+                    }
+                    put(state, path, 2)
+                    return
+                    ""
+                },
+            }
+        } else {
+            ""
+        }
+        let pdir = if is_std {
+            "<std:" + path + ">"
+        } else if path == mod_path {
             dir
         } else {
             dir + "/" + substr(path, str_len(mod_path) + 1, str_len(path) - str_len(mod_path) - 1)
         }
-        let entries = match read_dir(pdir) {
-            Ok(es) => es,
-            Err(msg) => {
-                match from_sp {
-                    Sp(s0, e0) => {
-                        push(diags, Diag(true, "E0433", "cannot find package \"" + path + "\": " + msg, "", s0, e0))
-                        push(dfiles, from_file)
-                    },
-                }
-                put(state, path, 2)
-                return
-                []
-            },
+        let entries = if is_std {
+            split(std_rels, chr(31))
+        } else {
+            match read_dir(pdir) {
+                Ok(es) => es,
+                Err(msg) => {
+                    match from_sp {
+                        Sp(s0, e0) => {
+                            push(diags, Diag(true, "E0433", "cannot find package \"" + path + "\": " + msg, "", s0, e0))
+                            push(dfiles, from_file)
+                        },
+                    }
+                    put(state, path, 2)
+                    return
+                    []
+                },
+            }
         }
 
         // parse every .bur file, splitting leading imports from declarations
@@ -562,13 +590,24 @@ fn load_module_opts(dir0, with_tests) {
             if str_ends_with(name, ".bur") && (want_tests || !str_ends_with(name, "_test.bur")) {
                 bur_files = bur_files + 1
                 let disp = pdir + "/" + name
-                let src = match read_file(disp) {
-                    Ok(s) => s,
-                    Err(msg) => {
-                        push(diags, Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
-                        push(dfiles, "")
-                        ""
-                    },
+                let src = if is_std {
+                    match std_embed_get(path, name) {
+                        Some(s) => s,
+                        None => {
+                            push(diags, Diag(true, "E0433", "missing embedded source " + path + "/" + name, "rebuild Burryn so its bundled standard library is complete", 0, 0))
+                            push(dfiles, "")
+                            ""
+                        },
+                    }
+                } else {
+                    match read_file(disp) {
+                        Ok(s) => s,
+                        Err(msg) => {
+                            push(diags, Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
+                            push(dfiles, "")
+                            ""
+                        },
+                    }
                 }
                 if src != "" {
                     match lex(src) {

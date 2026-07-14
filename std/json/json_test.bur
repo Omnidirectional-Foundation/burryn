@@ -1,0 +1,56 @@
+fn must_parse(s) {
+    match parse(s) {
+        Ok(v) => v,
+        Err(msg) => {
+            assert(false, "parse failed: " + msg)
+            JNull
+        },
+    }
+}
+
+fn test_parse_and_render_nested_values() {
+    let value = must_parse("{\"ok\":true,\"items\":[null,-7,1.5,\"x\"]}")
+    assert(render(value) == "{\"ok\":true,\"items\":[null,-7,1.5,\"x\"]}", "compact render changed JSON")
+}
+
+fn test_parse_unicode_and_escape_sequences() {
+    let value = must_parse("\"\\uD83D\\uDE00\\n\\t\\\\\\\"\"")
+    assert(render(value) == "\"😀\\n\\t\\\\\\\"\"", "unicode or string escapes rendered incorrectly")
+}
+
+fn test_parse_numbers() {
+    assert(render(must_parse("9223372036854775807")) == "9223372036854775807", "i64 boundary lost")
+    assert(render(must_parse("9223372036854775808")) == "9.223372036854776e+18", "out-of-range integer did not become float")
+    assert(render(must_parse("-1.25e+2")) == "-125.0", "exponent parse changed value")
+}
+
+fn test_pretty_uses_indentation_width() {
+    let value = must_parse("{\"a\":[1,{\"b\":false}]}")
+    let want = "{\n  \"a\": [\n    1,\n    {\n      \"b\": false\n    }\n  ]\n}"
+    assert(pretty(value, 2) == want, "pretty output differs")
+    assert(pretty(value, 0) == render(value), "zero indent must be compact")
+}
+
+fn test_object_get_keeps_first_duplicate() {
+    match must_parse("{\"a\":1,\"a\":2}") {
+        JObj(keys, vals) => match get(keys, vals, "a") {
+            Some(value) => match value {
+                JInt(n) => assert(n == 1, "get must return the first duplicate key"),
+                _ => assert(false, "get returned the wrong JSON variant"),
+            },
+            None => assert(false, "get missed an existing key"),
+        },
+        _ => assert(false, "object parsed as another variant"),
+    }
+}
+
+fn test_parse_errors_include_byte_offsets() {
+    match parse("[1,]") {
+        Err(msg) => assert(str_contains(msg, "byte 3"), "error omitted byte offset"),
+        Ok(_) => assert(false, "trailing comma was accepted"),
+    }
+    match parse("\"\\uD800\"") {
+        Err(msg) => assert(str_contains(msg, "byte 1"), "surrogate error offset changed"),
+        Ok(_) => assert(false, "unpaired high surrogate was accepted"),
+    }
+}
