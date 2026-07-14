@@ -5,10 +5,12 @@ frozen[0] = 9
 let imm = 5
 imm = 6
 undeclared = 7
+
 fn f(xs) {
     push(xs, 1)
     xs[0] = 2
 }
+
 f([1])
 let m = map()
 put(m, "k", 1)
@@ -16,3 +18,77 @@ let mut deep = [[1], [2]]
 deep[0][0] = 5
 let frozen2 = [[1], [2]]
 frozen2[0][0] = 5
+
+// ---- E0597: deep-mut flow rule (GOALS §2) ----
+// Violations (3 kinds): let init, assign RHS, mut-param argument.
+// Note: with the Ident-is-fresh compromise in is_fresh_source (see types.bur),
+// the let-init and assign cases below don't fire today — kept as latent
+// regressions for when the rule is tightened with pattern-name tracking.
+let _src = [1, 2, 3]
+let mut _bad1 = _src
+_bad1 = _src
+
+fn _sink(mut xs) {
+    push(xs, 99)
+}
+
+_sink(_src)
+
+// Exemptions.
+// scalar — int is copy-semantic, no alias harm
+let _n = 5
+let mut _mn = _n
+_mn = _n
+
+fn _scalar_sink(mut x) {
+    x = 0
+}
+
+_scalar_sink(_n)
+
+// fresh sources — list/map literal, call return, enum ctor, FnLit
+fn _make_list() {
+    [1, 2, 3]
+}
+
+let mut _fresh1 = []
+let mut _fresh2 = [4, 5, 6]
+let mut _fresh3 = _make_list()
+
+let mut _fresh4 = if true {
+    [1]
+} else {
+    [2]
+}
+
+let mut _fresh5 = match 0 {
+    0 => [1],
+    _ => [2],
+}
+
+let _cb = fn(mut xs) {
+    push(xs, 1)
+}
+
+_cb([7])
+
+// chan exemption — chan is CSP alias, exempt regardless of source mutability
+let _ch_src = chan(1)
+let mut _ch_alias = _ch_src
+_ch_alias = _ch_src
+
+// if/match arm-tail recursion — all arms fresh ⇒ whole expr fresh
+fn _cond_list(flag) {
+    if flag {
+        [1]
+    } else {
+        [2]
+    }
+}
+
+let mut _from_call = _cond_list(true)
+
+// mut-source exemption — Ident of a mut binding counts as fresh
+let mut _base = [10, 20]
+let mut _derived = _base
+_derived = _base
