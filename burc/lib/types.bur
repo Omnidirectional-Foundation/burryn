@@ -939,6 +939,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     // convert_type_expr lowers a written type to a handle; subst maps type
     // parameter names to handles. prefix is the defining package of the enum
     // whose fields are being converted: bare enum names resolve against it.
+    // Function annotations collect lowercase names into subst before calling
+    // this helper, so a written `a` remains the same type variable throughout
+    // one signature.
     fn convert_type_expr(te, subst, prefix) {
         match te {
             TEName(pkg, name, targs, _) => {
@@ -988,6 +991,31 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 tfn(phs, convert_type_expr(ret, subst, prefix))
             },
             _ => h_unit,
+        }
+    }
+
+    fn collect_annotation_vars(te, mut subst) {
+        match te {
+            TEName(pkg, name, targs, _) => {
+                let is_builtin = name == "int" || name == "float" || name == "bool" || name == "str" || name == "unit" || name == "chan" || name == "map"
+                if pkg == "" && !is_builtin && str_len(name) > 0 && byte_at(name, 0) >= 97 && byte_at(name, 0) <= 122 {
+                    match get(subst, name) {
+                        Some(_) => {},
+                        None => put(subst, name, fresh("")),
+                    }
+                }
+                for arg in targs {
+                    collect_annotation_vars(arg, subst)
+                }
+            },
+            TEList(elem, _) => collect_annotation_vars(elem, subst),
+            TEFn(params, ret, _) => {
+                for param in params {
+                    collect_annotation_vars(param, subst)
+                }
+                collect_annotation_vars(ret, subst)
+            },
+            _ => {},
         }
     }
 
@@ -1908,6 +1936,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
             FnLit(params, muts, pspans, param_tys, ret_ty, body, _, _) => {
                 push_scope()
+                let mut annotation_vars = map()
+                for te in param_tys {
+                    collect_annotation_vars(te, annotation_vars)
+                }
+                collect_annotation_vars(ret_ty, annotation_vars)
                 let mut phs = []
                 let mut i = 0
                 while i < len(params) {
@@ -1915,7 +1948,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     push(phs, pv)
                     match param_tys[i] {
                         NoNode => {},
-                        te => unify_at(pv, convert_type_expr(te, map(), cur_pkg), span_of(te), "with this parameter annotation"),
+                        te => unify_at(pv, convert_type_expr(te, annotation_vars, cur_pkg), span_of(te), "with this parameter annotation"),
                     }
                     let _ = declare(params[i], mono(pv), muts[i], "param", pspans[i])
                     i = i + 1
@@ -1923,7 +1956,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 let ret = fresh("")
                 match ret_ty {
                     NoNode => {},
-                    te => unify_at(ret, convert_type_expr(te, map(), cur_pkg), span_of(te), "with this return annotation"),
+                    te => unify_at(ret, convert_type_expr(te, annotation_vars, cur_pkg), span_of(te), "with this return annotation"),
                 }
                 push(ret_tys, ret)
                 let bt = infer_block_expr(body)
