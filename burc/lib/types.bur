@@ -143,7 +143,7 @@ fn is_fresh_source(e, lookup, b_mut, b_kind, fresh_names) {
         StrLit(_, _) => true,
         BoolLit(_, _) => true,
         ListLit(_, _) => true,
-        FnLit(_, _, _, _, _, _) => true,
+        FnLit(_, _, _, _, _, _, _, _) => true,
         VariantAccess(_, _, _) => true,
         QualVariantAccess(_, _, _, _) => true,
         Call(_, _, _) => true,
@@ -958,7 +958,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         push(cargs, convert_type_expr(a, subst, prefix))
                     }
                     let full = if pkg != "" {
-                        pkg + "." + name
+                        let actual_pkg = match get(cur_aliases, pkg) {
+                            Some(path) => path,
+                            None => pkg,
+                        }
+                        actual_pkg + "." + name
                     } else if name == "int" || name == "float" || name == "bool" || name == "str" || name == "unit" || name == "chan" || name == "map" {
                         name
                     } else {
@@ -1133,7 +1137,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 scan_free(t, sc, seen, out)
                 scan_free(e, sc, seen, out)
             },
-            FnLit(params, _, _, body, _, _) => {
+            FnLit(params, _, _, _, _, body, _, _) => {
                 push(sc, map())
                 for p in params {
                     scan_bind(sc, p)
@@ -1330,7 +1334,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     fn infer_let_init(init) {
         let is_fnlit = match init {
-            FnLit(_, _, _, _, _, _) => true,
+            FnLit(_, _, _, _, _, _, _, _) => true,
             _ => false,
         }
         if is_fnlit {
@@ -1902,17 +1906,25 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 con1("list", el)
             },
-            FnLit(params, muts, pspans, body, _, _) => {
+            FnLit(params, muts, pspans, param_tys, ret_ty, body, _, _) => {
                 push_scope()
                 let mut phs = []
                 let mut i = 0
                 while i < len(params) {
                     let pv = fresh("")
                     push(phs, pv)
+                    match param_tys[i] {
+                        NoNode => {},
+                        te => unify_at(pv, convert_type_expr(te, map(), cur_pkg), span_of(te), "with this parameter annotation"),
+                    }
                     let _ = declare(params[i], mono(pv), muts[i], "param", pspans[i])
                     i = i + 1
                 }
                 let ret = fresh("")
+                match ret_ty {
+                    NoNode => {},
+                    te => unify_at(ret, convert_type_expr(te, map(), cur_pkg), span_of(te), "with this return annotation"),
+                }
                 push(ret_tys, ret)
                 let bt = infer_block_expr(body)
                 unify_at(ret, bt, span_of(body), "as this function's result")
@@ -1964,7 +1976,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 let t = infer_let_init(init)
                 let is_fnlit = match init {
-                    FnLit(_, _, _, _, _, _) => true,
+                    FnLit(_, _, _, _, _, _, _, _) => true,
                     _ => false,
                 }
                 let sch = if is_fnlit {
@@ -1974,7 +1986,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 let bh = declare(name, sch, is_mut, "local", nsp)
                 match init {
-                    FnLit(_, muts, _, _, _, _) => {
+                    FnLit(_, muts, _, _, _, _, _, _) => {
                         put(b_muts, bh, muts)
                     },
                     _ => {},
@@ -1993,7 +2005,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 b_isfn[b] = true
                 b_used[b] = true // don't lint named helper fns
                 match lit {
-                    FnLit(_, muts, _, _, _, _) => {
+                    FnLit(_, muts, _, _, _, _, _, _) => {
                         put(b_muts, b, muts)
                     },
                     _ => {},
@@ -2434,7 +2446,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         }
                         let cb = lookup(name)
                         match lit {
-                            FnLit(_, muts, _, _, _, _) => {
+                            FnLit(_, muts, _, _, _, _, _, _) => {
                                 put(b_muts, cb, muts)
                             },
                             _ => {},
