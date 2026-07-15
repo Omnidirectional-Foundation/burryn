@@ -64,7 +64,7 @@ fn is_const_expr(e) {
         FloatLit(_, _) => true,
         StrLit(_, _) => true,
         BoolLit(_, _) => true,
-        FnLit(_, _, _, _, _, _) => true,
+        FnLit(_, _, _, _, _, _, _, _) => true,
         Unary(_, rhs, _) => is_const_expr(rhs),
         Binary(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
         Logical(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
@@ -244,7 +244,13 @@ fn mark_expr(e, aliases, mut used) {
                 mark_expr(el, aliases, used)
             }
         },
-        FnLit(_, _, _, body, _, _) => mark_expr(body, aliases, used),
+        FnLit(_, _, _, param_tys, ret_ty, body, _, _) => {
+            for te in param_tys {
+                mark_te(te, aliases, used)
+            }
+            mark_te(ret_ty, aliases, used)
+            mark_expr(body, aliases, used)
+        },
         Block(stmts, _) => {
             for s in stmts {
                 mark_stmt(s, aliases, used)
@@ -352,8 +358,8 @@ fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
     }
 }
 
-// resolve_file_tes rebuilds a file's EnumDecls with alias-resolved field
-// types; every other statement passes through untouched
+// resolve_file_tes rebuilds declarations with alias-resolved written types;
+// every other statement passes through untouched
 fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
     let mut out = []
     for s in stmts {
@@ -373,6 +379,22 @@ fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
                     }
                 }
                 push(out, EnumDecl(name, params, rvars, is_pub, sp))
+            },
+            FnDecl(name, nsp, is_pub, lit, sp) => {
+                match lit {
+                    FnLit(params, muts, pspans, param_tys, ret_ty, body, fname, lsp) => {
+                        let mut rparam_tys = []
+                        for te in param_tys {
+                            push(rparam_tys, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                        }
+                        let rret_ty = match ret_ty {
+                            NoNode => NoNode,
+                            te => resolve_te(te, aliases, mod_path, disp, diags, dfiles),
+                        }
+                        push(out, FnDecl(name, nsp, is_pub, FnLit(params, muts, pspans, rparam_tys, rret_ty, body, fname, lsp), sp))
+                    },
+                    _ => push(out, s),
+                }
             },
             _ => push(out, s),
         }
@@ -899,7 +921,7 @@ pub fn load_module_test(dir0, test_fn) {
                     }
                     let z = Sp(0, 0)
                     let call = ExprStmt(Call(Ident(test_fn, z), [], z), z)
-                    let lit = FnLit([], [], [], Block([call], z), "main", z)
+                    let lit = FnLit([], [], [], [], NoNode, Block([call], z), "main", z)
                     push(fstmts, [FnDecl("main", z, false, lit, z)])
                     push(fpaths, "<test:" + test_fn + ">")
                     push(fimps, [])
@@ -959,7 +981,7 @@ pub fn test_discover(dir) {
                                 FnDecl(n, _, _, flit, _) => {
                                     if str_has_prefix(n, "test_") {
                                         match flit {
-                                            FnLit(ps, _, _, _, _, _) => {
+                                            FnLit(ps, _, _, _, _, _, _, _) => {
                                                 if len(ps) == 0 {
                                                     push(names, n)
                                                 }
