@@ -69,7 +69,9 @@ type VM struct {
 	yieldFlag bool
 	parkRecv  *OChannel // set by the recv() native to ask OpCall to park & retry
 	out       io.Writer
-	args      []string // user command-line arguments, exposed via args()
+	args      []string           // user command-line arguments, exposed via args()
+	execs     map[int64]execDone // exec_start results awaiting exec_poll
+	execNext  int64
 }
 
 type runtimeErr struct {

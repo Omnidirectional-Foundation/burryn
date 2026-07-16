@@ -489,13 +489,98 @@ var nativeDefs = []nativeDef{
 	}},
 }
 
+// execDone holds a finished exec_start command until exec_poll reaps it. The
+// seed VM has no timer/IO parking, so exec_start runs the child to completion
+// and every live handle is already complete when exec_poll looks it up.
+type execDone struct {
+	code           int
+	stdout, stderr string
+	spawnErr       string // non-empty when the command could not start
+}
+
+// ioNativeDefs are the S6.7 natives. They keep current burc sources
+// compilable by the seed; the rebirth chain only runs `bur-seed build`, which
+// never calls them, so sleep may block the scheduler and exec_start may run
+// the child synchronously instead of parking the fiber.
+var ioNativeDefs = []nativeDef{
+	{"sleep", 1, func(vm *VM, args []Value) (Value, error) {
+		if args[0].T != VInt {
+			return Unit, fmt.Errorf("sleep() needs an int, got %s", typeOf(args[0]))
+		}
+		if ms := args[0].I; ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+		vm.yieldFlag = true // sleep(0) is a plain yield
+		return Unit, nil
+	}},
+	{"exec_start", 2, func(vm *VM, args []Value) (Value, error) {
+		cmd, ok := asString(args[0])
+		argList, ok2 := asList(args[1])
+		if !ok || !ok2 {
+			return Unit, fmt.Errorf("exec_start() needs (str, [str])")
+		}
+		cmdArgs := make([]string, len(argList.Elems))
+		for i, e := range argList.Elems {
+			s, ok := asString(e)
+			if !ok {
+				return Unit, fmt.Errorf("exec_start() args must be str, got %s", typeOf(e))
+			}
+			cmdArgs[i] = s
+		}
+		c := exec.Command(cmd, cmdArgs...)
+		var stdout, stderr bytes.Buffer
+		c.Stdout, c.Stderr = &stdout, &stderr
+		done := execDone{}
+		if runErr := c.Run(); runErr != nil {
+			if ee, ok := runErr.(*exec.ExitError); ok {
+				done.code = ee.ExitCode()
+			} else { // spawn failure: command not found, not executable, ...
+				done.spawnErr = runErr.Error()
+			}
+		}
+		done.stdout, done.stderr = stdout.String(), stderr.String()
+		if vm.execs == nil {
+			vm.execs = map[int64]execDone{}
+		}
+		h := vm.execNext
+		vm.execNext++
+		vm.execs[h] = done
+		return vm.ok(IntV(h)), nil
+	}},
+	{"exec_poll", 1, func(vm *VM, args []Value) (Value, error) {
+		if args[0].T != VInt {
+			return Unit, fmt.Errorf("exec_poll() needs an int, got %s", typeOf(args[0]))
+		}
+		h := args[0].I
+		done, ok := vm.execs[h]
+		if !ok {
+			return Unit, fmt.Errorf("exec_poll: invalid or consumed handle %d", h)
+		}
+		delete(vm.execs, h)
+		f := vm.current
+		if done.spawnErr != "" {
+			f.push(vm.errStr(done.spawnErr)) // root Err across the Some allocation
+		} else {
+			f.push(vm.output(done.code, done.stdout, done.stderr))
+		}
+		opt := vm.some(f.peek(0))
+		f.pop()
+		return opt, nil
+	}},
+}
+
 func nativeNames() []string {
 	names := make([]string, len(nativeDefs))
 	for i, d := range nativeDefs {
 		names[i] = d.name
 	}
-	// yield is registered specially in registerNatives
-	return append(names, "yield")
+	// yield is registered specially in registerNatives; the S6.7 natives come
+	// after it, mirroring burc's native_names order
+	names = append(names, "yield")
+	for _, d := range ioNativeDefs {
+		names = append(names, d.name)
+	}
+	return names
 }
 
 func registerNatives(vm *VM) {
@@ -511,6 +596,11 @@ func registerNatives(vm *VM) {
 	}}
 	vm.gc.alloc(y)
 	vm.globals["yield"] = ObjV(y)
+	for _, d := range ioNativeDefs {
+		n := &ONative{Name: d.name, Arity: d.arity, Fn: d.fn}
+		vm.gc.alloc(n)
+		vm.globals[d.name] = ObjV(n)
+	}
 }
 
 func joinDisplay(args []Value) string {
