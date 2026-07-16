@@ -1525,6 +1525,10 @@ func (c *Checker) declareBuiltins() {
 	decl("file_exists", mono(fn(tBool, tStr)))
 	decl("read_dir", mono(fn(res(list(tStr), tStr), tStr)))
 	decl("exec", mono(fn(res(&TCon{Name: "Output"}, tStr), tStr, list(tStr))))
+	// S6.7 natives: declared so the seed can typecheck current burc sources.
+	decl("sleep", mono(fn(tUnit, tInt)))
+	decl("exec_start", mono(fn(res(tInt, tStr), tStr, list(tStr))))
+	decl("exec_poll", mono(fn(opt(res(&TCon{Name: "Output"}, tStr)), tInt)))
 	decl("args", mono(fn(list(tStr))))
 	// exit never returns, so it unifies with any expected type
 	decl("exit", poly1(func(a *TV) *TFunc { return fn(a, tInt) }))

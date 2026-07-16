@@ -410,25 +410,61 @@ static Value nat_output(int code, const char *out, int64_t outn, const char *err
     bur_pop();
     return res;
 }
-static Value nat_exec(Value *args, int argc) {
-    (void)argc;
+static int64_t bur_proc_alloc(void) {
+    if (bur_nprocs == bur_procscap) {
+        bur_procscap = bur_procscap * 2 + 8;
+        bur_procs = (BurProc *)realloc(bur_procs, sizeof(BurProc) * (size_t)bur_procscap);
+    }
+    memset(&bur_procs[bur_nprocs], 0, sizeof(BurProc));
+    bur_procs[bur_nprocs].used = true;
+    return bur_nprocs++;
+}
+
+// wait on one proc's own fds until it completes (deterministic mode and
+// single-runnable shortcuts); pointer stays valid: no allocation inside
+static void bur_proc_finish(BurProc *p) {
+    while (!p->complete) {
+        struct pollfd pf[3]; int n = 0;
+        int fds[3] = { p->outfd, p->errfd, p->failfd };
+        for (int k = 0; k < 3; k++)
+            if (fds[k] >= 0) { pf[n].fd = fds[k]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
+        if (n > 0) poll(pf, (nfds_t)n, -1);
+        bur_proc_pump(p);
+    }
+}
+
+// consume a completed proc slot into exec's Result value
+static Value bur_proc_result(BurProc *p) {
+    p->consumed = true;
+    Value res;
+    if (p->have_err) res = bur_err_str(strerror(p->child_err));
+    else res = nat_output(p->code, p->ob.data ? p->ob.data : "", p->ob.len,
+                          p->eb.data ? p->eb.data : "", p->eb.len);
+    buf_free(&p->ob); buf_free(&p->eb);
+    p->ob = (Buf){0}; p->eb = (Buf){0};
+    return res;
+}
+
+// spawn a child into a fresh proc slot; on failure sets *errmsg and returns
+// -1. In deterministic mode the child is run to completion before returning.
+static int64_t bur_proc_spawn(Value cmdv, Value argsv, const char **errmsg) {
     const char *cmd; int64_t cmdn;
-    OList *al = nat_as_list(args[1]);
-    if (!nat_as_str(args[0], &cmd, &cmdn) || !al) bur_trap("exec() needs (str, [str])");
+    OList *al = nat_as_list(argsv);
+    if (!nat_as_str(cmdv, &cmd, &cmdn) || !al) bur_trap("exec needs (str, [str])");
     // build argv (NUL-terminated copies)
     int n = (int)al->len;
     char **cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 2));
     cargv[0] = strdup(cmd);
     for (int i = 0; i < n; i++) {
         const char *s; int64_t sn;
-        if (!nat_as_str(al->elems[i], &s, &sn)) { for (int j = 0; j <= i; j++) free(cargv[j]); free(cargv); bur_trap("exec() args must be str"); }
+        if (!nat_as_str(al->elems[i], &s, &sn)) { for (int j = 0; j <= i; j++) free(cargv[j]); free(cargv); bur_trap("exec args must be str"); }
         cargv[i + 1] = (char *)malloc((size_t)sn + 1);
         memcpy(cargv[i + 1], s, (size_t)sn); cargv[i + 1][sn] = '\0';
     }
     cargv[n + 1] = NULL;
 
     int outp[2], errp[2], failp[2];
-    if (pipe(outp) || pipe(errp) || pipe(failp)) { for (int i = 0; i <= n; i++) free(cargv[i]); free(cargv); return bur_err_str(strerror(errno)); }
+    if (pipe(outp) || pipe(errp) || pipe(failp)) { for (int i = 0; i <= n; i++) free(cargv[i]); free(cargv); *errmsg = strerror(errno); return -1; }
     fcntl(failp[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid == 0) {
@@ -441,19 +477,55 @@ static Value nat_exec(Value *args, int argc) {
     close(outp[1]); close(errp[1]); close(failp[1]);
     for (int i = 0; i <= n; i++) free(cargv[i]);
     free(cargv);
-    if (pid < 0) { close(outp[0]); close(errp[0]); close(failp[0]); return bur_err_str(strerror(errno)); }
+    if (pid < 0) { close(outp[0]); close(errp[0]); close(failp[0]); *errmsg = strerror(errno); return -1; }
+    fcntl(outp[0], F_SETFL, O_NONBLOCK);
+    fcntl(errp[0], F_SETFL, O_NONBLOCK);
+    fcntl(failp[0], F_SETFL, O_NONBLOCK);
 
-    int childErr = 0; ssize_t fr = read(failp[0], &childErr, sizeof childErr); close(failp[0]);
-    Buf ob = {0}, eb = {0}; char chunk[8192]; ssize_t r;
-    while ((r = read(outp[0], chunk, sizeof chunk)) > 0) buf_bytes(&ob, chunk, (int64_t)r);
-    while ((r = read(errp[0], chunk, sizeof chunk)) > 0) buf_bytes(&eb, chunk, (int64_t)r);
-    close(outp[0]); close(errp[0]);
-    int status = 0; waitpid(pid, &status, 0);
-    if (fr == (ssize_t)sizeof childErr) { buf_free(&ob); buf_free(&eb); return bur_err_str(strerror(childErr)); }
-    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
-    Value res = nat_output(code, ob.data ? ob.data : "", ob.len, eb.data ? eb.data : "", eb.len);
-    buf_free(&ob); buf_free(&eb);
-    return res;
+    int64_t h = bur_proc_alloc();
+    BurProc *p = &bur_procs[h];
+    p->pid = pid;
+    p->outfd = outp[0]; p->errfd = errp[0]; p->failfd = failp[0];
+    if (bur_deterministic) bur_proc_finish(p); // serialize: no IO overlap
+    return h;
+}
+
+// exec blocks its fiber, not the scheduler: it parks as FBLOCKED_IO and the
+// scheduler's poll wakes it once the child is done.
+static Value nat_exec(Value *args, int argc) {
+    (void)argc;
+    const char *errmsg = NULL;
+    int64_t h = bur_proc_spawn(args[0], args[1], &errmsg);
+    if (h < 0) return bur_err_str(errmsg);
+    for (;;) {
+        BurProc *p = &bur_procs[h]; // re-fetch: the table can move while parked
+        bur_proc_pump(p);
+        if (p->complete) return bur_proc_result(p);
+        bur_cur->io_proc = h;
+        bur_nio++;
+        bur_park(FBLOCKED_IO);
+    }
+}
+
+static Value nat_exec_start(Value *args, int argc) {
+    (void)argc;
+    const char *errmsg = NULL;
+    int64_t h = bur_proc_spawn(args[0], args[1], &errmsg);
+    if (h < 0) return bur_err_str(errmsg);
+    return bur_ok(bur_int(h));
+}
+
+static Value nat_exec_poll(Value *args, int argc) {
+    (void)argc;
+    int64_t h = args[0].u.i;
+    if (!bur_proc_valid(h)) bur_trap("exec_poll: invalid or consumed handle %lld", (long long)h);
+    BurProc *p = &bur_procs[h];
+    bur_proc_pump(p);
+    if (!p->complete) return bur_none();
+    bur_push(bur_proc_result(p)); // root the Result across the Some allocation
+    Value opt = bur_some(bur_peek(0));
+    bur_pop();
+    return opt;
 }
 
 // ---- process, misc ----------------------------------------------------
@@ -544,6 +616,19 @@ static Value nat_yield(Value *args, int argc) {
     bur_switch_to_sched();
     return bur_unit();
 }
+static Value nat_sleep(Value *args, int argc) {
+    (void)argc;
+    int64_t ms = args[0].u.i;
+    if (ms <= 0) { // sleep(0) is a plain yield
+        bur_schedule(bur_cur);
+        bur_switch_to_sched();
+        return bur_unit();
+    }
+    bur_cur->wake_ns = bur_now_ns() + ms * 1000000;
+    bur_ntimers++;
+    bur_park(FBLOCKED_TIMER); // the scheduler wakes us at the deadline
+    return bur_unit();
+}
 
 static Value nat_gc(Value *args, int argc) { (void)args; (void)argc; bur_gc_collect(); return bur_int(bur_gc_last_freed); }
 static Value nat_heap_objects(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_count); }
@@ -600,6 +685,9 @@ static void bur_register_natives(void) {
     bur_register_native("chr", 1, nat_chr);
     bur_register_native("ord", 1, nat_ord);
     bur_register_native("clock", 0, nat_clock);
+    bur_register_native("sleep", 1, nat_sleep);
+    bur_register_native("exec_start", 2, nat_exec_start);
+    bur_register_native("exec_poll", 1, nat_exec_poll);
     bur_register_native("type_of", 1, nat_type_of);
     bur_register_native("assert", 2, nat_assert);
     bur_register_native("gc", 0, nat_gc);
