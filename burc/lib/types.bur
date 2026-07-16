@@ -813,7 +813,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     fn validate_type_expr(te, pm) {
         match te {
-            TEName(pkg, name, targs, sp) => {
+            TEName(pkg, name, constraint, targs, sp) => {
+                if constraint != "" {
+                    cerr(sp, "E0109", "", "type constraints are only allowed on lowercase type parameters in function signatures")
+                }
                 if pkg != "" {
                     // the loader already rewrote pkg from alias to import path
                     let eh = lookup_pkg_enum(pkg, name, sp)
@@ -944,7 +947,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     // one signature.
     fn convert_type_expr(te, subst, prefix) {
         match te {
-            TEName(pkg, name, targs, _) => {
+            TEName(pkg, name, _, targs, _) => {
                 let hit = if pkg == "" {
                     match get(subst, name) {
                         Some(t) => t,
@@ -996,12 +999,32 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     fn collect_annotation_vars(te, mut subst) {
         match te {
-            TEName(pkg, name, targs, _) => {
+            TEName(pkg, name, constraint, targs, sp) => {
                 let is_builtin = name == "int" || name == "float" || name == "bool" || name == "str" || name == "unit" || name == "chan" || name == "map"
-                if pkg == "" && !is_builtin && str_len(name) > 0 && byte_at(name, 0) >= 97 && byte_at(name, 0) <= 122 {
+                let is_var = pkg == "" && !is_builtin && str_len(name) > 0 && byte_at(name, 0) >= 97 && byte_at(name, 0) <= 122
+                if constraint != "" && !is_var {
+                    cerr(sp, "E0109", "", "type constraints are only allowed on lowercase type parameters")
+                }
+                if is_var {
+                    if len(targs) > 0 {
+                        cerr(sp, "E0109", "", "type parameter `" + name + "` takes no arguments")
+                    }
+                    let valid_constraint = constraint == "" || len(con_set(constraint)) > 0
+                    if !valid_constraint {
+                        cerr(sp, "E0412", "", "cannot find type constraint `" + constraint + "`")
+                    }
+                    let actual_constraint = if valid_constraint {
+                        constraint
+                    } else {
+                        ""
+                    }
                     match get(subst, name) {
-                        Some(_) => {},
-                        None => put(subst, name, fresh("")),
+                        Some(existing) => {
+                            if actual_constraint != "" {
+                                unify_at(existing, fresh(actual_constraint), sp, "between constraints on type parameter `" + name + "`")
+                            }
+                        },
+                        None => put(subst, name, fresh(actual_constraint)),
                     }
                 }
                 for arg in targs {
@@ -2187,7 +2210,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     push_scope() // scope 0
 
     fn te(name) {
-        TEName("", name, [], Sp(0, 0))
+        TEName("", name, "", [], Sp(0, 0))
     }
     fn builtin_enum(name, params, vnames, vfieldss) {
         let mut vhs = []
