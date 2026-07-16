@@ -251,6 +251,7 @@
   - 调度器(burrt.h 与 vm.bur **两份**，parity 铁律)增加 idle-wait：无 runnable fiber 时 poll(等待 fd 集，timeout = 最近 timer deadline)；死锁检测把 IO/timer 等待者视为活跃
   - 确定性模式(`BUR_DETERMINISTIC=1`)：IO 串行化 + timer 唤醒按 deadline + fiber 创建序双键排序
 - 每个新 native 照五处约定走，加完必重跑自举定点
+- **重新接生缺口(2026-07-16 实测)**：`archive/go-host` 归档 seed 早于本批的 `sleep` / `exec_start` / `exec_poll` native 声明；用该 seed 执行 `bur-seed build burc -o gen1` 会在 `burc/lib/vm.bur` 报 7 个 E0425，gen1 未生成。runtime IO 实现本身仍已完成，但 CI 的 seed→gen1 路径须在继续 S6.1 前修复；修复前不得把当前 main 记为可重新接生或 CI 全绿
 
 **S6.8 checker 债批——已完成(2026-07-10)**
 
@@ -263,7 +264,7 @@
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**当前推进顺序(2026-07-16；deep-mut、S6.6 核心、缓存包 import 与 S7.8 已完成)**：S6.1 接口缓存 → 子包测试发现 + `bur mod tidy` 按 import 增删 require → CI `bur dev embed-std` regen+cmp → 诊断/DX 批(S6.5) → **S6 收尾 = v0.3 发布 + seed 定基** → S7。
+**当前推进顺序(2026-07-16；deep-mut、S6.6 核心、缓存包 import 与 S7.8 已完成)**：先修复 `archive/go-host` 的 seed→gen1 重新接生缺口 → S6.1 接口缓存 → 子包测试发现 + `bur mod tidy` 按 import 增删 require → CI `bur dev embed-std` regen+cmp → 诊断/DX 批(S6.5) → **S6 收尾 = v0.3 发布 + seed 定基** → S7。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
