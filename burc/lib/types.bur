@@ -516,6 +516,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut b_kind = []
     let mut b_span = []
     let mut b_muts = map()
+    let mut b_params = []
     let mut s_vars = []
     let mut s_t = []
     let mut e_qual = []
@@ -670,6 +671,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         push(b_special, "")
         push(b_kind, kind)
         push(b_span, sp)
+        push(b_params, [])
         push(b_pub, false)
         push(b_file, cur_file)
         push(b_ready, true)
@@ -1040,6 +1042,325 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
             _ => {},
         }
+    }
+
+    fn is_type_expr_node(n) {
+        match n {
+            TEName(_, _, _, _, _) => true,
+            TEList(_, _) => true,
+            TEFn(_, _, _) => true,
+            _ => false,
+        }
+    }
+
+    fn iface_var_name(i) {
+        if i < 26 {
+            chr(97 + i)
+        } else {
+            "t" + str(i)
+        }
+    }
+
+    fn iface_enum_name(eh) {
+        let prefix = e_prefix[eh]
+        if prefix == "" {
+            e_qual[eh]
+        } else {
+            substr(e_qual[eh], str_len(prefix) + 1, str_len(e_qual[eh]) - str_len(prefix) - 1)
+        }
+    }
+
+    fn iface_collect_type(h, mut local_enums, mut external_pkgs) {
+        let x = ty_resolve(tk, tr, h)
+        if tk[x] == 0 {
+            match get(enum_by_name, tn[x]) {
+                Some(eh) => {
+                    if e_prefix[eh] == cur_pkg {
+                        put(local_enums, eh, true)
+                    } else if e_prefix[eh] != "" {
+                        put(external_pkgs, e_prefix[eh], true)
+                    }
+                },
+                None => {},
+            }
+            for a in ta[x] {
+                iface_collect_type(a, local_enums, external_pkgs)
+            }
+        } else if tk[x] == 1 {
+            for p in ta[x] {
+                iface_collect_type(p, local_enums, external_pkgs)
+            }
+            iface_collect_type(tr[x], local_enums, external_pkgs)
+        }
+    }
+
+    fn iface_collect_te(te, mut local_enums, mut external_pkgs) {
+        match te {
+            TEName(pkg, name, _, targs, _) => {
+                if pkg == "" {
+                    match get(enum_by_name, cur_pkg + "." + name) {
+                        Some(eh) => put(local_enums, eh, true),
+                        None => {},
+                    }
+                } else if pkg == cur_pkg {
+                    match get(enum_by_name, pkg + "." + name) {
+                        Some(eh) => put(local_enums, eh, true),
+                        None => {},
+                    }
+                } else {
+                    put(external_pkgs, pkg, true)
+                }
+                for a in targs {
+                    iface_collect_te(a, local_enums, external_pkgs)
+                }
+            },
+            TEList(elem, _) => iface_collect_te(elem, local_enums, external_pkgs),
+            TEFn(params, ret, _) => {
+                for p in params {
+                    iface_collect_te(p, local_enums, external_pkgs)
+                }
+                iface_collect_te(ret, local_enums, external_pkgs)
+            },
+            _ => {},
+        }
+    }
+
+    fn iface_render_te(te, aliases) {
+        match te {
+            TEName(pkg, name, constraint, targs, _) => {
+                let mut out = if pkg == "" || pkg == cur_pkg {
+                    name
+                } else {
+                    match get(aliases, pkg) {
+                        Some(alias) => alias + "." + name,
+                        None => name,
+                    }
+                }
+                if constraint != "" {
+                    out = out + ":" + constraint
+                }
+                if len(targs) > 0 {
+                    let mut args = []
+                    for a in targs {
+                        push(args, iface_render_te(a, aliases))
+                    }
+                    out = out + "(" + join(args, ", ") + ")"
+                }
+                out
+            },
+            TEList(elem, _) => "[" + iface_render_te(elem, aliases) + "]",
+            TEFn(params, ret, _) => {
+                let mut ps = []
+                for p in params {
+                    push(ps, iface_render_te(p, aliases))
+                }
+                "fn(" + join(ps, ", ") + ") -> " + iface_render_te(ret, aliases)
+            },
+            _ => "unit",
+        }
+    }
+
+    fn iface_render_type(h, aliases, mut var_names, mut shown, mut next_var) {
+        let x = ty_resolve(tk, tr, h)
+        if tk[x] == 2 {
+            let name = match get(var_names, x) {
+                Some(n) => n,
+                None => {
+                    let n = iface_var_name(next_var[0])
+                    next_var[0] = next_var[0] + 1
+                    put(var_names, x, n)
+                    n
+                },
+            }
+            let was_shown = match get(shown, x) {
+                Some(_) => true,
+                None => false,
+            }
+            if !was_shown {
+                put(shown, x, true)
+            }
+            if !was_shown && tn[x] != "" {
+                name + ":" + tn[x]
+            } else {
+                name
+            }
+        } else if tk[x] == 1 {
+            let mut ps = []
+            for p in ta[x] {
+                push(ps, iface_render_type(p, aliases, var_names, shown, next_var))
+            }
+            "fn(" + join(ps, ", ") + ") -> " + iface_render_type(tr[x], aliases, var_names, shown, next_var)
+        } else if tn[x] == "list" && len(ta[x]) == 1 {
+            "[" + iface_render_type(ta[x][0], aliases, var_names, shown, next_var) + "]"
+        } else {
+            let mut name = tn[x]
+            match get(enum_by_name, tn[x]) {
+                Some(eh) => {
+                    if e_prefix[eh] == cur_pkg || e_prefix[eh] == "" {
+                        name = iface_enum_name(eh)
+                    } else {
+                        name = match get(aliases, e_prefix[eh]) {
+                            Some(alias) => alias + "." + iface_enum_name(eh),
+                            None => iface_enum_name(eh),
+                        }
+                    }
+                },
+                None => {},
+            }
+            if len(ta[x]) == 0 {
+                name
+            } else {
+                let mut args = []
+                for a in ta[x] {
+                    push(args, iface_render_type(a, aliases, var_names, shown, next_var))
+                }
+                name + "(" + join(args, ", ") + ")"
+            }
+        }
+    }
+
+    fn iface_type_context(sh) {
+        let mut names = map()
+        let mut i = 0
+        while i < len(s_vars[sh]) {
+            put(names, s_vars[sh][i], iface_var_name(i))
+            i = i + 1
+        }
+        names
+    }
+
+    fn iface_render_enum(eh, aliases) {
+        let mut out = if e_pub[eh] {
+            "pub enum "
+        } else {
+            "enum "
+        }
+        out = out + iface_enum_name(eh)
+        if len(e_params[eh]) > 0 {
+            out = out + "(" + join(e_params[eh], ", ") + ")"
+        }
+        out = out + " {\n"
+        for vh in e_variants[eh] {
+            out = out + "    " + v_name[vh]
+            if len(v_fields[vh]) > 0 {
+                let mut fields = []
+                for field in v_fields[vh] {
+                    push(fields, iface_render_te(field, aliases))
+                }
+                out = out + "(" + join(fields, ", ") + ")"
+            }
+            out = out + ",\n"
+        }
+        out + "}"
+    }
+
+    fn iface_render_binding(name, b, aliases) {
+        let sh = b_scheme[b]
+        let mut vars = iface_type_context(sh)
+        let mut shown = map()
+        let mut next_var = [len(s_vars[sh])]
+        let root = ty_resolve(tk, tr, s_t[sh])
+        if b_isfn[b] && tk[root] == 1 {
+            let mut params = []
+            let masks = match get(b_muts, b) {
+                Some(ms) => ms,
+                None => [],
+            }
+            let mut i = 0
+            while i < len(ta[root]) {
+                let pname = if i < len(b_params[b]) {
+                    b_params[b][i]
+                } else {
+                    "p" + str(i)
+                }
+                let mut prefix = ""
+                if i < len(masks) && masks[i] {
+                    prefix = "mut "
+                }
+                push(params, prefix + pname + ": " + iface_render_type(ta[root][i], aliases, vars, shown, next_var))
+                i = i + 1
+            }
+            "pub fn " + name + "(" + join(params, ", ") + ") -> " + iface_render_type(tr[root], aliases, vars, shown, next_var)
+        } else {
+            "pub let " + name + ": " + iface_render_type(root, aliases, vars, shown, next_var)
+        }
+    }
+
+    fn render_package_interface(top) {
+        let mut local_enums = map()
+        let mut external_pkgs = map()
+        let mut eh = 0
+        while eh < len(e_qual) {
+            if e_prefix[eh] == cur_pkg && e_pub[eh] {
+                put(local_enums, eh, true)
+            }
+            eh = eh + 1
+        }
+        let mut export_names = []
+        for name in keys(top) {
+            match get(top, name) {
+                Some(b) => {
+                    if b_pub[b] {
+                        push(export_names, name)
+                        iface_collect_type(s_t[b_scheme[b]], local_enums, external_pkgs)
+                    }
+                },
+                None => {},
+            }
+        }
+        let mut growing = true
+        while growing {
+            let before = len(keys(local_enums))
+            for idx in keys(local_enums) {
+                for vh in e_variants[idx] {
+                    for field in v_fields[vh] {
+                        iface_collect_te(field, local_enums, external_pkgs)
+                    }
+                }
+            }
+            growing = len(keys(local_enums)) > before
+        }
+        let paths = sort_strs(keys(external_pkgs))
+        let mut aliases = map()
+        let mut imports = []
+        let mut i = 0
+        while i < len(paths) {
+            let alias = "i" + str(i)
+            put(aliases, paths[i], alias)
+            push(imports, "import " + alias + " \"" + paths[i] + "\"")
+            i = i + 1
+        }
+        let mut enum_names = []
+        let mut enum_by_short = map()
+        for idx in keys(local_enums) {
+            let name = iface_enum_name(idx)
+            push(enum_names, name)
+            put(enum_by_short, name, idx)
+        }
+        let mut decls = []
+        for name in sort_strs(enum_names) {
+            match get(enum_by_short, name) {
+                Some(idx) => push(decls, iface_render_enum(idx, aliases)),
+                None => {},
+            }
+        }
+        for name in sort_strs(export_names) {
+            match get(top, name) {
+                Some(b) => push(decls, iface_render_binding(name, b, aliases)),
+                None => {},
+            }
+        }
+        let mut out = ""
+        if len(imports) > 0 {
+            out = join(imports, "\n") + "\n"
+            if len(decls) > 0 {
+                out = out + "\n"
+            }
+        }
+        if len(decls) > 0 {
+            out = out + join(decls, "\n\n") + "\n"
+        }
+        out
     }
 
     // instantiate_enum fills subst with fresh vars for the enum's parameters
@@ -1981,10 +2302,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     NoNode => {},
                     te => unify_at(ret, convert_type_expr(te, annotation_vars, cur_pkg), span_of(te), "with this return annotation"),
                 }
-                push(ret_tys, ret)
-                let bt = infer_block_expr(body)
-                unify_at(ret, bt, span_of(body), "as this function's result")
-                let _ = pop(ret_tys)
+                match body {
+                    NoNode => {},
+                    _ => {
+                        push(ret_tys, ret)
+                        let bt = infer_block_expr(body)
+                        unify_at(ret, bt, span_of(body), "as this function's result")
+                        let _ = pop(ret_tys)
+                    },
+                }
                 pop_scope()
                 tfn(phs, ret)
             },
@@ -2336,6 +2662,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     // entry-package globals for the bind dump, captured before the scope pop
     let mut bind_names = []
     let mut bind_by = map()
+    let mut interface_sources = []
 
     pi = 0
     while pi < n_pkgs {
@@ -2390,11 +2717,17 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             cur_file = file_paths[fi]
             for s in files_stmts[fi] {
                 match s {
-                    FnDecl(name, nsp, is_pub, _, _) => {
+                    FnDecl(name, nsp, is_pub, lit, _) => {
                         let b = declare(name, mono(fresh("")), false, "global", nsp)
                         b_isfn[b] = true
                         b_pub[b] = is_pub
                         b_ready[b] = false
+                        match lit {
+                            FnLit(params, _, _, _, _, _, _, _) => {
+                                b_params[b] = params
+                            },
+                            _ => {},
+                        }
                         let ni = match get(fname_idx, name) {
                             Some(x) => x,
                             None => {
@@ -2551,7 +2884,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         if is_pub && !is_pkg {
                             err_pub_script(span_of(s))
                         }
-                        let t = infer_let_init(init)
+                        let t = if is_type_expr_node(init) {
+                            let mut annotation_vars = map()
+                            collect_annotation_vars(init, annotation_vars)
+                            convert_type_expr(init, annotation_vars, cur_pkg)
+                        } else {
+                            infer_let_init(init)
+                        }
                         let pt = match get(pre, name) {
                             Some(x) => x,
                             None => t,
@@ -2629,6 +2968,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 None => {},
             }
         }
+        push(interface_sources, render_package_interface(top))
         put(pkg_seen, cur_pkg, true)
         let _ = pop(scopes)
         cur_aliases = map()
@@ -2681,7 +3021,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         push(sorted_files, diag_files[oidx])
     }
 
-    Checked(sorted_diags, sorted_files, bind_lines, chan_fors)
+    Checked(sorted_diags, sorted_files, bind_lines, chan_fors, interface_sources)
 }
 
 // ---- small sorts (no stdlib sort yet; stable pick-first-minimum) ----

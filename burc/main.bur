@@ -295,7 +295,7 @@ fn run_file(path, mode, argv) {
                         exit(exit_static)
                     }
                     match lib.typecheck_script(stmts) {
-                        lib.CheckOut.Checked(cdiags, _, binds, chan_fors) => {
+                        lib.CheckOut.Checked(cdiags, _, binds, chan_fors, _) => {
                             if mode == mode_check {
                                 if run_check(cdiags, binds) {
                                     exit(exit_static)
@@ -341,7 +341,7 @@ fn run_module(dir0, mode, argv) {
         },
         lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
             match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors) => {
+                lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors, _) => {
                     if mode == mode_check {
                         if run_check_f(cdiags, cfiles, binds) {
                             exit(exit_static)
@@ -531,7 +531,7 @@ fn compile_file_to_c(path) {
                         exit(exit_static)
                     }
                     match lib.typecheck_script(stmts) {
-                        lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
+                        lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
                             if emit_errors(cdiags, true) {
                                 exit(exit_static)
                             }
@@ -562,7 +562,7 @@ fn compile_module_to_c(dir) {
         },
         lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
             match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
+                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
                         exit(exit_static)
                     }
@@ -702,6 +702,14 @@ fn dev_cmd(rest) {
         dev_mod_graph(strip_trailing_slash(rest[1]))
         return
     }
+    if sub == "interface" {
+        dev_interface(strip_trailing_slash(rest[1]))
+        return
+    }
+    if sub == "interface-parse" {
+        dev_interface_parse(rest[1])
+        return
+    }
     if sub == "embed-std" {
         if len(rest) < 2 {
             eprintln("usage: bur dev embed-std <repo-root>")
@@ -746,6 +754,57 @@ fn dev_cmd(rest) {
     } else {
         println("unknown dev command:", sub)
         exit(exit_usage)
+    }
+}
+
+fn dev_interface(dir) {
+    match lib.load_module(dir) {
+        lib.ModOut.ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
+        },
+        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib.CheckOut.Checked(diags, dfiles, _, _, interfaces) => {
+                    if !emit_errors_f(diags, dfiles, true) {
+                        let mut i = 0
+                        while i < len(interfaces) {
+                            println("// package " + pkg_paths[i])
+                            print(interfaces[i])
+                            i = i + 1
+                        }
+                    }
+                },
+            }
+        },
+    }
+}
+
+fn dev_interface_parse(path) {
+    match read_file(path) {
+        Ok(src) => match lib.lex(src) {
+            lib.LexOut.Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    for d in ldiags {
+                        println(lib.dump_diag(d))
+                    }
+                } else {
+                    match lib.parse_interface(toks) {
+                        lib.ParseOut.Parsed(stmts, pdiags) => {
+                            for s in stmts {
+                                lib.dump_node(s, "")
+                            }
+                            for d in pdiags {
+                                println(lib.dump_diag(d))
+                            }
+                        },
+                    }
+                }
+            },
+        },
+        Err(msg) => {
+            println("error:", msg)
+            exit(exit_no_input)
+        },
     }
 }
 
@@ -964,7 +1023,7 @@ fn run_test_target(dir, fnname) {
         },
         lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
             match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
+                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
                         exit(exit_static)
                     }
@@ -999,7 +1058,7 @@ fn dev_build_dir(dir) {
                 i = i + 1
             }
             match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
+                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
                     let mut errs = false
                     i = 0
                     while i < len(cdiags) {
@@ -1073,7 +1132,7 @@ fn dev_check(src) {
                             }
                         } else {
                             match lib.typecheck_script(stmts) {
-                                lib.CheckOut.Checked(cdiags, _, binds, _) => {
+                                lib.CheckOut.Checked(cdiags, _, binds, _, _) => {
                                     for line in binds {
                                         println(line)
                                     }
@@ -1136,7 +1195,7 @@ fn dev_dis(src) {
                             }
                         } else {
                             match lib.typecheck_script(stmts) {
-                                lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
+                                lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
                                     let mut errs = false
                                     for d in cdiags {
                                         println(lib.dump_diag(d))
@@ -1176,7 +1235,7 @@ fn dev_emit_c(src) {
                             }
                         } else {
                             match lib.typecheck_script(stmts) {
-                                lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
+                                lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
                                     let mut errs = false
                                     for d in cdiags {
                                         println(lib.dump_diag(d))

@@ -29,6 +29,26 @@ pub fn parse(toks) {
     Parsed(stmts, diags)
 }
 
+// parse_interface accepts generated package declarations. Bodyless
+// functions and typed lets are deliberately unavailable through parse().
+pub fn parse_interface(toks) {
+    let mut pos = [0]
+    let mut stmts = []
+    let mut diags = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_eof) && len(diags) < 20 {
+        match p_interface_statement(toks, pos) {
+            Ok(s) => push(stmts, s),
+            Err(d) => {
+                push(diags, d)
+                p_synchronize(toks, pos)
+            },
+        }
+        p_skip_semis(toks, pos)
+    }
+    Parsed(stmts, diags)
+}
+
 // synchronize skips tokens until the next statement boundary: a semicolon at
 // the current brace depth (closers of blocks we bailed out of are swallowed
 // as residue) or a token that starts a statement.
@@ -230,6 +250,79 @@ fn p_statement(toks, mut pos) {
     }
 }
 
+fn p_interface_statement(toks, mut pos) {
+    if p_check(toks, pos, t_import) {
+        p_import_decl(toks, pos)
+    } else if p_check(toks, pos, t_enum) {
+        p_enum_decl(toks, pos)
+    } else if p_check(toks, pos, t_pub) {
+        let pub_tok = p_advance(toks, pos)
+        if p_check(toks, pos, t_fn) {
+            let fn_tok = p_advance(toks, pos)
+            let name = match p_expect(toks, pos, t_ident, "function name") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    Tok(0, "", 0, 0)
+                },
+            }
+            let lit = match p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(fn_tok), true) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            Ok(FnDecl(tok_lex(name), sp_of_tok(name), true, lit, sp_union(sp_of_tok(pub_tok), span_of(lit))))
+        } else if p_check(toks, pos, t_let) {
+            let let_tok = p_advance(toks, pos)
+            let name = match p_expect(toks, pos, t_ident, "variable name") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    Tok(0, "", 0, 0)
+                },
+            }
+            match p_expect(toks, pos, t_colon, "':' before the exported value type") {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            let te = match p_type_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            match p_end_stmt(toks, pos) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            Ok(LetStmt(tok_lex(name), sp_of_tok(name), false, true, te, sp_union(sp_of_tok(pub_tok), sp_union(sp_of_tok(let_tok), span_of(te)))))
+        } else if p_check(toks, pos, t_enum) {
+            let decl = match p_enum_decl(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            match decl {
+                EnumDecl(name, params, variants, _, sp) => Ok(EnumDecl(name, params, variants, true, sp_union(sp_of_tok(pub_tok), sp))),
+                other => Ok(other),
+            }
+        } else {
+            perr("E1114", "interface files contain imports, enums, and exported signatures", "expected `fn`, `enum`, or `let` after `pub`", sp_of_tok(pub_tok))
+        }
+    } else {
+        perr("E1114", "interface files contain imports, enums, and exported signatures", "expected an interface declaration", sp_of_tok(p_peek(toks, pos)))
+    }
+}
+
 fn p_let_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos) // let
     let is_mut = p_match(toks, pos, t_mut)
@@ -342,7 +435,7 @@ fn p_fn_decl(toks, mut pos) {
             Tok(0, "", 0, 0)
         },
     }
-    let lit = match p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(tok)) {
+    let lit = match p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(tok), false) {
         Ok(v) => v,
         Err(d) => {
             return Err(d)
@@ -353,7 +446,7 @@ fn p_fn_decl(toks, mut pos) {
 }
 
 // params and body, after 'fn [name]'; fn_sp is the span of the `fn` keyword
-fn p_fn_rest(toks, mut pos, name, fn_sp) {
+fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     match p_expect(toks, pos, t_lparen, "'(' after fn") {
         Ok(_) => {},
         Err(d) => {
@@ -385,6 +478,9 @@ fn p_fn_rest(toks, mut pos, name, fn_sp) {
                     NoNode
                 },
             }
+        } else if interface_only {
+            return perr("E1101", "interface parameters require explicit types", "expected ':' after interface parameter `" + tok_lex(ptok) + "`", sp_of_tok(ptok))
+            NoNode
         } else {
             NoNode
         }
@@ -395,10 +491,11 @@ fn p_fn_rest(toks, mut pos, name, fn_sp) {
         p_skip_semis(toks, pos)
     }
     p_skip_semis(toks, pos)
-    match p_expect(toks, pos, t_rparen, "')' after parameters") {
-        Ok(_) => {},
+    let rp = match p_expect(toks, pos, t_rparen, "')' after parameters") {
+        Ok(v) => v,
         Err(d) => {
             return Err(d)
+            Tok(0, "", 0, 0)
         },
     }
     let ret_ty = if p_match(toks, pos, t_thin_arrow) {
@@ -409,17 +506,30 @@ fn p_fn_rest(toks, mut pos, name, fn_sp) {
                 NoNode
             },
         }
+    } else if interface_only {
+        return perr("E1101", "interface functions require an explicit return type", "expected '->' after interface parameters", sp_of_tok(rp))
+        NoNode
     } else {
         NoNode
     }
-    let body = match p_block(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
+    if interface_only {
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, NoNode, name, sp_union(fn_sp, span_of(ret_ty))))
+    } else {
+        let body = match p_block(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, body, name, sp_union(fn_sp, span_of(body))))
     }
-    Ok(FnLit(params, muts, pspans, param_tys, ret_ty, body, name, sp_union(fn_sp, span_of(body))))
 }
 
 fn p_enum_decl(toks, mut pos) {
@@ -1221,7 +1331,7 @@ fn p_primary(toks, mut pos) {
         Ok(ListLit(elems, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     } else if t == t_fn {
         p_advance(toks, pos)
-        p_fn_rest(toks, pos, "", sp_of_tok(tok))
+        p_fn_rest(toks, pos, "", sp_of_tok(tok), false)
     } else if t == t_if {
         p_if_expr(toks, pos)
     } else if t == t_match {
