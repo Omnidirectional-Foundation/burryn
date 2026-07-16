@@ -145,7 +145,7 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析——MVS / `bur.sum` / 缓存包 import 已落地，接口缓存与 import-driven tidy 待完成；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；2026-07-15 补齐 std/testing)；S6.5 诊断/DX 批；S6.6 std/json + std/testing **核心实现已完成**(2026-07-15，CI regen+cmp 待补)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成**(2026-07-15) | 进行中 |
+| **S6 生态工具链** | S6.1 依赖解析——MVS / `bur.sum` / 缓存包 import 与 interface declaration pipeline 已落地，disk cache/fallback 与 import-driven tidy 待完成；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；2026-07-15 补齐 std/testing)；S6.5 诊断/DX 批；S6.6 std/json + std/testing **核心实现已完成**(2026-07-15，CI regen+cmp 待补)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成**(2026-07-15) | 进行中 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注(**已为 S6.1 提前完成**，2026-07-16) | 未开工 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
@@ -170,8 +170,8 @@
 
 **S6.1 + S6.2 依赖管理(P0，MVS + fetch + lockfile)**
 
-现状(2026-07-15)：离线 MVS、`bur.sum`、网络拉取、缓存定位与 require 闭包加载均已落地；跨模块 import 已能从 `$BURCACHE` 加载 required package 及其子包。
-剩余：接口缓存、子包测试发现，以及 `bur mod tidy` 按实际 import 增删 require。
+现状(2026-07-16)：离线 MVS、`bur.sum`、网络拉取、缓存定位与 require 闭包加载均已落地；跨模块 import 已能从 `$BURCACHE` 加载 required package 及其子包；interface reader、导出面 renderer 与 checker consumption pipeline 已落地。
+剩余：disk interface cache/fallback、子包测试发现，以及 `bur mod tidy` 按实际 import 增删 require。
 
 - S6.1 解析层(无网络)——**已落地**：`burc/lib/modgraph.bur` 构建依赖图跑 MVS(选满足约束的**最低**版本)；`bur.sum` lockfile(`path version hash`)；module loader 命中 require 图后从缓存加载跨模块 import；缓存目录 `$BURCACHE` 默认 `~/.burryn/pkg/<path>@<version>/`
 - S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native——**已落地(2026-07-10)**：shell-out 方案成立，零新 native；`bur mod init/tidy/download/verify` 与 `bur get` 全部接线；`bur get` 拉取失败回滚 bur.mod；树哈希输出已从 hex 纠正为定案的 `h1:<base64>`。**实现侧默认(2026-07-11 owner 追认为定案)**：clone URL = `https://<module path>`(Go 式「模块路径即仓库路径」，不支持子目录模块，真实需求出现再议 discovery)，环境变量 `$BURGITBASE` 可换 URL 前缀(镜像/离线测试)；`bur mod download` 在 bur.sum 存在时校验、缺失时写出
@@ -188,7 +188,7 @@
   - `bur.sum` 行格式 `<path> <version> h1:<base64(树哈希)>`；树哈希 = 规范化目录哈希(路径排序 + 逐文件 sha256 汇总，Go dirhash 式)；版本 ↔ git tag 映射 `v<semver>`
   - S6.1 离线解析只读 `$BURCACHE`；cache miss 报错并提示 `bur mod download`(自动拉取归 S6.2)
   - **std 分发形式 = 随工具链捆绑**：保留 import 前缀 `std/`，版本跟工具链走，不经网络拉取；modgraph 解析须把 `std/` 特判为工具链内置，绝不落缓存/网络路径
-  - **接口缓存已定(owner 2026-07-10，原必答题)**：对每个 `path@version` 首次编译后，把导出面序列化为接口文件缓存(enum 定义原样复制、fn 导出写成签名)；**接口文件语法 = S7.8 可选标注语法**(标注语法先在此定型，接口文件即自动生成的人类可读声明文件)；缓存 key = (工具链版本, 模块树哈希)，安全性由 bur.sum 锁定的哈希承担。**S7.8 语法形态已定(owner 2026-07-11，移出 §7 待定)**：参数 `name: type`、返回值 `-> type`，类型表达式复用 enum 字段既有语法(`[T]`、`fn(...) -> T`、`map(K, V)`、小写名即类型参数；受约束变量写 `a:addord`，规则见 §2)，标注可省略、语义不变。**落地状态(2026-07-16)**：参数/返回标注、普通泛型变量推导与 `a:addord` 的 parser/AST/formatter/module/checker 传播均已完成；接口序列化可直接使用完整 S7.8 类型表达式
+  - **接口缓存已定(owner 2026-07-10，原必答题)**：对每个 `path@version` 首次编译后，把导出面序列化为接口文件缓存(enum 定义原样复制、fn 导出写成签名)；**接口文件语法 = S7.8 可选标注语法**(标注语法先在此定型，接口文件即自动生成的人类可读声明文件)；缓存 key = (工具链版本, 模块树哈希)，安全性由 bur.sum 锁定的哈希承担。**S7.8 语法形态已定(owner 2026-07-11，移出 §7 待定)**：参数 `name: type`、返回值 `-> type`，类型表达式复用 enum 字段既有语法(`[T]`、`fn(...) -> T`、`map(K, V)`、小写名即类型参数；受约束变量写 `a:addord`，规则见 §2)，标注可省略、语义不变。**落地状态(2026-07-16)**：参数/返回标注、普通泛型变量推导与 `a:addord` 的 parser/AST/formatter/module/checker 传播均已完成；interface reader、确定性导出面 renderer 与 checker consumption pipeline 已落地，可生成/读取完整 S7.8 类型表达式。disk cache、失败回退与 companion metadata 尚未落地
     - 导出函数写成无函数体的 `pub fn name(param: Type) -> Return`；导出值写成带类型的 `pub let name: Type`；`pub enum` 原样复制
     - exported signature 引用的 private enum 作为非 `pub` 支撑声明递归复制，维持现有可见性
     - 无函数体声明与 typed `let` 只允许 interface reader 读取，普通 `.bur` source parser 不接受
