@@ -1,0 +1,268 @@
+// Disk interface cache for external packages. A cacheable package (one
+// with a bur.sum-backed identity from the loader) round-trips its export
+// surface through `$BURCACHE/.interfaces/<identity>/<flat pkg path>.buri`
+// plus a `.meta` sidecar holding the checker's channel-for metadata, which
+// interface-only checking cannot reproduce. Everything is best-effort: any
+// read, parse, or resolution failure is a silent miss, a cached run that
+// produces an error rediscovers the truth from full source, and only clean
+// source results are written back.
+
+// iface_flat_pkg flattens a package import path into a single file name;
+// `@` is already reserved by the cache layout (`<path>@<version>`), so it
+// never appears inside an import path element.
+fn iface_flat_pkg(path) {
+    let mut out = ""
+    let mut i = 0
+    while i < str_len(path) {
+        let c = char_at(path, i)
+        if c == "/" {
+            out = out + "@"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn iface_cache_dir(id) {
+    cache_root() + "/.interfaces/" + id
+}
+
+// iface_dirname strips the final path element ("a/b/c.bur" -> "a/b")
+fn iface_dirname(p) {
+    let mut cut = -1
+    let mut i = 0
+    while i < str_len(p) {
+        if char_at(p, i) == "/" {
+            cut = i
+        }
+        i = i + 1
+    }
+    if cut < 0 {
+        ""
+    } else {
+        substr(p, 0, cut)
+    }
+}
+
+// iface_try_load reads one package's cached interface. On a hit it pushes
+// the pseudo-file triple (decls / display path / imports) plus the sidecar
+// channel-for entries and answers true; any failure pushes nothing.
+fn iface_try_load(id, pkg_path, mut o_stmts, mut o_fpaths, mut o_imports, mut o_chans) {
+    let base = iface_cache_dir(id) + "/" + iface_flat_pkg(pkg_path)
+    let src = match read_file(base + ".buri") {
+        Ok(s) => s,
+        Err(_) => {
+            return false
+            ""
+        },
+    }
+    let meta = match read_file(base + ".meta") {
+        Ok(s) => s,
+        Err(_) => {
+            return false
+            ""
+        },
+    }
+    let mlines = split(meta, "\n")
+    if len(mlines) == 0 || mlines[0] != "buri1" {
+        return false
+    }
+    let mut entries = []
+    let mut mi = 1
+    while mi < len(mlines) {
+        if mlines[mi] != "" {
+            if !str_contains(mlines[mi], ":") {
+                return false
+            }
+            push(entries, mlines[mi])
+        }
+        mi = mi + 1
+    }
+    match lex(src) {
+        Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                return false
+            }
+            match parse_interface(toks) {
+                Parsed(stmts, pdiags) => {
+                    if len(pdiags) > 0 {
+                        return false
+                    }
+                    let mut imps = []
+                    let mut kept = []
+                    let mut imports_done = false
+                    for s in stmts {
+                        match s {
+                            ImportDecl(_, _, _, _, _) => {
+                                if imports_done {
+                                    return false
+                                }
+                                push(imps, s)
+                            },
+                            _ => {
+                                imports_done = true
+                                push(kept, s)
+                            },
+                        }
+                    }
+                    let mut rdiags = []
+                    let mut rfiles = []
+                    let decls = resolve_file_tes(kept, aliases_of(imps), pkg_path, base + ".buri", rdiags, rfiles)
+                    if len(rdiags) > 0 {
+                        return false
+                    }
+                    push(o_stmts, [decls])
+                    push(o_fpaths, [base + ".buri"])
+                    push(o_imports, [imps])
+                    push(o_chans, entries)
+                    true
+                },
+            }
+        },
+    }
+}
+
+fn iface_has_err(r) {
+    match r {
+        Checked(diags, _, _, _, _) => {
+            let mut has = false
+            for d in diags {
+                match d {
+                    Diag(ie, _, _, _, _, _) => {
+                        if ie {
+                            has = true
+                        }
+                    },
+                }
+            }
+            has
+        },
+    }
+}
+
+// iface_write_atomic goes through a `.tmp` sibling plus `mv -f` so a
+// reader never observes a half-written file; failures are silently dropped
+fn iface_write_atomic(path, content) {
+    match write_file(path + ".tmp", content) {
+        Ok(_) => {
+            let _ = exec("mv", ["-f", path + ".tmp", path])
+        },
+        Err(_) => {},
+    }
+}
+
+// iface_write_pkg serializes one package: the rendered interface source
+// and the sidecar of channel-for entries scoped to the package directory
+// (entries of nested sub-packages carry a `/` after the prefix and are
+// excluded; they belong to their own package's sidecar)
+fn iface_write_pkg(id, pkg_path, pkgdir, iface_src, chan_fors) {
+    let _ = exec("mkdir", ["-p", iface_cache_dir(id)])
+    let prefix = pkgdir + "/"
+    let mut meta = "buri1\n"
+    for e in chan_fors {
+        if str_has_prefix(e, prefix) {
+            let rest = substr(e, str_len(prefix), str_len(e) - str_len(prefix))
+            if !str_contains(rest, "/") {
+                meta = meta + rest + "\n"
+            }
+        }
+    }
+    let base = iface_cache_dir(id) + "/" + iface_flat_pkg(pkg_path)
+    iface_write_atomic(base + ".meta", meta)
+    iface_write_atomic(base + ".buri", iface_src)
+}
+
+// iface_store writes back every cacheable package that was checked from
+// source in this run, but only when the whole run is clean: a result with
+// any error must never seed the cache
+fn iface_store(r, pkgs_fpaths, pkg_paths, pkg_ids, hits) {
+    if iface_has_err(r) {
+        return
+    }
+    match r {
+        Checked(_, _, _, chan_fors, ifaces) => {
+            let mut i = 0
+            while i < len(pkg_paths) {
+                if pkg_ids[i] != "" && !hits[i] && len(pkgs_fpaths[i]) > 0 {
+                    iface_write_pkg(pkg_ids[i], pkg_paths[i], iface_dirname(pkgs_fpaths[i][0]), ifaces[i], chan_fors)
+                }
+                i = i + 1
+            }
+        },
+    }
+}
+
+// iface_merge_chans re-prefixes each hit package's sidecar entries with
+// its source directory: compilation still consumes the original source
+// AST, so the keys must point at the real files
+fn iface_merge_chans(r, pkgs_fpaths, hits, side_chans) {
+    match r {
+        Checked(diags, dfiles, binds, chan_fors, ifaces) => {
+            let mut merged = []
+            for e in chan_fors {
+                push(merged, e)
+            }
+            let mut i = 0
+            while i < len(hits) {
+                if hits[i] && len(pkgs_fpaths[i]) > 0 {
+                    let pkgdir = iface_dirname(pkgs_fpaths[i][0])
+                    for e in side_chans[i] {
+                        push(merged, pkgdir + "/" + e)
+                    }
+                }
+                i = i + 1
+            }
+            Checked(diags, dfiles, binds, merged, ifaces)
+        },
+    }
+}
+
+// typecheck_cached is typecheck_program behind the interface cache: each
+// cacheable package's checker input is swapped for its cached declaration
+// pseudo-file. A cached run that reports an error falls back to a full
+// source run and returns that result, so a stale cache can never surface
+// false diagnostics.
+pub fn typecheck_cached(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+    let n = len(pkg_paths)
+    let mut hits = []
+    let mut any_hit = false
+    let mut in_stmts = []
+    let mut in_fpaths = []
+    let mut in_imports = []
+    let mut side_chans = []
+    let mut i = 0
+    while i < n {
+        let mut used = false
+        if pkg_ids[i] != "" && len(pkgs_fpaths[i]) > 0 {
+            used = iface_try_load(pkg_ids[i], pkg_paths[i], in_stmts, in_fpaths, in_imports, side_chans)
+        }
+        if used {
+            any_hit = true
+        } else {
+            push(in_stmts, pkgs_stmts[i])
+            push(in_fpaths, pkgs_fpaths[i])
+            push(in_imports, pkgs_imports[i])
+            push(side_chans, [])
+        }
+        push(hits, used)
+        i = i + 1
+    }
+    if any_hit {
+        let r = typecheck_program(in_stmts, in_fpaths, true, pkg_paths, in_imports)
+        if !iface_has_err(r) {
+            iface_store(r, pkgs_fpaths, pkg_paths, pkg_ids, hits)
+            return iface_merge_chans(r, pkgs_fpaths, hits, side_chans)
+        }
+    }
+    let full = typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports)
+    let mut miss = []
+    i = 0
+    while i < n {
+        push(miss, false)
+        i = i + 1
+    }
+    iface_store(full, pkgs_fpaths, pkg_paths, pkg_ids, miss)
+    full
+}
