@@ -40,6 +40,26 @@ fn str_fields(s) {
     out
 }
 
+// iface_id_of flattens a bur.sum tree hash (`h1:<base64>`) into a
+// directory-safe interface-cache identity; the toolchain version prefix
+// keys the cache on (toolchain version, module tree hash)
+fn iface_id_of(hash) {
+    let mut out = ""
+    let mut i = 0
+    while i < str_len(hash) {
+        let c = char_at(hash, i)
+        if c == "+" {
+            out = out + "-"
+        } else if c == "/" {
+            out = out + "_"
+        } else if c == "=" || c == ":" {} else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    toolchain_version + "-" + out
+}
+
 fn valid_import_path(p) {
     if p == "" || str_has_prefix(p, "/") || str_ends_with(p, "/") {
         false
@@ -508,6 +528,21 @@ fn load_module_opts(dir0, with_tests) {
         return ModFailed(diags, dfiles)
     }
 
+    // bur.sum entries keyed "path@version" map to interface-cache
+    // identities; a missing or malformed file just disables the cache
+    let mut sum_ids = map()
+    match read_file(dir + "/bur.sum") {
+        Ok(sum) => {
+            for line in split(sum, "\n") {
+                let f = str_fields(line)
+                if len(f) == 3 {
+                    put(sum_ids, f[0] + "@" + f[1], iface_id_of(f[2]))
+                }
+            }
+        },
+        Err(_) => {},
+    }
+
     // Resolve the require closure once. External package paths are mapped to
     // immutable cache roots from this selected MVS result; local and bundled
     // std packages stay outside this table.
@@ -536,6 +571,7 @@ fn load_module_opts(dir0, with_tests) {
     let mut out_files = []
     let mut out_fpaths = []
     let mut out_imports = []
+    let mut out_ids = []
     fn load_pkg(path, from_file, from_sp, stack) {
         let st = match get(state, path) {
             Some(x) => x,
@@ -870,6 +906,15 @@ fn load_module_opts(dir0, with_tests) {
         push(out_files, files_stmts)
         push(out_fpaths, file_paths)
         push(out_imports, file_imports)
+        let pkg_id = if is_external {
+            match get(sum_ids, dep_paths[dep_ix] + "@" + dep_vers[dep_ix]) {
+                Some(x) => x,
+                None => "",
+            }
+        } else {
+            ""
+        }
+        push(out_ids, pkg_id)
     }
 
     load_pkg(mod_path, "", Sp(0, 0), [])
@@ -887,7 +932,7 @@ fn load_module_opts(dir0, with_tests) {
     if has_err {
         ModFailed(diags, dfiles)
     } else {
-        ModLoaded(diags, dfiles, out_paths, out_files, out_fpaths, out_imports)
+        ModLoaded(diags, dfiles, out_paths, out_files, out_fpaths, out_imports, out_ids)
     }
 }
 
@@ -897,7 +942,7 @@ fn load_module_opts(dir0, with_tests) {
 pub fn load_module_test(dir0, test_fn) {
     match load_module_opts(dir0, true) {
         ModFailed(d, f) => ModFailed(d, f),
-        ModLoaded(ld, lf, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
+        ModLoaded(ld, lf, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids) => {
             let ei = len(pkgs_stmts) - 1
             let mut np_stmts = []
             let mut np_fpaths = []
@@ -942,7 +987,7 @@ pub fn load_module_test(dir0, test_fn) {
                 }
                 pi = pi + 1
             }
-            ModLoaded(ld, lf, pkg_paths, np_stmts, np_fpaths, np_imports)
+            ModLoaded(ld, lf, pkg_paths, np_stmts, np_fpaths, np_imports, pkg_ids)
         },
     }
 }
