@@ -1440,7 +1440,24 @@ fn p_match_expr(toks, mut pos) {
                 NoNode
             },
         }
-        match p_expect(toks, pos, t_arrow, "'=>' after pattern") {
+        // guard 在 pattern 绑定之后求值，语法为 `pattern if expr => body`。/ A guard is evaluated after pattern binding and uses `pattern if expr => body`.
+        let has_guard = p_match(toks, pos, t_if)
+        let guard = if has_guard {
+            match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else {
+            NoNode
+        }
+        match p_expect(toks, pos, t_arrow, if has_guard {
+            "'=>' after pattern"
+        } else {
+            "'=>' after match guard"
+        }) {
             Ok(_) => {},
             Err(d) => {
                 return Err(d)
@@ -1454,7 +1471,7 @@ fn p_match_expr(toks, mut pos) {
                 NoNode
             },
         }
-        push(arms, MatchArm(pat, body, sp_union(span_of(pat), span_of(body))))
+        push(arms, MatchArm(pat, guard, body, sp_union(span_of(pat), span_of(body))))
         if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
             return perr("E1104", "", "expected ',' or newline between match arms", sp_of_tok(p_peek(toks, pos)))
         }

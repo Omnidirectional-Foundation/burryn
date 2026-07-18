@@ -161,7 +161,7 @@ fn is_fresh_source(e, lookup, b_mut, b_kind, fresh_names) {
             let mut all_fresh = true
             for arm in arms {
                 match arm {
-                    MatchArm(pat, body, _) => {
+                    MatchArm(pat, _, body, _) => {
                         let mut arm_names = fresh_name_copy(fresh_names)
                         fresh_pattern_names(pat, arm_names)
                         if !is_fresh_source(body, lookup, b_mut, b_kind, arm_names) {
@@ -1554,9 +1554,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     scan_free(arm, sc, seen, out)
                 }
             },
-            MatchArm(pat, body, _) => {
+            MatchArm(pat, guard, body, _) => {
                 push(sc, map())
                 scan_free(pat, sc, seen, out)
+                scan_free(guard, sc, seen, out)
                 scan_free(body, sc, seen, out)
                 let _ = pop(sc)
             },
@@ -1963,11 +1964,17 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
         for arm in arms {
             match arm {
-                MatchArm(pat, body, _) => {
+                MatchArm(pat, guard, body, _) => {
                     push_scope()
+                    let unguarded = match guard {
+                        NoNode => true,
+                        _ => false,
+                    }
                     match pat {
                         PatWildcard(_) => {
-                            has_catch_all = true
+                            if unguarded {
+                                has_catch_all = true
+                            }
                         },
                         PatLiteral(v, psp) => {
                             let lt = match v {
@@ -1975,7 +1982,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                 FloatLit(_, _) => h_float,
                                 StrLit(_, _) => h_str,
                                 BoolLit(bv, _) => {
-                                    put(covered, str(bv), true)
+                                    if unguarded {
+                                        put(covered, str(bv), true)
+                                    }
                                     h_bool
                                 },
                                 _ => fresh(""),
@@ -1990,11 +1999,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                 let mut subst = map()
                                 let enum_ty = instantiate_enum(fv[0], subst)
                                 unify_at(scrut_t, enum_ty, psp, "between this pattern and the matched value")
-                                put(covered, name, true)
+                                if unguarded {
+                                    put(covered, name, true)
+                                }
                             } else if fv[0] >= 0 {
                                 cerr(psp, "E0532", "", "variant `" + name + "` has " + str(len(v_fields[e_variants[fv[0]][fv[1]]])) + " field(s); bind them: `" + name + "(...)`")
                             } else {
-                                has_catch_all = true
+                                if unguarded {
+                                    has_catch_all = true
+                                }
                                 let _ = declare(name, mono(scrut_t), false, "pattern", psp)
                             }
                         },
@@ -2076,10 +2089,19 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                         i = i + 1
                                     }
                                 }
-                                put(covered, pvar, true)
+                                if unguarded {
+                                    put(covered, pvar, true)
+                                }
                             }
                         },
                         _ => {},
+                    }
+                    match guard {
+                        NoNode => {},
+                        _ => {
+                            let gt = infer_expr_ref(guard)
+                            unify_at(gt, h_bool, span_of(guard), "in this `match` guard (guards must be bool)")
+                        },
                     }
                     let bt = infer_expr_ref(body)
                     unify_at(res_t, bt, span_of(body), "between the arms of this `match` (all arms must produce one type)")
