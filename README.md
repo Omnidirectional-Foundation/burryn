@@ -186,11 +186,11 @@ See [`SECURITY.md`](SECURITY.md) for the full policy and private reporting instr
 
 ## Honest Limitations
 
-Stages S1–S6 and S7.1 are done.
-They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, dependency tooling, diagnostics, string interpolation, and a fully self-hosted compiler with the Go host removed.
+Stages S1–S6, S7.1, and S7.3 are done.
+They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, dependency tooling, diagnostics, string interpolation, match guards, and a fully self-hosted compiler with the Go host removed.
 Both backends produce byte-identical output for the whole language, concurrency included.
 
-Still missing: records/structs (model product types with single-variant enums), pipelines, match guards, compile-time constants, `defer`, and the net stdlib.
+Still missing: records/structs (model product types with single-variant enums), pipelines, compile-time constants, `defer`, and the net stdlib.
 Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.
 
 ## Documentation

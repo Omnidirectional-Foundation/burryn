@@ -146,7 +146,7 @@
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
 | **S6 生态工具链** | S6.1 依赖解析 **已完成**(2026-07-18：MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；2026-07-15 补齐 std/testing)；S6.5 诊断/DX 批 **已完成**(2026-07-19：cgen `#line` + `-g`、runtime/VM trap 带 span stack trace、公开命令 rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议 + loader 诊断接线)；S6.6 std/json + std/testing **已完成**(2026-07-15 核心实现；2026-07-18 CI regen+cmp)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成**(2026-07-15) | 已完成 |
-| **S7 语言特性扩展** | S7.1 字符串插值 **已完成**(2026-07-19)；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注(**已为 S6.1 提前完成**，2026-07-16) | 进行中 |
+| **S7 语言特性扩展** | S7.1 字符串插值 **已完成**(2026-07-19)；S7.2 管道 `\|>`；S7.3 match guard **已完成**(2026-07-19)；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注(**已为 S6.1 提前完成**，2026-07-16) | 进行中 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
 - S1–S5 为自举闭环，已全部达成：`bur` 由本语言写成、经 cc 逐字节重建自身，main 上 Go 整棵树已清零
@@ -290,6 +290,8 @@ S7.6 `defer` 语义已定(owner 2026-07-12，移出 §7 待定)：`defer { ... }
 S7.7 调度器升级已定(owner 2026-07-12，移出 §7 待定)：net natives 落地时把 idle-wait 抽成**通用 fd 注册接口**(socket/exec/timer 同一入口)，底层维持 poll；epoll/kqueue 只在 fd 规模成为瓶颈时换实现、接口不变；两份调度器(burrt.h + vm.bur)parity 铁律照旧。
 
 **S7.1 落地状态(2026-07-19)**：lexer 在字符串与表达式模式间切换，`{{` 产生字面左花括号，嵌套 block/match/插值按 brace depth 配平；parser 脱糖为现有 `+` AST，非 `str` 表达式沿用类型检查并提示显式 `str()`；formatter 重建插值表层语法并保留含注释片段；旧 seed 与当前 compiler 通过 `chr(123)` 字面 brace 迁移保持三段自举定点。
+
+**S7.3 落地状态(2026-07-19)**：match 臂语法为 `pattern if guard => body`；guard 在 pattern 绑定作用域内求值且必须为 `bool`；带 guard 的臂不计入穷尽覆盖。compiler 在 pattern 成功后发条件跳转，guard 为假时关闭捕获并清理本臂局部变量后继续匹配；VM/native parity 与 gen2 == gen3 已验证。
 
 ## 6.7 重型类型系统扩展评估(工程视角，对应 S8)
 

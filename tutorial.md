@@ -382,6 +382,25 @@ let letter = match grade / 10 {
 }
 ```
 
+match 臂可在 pattern 后加 `if` guard。guard 在 pattern 绑定之后求值,所以能使用
+刚绑定的名字;结果必须是 `bool`。带 guard 的臂不算穷尽覆盖,因为 guard 可能为假,
+因此仍须保留无 guard 的 fallback。
+
+A match arm may add an `if` guard after its pattern. The guard runs after
+pattern binding, so it can use newly bound names, and its result must be
+`bool`. A guarded arm does not count toward exhaustiveness because its guard
+may reject the value, so an unguarded fallback is still required.
+
+```rust
+let jobs = Some(3)
+let status = match jobs {
+    Some(n) if n > 0 => "active: " + str(n),
+    Some(_) => "idle",
+    None => "missing",
+}
+println(status)
+```
+
 同名变体属于多个枚举时,用 `Enum.Variant` 限定,如 `Shape.Circle(r)`。
 
 When a variant name is shared across enums, qualify it as `Enum.Variant`, e.g.

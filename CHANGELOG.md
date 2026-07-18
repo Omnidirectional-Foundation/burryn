@@ -8,6 +8,17 @@ Versions use a 2-day date range. Latest first.
 
 ## v0.3 (2026-07-19 ~ 07-20)
 
+**Landed S7.3 match guards** — a match arm can add `if <bool>` after its
+pattern, with pattern bindings visible to the guard.
+**落地 S7.3 match guard** — match 臂可在 pattern 后添加 `if <bool>`，guard 可访问 pattern 绑定。
+
+- **Added:** Guard parsing, type checking, formatting, AST dumps, and bytecode
+  generation for `pattern if guard => body` arms.
+- **Changed:** Guarded arms no longer count toward exhaustiveness because their
+  condition may reject an otherwise matching value.
+- **Added:** VM/native parity examples plus guard type, parser, and
+  exhaustiveness regression fixtures.
+
 **Landed S7.1 string interpolation** — strings can splice `str` expressions
 with `{expr}` and escape literal opening braces as `{{`.
 **落地 S7.1 字符串插值** — 字符串可用 `{expr}` 拼接 `str` 表达式，字面左花括号写成 `{{`。
