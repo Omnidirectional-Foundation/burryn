@@ -145,7 +145,7 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析 **已完成**(2026-07-18：MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；2026-07-15 补齐 std/testing)；S6.5 诊断/DX 批；S6.6 std/json + std/testing **核心实现已完成**(2026-07-15，CI regen+cmp 待补)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成**(2026-07-15) | 进行中 |
+| **S6 生态工具链** | S6.1 依赖解析 **已完成**(2026-07-18：MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；2026-07-15 补齐 std/testing)；S6.5 诊断/DX 批 **已完成**(2026-07-19：cgen `#line` + `-g`、runtime/VM trap 带 span stack trace、公开命令 rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议 + loader 诊断接线)；S6.6 std/json + std/testing **已完成**(2026-07-15 核心实现；2026-07-18 CI regen+cmp)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成**(2026-07-15) | 已完成 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `\|>`；S7.3 match guard；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量；S7.6 `defer`(倾向块作用域)；S7.7 net stdlib(依赖 S6.7 的 fd 感知调度讨论)；S7.8 可选函数签名标注(**已为 S6.1 提前完成**，2026-07-16) | 未开工 |
 | **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
 
@@ -227,6 +227,7 @@ S6.1 无剩余项。
 - runtime trap 打印带 source span 的 stack trace(复用 diag + line_starts)
 - 符合「终局只留 C 底座」，属后端增强非新工具
 - 扩容(owner 2026-07-12)：诊断深度 backlog 里最值钱的**多 span 标注 + 结构化修复建议**并入本批同做；`--explain`、JSON/彩色输出、compile 首错即停等其余项仍按需不排期
+- **落地状态(2026-07-19，全批完成)**：cgen 每函数头与每条指令前发射 `#line`(只在行变化处发射会被 cc 递增行号错标)、`bur build` 加 `-g`，gdb 三帧精确映射 `.bur` 行；runtime trap 打印 `at <fn> (<file>:<line>)` 逐帧 trace(burrt.h per-fiber trace 栈 + VM 侧 `fb_fr_callip` 对等实现，两侧输出逐字节一致，无源文件的合成帧抑制)；DiagT 增 `DiagX(..., [LabelT], [FixT])` 变体，`Lab(start, end, label)` 同文件次级 span、`Fix(start, end, replacement, desc)` 结构化建议；公开命令(`check`/`run`/`build`)走 `render.bur` rustc 风格渲染(file:line:col + 源行摘录 + caret + help/fix，源码不可读时降级 header-only)，dev parity dump 保持旧裸格式逐字节不动；loader 诊断(unused_import 等)接入公开命令渲染(此前被静默丢弃，`run_test_target` 有意不接防测试子进程刷屏)；判定沿用 5a 修正(gen2 == gen3)，首次实证 gen1 != gen2(cgen 发射变更所致，符合预期)
 
 **S6.6 std/json + std/testing(纯 Burryn，零新 native)——核心实现已完成(2026-07-15)**
 
@@ -265,7 +266,7 @@ S6.1 无剩余项。
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**当前推进顺序(2026-07-18 更新；接口缓存、子包测试发现、import-driven tidy、CI embed 校验与 seed 定基均已完成)**：诊断/DX 批(S6.5) → **S6 收尾 = v0.3 发布** → S7。
+**当前推进顺序(2026-07-19 更新；S6.1–S6.8 全部完成)**：**S6 收尾 = v0.3 发布** → S7。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
