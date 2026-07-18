@@ -285,6 +285,8 @@ S6.1 无剩余项。
 **S7 落地顺序**：S7.8 可选签名标注随 S6.1 接口缓存前置完成；S7 主批按字符串插值(最先，不阻塞任何事)→ 管道 / match guard(顺手)→ 编译期常量 → defer(S7.6) → net(S7.7)。
 封闭 records 移出 S7，归 **S8.4**(改 unify + 自举风险与 row poly 叠加，同段一次性验 fixpoint)。
 
+S7.2 管道语义已定(owner 2026-07-19，移出 §6.6 表格待定)：`lhs |> target` 脱糖为把 lhs 作为 target 首个实参调用(Elixir 式)；`|>` 最低优先级、左结合，`x |> f |> g` = `g(f(x))`，`1 + 2 |> str` = `str(1 + 2)`。RHS = pipe target 专用产生式 `path ("(" args? ")")?`(`path = Ident ("." Ident)*`)：裸名 `f`、包成员 `pkg.f`、带参 `f(a,b)`/`pkg.f(a,b)`；不接受任意括号表达式作 RHS——需“值当函数调用”的 apply 语义、与“无第二套求值规则”冲突，`x |> (f())` 为 parse error。`?` 绑定紧于 `|>`，传播写 `(x |> parse)?`。实现保留 Pipe AST 节点供 formatter 逐字重建 `|>` 表层(与 S7.1 插值同策略；无痕脱糖会被 `bur fmt` format-on-save 抹成 `g(f(x))`)；Pipe 在 checker 前经一趟 lowering pass 降为 Call，checker/compiler 不新增语义。非首位插入的 `_` 占位符预留将来扩展，S7.2 不实现。
+
 S7.6 `defer` 语义已定(owner 2026-07-12，移出 §7 待定)：`defer { ... }` 挂**包围函数**，函数退出时 LIFO 执行；块是闭包、捕获按闭包语义(无参数求值时机问题)；fiber 正常 return 执行 defer；trap/死锁 = 进程级 abort，defer 不执行。
 
 S7.7 调度器升级已定(owner 2026-07-12，移出 §7 待定)：net natives 落地时把 idle-wait 抽成**通用 fd 注册接口**(socket/exec/timer 同一入口)，底层维持 poll；epoll/kqueue 只在 fd 规模成为瓶颈时换实现、接口不变；两份调度器(burrt.h + vm.bur)parity 铁律照旧。
