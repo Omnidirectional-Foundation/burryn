@@ -1182,8 +1182,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         let mut end_jumps = []
         for arm in arms {
             match arm {
-                MatchArm(pat, body, asp) => {
+                MatchArm(pat, guard, body, asp) => {
                     let mut fail_j = -1
+                    let mut guard_fail_j = -1
                     begin_scope(ch)
                     let mut arm_locals = 0
 
@@ -1321,6 +1322,18 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         _ => {},
                     }
 
+                    match guard {
+                        NoNode => {},
+                        _ => {
+                            match cp_expr_ref(ch, guard) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return Err(d)
+                                },
+                            }
+                            guard_fail_j = emit_jump(ch, op_jump_if_false_pop, span_of(guard))
+                        },
+                    }
                     match cp_expr_ref(ch, body) {
                         Ok(_) => {},
                         Err(d) => {
@@ -1336,6 +1349,21 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         pop_local(ch)
                     }
                     push(end_jumps, emit_jump(ch, op_jump, asp))
+                    // guard 为假时 pattern 已绑定；用 unit 占位复用 op_end_block，关闭 upvalue 并删除本 arm locals，再继续尝试下一臂。/ On a false guard the pattern is already bound; a unit placeholder lets op_end_block close upvalues and remove this arm's locals before trying the next arm.
+                    if guard_fail_j >= 0 {
+                        match patch_jump(ch, guard_fail_j) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                        if arm_locals > 0 {
+                            emit(ch, op_unit, asp)
+                            emit(ch, op_end_block, asp)
+                            emit(ch, arm_locals, asp)
+                            emit(ch, op_pop, asp)
+                        }
+                    }
                     if fail_j >= 0 {
                         match patch_jump(ch, fail_j) {
                             Ok(_) => {},
