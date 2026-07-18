@@ -8,13 +8,21 @@
 #   bur-seed  build <seed-base-1>/burc -> bur-base (burc at the base tag)
 #   bur-base  build burc      --------> gen1 (current burc)
 #   gen1      build burc      --------> gen2 (second generation)
-#   cmp gen1 gen2 (byte-for-byte) ----> fixpoint reached
+#   gen2      build burc      --------> gen3 (third generation)
+#   cmp gen2 gen3 (byte-for-byte) ----> fixpoint reached
 # The base tag's burc obeys the archived seed's old checker rules forever;
 # burc after the base commit only needs to build under the base compiler.
 # 基准 tag 的 burc 永久遵守归档种子的旧 checker 纪律；
 # 基准之后的 burc 只需能被基准编译器构建。
-# If gen1 != gen2 the compiler is not a fixpoint and CI fails.
-# 若 gen1 != gen2 则编译器未达定点，CI 失败。
+# gen1 is compiled from C emitted by the frozen base cgen, so whenever the
+# current cgen changes its emission, gen1 legitimately differs from gen2.
+# gen1 and gen2 embed the same current compiler logic, so their emitted C
+# must agree: the fixpoint judgment is gen2 == gen3.
+# gen1 由冻结的基准 cgen 发射的 C 编成，当前 cgen 的发射一旦变化，
+# gen1 与 gen2 合理地不同；gen1 与 gen2 内含同一份当前编译器逻辑，
+# 二者发射的 C 必须一致：定点判定为 gen2 == gen3。
+# If gen2 != gen3 the compiler is not a fixpoint and CI fails.
+# 若 gen2 != gen3 则编译器未达定点，CI 失败。
 
 name: CI
 
@@ -91,13 +99,19 @@ jobs:
           ./gen1 build burc -o gen2
           test -x gen2
 
-      - name: Verify fixpoint (gen1 == gen2)
+      - name: Bootstrap gen3
         run: |
-          if ! cmp gen1 gen2; then
-            echo "::error::bootstrap fixpoint broken: gen1 != gen2"
+          rm -f program.c
+          ./gen2 build burc -o gen3
+          test -x gen3
+
+      - name: Verify fixpoint (gen2 == gen3)
+        run: |
+          if ! cmp gen2 gen3; then
+            echo "::error::bootstrap fixpoint broken: gen2 != gen3"
             exit 1
           fi
-          echo "fixpoint reached: $(sha256sum gen1 | cut -d' ' -f1)"
+          echo "fixpoint reached: $(sha256sum gen2 | cut -d' ' -f1)"
 
       # The checked-in std embed table must equal a fresh regeneration from
       # the std/ sources. 内嵌 std 表必须与从 std/ 重新生成的结果逐字节一致。
