@@ -435,6 +435,8 @@ fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
 // (module.go checkPackageDecls)
 fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
     let mut declared = map() // name -> file it was first declared in
+    let mut declared_s = map() // name -> first declaration's span start
+    let mut declared_e = map() // name -> first declaration's span end
     let mut fi = 0
     while fi < len(files_stmts) {
         let disp = file_paths[fi]
@@ -479,14 +481,36 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
                         } else {
                             ""
                         }
+                        let ps = match get(declared_s, name) {
+                            Some(x) => x,
+                            None => 0,
+                        }
+                        let pe = match get(declared_e, name) {
+                            Some(x) => x,
+                            None => 0,
+                        }
                         match name_sp {
                             Sp(ns0, ne0) => {
-                                push(diags, Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
+                                // the "first declared here" label is same-file
+                                // only: LabelT carries no file of its own
+                                if prev == disp {
+                                    push(diags, DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [Lab(ps, pe, "first declared here")], []))
+                                } else {
+                                    push(diags, Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
+                                }
                                 push(dfiles, disp)
                             },
                         }
                     },
-                    None => put(declared, name, disp),
+                    None => {
+                        put(declared, name, disp)
+                        match name_sp {
+                            Sp(ns0, ne0) => {
+                                put(declared_s, name, ns0)
+                                put(declared_e, name, ne0)
+                            },
+                        }
+                    },
                 }
             }
         }
@@ -942,6 +966,11 @@ fn load_module_opts(dir0, test_rel) {
     for d in diags {
         match d {
             Diag(ie, _, _, _, _, _) => {
+                if ie {
+                    has_err = true
+                }
+            },
+            DiagX(ie, _, _, _, _, _, _, _) => {
                 if ie {
                     has_err = true
                 }

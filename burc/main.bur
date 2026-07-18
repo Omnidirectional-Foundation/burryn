@@ -139,16 +139,14 @@ fn fmt_source(path, src, mut state) {
     match lib.lex(src) {
         lib.LexOut.Lexed(toks, ldiags, comments) => {
             if len(ldiags) > 0 {
-                eprintln(path + ":")
-                let _ = emit_errors(ldiags, false)
+                let _ = emit_errors(ldiags, path, false)
                 state[1] = 1
                 return None
             }
             match lib.parse(toks) {
                 lib.ParseOut.Parsed(stmts, pdiags) => {
                     if len(pdiags) > 0 {
-                        eprintln(path + ":")
-                        let _ = emit_errors(pdiags, false)
+                        let _ = emit_errors(pdiags, path, false)
                         state[1] = 1
                         return None
                     }
@@ -273,6 +271,7 @@ fn starts_with(s, prefix) {
 fn diag_is_error(d) {
     match d {
         lib.DiagT.Diag(ie, _, _, _, _, _) => ie,
+        lib.DiagT.DiagX(ie, _, _, _, _, _, _, _) => ie,
     }
 }
 
@@ -289,28 +288,28 @@ fn run_file(path, mode, argv) {
     }
     match lib.lex(src) {
         lib.LexOut.Lexed(toks, ldiags, _) => {
-            if emit_errors(ldiags, false) {
+            if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
             match lib.parse(toks) {
                 lib.ParseOut.Parsed(stmts, pdiags) => {
-                    if emit_errors(pdiags, false) {
+                    if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
                     match lib.typecheck_script(stmts) {
                         lib.CheckOut.Checked(cdiags, _, binds, chan_fors, _) => {
                             if mode == mode_check {
-                                if run_check(cdiags, binds) {
+                                if run_check(cdiags, path, binds) {
                                     exit(exit_static)
                                 }
                                 return
                             }
-                            if emit_errors(cdiags, true) {
+                            if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
                             match lib.compile_script(stmts, chan_fors) {
                                 lib.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(lib.dump_diag(d))
+                                    eprintln(lib.render_diag(d, path))
                                     exit(exit_static)
                                 },
                                 lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
@@ -342,7 +341,10 @@ fn run_module(dir0, mode, argv) {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        lib.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
             match lib.typecheck_cached(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                 lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors, _) => {
                     if mode == mode_check {
@@ -358,7 +360,7 @@ fn run_module(dir0, mode, argv) {
                     let ls_tables = concat_lists(pkgs_lstarts)
                     match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
                         lib.CompileOut.CompileFailed(d, f) => {
-                            eprintln(lib.dump_diag_f(d, f))
+                            eprintln(lib.render_diag(d, f))
                             exit(exit_static)
                         },
                         lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
@@ -388,8 +390,9 @@ fn concat_lists(xss) {
 }
 
 // emit_errors renders diagnostics to stderr; with errors_only it skips
-// warnings. Returns whether any error-level diagnostic was seen.
-fn emit_errors(diags, errors_only) {
+// warnings. path names the script the diagnostics point into. Returns
+// whether any error-level diagnostic was seen.
+fn emit_errors(diags, path, errors_only) {
     let mut errs = false
     for d in diags {
         let is_err = diag_is_error(d)
@@ -397,7 +400,7 @@ fn emit_errors(diags, errors_only) {
             errs = true
         }
         if is_err || !errors_only {
-            eprintln(lib.dump_diag(d))
+            eprintln(lib.render_diag(d, path))
         }
     }
     errs
@@ -412,7 +415,7 @@ fn emit_errors_f(diags, files, errors_only) {
             errs = true
         }
         if is_err || !errors_only {
-            eprintln(lib.dump_diag_f(diags[i], files[i]))
+            eprintln(lib.render_diag(diags[i], files[i]))
         }
         i = i + 1
     }
@@ -421,7 +424,7 @@ fn emit_errors_f(diags, files, errors_only) {
 
 // run_check prints top-level binding types then diagnostics, mirroring the
 // Go host's check output for scripts.
-fn run_check(cdiags, binds) {
+fn run_check(cdiags, path, binds) {
     let mut has_err = false
     for line in binds {
         println(line)
@@ -430,7 +433,7 @@ fn run_check(cdiags, binds) {
         if diag_is_error(d) {
             has_err = true
         }
-        println(lib.dump_diag(d))
+        println(lib.render_diag(d, path))
     }
     has_err
 }
@@ -445,7 +448,7 @@ fn run_check_f(cdiags, cfiles, binds) {
         if diag_is_error(cdiags[i]) {
             has_err = true
         }
-        println(lib.dump_diag_f(cdiags[i], cfiles[i]))
+        println(lib.render_diag(cdiags[i], cfiles[i]))
         i = i + 1
     }
     has_err
@@ -539,22 +542,22 @@ fn compile_file_to_c(path) {
     }
     match lib.lex(src) {
         lib.LexOut.Lexed(toks, ldiags, _) => {
-            if emit_errors(ldiags, false) {
+            if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
             match lib.parse(toks) {
                 lib.ParseOut.Parsed(stmts, pdiags) => {
-                    if emit_errors(pdiags, false) {
+                    if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
                     match lib.typecheck_script(stmts) {
                         lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
-                            if emit_errors(cdiags, true) {
+                            if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
                             match lib.compile_script(stmts, chan_fors) {
                                 lib.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(lib.dump_diag(d))
+                                    eprintln(lib.render_diag(d, path))
                                     exit(exit_static)
                                 },
                                 lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)]),
@@ -577,7 +580,10 @@ fn compile_module_to_c(dir) {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        lib.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
             match lib.typecheck_cached(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                 lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
@@ -587,7 +593,7 @@ fn compile_module_to_c(dir) {
                     let ls_tables = concat_lists(pkgs_lstarts)
                     match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
                         lib.CompileOut.CompileFailed(d, f) => {
-                            eprintln(lib.dump_diag_f(d, f))
+                            eprintln(lib.render_diag(d, f))
                             exit(exit_static)
                         },
                         lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
@@ -1142,7 +1148,7 @@ fn run_test_target(dir0, fnname) {
                     let ls_tables = concat_lists(pkgs_lstarts)
                     match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
                         lib.CompileOut.CompileFailed(d, f) => {
-                            eprintln(lib.dump_diag_f(d, f))
+                            eprintln(lib.render_diag(d, f))
                             exit(exit_static)
                         },
                         lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
