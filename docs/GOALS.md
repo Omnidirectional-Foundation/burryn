@@ -222,7 +222,7 @@ S6.1 无剩余项。
 
 **S6.5 诊断/DX 批(owner 2026-07-12 扩容：debugger + 诊断深度)**
 
-- **前置(owner 2026-07-17)**：seed 定基完成后才动工——本批的 cgen 与 runtime 改动会破坏归档 seed 的 gen1 == gen2 判定(见 S6.8 条目定基修订)
+- **前置(owner 2026-07-17)**：seed 定基完成后才动工——本批的 cgen 与 runtime 改动会破坏归档 seed 的 gen1 == gen2 判定(见 S6.8 条目定基修订)。**前置已满足(2026-07-18)**：tag `seed-base-1` 已推送，CI 三段链全绿
 - cgen 生成 C 时插 `#line <n> "<file>"`(cgen 已知每 Node span)→ 原生二进制直接 `gdb`/`lldb` 映射回 `.bur`
 - runtime trap 打印带 source span 的 stack trace(复用 diag + line_starts)
 - 符合「终局只留 C 底座」，属后端增强非新工具
@@ -260,12 +260,12 @@ S6.1 无剩余项。
 - 枚举注册改两遍(先收名字再验字段类型)，根除跨文件枚举只能「向前」引用(quirk #2)——已落地
 - `?` 在相互递归函数组内可用(`Result + ?` 是唯一错误机制，必须处处可用)——已落地：操作数类型未解时延迟到推导组尾再判 Option/Result，仍未解才报 E0277
 - 三项都触及推导核心，同批做、一次验自举定点——已验(gen1 == gen2 逐字节)
-- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至重新定基 seed。**定基时机已修订(owner 2026-07-17，取代 2026-07-12「S6 收尾发布」定案)：S6.5 诊断/DX 批动工前**，即 S6.1 接口缓存、子包测试发现、import-driven tidy 与 CI embed regen+cmp 完成后立即定基——S6.5 的 cgen `#line` 发射与 runtime trap-trace 改动会结构性破坏 seed 链(gen1 出自归档 cbackend.go、gen2 出自 main cgen.bur，逐字节 cmp 要求两代 C 与内嵌 runtime 头文件完全一致，2026-07-17 修复归档 seed 时实证过一次)，提前定基使归档 seed 在 S6.5 前退出接生链；**定基机制已定(owner 2026-07-17)：tag 基准 commit**——在 main 上打 tag 标记基准，重生链改三段(归档 Go seed → 构建基准 commit 的 burc → 构建当前 burc，gen1 == gen2 判定不变)，基准 commit 的源码永久遵守旧纪律、当前源码自定基起解禁，纯源码可重建、不引入二进制工件信任；定基后 S6.5 与 S7 从新 seed 起步；**v0.3 发布判据 = S6 全部收尾不变，与定基解绑**。**落地状态(2026-07-18)**：ci.yml 已改三段链(基准 tag 名 = `seed-base-1`，`env.SEED_BASE_TAG`)，三段链已在本地以 HEAD 模拟基准全通(gen1 == gen2 == 当前 bur)；**打 tag `seed-base-1` 与 push 归 owner**，tag 须先于(或随同)该 ci.yml 变更推送，否则 CI 在基准 worktree 步失败；解禁旧纪律自 tag 存在后生效
+- **seed 兼容注意**：CI 从 `archive/go-host` 的 Go seed 重建全链，seed 的 checker 仍是旧规则，故 **burc 自身源码继续遵守旧纪律**(文件字母序、bounce 惯用法)直至重新定基 seed。**定基时机已修订(owner 2026-07-17，取代 2026-07-12「S6 收尾发布」定案)：S6.5 诊断/DX 批动工前**，即 S6.1 接口缓存、子包测试发现、import-driven tidy 与 CI embed regen+cmp 完成后立即定基——S6.5 的 cgen `#line` 发射与 runtime trap-trace 改动会结构性破坏 seed 链(gen1 出自归档 cbackend.go、gen2 出自 main cgen.bur，逐字节 cmp 要求两代 C 与内嵌 runtime 头文件完全一致，2026-07-17 修复归档 seed 时实证过一次)，提前定基使归档 seed 在 S6.5 前退出接生链；**定基机制已定(owner 2026-07-17)：tag 基准 commit**——在 main 上打 tag 标记基准，重生链改三段(归档 Go seed → 构建基准 commit 的 burc → 构建当前 burc，gen1 == gen2 判定不变)，基准 commit 的源码永久遵守旧纪律、当前源码自定基起解禁，纯源码可重建、不引入二进制工件信任；定基后 S6.5 与 S7 从新 seed 起步；**v0.3 发布判据 = S6 全部收尾不变，与定基解绑**。**定基已完成(2026-07-18)**：ci.yml 三段链(基准 tag 名 = `seed-base-1`，`env.SEED_BASE_TAG`)，owner 已打 tag `seed-base-1`(= `bc8a40a`)并推送，CI 三段链实跑全绿(run 29637257373，bootstrap-fixpoint 12m30s)；**burc 源码自此解禁三条旧纪律**(文件字母序、bounce 惯用法、跨文件枚举向前引用)，基准 commit `bc8a40a` 的源码永久遵守旧纪律
 - deep-mut 流规则(§2)——**已完成(2026-07-15)**：local/global `let mut`、再赋值 RHS 与静态可知 mut 形参调用均已覆盖；list/map 递归检查、chan/标量豁免、fresh 来源与 pattern binding 规则均已落地并通过 fixpoint
 
 **探查结论**：`exec git clone` 可行性已确认(shell-out 可行，无需新 native)；lexer 注释保留已完成(见 §6.6 前置)。
 
-**当前推进顺序(2026-07-17；deep-mut、S6.6 核心、缓存包 import、S7.8 与 seed 重新接生修复已完成)**：S6.1 接口缓存 → 子包测试发现 + `bur mod tidy` 按 import 增删 require → CI `bur dev embed-std` regen+cmp → **seed 定基**(2026-07-17 修订：提前于 S6.5) → 诊断/DX 批(S6.5) → **S6 收尾 = v0.3 发布** → S7。
+**当前推进顺序(2026-07-18 更新；接口缓存、子包测试发现、import-driven tidy、CI embed 校验与 seed 定基均已完成)**：诊断/DX 批(S6.5) → **S6 收尾 = v0.3 发布** → S7。
 
 ## 6.6 轻量语法/语义扩展评估(工程视角，对应 S7)
 
