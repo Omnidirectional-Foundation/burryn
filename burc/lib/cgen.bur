@@ -650,15 +650,24 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         // one directive per instruction: later C lines of a multi-line
         // instruction drift by one line each, which is acceptable; a
         // directive only at line changes would misattribute every
-        // following instruction on the same source line
-        fn line_dir(ip) {
+        // following instruction on the same source line. In body position
+        // (with_ln) a BUR_LN bookkeeping store precedes the directive so
+        // trap traces know the live line; it lands before the directive
+        // on purpose, keeping the instruction itself mapped exactly.
+        fn line_dir(ip, with_ln) {
             if li >= 0 && ip < len(f_spans[fh]) {
                 match f_spans[fh][ip] {
-                    Sp(s0, _) => w("#line " + str(line_of_off(ls_tables[li], s0)) + " " + c_str(ls_names[li]) + "\n"),
+                    Sp(s0, _) => {
+                        let ln = line_of_off(ls_tables[li], s0)
+                        if with_ln {
+                            w("\tBUR_LN(" + str(ln) + ");\n")
+                        }
+                        w("#line " + str(ln) + " " + c_str(ls_names[li]) + "\n")
+                    },
                 }
             }
         }
-        line_dir(0)
+        line_dir(0, false)
         w("static void bur_fn_" + str(id) + "(void) { // " + f_name[fh] + "\n")
         w("\tint base = bur_cur->top - " + str(f_arity[fh]) + " - 1; (void)base;\n")
         w("\tOClosure *self = bur_cur_closure; (void)self;\n")
@@ -668,7 +677,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             if is_target(targets, ip) {
                 w("L" + str(ip) + ":;\n")
             }
-            line_dir(ip)
+            line_dir(ip, true)
             ip = emit_inst(id, fh, code, ip)
         }
         if is_target(targets, len(code)) {
@@ -739,7 +748,12 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             } else {
                 "NULL"
             }
-            let file = if f_file[fh] != "" {
+            // resolve the ls display name so runtime traces print the real
+            // path even in script mode, where f_file is ""
+            let fli = ls_index(f_file[fh])
+            let file = if fli >= 0 {
+                c_str(ls_names[fli])
+            } else if f_file[fh] != "" {
                 c_str(f_file[fh])
             } else {
                 "NULL"
