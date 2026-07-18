@@ -191,6 +191,9 @@ struct Fiber {
     Value sendVal;          // pending value while blocked on send
     OClosure *entry;        // closure the fiber runs on first resume
     int call_depth;         // per-fiber call depth, for stack-overflow trapping
+    OFunc **trace_fn;       // per-depth function, for trap stack traces
+    int *trace_ln;          // per-depth live source line (BUR_LN stores)
+    int trace_cap;
     int budget;             // instructions remaining before a forced yield
     int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
     int64_t io_proc;        // process handle awaited while FBLOCKED_IO
@@ -249,6 +252,10 @@ static char **bur_argv;
 
 // ---- traps ------------------------------------------------------------
 
+// BUR_LN: generated code records the live source line of the running
+// frame before each instruction; bur_trap walks these for the trace.
+#define BUR_LN(n) (bur_cur->trace_ln[bur_cur->call_depth] = (n))
+
 static void bur_trap(const char *fmt, ...) {
     fflush(stdout);
     va_list ap;
@@ -257,6 +264,16 @@ static void bur_trap(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
+    if (bur_cur && bur_cur->trace_fn) {
+        for (int d = bur_cur->call_depth; d >= 0; d--) {
+            if (d >= bur_cur->trace_cap) continue;
+            OFunc *fn = bur_cur->trace_fn[d];
+            if (!fn || !fn->file) continue; // synthetic glue has no source
+            fprintf(stderr, "  at %s (%s:%d)\n",
+                    fn->name && fn->name[0] ? fn->name : "<fn>",
+                    fn->file, bur_cur->trace_ln[d]);
+        }
+    }
     exit(4);
 }
 
@@ -1032,6 +1049,16 @@ static void bur_call(int argc) {
         if (argc != cl->fn->arity)
             bur_trap("%s expects %d argument(s), got %d", cl->fn->name, cl->fn->arity, argc);
         if (++bur_cur->call_depth > 2048) bur_trap("stack overflow (call depth > 2048)");
+        int d = bur_cur->call_depth;
+        if (d >= bur_cur->trace_cap) {
+            int nc = bur_cur->trace_cap ? bur_cur->trace_cap : 8;
+            while (nc <= d) nc *= 2;
+            bur_cur->trace_fn = (OFunc **)realloc(bur_cur->trace_fn, sizeof(OFunc *) * nc);
+            bur_cur->trace_ln = (int *)realloc(bur_cur->trace_ln, sizeof(int) * nc);
+            bur_cur->trace_cap = nc;
+        }
+        bur_cur->trace_fn[d] = cl->fn;
+        bur_cur->trace_ln[d] = 0;
         OClosure *prev = bur_cur_closure;
         bur_cur_closure = cl;
         cl->fn->code();
@@ -1276,6 +1303,10 @@ static Fiber *bur_new_fiber(OClosure *cl, Value *args, int argc, size_t stacksiz
     f->sendVal = bur_unit();
     f->budget = BUR_TIMESLICE;
     f->entry = cl;
+    f->trace_cap = 8;
+    f->trace_fn = (OFunc **)calloc(8, sizeof(OFunc *));
+    f->trace_ln = (int *)calloc(8, sizeof(int));
+    f->trace_fn[0] = cl->fn; // the entry body runs at depth 0, outside bur_call
     f->stack[f->top++] = bur_obj((Obj *)cl); // closure + args, like vm.newFiber
     for (int i = 0; i < argc; i++) f->stack[f->top++] = args[i];
     f->cstack = (char *)malloc(stacksize);

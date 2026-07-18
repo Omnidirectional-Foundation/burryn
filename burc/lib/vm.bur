@@ -60,7 +60,7 @@ let vm_time_slice = 10000
 // (name/file/arity/upvals/code/spans/consts, entry = handle 0), the enum
 // arena (qualified name, variant names, variant arities) and the
 // interpreted program's argv.
-pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args) {
+pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args, ls_files, ls_names, ls_tables) {
     let max_int = 9223372036854775807
     let min_int = -9223372036854775807 - 1
 
@@ -97,6 +97,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
     let mut fb_fr_cl = [] // call frames: closure handle
     let mut fb_fr_ip = [] // call frames: instruction pointer
     let mut fb_fr_base = [] // call frames: stack base
+    let mut fb_fr_callip = [] // call frames: caller's call-site ip (traces)
     let mut fb_wakeat = [] // absolute clock() deadline while fs_blocked_timer
     let mut fb_ioproc = [] // host exec handle awaited while fs_blocked_io
     let mut fb_iohas = [] // scheduler delivered an exec result
@@ -114,9 +115,56 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
     let mut out_enum = -1
     let mut k_vals = [] // converted constant tables, parallel to f_consts
 
-    // a trap always ends the program: report and exit like `bur run`
+    let mut cur_f = -1 // fiber whose instruction is executing (traces)
+    let mut cur_ip = 0 // start ip of that instruction (traces)
+
+    // a trap always ends the program: report the message, then the frame
+    // trace of the trapping fiber (same shape as the native runtime's)
     fn trap(msg) {
         eprintln("runtime error: " + msg)
+        if cur_f >= 0 {
+            let mut d = len(fb_fr_cl[cur_f]) - 1
+            while d >= 0 {
+                let fnh = o_i1[fb_fr_cl[cur_f][d]]
+                let ip = if d == len(fb_fr_cl[cur_f]) - 1 {
+                    cur_ip
+                } else {
+                    fb_fr_callip[cur_f][d + 1]
+                }
+                let name = if f_name[fnh] != "" {
+                    f_name[fnh]
+                } else {
+                    "<fn>"
+                }
+                let mut li = -1
+                let mut i = 0
+                while i < len(ls_files) {
+                    if ls_files[i] == f_file[fnh] {
+                        li = i
+                        i = len(ls_files)
+                    } else {
+                        i = i + 1
+                    }
+                }
+                let file = if li >= 0 {
+                    ls_names[li]
+                } else {
+                    f_file[fnh]
+                }
+                if file != "" {
+                    // synthetic glue (module entry) has no source to point at
+                    let ln = if li >= 0 && ip < len(f_spans[fnh]) {
+                        match f_spans[fnh][ip] {
+                            Sp(s0, _) => line_of(ls_tables[li], s0),
+                        }
+                    } else {
+                        0
+                    }
+                    eprintln("  at " + name + " (" + file + ":" + str(ln) + ")")
+                }
+                d = d - 1
+            }
+        }
         exit(4)
     }
 
@@ -650,6 +698,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
         push(fb_fr_cl, [cl])
         push(fb_fr_ip, [0])
         push(fb_fr_base, [0])
+        push(fb_fr_callip, [0])
         push(fb_wakeat, -1.0)
         push(fb_ioproc, -1)
         push(fb_iohas, false)
@@ -1286,6 +1335,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
             push(fb_fr_cl[f], h)
             push(fb_fr_ip[f], 0)
             push(fb_fr_base[f], ftop(f) - argc - 1)
+            push(fb_fr_callip[f], cur_ip)
         } else if t == ot_native {
             let res = do_native(f, o_i1[h], argc)
             if park_recv < 0 && park_io < 0 {
@@ -1457,6 +1507,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
     // ---- one fiber until it finishes, blocks, or exhausts its slice ----
     fn exec_fiber(f) {
         let mut budget = vm_time_slice
+        cur_f = f
         while true {
             if budget <= 0 {
                 // preemption point
@@ -1469,6 +1520,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
             let fnh = o_i1[clh]
             let code = f_code[fnh]
             let start_ip = fb_fr_ip[f][fi]
+            cur_ip = start_ip
             let op = code[start_ip]
             fb_fr_ip[f][fi] = start_ip + 1
 
@@ -1677,6 +1729,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
                 let _ = pop(fb_fr_cl[f])
                 let _ = pop(fb_fr_ip[f])
                 let _ = pop(fb_fr_base[f])
+                let _ = pop(fb_fr_callip[f])
                 if len(fb_fr_cl[f]) == 0 {
                     fb_status[f] = fs_done
                     return true
@@ -1796,6 +1849,7 @@ pub fn run_program(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_cons
                     let _ = pop(fb_fr_cl[f])
                     let _ = pop(fb_fr_ip[f])
                     let _ = pop(fb_fr_base[f])
+                    let _ = pop(fb_fr_callip[f])
                     if len(fb_fr_cl[f]) == 0 {
                         fb_status[f] = fs_done
                         return true
