@@ -448,9 +448,9 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
         },
         Logical(op, lhs, rhs, _) => {
             let level = if op == t_and_and {
-                2
+                3
             } else {
-                1
+                2
             }
             fmt_child(lhs, level, src, comments, cc, indent, buf)
             push(buf, " ")
@@ -458,20 +458,37 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " ")
             fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
         },
+        Pipe(lhs, target, args, sp) => {
+            fmt_child(lhs, 1, src, comments, cc, indent, buf)
+            push(buf, " |> ")
+            fmt_expr(target, src, comments, cc, indent, buf)
+            if len(args) > 0 || span_end(target) < span_end2(sp) {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(args) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_expr(args[i], src, comments, cc, indent, buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
         Unary(op, rhs, _) => {
             push(buf, unary_op_text(op))
-            fmt_child(rhs, 7, src, comments, cc, indent, buf)
+            fmt_child(rhs, 8, src, comments, cc, indent, buf)
         },
         RecvExpr(e, _) => {
             push(buf, "<-")
-            fmt_child(e, 7, src, comments, cc, indent, buf)
+            fmt_child(e, 8, src, comments, cc, indent, buf)
         },
         TryExpr(e, _) => {
-            fmt_child(e, 8, src, comments, cc, indent, buf)
+            fmt_child(e, 9, src, comments, cc, indent, buf)
             push(buf, "?")
         },
         Index(target, idx, _) => {
-            fmt_child(target, 8, src, comments, cc, indent, buf)
+            fmt_child(target, 9, src, comments, cc, indent, buf)
             push(buf, "[")
             fmt_expr(idx, src, comments, cc, indent, buf)
             push(buf, "]")
@@ -550,7 +567,7 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             push(buf, "}")
         },
         Call(callee, cargs, _) => {
-            fmt_child(callee, 8, src, comments, cc, indent, buf)
+            fmt_child(callee, 9, src, comments, cc, indent, buf)
             push(buf, "(")
             let mut i = 0
             while i < len(cargs) {
@@ -653,38 +670,39 @@ fn fmt_child(n, need, src, comments, mut cc, indent, mut buf) {
 // folds parentheses away, so the printer re-derives the minimal set from
 // these ranks:
 //   0 statement-like expressions (fn/block/if/match): wrapped as any operand
-//   1 ||   2 &&   3 == !=   4 < <= > >=   5 + -   6 * / %
-//   7 unary ! - and <-recv   8 postfix call/index/?   9 atoms
+//   1 |>   2 ||   3 &&   4 == !=   5 < <= > >=   6 + -   7 * / %
+//   8 unary ! - and <-recv   9 postfix call/index/?   10 atoms
 fn node_prec(n) {
     match n {
         Logical(op, _, _, _) => if op == t_and_and {
-            2
+            3
         } else {
-            1
+            2
         },
+        Pipe(_, _, _, _) => 1,
         Binary(op, _, _, _) => bin_prec(op),
-        Unary(_, _, _) => 7,
-        RecvExpr(_, _) => 7,
-        Call(_, _, _) => 8,
-        Index(_, _, _) => 8,
-        TryExpr(_, _) => 8,
+        Unary(_, _, _) => 8,
+        RecvExpr(_, _) => 8,
+        Call(_, _, _) => 9,
+        Index(_, _, _) => 9,
+        TryExpr(_, _) => 9,
         FnLit(_, _, _, _, _, _, _, _) => 0,
         Block(_, _) => 0,
         IfExpr(_, _, _, _) => 0,
         MatchExpr(_, _, _) => 0,
-        _ => 9,
+        _ => 10,
     }
 }
 
 fn bin_prec(op) {
     if op == t_eq_eq || op == t_bang_eq {
-        3
-    } else if op == t_lt || op == t_lt_eq || op == t_gt || op == t_gt_eq {
         4
-    } else if op == t_plus || op == t_minus {
+    } else if op == t_lt || op == t_lt_eq || op == t_gt || op == t_gt_eq {
         5
-    } else if op == t_star || op == t_slash || op == t_percent {
+    } else if op == t_plus || op == t_minus {
         6
+    } else if op == t_star || op == t_slash || op == t_percent {
+        7
     } else {
         fmt_internal("unknown binary operator token")
         0
