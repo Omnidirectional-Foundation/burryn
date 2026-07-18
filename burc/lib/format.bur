@@ -223,7 +223,7 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
                 }
                 push(buf, ")")
             }
-            push(buf, " {\n")
+            push(buf, " " + chr(123) + "\n")
             let deeper = indent + 4
             let mut i = 0
             let mut pe = 0
@@ -244,7 +244,7 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push(buf, "}")
         },
         SelectStmt(arms, has_default, dflt, dsp, sp) => {
-            push(buf, "select {\n")
+            push(buf, "select " + chr(123) + "\n")
             let deeper = indent + 4
             let mut i = 0
             let mut pe = 0
@@ -423,13 +423,28 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             "false"
         }),
         Ident(_, sp) => push(buf, span_text(src, sp)),
-        Binary(op, lhs, rhs, _) => {
-            let level = bin_prec(op)
-            fmt_child(lhs, level, src, comments, cc, indent, buf)
-            push(buf, " ")
-            push(buf, bin_op_text(op))
-            push(buf, " ")
-            fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
+        Binary(op, lhs, rhs, sp) => {
+            if op == t_plus && span_is_interpolation(src, sp) {
+                // parser 把插值脱糖为 `+`；这里重建表层语法并格式化各内嵌表达式。/ The parser lowers interpolation to `+`; reconstruct its surface syntax while formatting each embedded expression.
+                // 含注释的插值逐字节保留，因为行注释的位置属于语法。/ Keep a comment-bearing interpolation byte-identical because line-comment placement is syntactic.
+                if cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
+                    push(buf, span_text(src, sp))
+                    while cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
+                        cc[0] = cc[0] + 1
+                    }
+                } else {
+                    push(buf, "\"")
+                    fmt_interp_parts(n, src, comments, cc, indent, buf)
+                    push(buf, "\"")
+                }
+            } else {
+                let level = bin_prec(op)
+                fmt_child(lhs, level, src, comments, cc, indent, buf)
+                push(buf, " ")
+                push(buf, bin_op_text(op))
+                push(buf, " ")
+                fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
+            }
         },
         Logical(op, lhs, rhs, _) => {
             let level = if op == t_and_and {
@@ -476,9 +491,9 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
         FnLit(_, _, _, _, _, _, _, _) => fmt_fn_lit("", n, src, comments, cc, indent, buf),
         Block(stmts, sp) => {
             if len(stmts) == 0 && !comment_inside(comments, cc, span_end2(sp)) {
-                push(buf, "{}")
+                push(buf, "" + chr(123) + "}")
             } else {
-                push(buf, "{\n")
+                push(buf, "" + chr(123) + "\n")
                 let deeper = indent + 4
                 let mut i = 0
                 let mut pe = 0
@@ -514,7 +529,7 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
         MatchExpr(scrut, arms, sp) => {
             push(buf, "match ")
             fmt_expr(scrut, src, comments, cc, indent, buf)
-            push(buf, " {\n")
+            push(buf, " " + chr(123) + "\n")
             let deeper = indent + 4
             let mut i = 0
             let mut pe = 0
@@ -715,6 +730,89 @@ fn span_text(src, sp) {
     match sp {
         Sp(s, e) => substr(src, s, e - s),
     }
+}
+
+// span_is_interpolation 验证 sp 恰好覆盖一个插值字符串，而非 union span 同样以引号起止的更大 `"...{...}" + ...` 表达式；嵌套插值会增加 depth 直至自身结束。/ span_is_interpolation verifies that sp covers exactly one interpolated string, not a larger quoted union span; nested interpolations increase depth until their own end.
+fn span_is_interpolation(src, sp) {
+    let raw = span_text(src, sp)
+    match lex(raw) {
+        Lexed(toks, diags, _) => {
+            if len(diags) > 0 || len(toks) == 0 || tok_type(toks[0]) != t_interp_start {
+                false
+            } else {
+                let mut depth = 0
+                let mut i = 0
+                let mut done = false
+                let mut exact = false
+                while i < len(toks) && !done {
+                    let t = tok_type(toks[i])
+                    if t == t_interp_start {
+                        depth = depth + 1
+                    } else if t == t_interp_end {
+                        depth = depth - 1
+                        if depth == 0 {
+                            exact = tok_end(toks[i]) == str_len(raw)
+                            done = true
+                        }
+                    }
+                    i = i + 1
+                }
+                exact
+            }
+        },
+    }
+}
+
+// fmt_interp_parts 遍历 parser 产生的「片段、表达式、片段……」交替拼接链；字面左花括号加倍，确保重解析为字节而非新插值。/ fmt_interp_parts walks the parser's alternating segment/expression concat chain; literal opening braces are doubled so reparsing keeps them as bytes.
+fn fmt_interp_parts(n, src, comments, mut cc, indent, mut buf) {
+    match n {
+        StrLit(seg, _) => fmt_interp_segment(seg, buf),
+        Binary(op, with_expr, rhs, _) => match rhs {
+            StrLit(seg, _) => match with_expr {
+                Binary(op2, prefix, inner, _) => {
+                    if op != t_plus || op2 != t_plus {
+                        fmt_internal("malformed interpolation concat chain")
+                    }
+                    fmt_interp_parts(prefix, src, comments, cc, indent, buf)
+                    push(buf, "" + chr(123) + "")
+                    fmt_expr(inner, src, comments, cc, indent, buf)
+                    push(buf, "}")
+                    fmt_interp_segment(seg, buf)
+                },
+                _ => fmt_internal("malformed interpolation expression link"),
+            },
+            _ => fmt_internal("malformed interpolation segment link"),
+        },
+        _ => fmt_internal("malformed interpolation segment link"),
+    }
+}
+
+fn fmt_interp_segment(s, mut buf) {
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        let esc = if c == "\\" {
+            "\\\\"
+        } else if c == "\n" {
+            "\\n"
+        } else if c == "\t" {
+            "\\t"
+        } else if c == "\"" {
+            "\\\""
+        } else if c == "" + chr(123) + "" {
+            "" + chr(123) + "" + chr(123) + ""
+        } else {
+            ""
+        }
+        if esc != "" {
+            push(buf, substr(s, seg, i - seg))
+            push(buf, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(buf, substr(s, seg, str_len(s) - seg))
 }
 
 // src_blank_between reports whether the source holds a blank line between
