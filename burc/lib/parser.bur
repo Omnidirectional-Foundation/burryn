@@ -564,7 +564,7 @@ fn p_enum_decl(toks, mut pos) {
             },
         }
     }
-    match p_expect(toks, pos, t_lbrace, "'{' after enum name") {
+    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after enum name") {
         Ok(_) => {},
         Err(d) => {
             return Err(d)
@@ -825,7 +825,7 @@ fn p_spawn_stmt(toks, mut pos) {
 // or `default => body` (at most one).
 fn p_select_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos) // select
-    match p_expect(toks, pos, t_lbrace, "'{' after select") {
+    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after select") {
         Ok(_) => {},
         Err(d) => {
             return Err(d)
@@ -971,7 +971,7 @@ fn p_select_arm(toks, mut pos) {
 }
 
 fn p_block(toks, mut pos) {
-    let lb = match p_expect(toks, pos, t_lbrace, "'{'") {
+    let lb = match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "'") {
         Ok(v) => v,
         Err(d) => {
             return Err(d)
@@ -1277,6 +1277,8 @@ fn p_primary(toks, mut pos) {
     } else if t == t_string {
         p_advance(toks, pos)
         Ok(StrLit(tok_lex(tok), sp_of_tok(tok)))
+    } else if t == t_interp_start {
+        p_interpolated(toks, pos)
     } else if t == t_true {
         p_advance(toks, pos)
         Ok(BoolLit(true, sp_of_tok(tok)))
@@ -1343,6 +1345,35 @@ fn p_primary(toks, mut pos) {
     }
 }
 
+// p_interpolated 把 `"head {expr} tail"` 脱糖为现有左结合字符串拼接 AST；保留空首尾片段，使普通 `+` 规则把每个内嵌表达式约束为 str。/ p_interpolated lowers `"head {expr} tail"` into the existing left-associative concat AST; empty edge segments make normal `+` rules constrain every embedded expression to str.
+fn p_interpolated(toks, mut pos) {
+    let start = p_advance(toks, pos)
+    let mut out = StrLit(tok_lex(start), sp_of_tok(start))
+    let mut done = false
+    while !done {
+        let inner = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        out = Binary(t_plus, out, inner, sp_union(span_of(out), span_of(inner)))
+        p_skip_semis(toks, pos)
+        let next = p_peek(toks, pos)
+        let nt = tok_type(next)
+        let part = if nt == t_interp_mid || nt == t_interp_end {
+            p_advance(toks, pos)
+        } else {
+            return perr("E1101", "close the interpolation with '}'", "expected the end of a string interpolation, got \"" + tok_lex(next) + "\"", sp_of_tok(next))
+            Tok(0, "", 0, 0)
+        }
+        out = Binary(t_plus, out, StrLit(tok_lex(part), sp_of_tok(part)), sp_union(sp_of_tok(start), sp_of_tok(part)))
+        done = nt == t_interp_end
+    }
+    Ok(out)
+}
+
 fn p_if_expr(toks, mut pos) {
     let tok = p_advance(toks, pos) // if
     let cond = match p_expression(toks, pos) {
@@ -1393,7 +1424,7 @@ fn p_match_expr(toks, mut pos) {
             NoNode
         },
     }
-    match p_expect(toks, pos, t_lbrace, "'{' after match scrutinee") {
+    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after match scrutinee") {
         Ok(_) => {},
         Err(d) => {
             return Err(d)

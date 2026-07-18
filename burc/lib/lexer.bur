@@ -101,8 +101,8 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
         lex_emit(st, toks, t_lparen, "(")
     } else if c == ")" {
         lex_emit(st, toks, t_rparen, ")")
-    } else if c == "{" {
-        lex_emit(st, toks, t_lbrace, "{")
+    } else if c == "" + chr(123) + "" {
+        lex_emit(st, toks, t_lbrace, "" + chr(123) + "")
     } else if c == "}" {
         lex_emit(st, toks, t_rbrace, "}")
     } else if c == "[" {
@@ -172,7 +172,7 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
             lex_fail(diags, st[0], st[1], "E1001", "Burryn has no bitwise operators; logical or is `||`", "unexpected '|'")
         }
     } else if c == "\"" {
-        lex_string(src, st, toks, diags)
+        lex_string(src, st, toks, diags, comments)
     } else if lex_is_digit(c) {
         lex_number(src, st, toks)
     } else if lex_is_alpha(c) {
@@ -182,38 +182,92 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     }
 }
 
-// lex_string collects the literal as raw byte segments between escapes, so
-// multi-byte characters pass through untouched.
-fn lex_string(src, mut st, mut toks, mut diags) {
+// lex_string 收集转义之间的字面字节；单个 `{` 发射插值起始 token 并暂时切回普通表达式扫描，`{{` 产生一个字面左花括号。/ lex_string collects literal bytes between escapes; one `{` starts interpolation and `{{` yields one literal opening brace.
+fn lex_string(src, mut st, mut toks, mut diags, mut comments) {
+    lex_string_part(src, st, toks, diags, comments, true)
+}
+
+// first 区分开头片段与插值 `}` 后恢复的片段；后者以 TInterpMid 或 TInterpEnd 结束。/ first distinguishes the opening segment from one resumed after an interpolation-closing `}`; the latter ends in TInterpMid or TInterpEnd.
+fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
     let mut parts = []
     let mut seg = st[1]
-    while st[1] < str_len(src) && lex_peek(src, st) != "\"" {
-        let c = lex_advance(src, st)
-        if c == "\\" && st[1] < str_len(src) {
-            push(parts, substr(src, seg, st[1] - 1 - seg))
-            let e = lex_advance(src, st)
-            if e == "n" {
-                push(parts, "\n")
-            } else if e == "t" {
-                push(parts, "\t")
-            } else if e == "\"" {
-                push(parts, "\"")
-            } else if e == "\\" {
-                push(parts, "\\")
+    while st[1] < str_len(src) {
+        let c = lex_peek(src, st)
+        if c == "\"" {
+            push(parts, substr(src, seg, st[1] - seg))
+            lex_bump(st) // 结束引号 / closing quote
+            lex_emit(st, toks, if first {
+                t_string
             } else {
-                lex_fail(diags, st[1] - 2, st[1], "E1003", "supported escapes: \\n \\t \\\" \\\\", "bad escape \\" + e)
-                push(parts, e) // keep scanning the rest of the string
+                t_interp_end
+            }, join(parts, ""))
+            return
+        } else if c == "" + chr(123) + "" {
+            if lex_peek2(src, st) == "" + chr(123) + "" {
+                push(parts, substr(src, seg, st[1] - seg))
+                push(parts, "" + chr(123) + "")
+                st[1] = st[1] + 2
+                seg = st[1]
+            } else {
+                push(parts, substr(src, seg, st[1] - seg))
+                lex_bump(st) // 插值起始花括号 / interpolation-opening brace
+                lex_emit(st, toks, if first {
+                    t_interp_start
+                } else {
+                    t_interp_mid
+                }, join(parts, ""))
+                lex_interpolation(src, st, toks, diags, comments, st[1] - 1)
+                return
             }
-            seg = st[1]
+        } else {
+            let _ = lex_advance(src, st)
+            if c == "\\" && st[1] < str_len(src) {
+                push(parts, substr(src, seg, st[1] - 1 - seg))
+                let e = lex_advance(src, st)
+                if e == "n" {
+                    push(parts, "\n")
+                } else if e == "t" {
+                    push(parts, "\t")
+                } else if e == "\"" {
+                    push(parts, "\"")
+                } else if e == "\\" {
+                    push(parts, "\\")
+                } else {
+                    lex_fail(diags, st[1] - 2, st[1], "E1003", "supported escapes: \\n \\t \\\" \\\\", "bad escape \\" + e)
+                    push(parts, e) // keep scanning the rest of the string
+                }
+                seg = st[1]
+            }
         }
     }
-    if st[1] >= str_len(src) {
-        lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
-    } else {
-        push(parts, substr(src, seg, st[1] - seg))
-        st[1] = st[1] + 1 // closing quote
-        lex_emit(st, toks, t_string, join(parts, ""))
+    lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
+}
+
+// lex_interpolation 扫描普通表达式 token 直至匹配的 `}`；block、match 与嵌套插值中的花括号先各自配平，再恢复外层字符串模式。/ lex_interpolation scans ordinary expression tokens to the matching `}`; braces inside blocks, match expressions, and nested interpolations balance before the outer string resumes.
+fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open) {
+    let mut depth = 0
+    while st[1] < str_len(src) {
+        if lex_peek(src, st) == "}" && depth == 0 {
+            st[0] = st[1]
+            lex_bump(st)
+            lex_string_part(src, st, toks, diags, comments, false)
+            return
+        }
+        st[0] = st[1]
+        let before = len(toks)
+        lex_scan(src, st, toks, diags, comments)
+        let mut i = before
+        while i < len(toks) {
+            let t = tok_type(toks[i])
+            if t == t_lbrace {
+                depth = depth + 1
+            } else if t == t_rbrace {
+                depth = depth - 1
+            }
+            i = i + 1
+        }
     }
+    lex_fail(diags, open, open + 1, "E1004", "add a closing '}' before the end of the string", "unterminated string interpolation")
 }
 
 fn lex_number(src, mut st, mut toks) {
