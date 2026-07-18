@@ -1,0 +1,132 @@
+// Rustc-style diagnostic rendering for the public commands (`bur check`,
+// `bur run`, `bur build`). The dev parity dumps keep dump_diag's raw
+// format. Sources are re-read from disk best-effort: an unreadable file
+// (embedded std, synthetic entries) degrades to a header-only rendering.
+// DiagX labels are same-file only; a label pointing into another file
+// would need a file field on LabelT first.
+
+fn pad_num(n, w) {
+    let s = str(n)
+    let mut out = s
+    while str_len(out) < w {
+        out = " " + out
+    }
+    out
+}
+
+fn spaces(n) {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    out
+}
+
+fn carets(n) {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + "^"
+        i = i + 1
+    }
+    out
+}
+
+// the text of the 1-based line ln, without its trailing newline
+fn line_text(src, starts, ln) {
+    let s0 = starts[ln - 1]
+    let e0 = if ln < len(starts) {
+        starts[ln] - 1
+    } else {
+        str_len(src)
+    }
+    if e0 > s0 {
+        substr(src, s0, e0 - s0)
+    } else {
+        ""
+    }
+}
+
+// one "  --> file:line:col" header plus the gutter/snippet/caret block;
+// used for the primary span and for each label
+fn snippet(mut parts, src, starts, file, s, e, label) {
+    let ln = line_of(starts, s)
+    let col = s - starts[ln - 1] + 1
+    push(parts, "  --> " + file + ":" + str(ln) + ":" + str(col) + "\n")
+    let text = line_text(src, starts, ln)
+    let line_end = starts[ln - 1] + str_len(text)
+    let stop = if e < line_end {
+        e
+    } else {
+        line_end
+    }
+    let width = if stop > s {
+        stop - s
+    } else {
+        1
+    }
+    let nw = str_len(str(ln))
+    push(parts, spaces(nw + 1) + "|\n")
+    push(parts, pad_num(ln, nw) + " | " + text + "\n")
+    let mark = spaces(nw + 1) + "| " + spaces(col - 1) + carets(width)
+    if label != "" {
+        push(parts, mark + " " + label + "\n")
+    } else {
+        push(parts, mark + "\n")
+    }
+}
+
+fn render_parts(is_err, code, msg, help, s, e, file, labs, fixes) {
+    let mut parts = []
+    let kind = if is_err {
+        "error"
+    } else {
+        "warning"
+    }
+    push(parts, kind + "[" + code + "]: " + msg + "\n")
+    match read_file(file) {
+        Ok(src) => {
+            let starts = line_starts(src)
+            snippet(parts, src, starts, file, s, e, "")
+            for lab in labs {
+                match lab {
+                    Lab(ls, le, ltext) => {
+                        push(parts, "note:\n")
+                        snippet(parts, src, starts, file, ls, le, ltext)
+                    },
+                }
+            }
+        },
+        Err(_) => {
+            push(parts, "  --> " + file + ":" + str(s) + ".." + str(e) + " (source unavailable)\n")
+        },
+    }
+    if help != "" {
+        push(parts, "  = help: " + help + "\n")
+    }
+    for fx in fixes {
+        match fx {
+            Fix(_, _, rep, desc) => {
+                if rep == "" {
+                    push(parts, "  = fix: " + desc + "\n")
+                } else {
+                    push(parts, "  = fix: " + desc + ": `" + rep + "`\n")
+                }
+            },
+        }
+    }
+    join(parts, "")
+}
+
+// render_diag renders one diagnostic with source excerpt and carets; file
+// is the display path the diagnostic was raised in (callers substitute the
+// real script path for ""). No trailing newline: println/eprintln add it.
+pub fn render_diag(d, file) {
+    let out = match d {
+        Diag(ie, code, msg, help, s, e) => render_parts(ie, code, msg, help, s, e, file, [], []),
+        DiagX(ie, code, msg, help, s, e, labs, fixes) => render_parts(ie, code, msg, help, s, e, file, labs, fixes),
+    }
+    substr(out, 0, str_len(out) - 1)
+}
