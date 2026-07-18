@@ -22,6 +22,7 @@ enum Node {
     Binary(int, Node, Node, SpanT), // op, lhs, rhs
     Logical(int, Node, Node, SpanT), // op (t_and_and/t_or_or), lhs, rhs
     Call(Node, [Node], SpanT), // callee, args
+    Pipe(Node, Node, [Node], SpanT), // lhs, target path, target args
     Index(Node, Node, SpanT), // target, idx
     ListLit([Node], SpanT),
     FnLit([str], [bool], [SpanT], [Node], Node, Node, str, SpanT), // params, muts, pspans, param types, return type, body, name
@@ -134,6 +135,10 @@ fn ast_eq(a, b) {
         },
         Call(c1, a1, _) => match b {
             Call(c2, a2, _) => ast_eq(c1, c2) && ast_eq_list(a1, a2),
+            _ => false,
+        },
+        Pipe(l1, t1, a1, _) => match b {
+            Pipe(l2, t2, a2, _) => ast_eq(l1, l2) && ast_eq(t1, t2) && ast_eq_list(a1, a2),
             _ => false,
         },
         Index(t1, i1, _) => match b {
@@ -336,6 +341,7 @@ fn span_of(n) {
         Binary(_, _, _, sp) => sp,
         Logical(_, _, _, sp) => sp,
         Call(_, _, sp) => sp,
+        Pipe(_, _, _, sp) => sp,
         Index(_, _, sp) => sp,
         ListLit(_, sp) => sp,
         FnLit(_, _, _, _, _, _, _, sp) => sp,
@@ -372,5 +378,69 @@ fn span_of(n) {
         TEList(_, sp) => sp,
         TEFn(_, _, sp) => sp,
         NoNode => Sp(0, 0),
+    }
+}
+
+// lower_pipes removes surface-only Pipe nodes immediately before checking.
+// The parser and formatter keep Pipe intact; the checker and compiler only
+// receive ordinary Call nodes with the piped value inserted as argument zero.
+pub fn lower_pipes(stmts) {
+    lower_pipe_nodes(stmts)
+}
+
+pub fn lower_pipe_packages(pkgs_stmts) {
+    let mut out = []
+    for pkg in pkgs_stmts {
+        let mut files = []
+        for stmts in pkg {
+            push(files, lower_pipe_nodes(stmts))
+        }
+        push(out, files)
+    }
+    out
+}
+
+fn lower_pipe_nodes(nodes) {
+    let mut out = []
+    for n in nodes {
+        push(out, lower_pipe_node(n))
+    }
+    out
+}
+
+fn lower_pipe_node(n) {
+    match n {
+        Unary(op, rhs, sp) => Unary(op, lower_pipe_node(rhs), sp),
+        Binary(op, lhs, rhs, sp) => Binary(op, lower_pipe_node(lhs), lower_pipe_node(rhs), sp),
+        Logical(op, lhs, rhs, sp) => Logical(op, lower_pipe_node(lhs), lower_pipe_node(rhs), sp),
+        Call(callee, args, sp) => Call(lower_pipe_node(callee), lower_pipe_nodes(args), sp),
+        Pipe(lhs, target, args, sp) => {
+            let mut call_args = [lower_pipe_node(lhs)]
+            for a in args {
+                push(call_args, lower_pipe_node(a))
+            }
+            Call(lower_pipe_node(target), call_args, sp)
+        },
+        Index(target, idx, sp) => Index(lower_pipe_node(target), lower_pipe_node(idx), sp),
+        ListLit(elems, sp) => ListLit(lower_pipe_nodes(elems), sp),
+        FnLit(params, muts, pspans, param_tys, ret_ty, body, name, sp) => FnLit(params, muts, pspans, param_tys, ret_ty, lower_pipe_node(body), name, sp),
+        Block(stmts, sp) => Block(lower_pipe_nodes(stmts), sp),
+        IfExpr(cond, then, els, sp) => IfExpr(lower_pipe_node(cond), lower_pipe_node(then), lower_pipe_node(els), sp),
+        MatchExpr(scrut, arms, sp) => MatchExpr(lower_pipe_node(scrut), lower_pipe_nodes(arms), sp),
+        MatchArm(pat, guard, body, sp) => MatchArm(pat, lower_pipe_node(guard), lower_pipe_node(body), sp),
+        TryExpr(inner, sp) => TryExpr(lower_pipe_node(inner), sp),
+        RecvExpr(ch, sp) => RecvExpr(lower_pipe_node(ch), sp),
+        LetStmt(name, nsp, is_mut, is_pub, init, sp) => LetStmt(name, nsp, is_mut, is_pub, lower_pipe_node(init), sp),
+        AssignStmt(target, val, sp) => AssignStmt(lower_pipe_node(target), lower_pipe_node(val), sp),
+        ExprStmt(e, sp) => ExprStmt(lower_pipe_node(e), sp),
+        WhileStmt(cond, body, sp) => WhileStmt(lower_pipe_node(cond), lower_pipe_node(body), sp),
+        ForStmt(name, nsp, iter, is_chan, body, sp) => ForStmt(name, nsp, lower_pipe_node(iter), is_chan, lower_pipe_node(body), sp),
+        ReturnStmt(val, sp) => ReturnStmt(lower_pipe_node(val), sp),
+        FnDecl(name, nsp, is_pub, lit, sp) => FnDecl(name, nsp, is_pub, lower_pipe_node(lit), sp),
+        SpawnStmt(call, sp) => SpawnStmt(lower_pipe_node(call), sp),
+        SelectStmt(arms, has_default, dflt, dsp, sp) => SelectStmt(lower_pipe_nodes(arms), has_default, lower_pipe_node(dflt), dsp, sp),
+        SelectArm(is_send, bind, bsp, ch, val, body, sp) => SelectArm(is_send, bind, bsp, lower_pipe_node(ch), lower_pipe_node(val), lower_pipe_node(body), sp),
+        SendStmt(ch, val, sp) => SendStmt(lower_pipe_node(ch), lower_pipe_node(val), sp),
+        _ => n,
     }
 }
