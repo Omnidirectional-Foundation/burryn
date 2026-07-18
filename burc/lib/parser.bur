@@ -1004,7 +1004,88 @@ fn p_block(toks, mut pos) {
 // ---- expressions (precedence climbing) ----
 
 fn p_expression(toks, mut pos) {
-    p_or_expr(toks, pos)
+    p_pipe_expr(toks, pos)
+}
+
+fn p_pipe_expr(toks, mut pos) {
+    let mut e = match p_or_expr(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    while p_check(toks, pos, t_pipe) {
+        p_advance(toks, pos)
+        e = match p_pipe_target(toks, pos, e) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    }
+    Ok(e)
+}
+
+// A pipe target is deliberately narrower than a general postfix expression:
+// a name path, optionally followed by one argument list. In particular, a
+// parenthesized expression cannot introduce a second apply-like call rule.
+fn p_pipe_target(toks, mut pos, lhs) {
+    let first = match p_expect(toks, pos, t_ident, "a pipe target") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            Tok(0, "", 0, 0)
+        },
+    }
+    let mut path = Ident(tok_lex(first), sp_of_tok(first))
+    while p_match(toks, pos, t_dot) {
+        let part = match p_expect(toks, pos, t_ident, "a name after '.' in pipe target") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                Tok(0, "", 0, 0)
+            },
+        }
+        path = match path {
+            Ident(name, sp) => VariantAccess(name, tok_lex(part), sp_union(sp, sp_of_tok(part))),
+            VariantAccess(pkg, name, sp) => QualVariantAccess(pkg, name, tok_lex(part), sp_union(sp, sp_of_tok(part))),
+            _ => {
+                return perr("E1107", "", "a pipe target path has at most three names", sp_of_tok(part))
+                NoNode
+            },
+        }
+    }
+    let mut args = []
+    let mut end_sp = span_of(path)
+    if p_match(toks, pos, t_lparen) {
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rparen) {
+            let arg = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            push(args, arg)
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        p_skip_semis(toks, pos)
+        let rp = match p_expect(toks, pos, t_rparen, "')' after pipe target arguments") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                Tok(0, "", 0, 0)
+            },
+        }
+        end_sp = sp_union(end_sp, sp_of_tok(rp))
+    }
+    Ok(Pipe(lhs, path, args, sp_union(span_of(lhs), end_sp)))
 }
 
 fn p_or_expr(toks, mut pos) {
