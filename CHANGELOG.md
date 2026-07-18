@@ -8,6 +8,18 @@ Versions use a 2-day date range. Latest first.
 
 ## v0.3 (2026-07-19 ~ 07-20)
 
+**Landed the S7.2 pipe operator** — `x |> f(a)` calls `f(x, a)`; pipes are
+lowest-precedence and left-associative, so `x |> f |> g` reads `g(f(x))`.
+**落地 S7.2 管道操作符** — `x |> f(a)` 即 `f(x, a)`；`|>` 优先级最低、左结合，`x |> f |> g` 即 `g(f(x))`。
+
+- **Added:** `|>` lexing, a dedicated pipe-target grammar (`f`, `pkg.f`,
+  optional arguments), and a pre-checker lowering pass from `Pipe` nodes to
+  plain calls.
+- **Added:** Formatter rendering that keeps `|>` chains and explicit empty
+  parentheses intact across `bur fmt`.
+- **Added:** Pipe examples plus parser, module, and formatter regression
+  fixtures.
+
 **Landed S7.3 match guards** — a match arm can add `if <bool>` after its
 pattern, with pattern bindings visible to the guard.
 **落地 S7.3 match guard** — match 臂可在 pattern 后添加 `if <bool>`，guard 可访问 pattern 绑定。

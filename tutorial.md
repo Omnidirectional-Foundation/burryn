@@ -230,6 +230,30 @@ fn append_one(mut xs) {
 }
 ```
 
+### 管道操作符 / The pipe operator
+
+`x |> f` 把左侧的值作为第一个实参传给右侧调用,等价 `f(x)`;带参写 `x |> f(a)` =
+`f(x, a)`。`|>` 优先级最低、左结合,所以 `x |> f |> g` 是 `g(f(x))`,
+`1 + 2 |> str` 是 `str(1 + 2)`。右侧只接受函数名或 `pkg.name`(可带实参),
+其它表达式是 parse error;`?` 结合更紧,传播错误写 `(x |> parse)?`。
+
+`x |> f` feeds the left value as the first argument of the call on the right,
+equivalent to `f(x)`; with arguments, `x |> f(a)` is `f(x, a)`. `|>` has the
+lowest precedence and associates left, so `x |> f |> g` is `g(f(x))` and
+`1 + 2 |> str` is `str(1 + 2)`. The right side only accepts a function name or
+`pkg.name`, optionally with arguments; any other expression is a parse error.
+`?` binds tighter, so error propagation is written `(x |> parse)?`.
+
+```rust
+fn double(x) { x * 2 }
+fn clamp(x, hi) {
+    if x > hi { hi } else { x }
+}
+let n = 3 |> double |> clamp(5)   // clamp(double(3), 5)
+println(n)                        // 5
+println(1 + 2 |> str)             // 3
+```
+
 ---
 
 ## 6. 列表与循环 / Lists and loops
