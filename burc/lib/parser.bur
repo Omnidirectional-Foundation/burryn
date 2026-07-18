@@ -75,7 +75,7 @@ fn p_synchronize(toks, mut pos) {
 }
 
 fn p_starts_stmt(t) {
-    t == t_let || t == t_fn || t == t_enum || t == t_while || t == t_for || t == t_return || t == t_spawn || t == t_select || t == t_break || t == t_continue || t == t_pub || t == t_import
+    t == t_let || t == t_const || t == t_fn || t == t_enum || t == t_while || t == t_for || t == t_return || t == t_spawn || t == t_select || t == t_break || t == t_continue || t == t_pub || t == t_import
 }
 
 fn p_peek(toks, pos) {
@@ -136,6 +136,8 @@ fn p_end_stmt(toks, mut pos) {
 fn p_statement(toks, mut pos) {
     if p_check(toks, pos, t_let) {
         p_let_stmt(toks, pos)
+    } else if p_check(toks, pos, t_const) {
+        p_const_stmt(toks, pos)
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
         p_fn_decl(toks, pos)
     } else if p_check(toks, pos, t_enum) {
@@ -355,6 +357,40 @@ fn p_let_stmt(toks, mut pos) {
     Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
+// const bindings are immutable by construction: the grammar has no `const mut`,
+// and after folding they lower to non-mut lets, so reassignment is rejected by
+// the checker's existing immutability rule.
+fn p_const_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos) // const
+    let name = match p_expect(toks, pos, t_ident, "constant name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            Tok(0, "", 0, 0)
+        },
+    }
+    match p_expect(toks, pos, t_eq, "'=' in const declaration") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let init = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, init, sp_union(sp_of_tok(tok), span_of(init))))
+}
+
 // p_pub_decl parses `pub` followed by an exportable declaration; nodes are
 // immutable, so the parsed declaration is rebuilt with pub set.
 fn p_pub_decl(toks, mut pos) {
@@ -369,6 +405,18 @@ fn p_pub_decl(toks, mut pos) {
         }
         match s {
             LetStmt(name, nsp, is_mut, _, init, sp) => Ok(LetStmt(name, nsp, is_mut, true, init, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_const) {
+        let s = match p_const_stmt(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match s {
+            ConstDecl(name, nsp, _, init, sp) => Ok(ConstDecl(name, nsp, true, init, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
@@ -396,7 +444,7 @@ fn p_pub_decl(toks, mut pos) {
             other => Ok(other),
         }
     } else {
-        perr("E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, or `pub let`", "expected `fn`, `enum`, or `let` after `pub`, got \"" + tok_lex(p_peek(toks, pos)) + "\"", sp_of_tok(tok))
+        perr("E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, `pub let`, or `pub const`", "expected `fn`, `enum`, `let`, or `const` after `pub`, got \"" + tok_lex(p_peek(toks, pos)) + "\"", sp_of_tok(tok))
     }
 }
 
