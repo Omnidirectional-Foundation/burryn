@@ -477,8 +477,150 @@ pub fn mod_init_text(mpath) {
     }
 }
 
-// mod_tidy recomputes MVS offline and rewrites dir/bur.sum
+// tidy_scan_imports gathers every import path in the module's .bur files,
+// test files included, across all package directories
+fn tidy_scan_imports(dir) {
+    let mut out = []
+    let mut seen = map()
+    for rel in test_walk(dir) {
+        let pdir = if rel == "." {
+            dir
+        } else {
+            dir + "/" + rel
+        }
+        let entries = match read_dir(pdir) {
+            Ok(es) => es,
+            Err(m) => {
+                return Err("cannot read " + pdir + ": " + m)
+                []
+            },
+        }
+        for name in entries {
+            if str_ends_with(name, ".bur") {
+                let disp = pdir + "/" + name
+                let src = match read_file(disp) {
+                    Ok(s) => s,
+                    Err(m) => {
+                        return Err("cannot read " + disp + ": " + m)
+                        ""
+                    },
+                }
+                match lex(src) {
+                    Lexed(toks, ldiags, _) => {
+                        if len(ldiags) > 0 {
+                            return Err(disp + " has lex errors; run `bur check " + dir + "`")
+                        }
+                        match parse(toks) {
+                            Parsed(stmts, pdiags) => {
+                                if len(pdiags) > 0 {
+                                    return Err(disp + " has parse errors; run `bur check " + dir + "`")
+                                }
+                                for s in stmts {
+                                    match s {
+                                        ImportDecl(_, _, ipath, _, _) => {
+                                            match get(seen, ipath) {
+                                                Some(_) => {},
+                                                None => {
+                                                    put(seen, ipath, true)
+                                                    push(out, ipath)
+                                                },
+                                            }
+                                        },
+                                        _ => {},
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// mod_tidy syncs bur.mod's requires with the imports the module actually
+// uses, then recomputes MVS offline and rewrites dir/bur.sum. A require no
+// import needs is dropped; an import whose module is missing from the
+// require list is promoted to a direct require at the version the current
+// MVS graph already selected; an import no selected module covers is an
+// error pointing at `bur get`.
 pub fn mod_tidy(dir) {
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod: " + m)
+            ""
+        },
+    }
+    let mi = modgraph_parse(text)?
+    let mod_path = match mi {
+        MI(p, _, _) => p,
+    }
+    let imports = tidy_scan_imports(dir)?
+    let pick0 = mvs_resolve(dir)?
+    let gpaths = match pick0 {
+        MP(ps, _) => ps,
+    }
+    let gvers = match pick0 {
+        MP(_, vs) => vs,
+    }
+    // needed: covering module -> selected version, per external import
+    // (longest module-path prefix wins)
+    let mut needed = map()
+    for ip in imports {
+        let local = ip == "std" || str_has_prefix(ip, "std/") || ip == mod_path || str_has_prefix(ip, mod_path + "/")
+        if !local {
+            let mut best = -1
+            let mut blen = -1
+            let mut gi = 0
+            while gi < len(gpaths) {
+                if (ip == gpaths[gi] || str_has_prefix(ip, gpaths[gi] + "/")) && str_len(gpaths[gi]) > blen {
+                    best = gi
+                    blen = str_len(gpaths[gi])
+                }
+                gi = gi + 1
+            }
+            if best < 0 {
+                return Err("cannot resolve import \"" + ip + "\": no required module provides it; add its module with `bur get <path>@<version>`")
+            }
+            put(needed, gpaths[best], gvers[best])
+        }
+    }
+    let mut kept = []
+    for line in split(text, "\n") {
+        let f = str_fields(line)
+        let drop = if len(f) >= 2 && f[0] == "require" {
+            match get(needed, f[1]) {
+                Some(_) => false,
+                None => true,
+            }
+        } else {
+            false
+        }
+        if !drop {
+            push(kept, line)
+        }
+    }
+    let mut out = join(kept, "\n")
+    for p in sorted_strs(keys(needed)) {
+        match get(needed, p) {
+            Some(v) => {
+                out = mod_edit_require(out, p, v)
+            },
+            None => {},
+        }
+    }
+    if out != text {
+        write_file(dir + "/bur.mod", out)?
+    }
+    mod_sum_sync(dir)
+}
+
+// mod_sum_sync recomputes MVS offline over the current bur.mod and
+// rewrites dir/bur.sum; `bur get` uses it directly so a just-added require
+// survives until an import consumes it
+fn mod_sum_sync(dir) {
     let pick = mvs_resolve(dir)?
     let hs = mod_hashes(pick, cache_root())?
     write_file(dir + "/bur.sum", sum_render(pick, hs))?
@@ -585,5 +727,5 @@ pub fn mod_get(dir, spec) {
             return Err(m)
         },
     }
-    mod_tidy(dir)
+    mod_sum_sync(dir)
 }
