@@ -499,13 +499,15 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
 // imports. Packages come back in dependency order, entry last (module.go
 // loadPackage).
 pub fn load_module(dir0) {
-    load_module_opts(dir0, false)
+    load_module_opts(dir0, "")
 }
 
-// load_module_opts is load_module with a switch: with_tests additionally
-// loads the root package's `*_test.bur` files (`bur test`); every other
-// load excludes them, so test files never reach a normal build
-fn load_module_opts(dir0, with_tests) {
+// load_module_opts is load_module with a switch: test_rel names the
+// package under test as a module-root-relative directory ("." is the root
+// package), which additionally loads that package's `*_test.bur` files and
+// makes it the entry (`bur test`); "" is a normal load, so test files
+// never reach a normal build
+fn load_module_opts(dir0, test_rel) {
     let dir = if str_ends_with(dir0, "/") {
         substr(dir0, 0, str_len(dir0) - 1)
     } else {
@@ -526,6 +528,13 @@ fn load_module_opts(dir0, with_tests) {
     let mod_path = parse_bur_mod(mod_file, mod_src, diags, dfiles)
     if len(diags) > 0 {
         return ModFailed(diags, dfiles)
+    }
+    let test_pkg = if test_rel == "" {
+        ""
+    } else if test_rel == "." {
+        mod_path
+    } else {
+        mod_path + "/" + test_rel
     }
 
     // bur.sum entries keyed "path@version" map to interface-cache
@@ -693,7 +702,7 @@ fn load_module_opts(dir0, with_tests) {
         let mut file_paths = []
         let mut file_imports = []
         let mut bur_files = 0
-        let want_tests = with_tests && path == mod_path
+        let want_tests = test_pkg != "" && path == test_pkg
         for name in entries {
             if str_ends_with(name, ".bur") && (want_tests || !str_ends_with(name, "_test.bur")) {
                 bur_files = bur_files + 1
@@ -917,7 +926,13 @@ fn load_module_opts(dir0, with_tests) {
         push(out_ids, pkg_id)
     }
 
-    load_pkg(mod_path, "", Sp(0, 0), [])
+    if test_pkg == "" {
+        load_pkg(mod_path, "", Sp(0, 0), [])
+    } else {
+        // the package under test is the entry: it loads last, so the
+        // synthetic test main lands in the entry package
+        load_pkg(test_pkg, "", Sp(0, 0), [])
+    }
 
     let mut has_err = false
     for d in diags {
@@ -936,11 +951,12 @@ fn load_module_opts(dir0, with_tests) {
     }
 }
 
-// load_module_test loads dir with its root `*_test.bur` files, drops the
+// load_module_test loads the module rooted at dir0 with the `*_test.bur`
+// files of the package at rel ("." is the root package), drops that
 // package's own `fn main`, and appends a synthetic entry file whose main
 // calls the one target test fn (`bur dev run-test`)
-pub fn load_module_test(dir0, test_fn) {
-    match load_module_opts(dir0, true) {
+pub fn load_module_test(dir0, rel, test_fn) {
+    match load_module_opts(dir0, rel) {
         ModFailed(d, f) => ModFailed(d, f),
         ModLoaded(ld, lf, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids) => {
             let ei = len(pkgs_stmts) - 1
@@ -990,6 +1006,45 @@ pub fn load_module_test(dir0, test_fn) {
             ModLoaded(ld, lf, pkg_paths, np_stmts, np_fpaths, np_imports, pkg_ids)
         },
     }
+}
+
+// test_walk lists the module's package directories relative to root: "."
+// first, then every subdirectory in sorted order, skipping dot-entries and
+// nested modules (a subdirectory with its own bur.mod)
+pub fn test_walk(root) {
+    let mut acc = ["."]
+    fn walk(rel) {
+        let dir = if rel == "" {
+            root
+        } else {
+            root + "/" + rel
+        }
+        match read_dir(dir) {
+            Ok(names) => {
+                for n in sorted_strs(names) {
+                    if !str_has_prefix(n, ".") {
+                        let sub = if rel == "" {
+                            n
+                        } else {
+                            rel + "/" + n
+                        }
+                        match read_dir(root + "/" + sub) {
+                            Ok(_) => {
+                                if !file_exists(root + "/" + sub + "/bur.mod") {
+                                    push(acc, sub)
+                                    walk(sub)
+                                }
+                            },
+                            Err(_) => {},
+                        }
+                    }
+                }
+            },
+            Err(_) => {},
+        }
+    }
+    walk("")
+    acc
 }
 
 // test_discover lists the zero-parameter `fn test_*` names declared in the

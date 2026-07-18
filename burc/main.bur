@@ -957,19 +957,46 @@ fn test_cmd(rest) {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
     }
-    let all = match lib.test_discover(dir) {
-        Ok(ns) => ns,
-        Err(m) => {
-            eprintln("error: " + m)
-            exit(exit_no_input)
-            []
-        },
+    // discover across the root package and every subpackage; subpackage
+    // tests display as `<rel dir>/<fn>` while root tests keep bare names
+    let mut all = []
+    let mut all_dirs = []
+    let mut all_fns = []
+    for rel in lib.test_walk(dir) {
+        let pdir = if rel == "." {
+            dir
+        } else {
+            dir + "/" + rel
+        }
+        match lib.test_discover(pdir) {
+            Ok(ns) => {
+                for n in ns {
+                    if rel == "." {
+                        push(all, n)
+                    } else {
+                        push(all, rel + "/" + n)
+                    }
+                    push(all_dirs, pdir)
+                    push(all_fns, n)
+                }
+            },
+            Err(m) => {
+                eprintln("error: " + m)
+                exit(exit_no_input)
+            },
+        }
     }
     let mut selected = []
-    for n in all {
-        if run_filter == "" || str_contains(n, run_filter) {
-            push(selected, n)
+    let mut sel_dirs = []
+    let mut sel_fns = []
+    let mut ai = 0
+    while ai < len(all) {
+        if run_filter == "" || str_contains(all[ai], run_filter) {
+            push(selected, all[ai])
+            push(sel_dirs, all_dirs[ai])
+            push(sel_fns, all_fns[ai])
         }
+        ai = ai + 1
     }
     if len(selected) == 0 {
         println("no tests to run")
@@ -981,8 +1008,10 @@ fn test_cmd(rest) {
         exit(exit_no_input)
     }
     let mut failed = 0
-    for name in selected {
-        match exec("env", ["BUR_DETERMINISTIC=1", self_path, "dev", "run-test", dir, name]) {
+    let mut si = 0
+    while si < len(selected) {
+        let name = selected[si]
+        match exec("env", ["BUR_DETERMINISTIC=1", self_path, "dev", "run-test", sel_dirs[si], sel_fns[si]]) {
             Ok(o) => match o {
                 Output(code, so, se) => {
                     if code == 0 {
@@ -1007,6 +1036,7 @@ fn test_cmd(rest) {
                 println("FAIL " + name + ": " + m)
             },
         }
+        si = si + 1
     }
     if failed == 0 {
         println("PASS  " + str(len(selected)) + " test(s)")
@@ -1016,10 +1046,71 @@ fn test_cmd(rest) {
     }
 }
 
-// run_test_target compiles the module with its test files and a synthetic
-// main that calls one test fn, then runs it (the `bur dev run-test` child)
-fn run_test_target(dir, fnname) {
-    match lib.load_module_test(dir, fnname) {
+// parent_dir strips the final path element; "" means no parent is left
+fn parent_dir(p) {
+    let mut cut = -1
+    let mut i = 0
+    while i < str_len(p) {
+        if char_at(p, i) == "/" {
+            cut = i
+        }
+        i = i + 1
+    }
+    if cut < 0 {
+        if p == "." {
+            ""
+        } else {
+            "."
+        }
+    } else if cut == 0 {
+        if p == "/" {
+            ""
+        } else {
+            "/"
+        }
+    } else {
+        substr(p, 0, cut)
+    }
+}
+
+// module_root_of walks upward from p0 to the nearest directory holding a
+// bur.mod; "" when none is found
+fn module_root_of(p0) {
+    let mut p = strip_trailing_slash(p0)
+    let mut root = ""
+    let mut going = true
+    while going {
+        if file_exists(p + "/bur.mod") {
+            root = p
+            going = false
+        } else {
+            let d = parent_dir(p)
+            if d == "" {
+                going = false
+            } else {
+                p = d
+            }
+        }
+    }
+    root
+}
+
+// run_test_target compiles the module owning dir with dir's test files and
+// a synthetic main that calls one test fn, then runs it (the `bur dev
+// run-test` child); dir may be any package directory inside a module
+fn run_test_target(dir0, fnname) {
+    let dir = strip_trailing_slash(dir0)
+    let root = module_root_of(dir)
+    if root == "" {
+        eprintln("error: bur.mod not found in " + dir + " or any parent directory")
+        exit(exit_no_input)
+    }
+    let rel = if root == dir {
+        "."
+    } else {
+        substr(dir, str_len(root) + 1, str_len(dir) - str_len(root) - 1)
+    }
+    match lib.load_module_test(root, rel, fnname) {
         lib.ModOut.ModFailed(diags, dfiles) => {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
