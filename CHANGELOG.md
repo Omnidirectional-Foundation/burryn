@@ -8,6 +8,17 @@ Versions use a 2-day date range. Latest first.
 
 ## v0.3 (2026-07-19 ~ 07-20)
 
+**Landed S7.1 string interpolation** — strings can splice `str` expressions
+with `{expr}` and escape literal opening braces as `{{`.
+**落地 S7.1 字符串插值** — 字符串可用 `{expr}` 拼接 `str` 表达式，字面左花括号写成 `{{`。
+
+- **Added:** Lexer mode switching for interpolation segments, nested brace
+  balancing, and parser lowering to the existing string-concatenation AST.
+- **Changed:** Non-`str` interpolation expressions now produce a compile error
+  whose help suggests an explicit `str()` conversion.
+- **Added:** Formatter reconstruction, interpolation examples, and malformed
+  interpolation regression fixtures.
+
 **S6 (ecosystem toolchain) is complete** — this version closes every S6
 work package: dependency management with a disk interface cache,
 sub-package testing, embedded std, a rebased bootstrap seed, and the

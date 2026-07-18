@@ -137,6 +137,23 @@ integer divide/modulo by zero also traps. Deliberate: safe by default.
 Strings are **UTF-8 byte sequences**; `len` and indexing count **bytes**. Use
 `char_at`, `ord`, `chr` for code points (section 7).
 
+### 字符串插值 / String interpolation
+
+字符串里的 `{expr}` 会求值并拼进结果。表达式必须已经是 `str`;Burryn 不做隐式
+转换,其他类型须显式调用 `str()`。字面左花括号写成 `{{`。
+
+`{expr}` inside a string evaluates the expression and appends its result. The
+expression must already be `str`; Burryn performs no implicit conversion, so
+other types require an explicit `str()`. Write `{{` for a literal opening
+brace.
+
+```rust
+let name = "Burryn"
+let jobs = 3
+println("hello {name}, jobs={str(jobs)}")
+println("literal brace: {{")
+```
+
 ---
 
 ## 4. 表达式导向 / Expression orientation
@@ -621,21 +638,11 @@ enforced by tests.
   凑,字段按位置访问。
   No **records/structs**: model them with single-variant enums for now, fields
   positional.
-- **`defer`**、**字符串插值**:计划中,还没实现;拼字符串暂时靠 `+ str(x) +`。
-  **`defer`** and **string interpolation** are planned but not built; build
-  strings with `+ str(x) +` for now.
-- 还没有 `sort`、`getenv`、`math`(sqrt/floor…)、`json`、`net`、regex 等标准库;
+- **`defer`** 计划中,还没实现。
+  **`defer`** is planned but not built.
+- 还没有 `sort`、`getenv`、`math`(sqrt/floor…)、`net`、regex 等标准库;
   按需生长中。
-  No `sort`, `getenv`, `math`, `json`, `net`, regex yet; growing as needed.
-
-工具链 / toolchain:
-
-- **依赖拉取(MVS + 网络)** 还没做——目前只能用本地包,拉不了第三方库。
-  **Dependency fetching** isn't in yet — only local packages work; third-party
-  libraries can't be pulled.
-- `fmt`(官方格式化)、`test` 命令:规划中。
-  `fmt` and a `test` command are planned.
-
+  No `sort`, `getenv`, `math`, `net`, regex yet; growing as needed.
 
 ---
 

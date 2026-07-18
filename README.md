@@ -179,18 +179,18 @@ Security-sensitive surfaces include:
   Audit generated C when running untrusted sources.
 - **Process spawning**: the `exec` native calls `fork` + `execvp` without a shell.
 - **Persistent state**: the toolchain writes build artifacts (`program.c`, the output binary, and temporary files) to the working directory.
-- **Network endpoints**: future dependency fetching (S6) will use `git clone` over the network; the current release only resolves local packages.
+- **Network endpoints**: `bur mod download` and `bur get` fetch dependencies with `git clone` over the network.
 - **Trust boundary**: treat compiled native binaries and `.bur` source from untrusted origins as untrusted code.
 
 See [`SECURITY.md`](SECURITY.md) for the full policy and private reporting instructions.
 
 ## Honest Limitations
 
-Stages S1–S5 are done.
-They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, and a fully self-hosted compiler with the Go host removed.
+Stages S1–S6 and S7.1 are done.
+They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, dependency tooling, diagnostics, string interpolation, and a fully self-hosted compiler with the Go host removed.
 Both backends produce byte-identical output for the whole language, concurrency included.
 
-Still missing: records/structs (model product types with single-variant enums), `defer`, string interpolation, and third-party dependency fetching (only local packages resolve).
+Still missing: records/structs (model product types with single-variant enums), pipelines, match guards, compile-time constants, `defer`, and the net stdlib.
 Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.
 
 ## Documentation
