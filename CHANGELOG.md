@@ -8,6 +8,25 @@ Versions use a 2-day date range. Latest first.
 
 ## v0.3 (2026-07-19 ~ 07-20)
 
+**Landed S7.5 compile-time constants** — `const` declarations fold supported
+expressions before type checking in scripts, blocks, and packages.
+**落地 S7.5 编译期常量** — `const` 声明在脚本、block 与 package 中于类型检查前
+折叠受支持的初始化式。
+
+- **Added:** Constant folding for literals, constant references, arithmetic,
+  comparisons, boolean operators, and string concatenation; package constants
+  support forward references across files and exported references across
+  packages.
+- **Added:** E0015 for non-constant initializers, E0080 for fold-time traps,
+  and E0391 for constant cycles; short-circuit operators retain their dead
+  side's type and shape checks without evaluating dead traps.
+- **Changed:** `const` declarations lower to immutable `let` bindings, so
+  existing type inference and reassignment diagnostics remain authoritative.
+- **Fixed:** VM and C runtime ordered comparisons now compare two integers as
+  exact `int64` values instead of converting them to `double`.
+- **Added:** Constant examples, formatter fixtures, package and cycle fixtures,
+  fold diagnostic fixtures, and test-runner coverage.
+
 **Landed the S7.2 pipe operator** — `x |> f(a)` calls `f(x, a)`; pipes are
 lowest-precedence and left-associative, so `x |> f |> g` reads `g(f(x))`.
 **落地 S7.2 管道操作符** — `x |> f(a)` 即 `f(x, a)`；`|>` 优先级最低、左结合，`x |> f |> g` 即 `g(f(x))`。
