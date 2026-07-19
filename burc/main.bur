@@ -296,7 +296,7 @@ fn run_file(path, mode, argv) {
                     if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
-                    let checked_stmts = lib.lower_pipes(stmts)
+                    let checked_stmts = fold_script_or_exit(stmts, path)
                     match lib.typecheck_script(checked_stmts) {
                         lib.CheckOut.Checked(cdiags, _, binds, chan_fors, _) => {
                             if mode == mode_check {
@@ -346,7 +346,7 @@ fn run_module(dir0, mode, argv) {
             if emit_errors_f(ldiags, lfiles, false) {
                 exit(exit_static)
             }
-            let checked_stmts = lib.lower_pipe_packages(pkgs_stmts)
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
             match lib.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                 lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors, _) => {
                     if mode == mode_check {
@@ -422,6 +422,64 @@ fn emit_errors_f(diags, files, errors_only) {
         i = i + 1
     }
     errs
+}
+
+fn fold_script_or_exit(stmts, path) {
+    match lib.fold_consts(stmts) {
+        lib.FoldOut.FoldedScript(out, diags) => {
+            if emit_errors(diags, path, false) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+fn fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    match lib.fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        lib.FoldOut.FoldedPkgs(out, diags, files) => {
+            if emit_errors_f(diags, files, false) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+fn fold_script_for_dev(stmts) {
+    match lib.fold_consts(stmts) {
+        lib.FoldOut.FoldedScript(out, diags) => {
+            for d in diags {
+                println(lib.dump_diag(d))
+            }
+            if len(diags) > 0 {
+                None
+            } else {
+                Some(out)
+            }
+        },
+        _ => None,
+    }
+}
+
+fn fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    match lib.fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        lib.FoldOut.FoldedPkgs(out, diags, files) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(lib.dump_diag_f(diags[i], files[i]))
+                i = i + 1
+            }
+            if len(diags) > 0 {
+                None
+            } else {
+                Some(out)
+            }
+        },
+        _ => None,
+    }
 }
 
 // run_check prints top-level binding types then diagnostics, mirroring the
@@ -552,7 +610,7 @@ fn compile_file_to_c(path) {
                     if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
-                    let checked_stmts = lib.lower_pipes(stmts)
+                    let checked_stmts = fold_script_or_exit(stmts, path)
                     match lib.typecheck_script(checked_stmts) {
                         lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
                             if emit_errors(cdiags, path, true) {
@@ -587,7 +645,7 @@ fn compile_module_to_c(dir) {
             if emit_errors_f(ldiags, lfiles, false) {
                 exit(exit_static)
             }
-            let checked_stmts = lib.lower_pipe_packages(pkgs_stmts)
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
             match lib.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                 lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
@@ -793,7 +851,7 @@ fn dev_interface(dir) {
             let _ = emit_errors_f(diags, dfiles, false)
         },
         lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, _, _) => {
-            let checked_stmts = lib.lower_pipe_packages(pkgs_stmts)
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
             match lib.typecheck_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
                 lib.CheckOut.Checked(diags, dfiles, _, _, interfaces) => {
                     if !emit_errors_f(diags, dfiles, true) {
@@ -1144,7 +1202,7 @@ fn run_test_target(dir0, fnname) {
             exit(exit_static)
         },
         lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
-            let checked_stmts = lib.lower_pipe_packages(pkgs_stmts)
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
             match lib.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                 lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
@@ -1182,27 +1240,29 @@ fn dev_build_dir(dir) {
                 println(lib.dump_diag_f(ldiags[i], lfiles[i]))
                 i = i + 1
             }
-            let checked_stmts = lib.lower_pipe_packages(pkgs_stmts)
-            match lib.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
-                    let mut errs = false
-                    i = 0
-                    while i < len(cdiags) {
-                        println(lib.dump_diag_f(cdiags[i], cfiles[i]))
-                        if diag_is_error(cdiags[i]) {
-                            errs = true
+            match fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                Some(checked_stmts) => match lib.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                    lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
+                        let mut errs = false
+                        i = 0
+                        while i < len(cdiags) {
+                            println(lib.dump_diag_f(cdiags[i], cfiles[i]))
+                            if diag_is_error(cdiags[i]) {
+                                errs = true
+                            }
+                            i = i + 1
                         }
-                        i = i + 1
-                    }
-                    if !errs {
-                        let ls_files = concat_lists(pkgs_fpaths)
-                        let ls_tables = concat_lists(pkgs_lstarts)
-                        match lib.compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                            lib.CompileOut.CompileFailed(d, f) => println(lib.dump_diag_f(d, f)),
-                            lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
+                        if !errs {
+                            let ls_files = concat_lists(pkgs_fpaths)
+                            let ls_tables = concat_lists(pkgs_lstarts)
+                            match lib.compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                                lib.CompileOut.CompileFailed(d, f) => println(lib.dump_diag_f(d, f)),
+                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
+                            }
                         }
-                    }
+                    },
                 },
+                None => {},
             }
         },
     }
@@ -1259,16 +1319,18 @@ fn dev_check(src) {
                                 println(lib.dump_diag(d))
                             }
                         } else {
-                            let checked_stmts = lib.lower_pipes(stmts)
-                            match lib.typecheck_script(checked_stmts) {
-                                lib.CheckOut.Checked(cdiags, _, binds, _, _) => {
-                                    for line in binds {
-                                        println(line)
-                                    }
-                                    for d in cdiags {
-                                        println(lib.dump_diag(d))
-                                    }
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match lib.typecheck_script(checked_stmts) {
+                                    lib.CheckOut.Checked(cdiags, _, binds, _, _) => {
+                                        for line in binds {
+                                            println(line)
+                                        }
+                                        for d in cdiags {
+                                            println(lib.dump_diag(d))
+                                        }
+                                    },
                                 },
+                                None => {},
                             }
                         }
                     },
@@ -1323,23 +1385,25 @@ fn dev_dis(src) {
                                 println(lib.dump_diag(d))
                             }
                         } else {
-                            let checked_stmts = lib.lower_pipes(stmts)
-                            match lib.typecheck_script(checked_stmts) {
-                                lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
-                                    let mut errs = false
-                                    for d in cdiags {
-                                        println(lib.dump_diag(d))
-                                        if diag_is_error(d) {
-                                            errs = true
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match lib.typecheck_script(checked_stmts) {
+                                    lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(lib.dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
                                         }
-                                    }
-                                    if !errs {
-                                        match lib.compile_script(checked_stmts, chan_fors) {
-                                            lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
-                                            lib.CompileOut.Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => lib.dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib.line_starts(src)),
+                                        if !errs {
+                                            match lib.compile_script(checked_stmts, chan_fors) {
+                                                lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
+                                                lib.CompileOut.Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => lib.dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib.line_starts(src)),
+                                            }
                                         }
-                                    }
+                                    },
                                 },
+                                None => {},
                             }
                         }
                     },
@@ -1364,23 +1428,25 @@ fn dev_emit_c(src, path) {
                                 println(lib.dump_diag(d))
                             }
                         } else {
-                            let checked_stmts = lib.lower_pipes(stmts)
-                            match lib.typecheck_script(checked_stmts) {
-                                lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
-                                    let mut errs = false
-                                    for d in cdiags {
-                                        println(lib.dump_diag(d))
-                                        if diag_is_error(d) {
-                                            errs = true
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match lib.typecheck_script(checked_stmts) {
+                                    lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(lib.dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
                                         }
-                                    }
-                                    if !errs {
-                                        match lib.compile_script(checked_stmts, chan_fors) {
-                                            lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
-                                            lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)])),
+                                        if !errs {
+                                            match lib.compile_script(checked_stmts, chan_fors) {
+                                                lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
+                                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)])),
+                                            }
                                         }
-                                    }
+                                    },
                                 },
+                                None => {},
                             }
                         }
                     },

@@ -1,0 +1,898 @@
+// Constant folding for `const` declarations (S7.5).
+//
+// Runs immediately before the type checker and owns pipe lowering as its
+// first step. Package-level consts fold
+// to a fixpoint so declaration order and file order never matter (cycles are
+// E0391); every ConstDecl then lowers to a non-mut LetStmt whose initializer
+// is the folded literal, so the checker and compiler see no const-specific
+// semantics. Initializers are restricted to literals, const references,
+// arithmetic, comparisons, `&&`/`||`/`!`, and str concatenation (GOALS §6.6);
+// anything else is E0015. A fold-time integer trap (overflow, division or
+// modulo by zero) is E0080 — the trap the runtime would raise, just early.
+// Logical operators preserve runtime short-circuiting; the dead side is still
+// checked for an allowed constant shape and a bool type. Operand type
+// mismatches emit nothing here: the initializer is left unfolded and the
+// checker reports its usual E0308. Non-finite float results remain ordinary
+// float constants and are rendered by cgen as INFINITY/NAN.
+
+pub enum FoldOut {
+    FoldedScript([Node], [DiagT]),
+    FoldedPkgs([[[Node]]], [DiagT], [str]),
+}
+
+enum FVal {
+    FVInt(int),
+    FVFloat(float),
+    FVStr(str),
+    FVBool(bool),
+    FVMasked, // a runtime binding shadows the name: referencing it is E0015
+    FVPoison, // a const that failed to fold: references to it stay silent
+}
+
+enum FRes {
+    FRVal(FVal),
+    FRBlocked(str), // waits on a package const not folded yet (fixpoint only)
+    FRSoft, // not foldable, no diagnostic here: the checker reports it
+    FRErr, // not foldable, diagnostic already pushed
+}
+
+enum FTRes {
+    FTType(int), // 0 int, 1 float, 2 str, 3 bool
+    FTBlocked(str),
+    FTSoft,
+    FTErr,
+}
+
+let fold_max_int = 9223372036854775807
+let fold_min_int = -9223372036854775807 - 1
+
+let fold_help = "const initializers allow literals, references to other constants, arithmetic, comparisons, `&&`/`||`/`!`, and str concatenation"
+let trap_help = "this operation traps at runtime; constant initializers are evaluated at compile time, so the trap is reported as a compile error"
+
+// fold_consts folds a script's statements; top-level consts fold
+// sequentially, in declaration order, like any other block.
+pub fn fold_consts(stmts) {
+    let mut diags = []
+    let mut dfiles = []
+    let mut e_n = []
+    let mut e_v = []
+    let out = fr_stmts(lower_pipes(stmts), map(), map(), map(), e_n, e_v, diags, dfiles, "")
+    FoldOut.FoldedScript(out, diags)
+}
+
+// fold_const_packages folds a whole loaded module, packages in load order so
+// dependency consts are available to dependents via import aliases.
+pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    let mut diags = []
+    let mut dfiles = []
+    let mut qenv = map() // "<import path>.<name>" -> FVal, pub consts only
+    let mut out_pkgs = []
+    let lowered_pkgs = lower_pipe_packages(pkgs_stmts)
+    let mut pi = 0
+    while pi < len(pkgs_stmts) {
+        let files = lowered_pkgs[pi]
+        let fpaths = pkgs_fpaths[pi]
+        let imps = pkgs_imports[pi]
+        let mut amaps = []
+        let mut fi = 0
+        while fi < len(files) {
+            push(amaps, aliases_of(imps[fi]))
+            fi = fi + 1
+        }
+        // collect package-level consts across all files of the package
+        let mut c_file = []
+        let mut c_name = []
+        let mut c_init = []
+        let mut c_nsp = []
+        let mut c_state = [] // 0 pending, 1 folded, 2 failed
+        fi = 0
+        while fi < len(files) {
+            for s in files[fi] {
+                match s {
+                    ConstDecl(n, nsp, _, init, _) => {
+                        push(c_file, fi)
+                        push(c_name, n)
+                        push(c_init, init)
+                        push(c_nsp, nsp)
+                        push(c_state, 0)
+                    },
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+        let mut penv = map()
+        let mut pending = map()
+        let mut ci = 0
+        while ci < len(c_name) {
+            put(pending, c_name[ci], true)
+            ci = ci + 1
+        }
+        // fixpoint: attempts blocked on a not-yet-folded const retry until no
+        // attempt makes progress; attempt diagnostics are discarded here and
+        // re-derived exactly once by the rewrite walk below
+        let mut e_n0 = []
+        let mut e_v0 = []
+        let mut progress = true
+        while progress {
+            progress = false
+            ci = 0
+            while ci < len(c_name) {
+                if c_state[ci] == 0 {
+                    let mut adiags = []
+                    let r = fc_eval(c_init[ci], amaps[c_file[ci]], penv, qenv, pending, e_n0, e_v0, adiags)
+                    match r {
+                        FRVal(v) => {
+                            c_state[ci] = 1
+                            put(penv, c_name[ci], v)
+                            put(pending, c_name[ci], false)
+                            progress = true
+                        },
+                        FRBlocked(_) => {},
+                        _ => {
+                            c_state[ci] = 2
+                            put(penv, c_name[ci], FVPoison)
+                            put(pending, c_name[ci], false)
+                            progress = true
+                        },
+                    }
+                }
+                ci = ci + 1
+            }
+        }
+        // still-pending consts form (or depend on) a reference cycle
+        let mut cycled = map()
+        ci = 0
+        while ci < len(c_name) {
+            if c_state[ci] == 0 {
+                match c_nsp[ci] {
+                    Sp(s0, e0) => {
+                        push(diags, Diag(true, "E0391", "cycle detected while evaluating constant `" + c_name[ci] + "`", "constant initializers cannot depend on themselves", s0, e0))
+                        push(dfiles, fpaths[c_file[ci]])
+                    },
+                }
+                put(penv, c_name[ci], FVPoison)
+                put(pending, c_name[ci], false)
+                put(cycled, c_name[ci], true)
+            }
+            ci = ci + 1
+        }
+        // rewrite every file: consts lower to lets, failures re-derive their
+        // diagnostic once, nested block consts fold with lexical scoping
+        let mut new_files = []
+        fi = 0
+        while fi < len(files) {
+            let mut e_n = []
+            let mut e_v = []
+            push(new_files, fr_top_stmts(files[fi], amaps[fi], penv, qenv, cycled, e_n, e_v, diags, dfiles, fpaths[fi]))
+            fi = fi + 1
+        }
+        push(out_pkgs, new_files)
+        // export folded pub consts (and their poisons) to dependents
+        fi = 0
+        while fi < len(files) {
+            for s in files[fi] {
+                match s {
+                    ConstDecl(n, _, is_pub, _, _) => {
+                        if is_pub {
+                            match get(penv, n) {
+                                Some(v) => put(qenv, pkg_paths[pi] + "." + n, v),
+                                None => {},
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    FoldOut.FoldedPkgs(out_pkgs, diags, dfiles)
+}
+
+// ---- evaluation ----
+
+fn fc_not_const(label, sp, mut adiags) {
+    match sp {
+        Sp(s0, e0) => push(adiags, Diag(true, "E0015", "`" + label + "` is not a compile-time constant", fold_help, s0, e0)),
+    }
+    FRErr
+}
+
+fn fc_shape(sp, mut adiags) {
+    match sp {
+        Sp(s0, e0) => push(adiags, Diag(true, "E0015", "const initializer must be a compile-time constant expression", fold_help, s0, e0)),
+    }
+    FRErr
+}
+
+fn fc_trap(text, sp, mut adiags) {
+    match sp {
+        Sp(s0, e0) => push(adiags, Diag(true, "E0080", "evaluating this constant traps: " + text, trap_help, s0, e0)),
+    }
+    FRErr
+}
+
+fn fc_of_val(v, label, sp, mut adiags) {
+    match v {
+        FVMasked => fc_not_const(label, sp, adiags),
+        FVPoison => FRSoft,
+        val => FRVal(val),
+    }
+}
+
+fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
+    match e {
+        IntLit(v, _) => FRVal(FVInt(v)),
+        FloatLit(v, _) => FRVal(FVFloat(v)),
+        StrLit(v, _) => FRVal(FVStr(v)),
+        BoolLit(v, _) => FRVal(FVBool(v)),
+        Ident(n, sp) => {
+            let mut hit = -1
+            let mut i = len(env_names) - 1
+            while i >= 0 {
+                if hit < 0 && env_names[i] == n {
+                    hit = i
+                }
+                i = i - 1
+            }
+            if hit >= 0 {
+                fc_of_val(env_vals[hit], n, sp, adiags)
+            } else {
+                match get(penv, n) {
+                    Some(v) => fc_of_val(v, n, sp, adiags),
+                    None => match get(pending, n) {
+                        Some(p) => if p {
+                            FRBlocked(n)
+                        } else {
+                            fc_not_const(n, sp, adiags)
+                        },
+                        None => fc_not_const(n, sp, adiags),
+                    },
+                }
+            }
+        },
+        VariantAccess(en, vn, sp) => match get(aliases, en) {
+            Some(path) => match get(qenv, path + "." + vn) {
+                Some(v) => fc_of_val(v, en + "." + vn, sp, adiags),
+                None => fc_not_const(en + "." + vn, sp, adiags),
+            },
+            None => fc_shape(sp, adiags),
+        },
+        Unary(op, rhs, sp) => {
+            let r = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            match r {
+                FRVal(v) => fc_un(op, v, sp, adiags),
+                other => other,
+            }
+        },
+        Binary(op, lhs, rhs, sp) => {
+            let lr = fc_eval(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            let rr = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            fc_combine(lr, rr, op, sp, adiags)
+        },
+        Logical(op, lhs, rhs, _) => {
+            let lr = fc_eval(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            match lr {
+                FRVal(lv) => match lv {
+                    FVBool(x) => if op == t_and_and && !x || op == t_or_or && x {
+                        match fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags) {
+                            FTType(t) => if t == 3 {
+                                FRVal(FVBool(x))
+                            } else {
+                                FRSoft
+                            },
+                            FTBlocked(n) => FRBlocked(n),
+                            FTSoft => FRSoft,
+                            FTErr => FRErr,
+                        }
+                    } else {
+                        let rr = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+                        match rr {
+                            FRVal(rv) => fc_logical(op, lv, rv),
+                            other => other,
+                        }
+                    },
+                    _ => FRSoft,
+                },
+                FRBlocked(n) => FRBlocked(n),
+                other => other,
+            }
+        },
+        _ => fc_shape(span_of(e), adiags),
+    }
+}
+
+// fc_type checks the primitive type and constant-only shape of an expression
+// without evaluating it. Short-circuited logical operands use this path so a
+// dead integer trap stays dead while calls and type mismatches remain invalid.
+fn fc_type(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
+    match e {
+        IntLit(_, _) => FTType(0),
+        FloatLit(_, _) => FTType(1),
+        StrLit(_, _) => FTType(2),
+        BoolLit(_, _) => FTType(3),
+        Ident(n, sp) => {
+            let mut hit = -1
+            let mut i = len(env_names) - 1
+            while i >= 0 {
+                if hit < 0 && env_names[i] == n {
+                    hit = i
+                }
+                i = i - 1
+            }
+            if hit >= 0 {
+                fc_type_val(env_vals[hit], n, sp, adiags)
+            } else {
+                match get(penv, n) {
+                    Some(v) => fc_type_val(v, n, sp, adiags),
+                    None => match get(pending, n) {
+                        Some(p) => if p {
+                            FTBlocked(n)
+                        } else {
+                            let _ = fc_not_const(n, sp, adiags)
+                            FTErr
+                        },
+                        None => {
+                            let _ = fc_not_const(n, sp, adiags)
+                            FTErr
+                        },
+                    },
+                }
+            }
+        },
+        VariantAccess(en, vn, sp) => match get(aliases, en) {
+            Some(path) => match get(qenv, path + "." + vn) {
+                Some(v) => fc_type_val(v, en + "." + vn, sp, adiags),
+                None => {
+                    let _ = fc_not_const(en + "." + vn, sp, adiags)
+                    FTErr
+                },
+            },
+            None => {
+                let _ = fc_shape(sp, adiags)
+                FTErr
+            },
+        },
+        Unary(op, rhs, _) => match fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags) {
+            FTType(t) => if op == t_minus && (t == 0 || t == 1) {
+                FTType(t)
+            } else if op == t_bang && t == 3 {
+                FTType(3)
+            } else {
+                FTSoft
+            },
+            FTBlocked(n) => FTBlocked(n),
+            FTSoft => FTSoft,
+            FTErr => FTErr,
+        },
+        Binary(op, lhs, rhs, _) => {
+            let lt = fc_type(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            let rt = fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            fc_type_combine(lt, rt, op)
+        },
+        Logical(_, lhs, rhs, _) => {
+            let lt = fc_type(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            let rt = fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            match lt {
+                FTType(l) => match rt {
+                    FTType(r) => if l == 3 && r == 3 {
+                        FTType(3)
+                    } else {
+                        FTSoft
+                    },
+                    FTBlocked(n) => FTBlocked(n),
+                    FTSoft => FTSoft,
+                    FTErr => FTErr,
+                },
+                FTBlocked(n) => FTBlocked(n),
+                FTErr => FTErr,
+                FTSoft => match rt {
+                    FTBlocked(n) => FTBlocked(n),
+                    FTErr => FTErr,
+                    _ => FTSoft,
+                },
+            }
+        },
+        _ => {
+            let _ = fc_shape(span_of(e), adiags)
+            FTErr
+        },
+    }
+}
+
+fn fc_type_val(v, label, sp, mut adiags) {
+    match v {
+        FVInt(_) => FTType(0),
+        FVFloat(_) => FTType(1),
+        FVStr(_) => FTType(2),
+        FVBool(_) => FTType(3),
+        FVMasked => {
+            let _ = fc_not_const(label, sp, adiags)
+            FTErr
+        },
+        FVPoison => FTSoft,
+    }
+}
+
+fn fc_type_combine(lt, rt, op) {
+    match lt {
+        FTType(l) => match rt {
+            FTType(r) => {
+                if op == t_plus && l == r && (l == 0 || l == 1 || l == 2) {
+                    FTType(l)
+                } else if (op == t_minus || op == t_star || op == t_slash) && l == r && (l == 0 || l == 1) {
+                    FTType(l)
+                } else if op == t_percent && l == 0 && r == 0 {
+                    FTType(0)
+                } else if (op == t_lt || op == t_lt_eq || op == t_gt || op == t_gt_eq) && l == r && (l == 0 || l == 1 || l == 2) {
+                    FTType(3)
+                } else if (op == t_eq_eq || op == t_bang_eq) && l == r {
+                    FTType(3)
+                } else {
+                    FTSoft
+                }
+            },
+            FTBlocked(n) => FTBlocked(n),
+            FTSoft => FTSoft,
+            FTErr => FTErr,
+        },
+        FTBlocked(n) => FTBlocked(n),
+        FTErr => FTErr,
+        FTSoft => match rt {
+            FTBlocked(n) => FTBlocked(n),
+            FTErr => FTErr,
+            _ => FTSoft,
+        },
+    }
+}
+
+// fc_combine merges two operand results: a blocked operand always retries,
+// an emitted diagnostic outranks a silent failure
+fn fc_combine(lr, rr, op, sp, mut adiags) {
+    match lr {
+        FRVal(lv) => match rr {
+            FRVal(rv) => fc_bin(op, lv, rv, sp, adiags),
+            other => other,
+        },
+        FRBlocked(n) => FRBlocked(n),
+        lother => match rr {
+            FRBlocked(n2) => FRBlocked(n2),
+            FRErr => FRErr,
+            _ => lother,
+        },
+    }
+}
+
+fn fc_logical(op, lv, rv) {
+    match lv {
+        FVBool(x) => match rv {
+            FVBool(y) => if op == t_and_and {
+                FRVal(FVBool(x && y))
+            } else {
+                FRVal(FVBool(x || y))
+            },
+            _ => FRSoft,
+        },
+        _ => FRSoft,
+    }
+}
+
+fn fc_bin(op, lv, rv, sp, mut adiags) {
+    match lv {
+        FVInt(x) => match rv {
+            FVInt(y) => fc_bin_int(op, x, y, sp, adiags),
+            _ => FRSoft,
+        },
+        FVFloat(x) => match rv {
+            FVFloat(y) => fc_bin_float(op, x, y),
+            _ => FRSoft,
+        },
+        FVStr(x) => match rv {
+            FVStr(y) => fc_bin_str(op, x, y),
+            _ => FRSoft,
+        },
+        FVBool(x) => match rv {
+            FVBool(y) => fc_bin_bool(op, x, y),
+            _ => FRSoft,
+        },
+        _ => FRSoft,
+    }
+}
+
+// integer arithmetic mirrors the VM's pre-checks (vm.bur do_arith): overflow
+// and zero divisors trap there, so they are compile errors here
+fn fc_bin_int(op, x, y, sp, mut adiags) {
+    if op == t_plus {
+        if y > 0 && x > fold_max_int - y {
+            fc_trap("integer overflow: " + str(x) + " + " + str(y), sp, adiags)
+        } else if y < 0 && x < fold_min_int - y {
+            fc_trap("integer overflow: " + str(x) + " + " + str(y), sp, adiags)
+        } else {
+            FRVal(FVInt(x + y))
+        }
+    } else if op == t_minus {
+        if y > 0 && x < fold_min_int + y {
+            fc_trap("integer overflow: " + str(x) + " - " + str(y), sp, adiags)
+        } else if y < 0 && x > fold_max_int + y {
+            fc_trap("integer overflow: " + str(x) + " - " + str(y), sp, adiags)
+        } else {
+            FRVal(FVInt(x - y))
+        }
+    } else if op == t_star {
+        let mut over = false
+        if x > 0 && y > 0 && x > fold_max_int / y {
+            over = true
+        }
+        if x > 0 && y < 0 && y < fold_min_int / x {
+            over = true
+        }
+        if x < 0 && y > 0 && x < fold_min_int / y {
+            over = true
+        }
+        if x < 0 && y < 0 && x < fold_max_int / y {
+            over = true
+        }
+        if over {
+            fc_trap("integer overflow: " + str(x) + " * " + str(y), sp, adiags)
+        } else {
+            FRVal(FVInt(x * y))
+        }
+    } else if op == t_slash {
+        if y == 0 {
+            fc_trap("integer division by zero", sp, adiags)
+        } else if x == fold_min_int && y == -1 {
+            fc_trap("integer overflow: " + str(x) + " / " + str(y), sp, adiags)
+        } else {
+            FRVal(FVInt(x / y))
+        }
+    } else if op == t_percent {
+        if y == 0 {
+            fc_trap("integer modulo by zero", sp, adiags)
+        } else if x == fold_min_int && y == -1 {
+            fc_trap("integer overflow: " + str(x) + " % " + str(y), sp, adiags)
+        } else {
+            FRVal(FVInt(x % y))
+        }
+    } else {
+        fc_cmp_int(op, x, y)
+    }
+}
+
+fn fc_cmp_int(op, x, y) {
+    if op == t_eq_eq {
+        FRVal(FVBool(x == y))
+    } else if op == t_bang_eq {
+        FRVal(FVBool(x != y))
+    } else if op == t_lt {
+        FRVal(FVBool(x < y))
+    } else if op == t_lt_eq {
+        FRVal(FVBool(x <= y))
+    } else if op == t_gt {
+        FRVal(FVBool(x > y))
+    } else if op == t_gt_eq {
+        FRVal(FVBool(x >= y))
+    } else {
+        FRSoft
+    }
+}
+
+fn fc_bin_float(op, x, y) {
+    if op == t_plus || op == t_minus || op == t_star || op == t_slash {
+        let r = if op == t_plus {
+            x + y
+        } else if op == t_minus {
+            x - y
+        } else if op == t_star {
+            x * y
+        } else {
+            x / y
+        }
+        FRVal(FVFloat(r))
+    } else if op == t_eq_eq {
+        FRVal(FVBool(x == y))
+    } else if op == t_bang_eq {
+        FRVal(FVBool(x != y))
+    } else if op == t_lt {
+        FRVal(FVBool(x < y))
+    } else if op == t_lt_eq {
+        FRVal(FVBool(x <= y))
+    } else if op == t_gt {
+        FRVal(FVBool(x > y))
+    } else if op == t_gt_eq {
+        FRVal(FVBool(x >= y))
+    } else {
+        FRSoft
+    }
+}
+
+fn fc_bin_str(op, x, y) {
+    if op == t_plus {
+        FRVal(FVStr(x + y))
+    } else if op == t_eq_eq {
+        FRVal(FVBool(x == y))
+    } else if op == t_bang_eq {
+        FRVal(FVBool(x != y))
+    } else if op == t_lt {
+        FRVal(FVBool(x < y))
+    } else if op == t_lt_eq {
+        FRVal(FVBool(x <= y))
+    } else if op == t_gt {
+        FRVal(FVBool(x > y))
+    } else if op == t_gt_eq {
+        FRVal(FVBool(x >= y))
+    } else {
+        FRSoft
+    }
+}
+
+fn fc_bin_bool(op, x, y) {
+    if op == t_eq_eq {
+        FRVal(FVBool(x == y))
+    } else if op == t_bang_eq {
+        FRVal(FVBool(x != y))
+    } else {
+        FRSoft
+    }
+}
+
+fn fc_un(op, v, sp, mut adiags) {
+    if op == t_minus {
+        match v {
+            FVInt(x) => if x == fold_min_int {
+                fc_trap("integer overflow: -(" + str(x) + ")", sp, adiags)
+            } else {
+                FRVal(FVInt(0 - x))
+            },
+            FVFloat(x) => FRVal(FVFloat(0.0 - x)),
+            _ => FRSoft,
+        }
+    } else if op == t_bang {
+        match v {
+            FVBool(x) => FRVal(FVBool(!x)),
+            _ => FRSoft,
+        }
+    } else {
+        FRSoft
+    }
+}
+
+fn fc_lit(v, sp) {
+    match v {
+        FVInt(x) => IntLit(x, sp),
+        FVFloat(x) => FloatLit(x, sp),
+        FVStr(x) => StrLit(x, sp),
+        FVBool(x) => BoolLit(x, sp),
+        _ => NoNode,
+    }
+}
+
+// ---- rewrite walk ----
+
+fn fr_trunc(mark, mut env_names, mut env_vals) {
+    while len(env_names) > mark {
+        let _ = pop(env_names)
+        let _ = pop(env_vals)
+    }
+}
+
+fn fr_mask(name, mut env_names, mut env_vals) {
+    push(env_names, name)
+    push(env_vals, FVMasked)
+}
+
+fn fr_mask_pattern(p, mut env_names, mut env_vals) {
+    match p {
+        PatBinding(n, _) => fr_mask(n, env_names, env_vals),
+        PatVariant(_, _, _, binds, _) => {
+            for sub in binds {
+                fr_mask_pattern(sub, env_names, env_vals)
+            }
+        },
+        _ => {},
+    }
+}
+
+// fr_top_stmts rewrites a package file's top level: package consts were
+// already folded by the fixpoint, so folded ones become literal lets
+// silently, cycle members were already reported, and other failures re-run
+// evaluation once to commit their diagnostic
+fn fr_top_stmts(stmts, aliases, penv, qenv, cycled, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    let mut out = []
+    for s in stmts {
+        match s {
+            ConstDecl(name, nsp, is_pub, init, sp) => {
+                let folded = match get(penv, name) {
+                    Some(v) => match v {
+                        FVPoison => NoNode,
+                        val => fc_lit(val, span_of(init)),
+                    },
+                    None => NoNode,
+                }
+                match folded {
+                    NoNode => {
+                        let in_cycle = match get(cycled, name) {
+                            Some(_) => true,
+                            None => false,
+                        }
+                        if !in_cycle {
+                            let mut adiags = []
+                            let r = fc_eval(init, aliases, penv, qenv, map(), env_names, env_vals, adiags)
+                            match r {
+                                FRErr => {
+                                    for d in adiags {
+                                        push(diags, d)
+                                        push(dfiles, disp)
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                        let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        push(out, LetStmt(name, nsp, false, is_pub, init2, sp))
+                    },
+                    lit => push(out, LetStmt(name, nsp, false, is_pub, lit, sp)),
+                }
+            },
+            other => push(out, fr_stmt(other, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)),
+        }
+    }
+    out
+}
+
+fn fr_stmts(stmts, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    let mut out = []
+    for s in stmts {
+        push(out, fr_stmt(s, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp))
+    }
+    out
+}
+
+fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    match s {
+        ConstDecl(name, nsp, is_pub, init, sp) => {
+            let mut adiags = []
+            let r = fc_eval(init, aliases, penv, qenv, map(), env_names, env_vals, adiags)
+            match r {
+                FRVal(v) => {
+                    push(env_names, name)
+                    push(env_vals, v)
+                    LetStmt(name, nsp, false, is_pub, fc_lit(v, span_of(init)), sp)
+                },
+                FRErr => {
+                    for d in adiags {
+                        push(diags, d)
+                        push(dfiles, disp)
+                    }
+                    let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                    push(env_names, name)
+                    push(env_vals, FVPoison)
+                    LetStmt(name, nsp, false, is_pub, init2, sp)
+                },
+                _ => {
+                    let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                    push(env_names, name)
+                    push(env_vals, FVPoison)
+                    LetStmt(name, nsp, false, is_pub, init2, sp)
+                },
+            }
+        },
+        LetStmt(name, nsp, is_mut, is_pub, init, sp) => {
+            let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            fr_mask(name, env_names, env_vals)
+            LetStmt(name, nsp, is_mut, is_pub, init2, sp)
+        },
+        FnDecl(name, nsp, is_pub, lit, sp) => {
+            fr_mask(name, env_names, env_vals)
+            FnDecl(name, nsp, is_pub, fr_expr(lit, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp)
+        },
+        AssignStmt(target, val, sp) => AssignStmt(fr_expr(target, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(val, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        ExprStmt(e, sp) => ExprStmt(fr_expr(e, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        WhileStmt(cond, body, sp) => WhileStmt(fr_expr(cond, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        ForStmt(v, vsp, iter, isch, body, sp) => {
+            let iter2 = fr_expr(iter, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            let mark = len(env_names)
+            fr_mask(v, env_names, env_vals)
+            let body2 = fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            fr_trunc(mark, env_names, env_vals)
+            ForStmt(v, vsp, iter2, isch, body2, sp)
+        },
+        ReturnStmt(v, sp) => ReturnStmt(fr_expr(v, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        SpawnStmt(call, sp) => SpawnStmt(fr_expr(call, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        SelectStmt(arms, has_def, def, dsp, sp) => {
+            let mut arms2 = []
+            for arm in arms {
+                match arm {
+                    SelectArm(is_send, bind, bsp, ch, val, body, asp) => {
+                        let ch2 = fr_expr(ch, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        let val2 = fr_expr(val, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        let mark = len(env_names)
+                        if !is_send && bind != "" {
+                            fr_mask(bind, env_names, env_vals)
+                        }
+                        let body2 = fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        fr_trunc(mark, env_names, env_vals)
+                        push(arms2, SelectArm(is_send, bind, bsp, ch2, val2, body2, asp))
+                    },
+                    other => push(arms2, other),
+                }
+            }
+            SelectStmt(arms2, has_def, fr_expr(def, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), dsp, sp)
+        },
+        SendStmt(ch, val, sp) => SendStmt(fr_expr(ch, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(val, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        other => other,
+    }
+}
+
+fn fr_expr(e, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    match e {
+        Unary(op, rhs, sp) => Unary(op, fr_expr(rhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        Binary(op, lhs, rhs, sp) => Binary(op, fr_expr(lhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(rhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        Logical(op, lhs, rhs, sp) => Logical(op, fr_expr(lhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(rhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        Call(callee, cargs, sp) => {
+            let callee2 = fr_expr(callee, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            let mut args2 = []
+            for a in cargs {
+                push(args2, fr_expr(a, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp))
+            }
+            Call(callee2, args2, sp)
+        },
+        Pipe(lhs, target, pargs, sp) => {
+            let lhs2 = fr_expr(lhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            let mut args2 = []
+            for a in pargs {
+                push(args2, fr_expr(a, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp))
+            }
+            Pipe(lhs2, target, args2, sp)
+        },
+        Index(target, idx, sp) => Index(fr_expr(target, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(idx, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        ListLit(elems, sp) => {
+            let mut elems2 = []
+            for el in elems {
+                push(elems2, fr_expr(el, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp))
+            }
+            ListLit(elems2, sp)
+        },
+        FnLit(params, muts, pspans, ptys, rty, body, name, sp) => {
+            let mark = len(env_names)
+            if name != "" {
+                fr_mask(name, env_names, env_vals)
+            }
+            for p in params {
+                fr_mask(p, env_names, env_vals)
+            }
+            let body2 = fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            fr_trunc(mark, env_names, env_vals)
+            FnLit(params, muts, pspans, ptys, rty, body2, name, sp)
+        },
+        Block(stmts, sp) => {
+            let mark = len(env_names)
+            let stmts2 = fr_stmts(stmts, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            fr_trunc(mark, env_names, env_vals)
+            Block(stmts2, sp)
+        },
+        IfExpr(cond, then, els, sp) => IfExpr(fr_expr(cond, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(then, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(els, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        MatchExpr(scrut, arms, sp) => {
+            let scrut2 = fr_expr(scrut, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            let mut arms2 = []
+            for arm in arms {
+                match arm {
+                    MatchArm(pat, guard, body, asp) => {
+                        let mark = len(env_names)
+                        fr_mask_pattern(pat, env_names, env_vals)
+                        let guard2 = fr_expr(guard, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        let body2 = fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        fr_trunc(mark, env_names, env_vals)
+                        push(arms2, MatchArm(pat, guard2, body2, asp))
+                    },
+                    other => push(arms2, other),
+                }
+            }
+            MatchExpr(scrut2, arms2, sp)
+        },
+        TryExpr(inner, sp) => TryExpr(fr_expr(inner, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        RecvExpr(ch, sp) => RecvExpr(fr_expr(ch, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        other => other,
+    }
+}
