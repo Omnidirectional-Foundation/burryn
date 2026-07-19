@@ -945,6 +945,14 @@ static Value bur_compare(Value a, Value b, int kind) {
         default: return bur_bool(c <= 0);
         }
     }
+    if (a.t == VINT && b.t == VINT) {
+        switch (kind) {
+        case 0: return bur_bool(a.u.i > b.u.i);
+        case 1: return bur_bool(a.u.i >= b.u.i);
+        case 2: return bur_bool(a.u.i < b.u.i);
+        default: return bur_bool(a.u.i <= b.u.i);
+        }
+    }
     if ((a.t == VINT || a.t == VFLOAT) && (b.t == VINT || b.t == VFLOAT)) {
         double af = a.t == VINT ? (double)a.u.i : a.u.f;
         double bf = b.t == VINT ? (double)b.u.i : b.u.f;
