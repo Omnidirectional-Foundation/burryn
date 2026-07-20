@@ -1391,6 +1391,44 @@ typedef struct {
 static BurProc *bur_procs;
 static int64_t bur_nprocs, bur_procscap;
 
+typedef void (*BurWaitReadyFn)(int64_t owner, short revents);
+
+typedef struct {
+    struct pollfd *fds;
+    int64_t *owners;
+    BurWaitReadyFn *ready;
+    int n, cap;
+    int64_t deadline_ns;
+} BurWaitSet;
+
+static BurWaitSet bur_waitset;
+
+static void bur_wait_reset(void) {
+    bur_waitset.n = 0;
+    bur_waitset.deadline_ns = INT64_MAX;
+}
+
+static void bur_wait_fd(int fd, short events, int64_t owner, BurWaitReadyFn ready) {
+    if (fd < 0) return;
+    if (bur_waitset.n == bur_waitset.cap) {
+        bur_waitset.cap = bur_waitset.cap * 2 + 16;
+        size_t size = (size_t)bur_waitset.cap;
+        bur_waitset.fds = (struct pollfd *)realloc(bur_waitset.fds, sizeof(struct pollfd) * size);
+        bur_waitset.owners = (int64_t *)realloc(bur_waitset.owners, sizeof(int64_t) * size);
+        bur_waitset.ready = (BurWaitReadyFn *)realloc(bur_waitset.ready, sizeof(BurWaitReadyFn) * size);
+    }
+    int i = bur_waitset.n++;
+    bur_waitset.fds[i].fd = fd;
+    bur_waitset.fds[i].events = events;
+    bur_waitset.fds[i].revents = 0;
+    bur_waitset.owners[i] = owner;
+    bur_waitset.ready[i] = ready;
+}
+
+static void bur_wait_timer(int64_t deadline_ns) {
+    if (deadline_ns < bur_waitset.deadline_ns) bur_waitset.deadline_ns = deadline_ns;
+}
+
 static bool bur_proc_valid(int64_t h) {
     return h >= 0 && h < bur_nprocs && bur_procs[h].used && !bur_procs[h].consumed;
 }
@@ -1425,28 +1463,38 @@ static void bur_proc_pump(BurProc *p) {
     }
 }
 
-// poll every live proc fd (waiting timeout_ms, -1 = forever), pump what is
-// ready, and wake fibers whose awaited proc completed, in fiber id order
-static void bur_poll_io(int timeout_ms) {
-    struct pollfd *pfds = NULL;
-    int64_t *owner = NULL;
-    int n = 0;
+static void bur_proc_ready(int64_t owner, short revents) {
+    (void)revents;
+    bur_proc_pump(&bur_procs[owner]);
+}
+
+// Register every idle source through one wait set, then poll once. The
+// timer entry supplies poll's timeout; fd callbacks handle ready sources.
+static void bur_wait_poll(bool block) {
+    bur_wait_reset();
     for (int64_t i = 0; i < bur_nprocs; i++) {
         BurProc *p = &bur_procs[i];
         if (!p->used || p->complete) continue;
-        int fds[3] = { p->outfd, p->errfd, p->failfd };
-        for (int k = 0; k < 3; k++) {
-            if (fds[k] < 0) continue;
-            pfds = (struct pollfd *)realloc(pfds, sizeof(struct pollfd) * (size_t)(n + 1));
-            owner = (int64_t *)realloc(owner, sizeof(int64_t) * (size_t)(n + 1));
-            pfds[n].fd = fds[k]; pfds[n].events = POLLIN; pfds[n].revents = 0;
-            owner[n] = i; n++;
+        bur_wait_fd(p->outfd, POLLIN, i, bur_proc_ready);
+        bur_wait_fd(p->errfd, POLLIN, i, bur_proc_ready);
+        bur_wait_fd(p->failfd, POLLIN, i, bur_proc_ready);
+    }
+    for (int64_t i = 0; i < bur_nfibers; i++) {
+        Fiber *f = bur_fibers[i];
+        if (f->status == FBLOCKED_TIMER) bur_wait_timer(f->wake_ns);
+    }
+    int timeout_ms = 0;
+    if (block) {
+        timeout_ms = -1;
+        if (bur_waitset.deadline_ns != INT64_MAX) {
+            int64_t d = bur_waitset.deadline_ns - bur_now_ns();
+            timeout_ms = d <= 0 ? 0 : (int)(d / 1000000) + 1;
         }
     }
-    poll(pfds, (nfds_t)n, timeout_ms); // n == 0 degenerates to a plain sleep
-    for (int i = 0; i < n; i++)
-        if (pfds[i].revents) bur_proc_pump(&bur_procs[owner[i]]);
-    free(pfds); free(owner);
+    poll(bur_waitset.fds, (nfds_t)bur_waitset.n, timeout_ms);
+    for (int i = 0; i < bur_waitset.n; i++)
+        if (bur_waitset.fds[i].revents)
+            bur_waitset.ready[i](bur_waitset.owners[i], bur_waitset.fds[i].revents);
     if (bur_nio == 0) return;
     for (int64_t i = 0; i < bur_nfibers; i++) { // wake in fiber id order
         Fiber *f = bur_fibers[i];
@@ -1482,20 +1530,11 @@ static void bur_scheduler(void) {
     for (;;) {
         if (bur_main_fiber->status == FDONE) return;
         if (bur_ntimers > 0) bur_wake_due_timers();
-        if (bur_nio > 0) bur_poll_io(0); // keep child pipes drained
+        if (bur_nio > 0) bur_wait_poll(false); // keep child pipes drained
         Fiber *f = bur_ready_pop();
         if (!f) {
             if (bur_ntimers > 0 || bur_nio > 0) {
-                int tmo = -1; // sleep on the io fds until the nearest timer
-                if (bur_ntimers > 0) {
-                    int64_t nearest = INT64_MAX;
-                    for (int64_t i = 0; i < bur_nfibers; i++)
-                        if (bur_fibers[i]->status == FBLOCKED_TIMER && bur_fibers[i]->wake_ns < nearest)
-                            nearest = bur_fibers[i]->wake_ns;
-                    int64_t d = nearest - bur_now_ns();
-                    tmo = d <= 0 ? 0 : (int)(d / 1000000) + 1;
-                }
-                bur_poll_io(tmo);
+                bur_wait_poll(true);
                 continue;
             }
             int blocked = 0;
