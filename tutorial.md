@@ -254,6 +254,35 @@ println(n)                        // 5
 println(1 + 2 |> str)             // 3
 ```
 
+### defer / 延迟清理
+
+`defer { ... }` 把一个块挂到**包围函数**上,函数退出时按注册的逆序(LIFO)执行——
+`return`、末尾表达式和 `?` 传播都算退出。块是闭包:按引用捕获环境,退出时读到的是
+变量的最终值。trap 是进程级中止,不执行 defer。
+
+`defer { ... }` attaches a block to the **enclosing function**; the blocks run
+in reverse registration order (LIFO) when the function exits — via `return`,
+the tail expression, or `?` propagation. The block is a closure: it captures
+its environment by reference and sees each variable's final value at exit. A
+trap aborts the process and runs no defers.
+
+```rust
+fn process(path) {
+    let mut lines = 0
+    defer {
+        println("processed " + str(lines) + " line(s)")
+    }
+    let text = read_file(path)?
+    lines = len(split(text, "\n"))
+    Ok(lines)
+}
+```
+
+脚本顶层也能写 `defer`——整个脚本就是一个函数,块在脚本结束时执行。
+
+`defer` works at script top level too — the whole script is one function, so
+the blocks run when the script ends.
+
 ---
 
 ## 6. 列表与循环 / Lists and loops
@@ -681,8 +710,6 @@ enforced by tests.
   凑,字段按位置访问。
   No **records/structs**: model them with single-variant enums for now, fields
   positional.
-- **`defer`** 计划中,还没实现。
-  **`defer`** is planned but not built.
 - 还没有 `sort`、`getenv`、`math`(sqrt/floor…)、`net`、regex 等标准库;
   按需生长中。
   No `sort`, `getenv`, `math`, `net`, regex yet; growing as needed.
