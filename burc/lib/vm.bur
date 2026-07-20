@@ -98,6 +98,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut fb_fr_ip = [] // call frames: instruction pointer
     let mut fb_fr_base = [] // call frames: stack base
     let mut fb_fr_callip = [] // call frames: caller's call-site ip (traces)
+    let mut fb_fr_defers = [] // call frames: registered defer closures (run LIFO)
+    let mut fb_fr_dstash = [] // call frames: stashed exit value while defers run
+    let mut fb_fr_dact = [] // call frames: a defer exit sequence is in progress
     let mut fb_wakeat = [] // absolute clock() deadline while fs_blocked_timer
     let mut fb_ioproc = [] // host exec handle awaited while fs_blocked_io
     let mut fb_iohas = [] // scheduler delivered an exec result
@@ -476,6 +479,14 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             for ch in fb_fr_cl[fi] {
                 mark_obj(ch)
             }
+            for dl in fb_fr_defers[fi] {
+                for dh in dl {
+                    mark_obj(dh)
+                }
+            }
+            for dv in fb_fr_dstash[fi] {
+                mark_val(dv)
+            }
             for uh in fb_openuv[fi] {
                 mark_obj(uh)
             }
@@ -699,6 +710,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         push(fb_fr_ip, [0])
         push(fb_fr_base, [0])
         push(fb_fr_callip, [0])
+        push(fb_fr_defers, [[]])
+        push(fb_fr_dstash, [VUnit])
+        push(fb_fr_dact, [false])
         push(fb_wakeat, -1.0)
         push(fb_ioproc, -1)
         push(fb_iohas, false)
@@ -1336,6 +1350,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             push(fb_fr_ip[f], 0)
             push(fb_fr_base[f], ftop(f) - argc - 1)
             push(fb_fr_callip[f], cur_ip)
+            push(fb_fr_defers[f], [])
+            push(fb_fr_dstash[f], VUnit)
+            push(fb_fr_dact[f], false)
         } else if t == ot_native {
             let res = do_native(f, o_i1[h], argc)
             if park_recv < 0 && park_io < 0 {
@@ -1736,19 +1753,43 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 }
                 fb_fr_ip[f][fi] = ip
             } else if op == op_return {
-                let result = fpop(f)
-                let base = fb_fr_base[f][fi]
-                close_upvalues(f, base)
-                let _ = pop(fb_fr_cl[f])
-                let _ = pop(fb_fr_ip[f])
-                let _ = pop(fb_fr_base[f])
-                let _ = pop(fb_fr_callip[f])
-                if len(fb_fr_cl[f]) == 0 {
-                    fb_status[f] = fs_done
-                    return true
+                if len(fb_fr_defers[f][fi]) > 0 || fb_fr_dact[f][fi] {
+                    // registered defers: stash the exit value once, then run
+                    // each deferred block by re-executing this return after
+                    // its call (the re-entry pops the block's result)
+                    let v = fpop(f)
+                    if !fb_fr_dact[f][fi] {
+                        fb_fr_dstash[f][fi] = v
+                        fb_fr_dact[f][fi] = true
+                    }
+                    if len(fb_fr_defers[f][fi]) > 0 {
+                        let dh = pop(fb_fr_defers[f][fi])
+                        fb_fr_ip[f][fi] = start_ip
+                        fpush(f, VObj(dh))
+                        call_value(f, 0)
+                    } else {
+                        fpush(f, fb_fr_dstash[f][fi])
+                        fb_fr_dact[f][fi] = false
+                        fb_fr_ip[f][fi] = start_ip // plain return path below
+                    }
+                } else {
+                    let result = fpop(f)
+                    let base = fb_fr_base[f][fi]
+                    close_upvalues(f, base)
+                    let _ = pop(fb_fr_cl[f])
+                    let _ = pop(fb_fr_ip[f])
+                    let _ = pop(fb_fr_base[f])
+                    let _ = pop(fb_fr_callip[f])
+                    let _ = pop(fb_fr_defers[f])
+                    let _ = pop(fb_fr_dstash[f])
+                    let _ = pop(fb_fr_dact[f])
+                    if len(fb_fr_cl[f]) == 0 {
+                        fb_status[f] = fs_done
+                        return true
+                    }
+                    fsettop(f, base)
+                    fpush(f, result)
                 }
-                fsettop(f, base)
-                fpush(f, result)
             } else if op == op_list {
                 let n = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
@@ -1840,36 +1881,84 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             } else if op == op_no_match {
                 trap("no pattern matched value " + format_val(fpeek(f, 0), true))
             } else if op == op_try {
-                let v = fpeek(f, 0)
-                let ih = tagged_h(v, ot_enuminst)
-                let is_opt_res = if ih >= 0 {
-                    o_i1[ih] == opt_enum || o_i1[ih] == res_enum
-                } else {
-                    false
-                }
-                if !is_opt_res {
-                    trap("'?' needs an Option or Result, got " + type_name(v))
-                }
-                if o_i2[ih] == 0 {
-                    // Some/Ok
+                if fb_fr_dact[f][fi] {
+                    // mid defer-exit re-entry: drop the deferred block's
+                    // result and continue unwinding with the stashed None/Err
                     let _ = fpop(f)
-                    fpush(f, o_vals[ih][0])
-                } else {
-                    // early-return the None/Err itself
-                    let _ = fpop(f)
-                    let base = fb_fr_base[f][fi]
-                    close_upvalues(f, base)
-                    let _ = pop(fb_fr_cl[f])
-                    let _ = pop(fb_fr_ip[f])
-                    let _ = pop(fb_fr_base[f])
-                    let _ = pop(fb_fr_callip[f])
-                    if len(fb_fr_cl[f]) == 0 {
-                        fb_status[f] = fs_done
-                        return true
+                    if len(fb_fr_defers[f][fi]) > 0 {
+                        let dh = pop(fb_fr_defers[f][fi])
+                        fb_fr_ip[f][fi] = start_ip
+                        fpush(f, VObj(dh))
+                        call_value(f, 0)
+                    } else {
+                        let result = fb_fr_dstash[f][fi]
+                        let base = fb_fr_base[f][fi]
+                        close_upvalues(f, base)
+                        let _ = pop(fb_fr_cl[f])
+                        let _ = pop(fb_fr_ip[f])
+                        let _ = pop(fb_fr_base[f])
+                        let _ = pop(fb_fr_callip[f])
+                        let _ = pop(fb_fr_defers[f])
+                        let _ = pop(fb_fr_dstash[f])
+                        let _ = pop(fb_fr_dact[f])
+                        if len(fb_fr_cl[f]) == 0 {
+                            fb_status[f] = fs_done
+                            return true
+                        }
+                        fsettop(f, base)
+                        fpush(f, result)
                     }
-                    fsettop(f, base)
-                    fpush(f, v)
+                } else {
+                    let v = fpeek(f, 0)
+                    let ih = tagged_h(v, ot_enuminst)
+                    let is_opt_res = if ih >= 0 {
+                        o_i1[ih] == opt_enum || o_i1[ih] == res_enum
+                    } else {
+                        false
+                    }
+                    if !is_opt_res {
+                        trap("'?' needs an Option or Result, got " + type_name(v))
+                    }
+                    if o_i2[ih] == 0 {
+                        // Some/Ok
+                        let _ = fpop(f)
+                        fpush(f, o_vals[ih][0])
+                    } else if len(fb_fr_defers[f][fi]) > 0 {
+                        // early exit with registered defers: run them first
+                        let _ = fpop(f)
+                        fb_fr_dstash[f][fi] = v
+                        fb_fr_dact[f][fi] = true
+                        let dh = pop(fb_fr_defers[f][fi])
+                        fb_fr_ip[f][fi] = start_ip
+                        fpush(f, VObj(dh))
+                        call_value(f, 0)
+                    } else {
+                        // early-return the None/Err itself
+                        let _ = fpop(f)
+                        let base = fb_fr_base[f][fi]
+                        close_upvalues(f, base)
+                        let _ = pop(fb_fr_cl[f])
+                        let _ = pop(fb_fr_ip[f])
+                        let _ = pop(fb_fr_base[f])
+                        let _ = pop(fb_fr_callip[f])
+                        let _ = pop(fb_fr_defers[f])
+                        let _ = pop(fb_fr_dstash[f])
+                        let _ = pop(fb_fr_dact[f])
+                        if len(fb_fr_cl[f]) == 0 {
+                            fb_status[f] = fs_done
+                            return true
+                        }
+                        fsettop(f, base)
+                        fpush(f, v)
+                    }
                 }
+            } else if op == op_defer {
+                let v = fpop(f)
+                let dh = tagged_h(v, ot_closure)
+                if dh < 0 {
+                    trap("defer needs a function, got " + type_name(v) + " (VM bug)")
+                }
+                push(fb_fr_defers[f][fi], dh)
             } else if op == op_spawn {
                 let argc = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
