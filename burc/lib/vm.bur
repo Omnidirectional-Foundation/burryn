@@ -53,6 +53,9 @@ let fs_done = 4
 let fs_blocked_timer = 5
 let fs_blocked_io = 6
 
+let wait_timer = 1
+let wait_exec = 2
+
 // instructions per fiber before a forced yield (vm.go timeSlice)
 let vm_time_slice = 10000
 
@@ -112,6 +115,10 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut park_io = -1 // host exec handle set by the exec() native
     let mut ntimers = 0 // fibers currently parked on a timer
     let mut nio = 0 // fibers currently parked on child-process IO
+    let mut wait_fiber = []
+    let mut wait_kind = []
+    let mut wait_deadline = []
+    let mut wait_handle = []
     let mut yield_flag = false
     let mut opt_enum = -1
     let mut res_enum = -1
@@ -654,25 +661,74 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // poll every io-parked fiber's child; deliver finished results and wake
-    // the owners, in fiber id order
-    fn deliver_io() {
+    fn wait_reset() {
+        wait_fiber = []
+        wait_kind = []
+        wait_deadline = []
+        wait_handle = []
+    }
+
+    fn wait_add_timer(f, deadline) {
+        push(wait_fiber, f)
+        push(wait_kind, wait_timer)
+        push(wait_deadline, deadline)
+        push(wait_handle, -1)
+    }
+
+    fn wait_add_exec(f, h) {
+        push(wait_fiber, f)
+        push(wait_kind, wait_exec)
+        push(wait_deadline, -1.0)
+        push(wait_handle, h)
+    }
+
+    // Register every blocked timer and IO source through one wait list.
+    fn wait_register_all() {
+        wait_reset()
         let mut i = 0
         while i < len(fb_status) {
-            if fb_status[i] == fs_blocked_io {
-                match exec_poll(fb_ioproc[i]) {
+            if fb_status[i] == fs_blocked_timer {
+                wait_add_timer(i, fb_wakeat[i])
+            } else if fb_status[i] == fs_blocked_io {
+                wait_add_exec(i, fb_ioproc[i])
+            }
+            i = i + 1
+        }
+    }
+
+    // Poll registered IO sources and wake their fibers in fiber id order.
+    fn wait_poll_io() {
+        let mut i = 0
+        while i < len(wait_fiber) {
+            if wait_kind[i] == wait_exec {
+                let f = wait_fiber[i]
+                match exec_poll(wait_handle[i]) {
                     Some(r) => {
-                        fb_iores[i] = conv_exec_result(i, r)
-                        fb_iohas[i] = true
-                        fb_ioproc[i] = -1
+                        fb_iores[f] = conv_exec_result(f, r)
+                        fb_iohas[f] = true
+                        fb_ioproc[f] = -1
                         nio = nio - 1
-                        schedule(i)
+                        schedule(f)
                     },
                     None => {},
                 }
             }
             i = i + 1
         }
+    }
+
+    fn wait_nearest_timer() {
+        let mut nearest = -1.0
+        let mut i = 0
+        while i < len(wait_fiber) {
+            if wait_kind[i] == wait_timer {
+                if nearest < 0.0 || wait_deadline[i] < nearest {
+                    nearest = wait_deadline[i]
+                }
+            }
+            i = i + 1
+        }
+        nearest
     }
 
     // wake every timer whose deadline has passed, in (deadline, fiber id)
@@ -696,6 +752,26 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 ntimers = ntimers - 1
                 schedule(best)
                 going = true
+            }
+        }
+    }
+
+    // Block the host only while the guest has no runnable fibers.
+    fn wait_idle() {
+        while len(ready) == 0 {
+            wait_register_all()
+            if nio > 0 {
+                sleep(1)
+            } else {
+                let nearest = wait_nearest_timer()
+                let waitms = trunc((nearest - clock()) * 1000.0) + 1
+                if waitms > 0 {
+                    sleep(waitms)
+                }
+            }
+            wait_poll_io()
+            if ntimers > 0 {
+                wake_due_timers()
             }
         }
     }
@@ -2259,38 +2335,12 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             wake_due_timers()
         }
         if nio > 0 {
-            deliver_io()
+            wait_register_all()
+            wait_poll_io()
         }
         if len(ready) == 0 {
-            if nio > 0 {
-                // children still running: tick until one finishes or a timer fires
-                while len(ready) == 0 {
-                    sleep(1)
-                    deliver_io()
-                    if ntimers > 0 {
-                        wake_due_timers()
-                    }
-                }
-            } else if ntimers > 0 {
-                // all runnable work waits on timers: host-sleep until the
-                // nearest deadline, then wake whatever came due
-                while len(ready) == 0 {
-                    let mut nearest = -1.0
-                    let mut ti = 0
-                    while ti < len(fb_status) {
-                        if fb_status[ti] == fs_blocked_timer {
-                            if nearest < 0.0 || fb_wakeat[ti] < nearest {
-                                nearest = fb_wakeat[ti]
-                            }
-                        }
-                        ti = ti + 1
-                    }
-                    let waitms = trunc((nearest - clock()) * 1000.0) + 1
-                    if waitms > 0 {
-                        sleep(waitms)
-                    }
-                    wake_due_timers()
-                }
+            if nio > 0 || ntimers > 0 {
+                wait_idle()
             } else {
                 // main finished => program over (checked below); otherwise deadlock
                 let mut blocked = 0
