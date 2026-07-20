@@ -423,8 +423,23 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         }
     }
 
+    // fn_has_defer: whether fh registers defers, stepping by instruction so
+    // an operand byte can never be mistaken for the opcode
+    fn fn_has_defer(fh) {
+        let code = f_code[fh]
+        let mut ip = 0
+        while ip < len(code) {
+            if code[ip] == op_defer {
+                return true
+            }
+            ip = ip + inst_len(fh, code, ip)
+        }
+        false
+    }
+
     // ---- per-instruction translation (mirrors emitInst) ----
-    fn emit_inst(id, fh, code, ip) {
+    // hd: the function registers defers, so every exit runs bur_run_defers
+    fn emit_inst(id, fh, code, ip, hd) {
         let op = code[ip]
         if op == op_const {
             w("\tbur_push(bur_consts_" + str(id) + "[" + str(read_u16(code, ip + 1)) + "]);\n")
@@ -554,7 +569,13 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             w("\t}\n")
             p
         } else if op == op_return {
-            w("\t" + chr(123) + " Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }\n")
+            if hd {
+                // defers run before the pop: the exit value stays rooted on
+                // the stack across the deferred calls
+                w("\t" + chr(123) + " bur_run_defers(dbase); Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }\n")
+            } else {
+                w("\t" + chr(123) + " Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }\n")
+            }
             ip + 1
         } else if op == op_list {
             let n = str(read_u16(code, ip + 1))
@@ -583,7 +604,14 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             w("\t  OEnumInst *in = (v.t == VOBJ && v.u.o->type == OBJ_ENUMINST) ? (OEnumInst *)v.u.o : NULL;\n")
             w("\t  if (!in || (in->enm != bur_opt_enum && in->enm != bur_res_enum)) bur_trap(\"'?' needs an Option or Result, got %s\", bur_typename(v));\n")
             w("\t  if (in->variant == 0) " + chr(123) + " Value inner = in->fields[0]; bur_pop(); bur_push(inner); }\n")
-            w("\t  else " + chr(123) + " bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(v); return; } }\n")
+            if hd {
+                w("\t  else " + chr(123) + " bur_run_defers(dbase); bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(v); return; } }\n")
+            } else {
+                w("\t  else " + chr(123) + " bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(v); return; } }\n")
+            }
+            ip + 1
+        } else if op == op_defer {
+            w("\t" + chr(123) + " Value cl = bur_pop(); bur_defer_push(cl); }\n")
             ip + 1
         } else if op == op_spawn {
             w("\tbur_spawn(" + str(code[ip + 1]) + ");\n")
@@ -668,9 +696,13 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             }
         }
         line_dir(0, false)
+        let hd = fn_has_defer(fh)
         w("static void bur_fn_" + str(id) + "(void) " + chr(123) + " // " + f_name[fh] + "\n")
         w("\tint base = bur_cur->top - " + str(f_arity[fh]) + " - 1; (void)base;\n")
         w("\tOClosure *self = bur_cur_closure; (void)self;\n")
+        if hd {
+            w("\tint dbase = bur_cur->ndefers;\n")
+        }
         w("\tif (--bur_cur->budget <= 0) bur_preempt();\n") // preemption hook on entry
         let mut ip = 0
         while ip < len(code) {
@@ -678,7 +710,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
                 w("L" + str(ip) + ":;\n")
             }
             line_dir(ip, true)
-            ip = emit_inst(id, fh, code, ip)
+            ip = emit_inst(id, fh, code, ip, hd)
         }
         if is_target(targets, len(code)) {
             w("L" + str(len(code)) + ":;\n")

@@ -1477,6 +1477,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             RecvExpr(e, _) => scan_free(e, sc, seen, out),
             ExprStmt(e, _) => scan_free(e, sc, seen, out),
             SpawnStmt(e, _) => scan_free(e, sc, seen, out),
+            DeferStmt(e, _) => scan_free(e, sc, seen, out),
             ReturnStmt(e, _) => scan_free(e, sc, seen, out),
             Binary(_, l, r, _) => {
                 scan_free(l, sc, seen, out)
@@ -2535,6 +2536,20 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
             SpawnStmt(call, _) => {
                 let _ = infer_expr(call)
+            },
+            DeferStmt(body, ssp) => {
+                // the block is a closure body: `return`/`?` inside exit the
+                // block, and the runtime discards its result — so a dropped
+                // Result/Option must be handled, same as an expression stmt
+                let ret = fresh("")
+                push(ret_tys, ret)
+                let bt = infer_block_expr(body)
+                unify_at(ret, bt, span_of(body), "as this `defer` block's result")
+                let _ = pop(ret_tys)
+                let r = ty_resolve(tk, tr, ret)
+                if tk[r] == 0 && (tn[r] == "Result" || tn[r] == "Option") {
+                    cerr(ssp, "unused_must_use", "handle it with `match`/`?`, or discard explicitly with `let _ = ...`", "unused `" + tn[r] + "` value must be handled")
+                }
             },
             SelectStmt(arms, has_default, dflt, _, _) => {
                 for arm in arms {

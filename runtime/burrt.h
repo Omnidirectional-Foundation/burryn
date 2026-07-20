@@ -198,6 +198,9 @@ struct Fiber {
     int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
     int64_t io_proc;        // process handle awaited while FBLOCKED_IO
 
+    Value *defers;          // registered defer closures; frames delimit their
+    int ndefers, defercap;  // slice by watermark and pop it LIFO on exit
+
     ucontext_t ctx;
     char *cstack;           // heap-allocated native stack backing ctx
 
@@ -467,6 +470,7 @@ static void bur_gc_collect(void) {
         Fiber *f = bur_fibers[fi];
         for (int i = 0; i < f->top; i++) bur_mark_value(f->stack[i]);
         for (int i = 0; i < f->nopen; i++) bur_gray_push((Obj *)f->openUpvals[i]);
+        for (int i = 0; i < f->ndefers; i++) bur_mark_value(f->defers[i]);
         bur_mark_value(f->sendVal);
     }
 
@@ -1095,6 +1099,30 @@ static void bur_call(int argc) {
     }
     default:
         bur_trap("cannot call %s", bur_typename(callee));
+    }
+}
+
+// ---- defers -----------------------------------------------------------
+
+// bur_defer_push registers a closure on the current fiber's defer stack;
+// the registering frame runs its slice LIFO on every function exit
+static void bur_defer_push(Value cl) {
+    if (bur_cur->ndefers == bur_cur->defercap) {
+        bur_cur->defercap = bur_cur->defercap * 2 + 8;
+        bur_cur->defers = (Value *)realloc(bur_cur->defers, sizeof(Value) * (size_t)bur_cur->defercap);
+    }
+    bur_cur->defers[bur_cur->ndefers++] = cl;
+}
+
+// bur_run_defers pops and calls the frame's defers (those above dbase)
+// LIFO; callers run it before popping the exit value so that value stays
+// rooted on the stack across the deferred calls
+static void bur_run_defers(int dbase) {
+    while (bur_cur->ndefers > dbase) {
+        Value cl = bur_cur->defers[--bur_cur->ndefers];
+        bur_push(cl);
+        bur_call(0);
+        bur_pop();
     }
 }
 

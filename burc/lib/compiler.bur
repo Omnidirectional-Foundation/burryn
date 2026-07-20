@@ -54,6 +54,7 @@ let op_send = 45
 let op_recv = 46
 let op_chan_next = 47
 let op_select = 48
+let op_defer = 49
 
 // native global names, mirroring nativeNames() in builtins.go
 let native_names = ["print", "println", "eprintln", "len", "map", "get", "put", "delete", "keys", "push", "pop", "str", "trunc", "to_float", "float_bits", "parse_int", "parse_float", "str_len", "char_at", "byte_at", "range", "split", "join", "substr", "str_contains", "str_index_of", "trim", "slice", "concat", "contains", "read_file", "write_file", "file_exists", "read_dir", "exec", "args", "exit", "chan", "close", "recv", "chr", "ord", "clock", "type_of", "assert", "gc", "heap_objects", "gc_cycles", "yield", "sleep", "exec_start", "exec_poll"]
@@ -1790,6 +1791,18 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     },
                     _ => Ok(true),
                 }
+            },
+            DeferStmt(body, sp) => {
+                // the block compiles as a zero-param closure; op_defer moves
+                // it onto the current frame's defer stack, run LIFO on exit
+                match cp_function(ch, FnLit([], [], [], [], NoNode, body, "<defer>", sp)) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                emit(ch, op_defer, sp)
+                Ok(true)
             },
             SendStmt(cch, val, sp) => {
                 match cp_expr(ch, cch) {
