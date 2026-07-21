@@ -771,6 +771,96 @@ static Value nat_net_close(Value *args, int argc) {
     return bur_unit();
 }
 
+// net_nb: non-blocking socket operation for the VM scheduler.
+// op 0 = accept, op 1 = read, op 2 = write.
+// Returns Ok(str) on success, Err("__eagain") when the operation would
+// block, Err(msg) on real errors.
+static Value nat_net_nb(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT || args[1].t != VINT || args[3].t != VINT)
+        bur_trap("net_nb() needs (int, int, str, int)");
+    int64_t op = args[0].u.i, h = args[1].u.i;
+
+    if (op == 0) { // accept
+        BurNet *listener = bur_net_get(h, BUR_NET_LISTENER);
+        if (!listener) return bur_net_err("tcp_accept", "invalid listener handle");
+        for (;;) {
+            int fd = accept(listener->fd, NULL, NULL);
+            if (fd >= 0) {
+                int flags = fcntl(fd, F_GETFL, 0);
+                if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+                    fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+                    int saved = errno;
+                    close(fd);
+                    return bur_net_err("tcp_accept", strerror(saved));
+                }
+#ifdef SO_NOSIGPIPE
+                int one = 1;
+                setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+                int64_t ch = bur_net_alloc(fd, BUR_NET_CONN);
+                char buf[24];
+                int n = snprintf(buf, sizeof buf, "%lld", (long long)ch);
+                return bur_ok(bur_obj((Obj *)bur_new_string_n(buf, n)));
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return bur_net_err("tcp_accept", "__eagain");
+            return bur_net_err("tcp_accept", strerror(errno));
+        }
+    }
+    if (op == 1) { // read
+        int64_t max = args[3].u.i;
+        if (max < 0) return bur_net_err("net_read", "max must not be negative");
+        if (max == 0) return bur_net_ok_str("", 0);
+        char *buf = (char *)malloc((size_t)max);
+        for (;;) {
+            BurNet *conn = bur_net_get(h, BUR_NET_CONN);
+            if (!conn) { free(buf); return bur_net_err("net_read", "invalid connection handle"); }
+            ssize_t n = recv(conn->fd, buf, (size_t)max, 0);
+            if (n >= 0) {
+                Value res = bur_net_ok_str(buf, (int64_t)n);
+                free(buf);
+                return res;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                free(buf);
+                return bur_net_err("net_read", "__eagain");
+            }
+            int saved = errno;
+            free(buf);
+            return bur_net_err("net_read", strerror(saved));
+        }
+    }
+    if (op == 2) { // write (single attempt, returns bytes written)
+        const char *data; int64_t len;
+        if (!nat_as_str(args[2], &data, &len))
+            bur_trap("net_nb(write) needs a str argument");
+        BurNet *conn = bur_net_get(h, BUR_NET_CONN);
+        if (!conn) return bur_net_err("net_write", "invalid connection handle");
+        if (len == 0) return bur_net_ok_str("0", 1);
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        for (;;) {
+            ssize_t n = send(conn->fd, data, (size_t)len, flags);
+            if (n >= 0) {
+                char buf[24];
+                int sn = snprintf(buf, sizeof buf, "%lld", (long long)n);
+                return bur_ok(bur_obj((Obj *)bur_new_string_n(buf, sn)));
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return bur_net_err("net_write", "__eagain");
+            return bur_net_err("net_write", strerror(errno));
+        }
+    }
+    bur_trap("net_nb: invalid op %lld", (long long)op);
+    return bur_unit();
+}
+
 // ---- process, misc ----------------------------------------------------
 
 static Value nat_args(Value *args, int argc) {
@@ -937,6 +1027,7 @@ static void bur_register_natives(void) {
     bur_register_native("net_read", 2, nat_net_read);
     bur_register_native("net_write", 2, nat_net_write);
     bur_register_native("net_close", 1, nat_net_close);
+    bur_register_native("net_nb", 4, nat_net_nb);
     bur_register_native("type_of", 1, nat_type_of);
     bur_register_native("assert", 2, nat_assert);
     bur_register_native("gc", 0, nat_gc);
