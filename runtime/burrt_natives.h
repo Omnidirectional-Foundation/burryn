@@ -805,7 +805,7 @@ static Value nat_net_nb(Value *args, int argc) {
             }
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return bur_net_err("tcp_accept", "__eagain");
+                return bur_err_str("__eagain");
             return bur_net_err("tcp_accept", strerror(errno));
         }
     }
@@ -826,7 +826,7 @@ static Value nat_net_nb(Value *args, int argc) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 free(buf);
-                return bur_net_err("net_read", "__eagain");
+                return bur_err_str("__eagain");
             }
             int saved = errno;
             free(buf);
@@ -853,7 +853,7 @@ static Value nat_net_nb(Value *args, int argc) {
             }
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return bur_net_err("net_write", "__eagain");
+                return bur_err_str("__eagain");
             return bur_net_err("net_write", strerror(errno));
         }
     }
