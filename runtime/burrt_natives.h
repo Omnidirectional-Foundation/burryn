@@ -528,6 +528,249 @@ static Value nat_exec_poll(Value *args, int argc) {
     return opt;
 }
 
+// ---- tcp -------------------------------------------------------------
+
+typedef enum { BUR_NET_LISTENER, BUR_NET_CONN } BurNetKind;
+
+typedef struct {
+    int fd;
+    BurNetKind kind;
+    bool used;
+} BurNet;
+
+static BurNet *bur_nets;
+static int64_t bur_nnets, bur_netscap;
+
+static Value bur_net_err(const char *op, const char *msg) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s: %s", op, msg);
+    return bur_err_str(buf);
+}
+
+static Value bur_net_ok_str(const char *data, int64_t len) {
+    bur_push(bur_obj((Obj *)bur_new_string_n(data, len)));
+    Value res = bur_ok(bur_peek(0));
+    bur_pop();
+    return res;
+}
+
+static int bur_net_socket(int family, int socktype, int protocol) {
+    int fd = socket(family, socktype, protocol);
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+        fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    return fd;
+}
+
+static int64_t bur_net_alloc(int fd, BurNetKind kind) {
+    if (bur_nnets == bur_netscap) {
+        bur_netscap = bur_netscap * 2 + 16;
+        bur_nets = (BurNet *)realloc(bur_nets, sizeof(BurNet) * (size_t)bur_netscap);
+    }
+    int64_t h = bur_nnets++;
+    bur_nets[h].fd = fd;
+    bur_nets[h].kind = kind;
+    bur_nets[h].used = true;
+    return h;
+}
+
+static BurNet *bur_net_get(int64_t h, BurNetKind kind) {
+    if (h < 0 || h >= bur_nnets || !bur_nets[h].used || bur_nets[h].kind != kind) return NULL;
+    return &bur_nets[h];
+}
+
+static void bur_net_cancel_waiters(int fd) {
+    for (int64_t i = 0; i < bur_nfibers; i++) {
+        Fiber *f = bur_fibers[i];
+        if (f->status != FBLOCKED_IO || f->io_fd != fd) continue;
+        bur_nio--;
+        f->io_fd = -1;
+        f->io_events = 0;
+        f->io_ready = false;
+        bur_schedule(f);
+    }
+}
+
+static Value nat_tcp_listen(Value *args, int argc) {
+    (void)argc;
+    const char *host; int64_t hostn;
+    if (!nat_as_str(args[0], &host, &hostn) || args[1].t != VINT)
+        bur_trap("tcp_listen() needs (str, int)");
+    int64_t port = args[1].u.i;
+    if (port < 0 || port > 65535) return bur_net_err("tcp_listen", "port out of range");
+
+    char service[24];
+    snprintf(service, sizeof service, "%lld", (long long)port);
+    struct addrinfo hints = {0}, *addrs = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
+    int gai = getaddrinfo(hostn == 0 ? NULL : host, service, &hints, &addrs);
+    if (gai != 0) return bur_net_err("tcp_listen", gai_strerror(gai));
+
+    int fd = -1, saved = EADDRNOTAVAIL;
+    for (struct addrinfo *a = addrs; a; a = a->ai_next) {
+        fd = bur_net_socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (fd < 0) { saved = errno; continue; }
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind(fd, a->ai_addr, a->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
+        saved = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(addrs);
+    if (fd < 0) return bur_net_err("tcp_listen", strerror(saved));
+    return bur_ok(bur_int(bur_net_alloc(fd, BUR_NET_LISTENER)));
+}
+
+static Value nat_tcp_accept(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT) bur_trap("tcp_accept() needs an int");
+    int64_t h = args[0].u.i;
+    for (;;) {
+        BurNet *listener = bur_net_get(h, BUR_NET_LISTENER);
+        if (!listener) return bur_net_err("tcp_accept", "invalid listener handle");
+        int fd = accept(listener->fd, NULL, NULL);
+        if (fd >= 0) {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+                fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+                int saved = errno;
+                close(fd);
+                return bur_net_err("tcp_accept", strerror(saved));
+            }
+#ifdef SO_NOSIGPIPE
+            int one = 1;
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+            return bur_ok(bur_int(bur_net_alloc(fd, BUR_NET_CONN)));
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return bur_net_err("tcp_accept", strerror(errno));
+        bur_wait_current_fd(listener->fd, POLLIN);
+    }
+}
+
+static Value nat_tcp_dial(Value *args, int argc) {
+    (void)argc;
+    const char *host; int64_t hostn;
+    if (!nat_as_str(args[0], &host, &hostn) || args[1].t != VINT)
+        bur_trap("tcp_dial() needs (str, int)");
+    int64_t port = args[1].u.i;
+    if (hostn == 0) return bur_net_err("tcp_dial", "empty host");
+    if (port < 0 || port > 65535) return bur_net_err("tcp_dial", "port out of range");
+
+    char service[24];
+    snprintf(service, sizeof service, "%lld", (long long)port);
+    struct addrinfo hints = {0}, *addrs = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV;
+    int gai = getaddrinfo(host, service, &hints, &addrs);
+    if (gai != 0) return bur_net_err("tcp_dial", gai_strerror(gai));
+
+    int fd = -1, saved = ECONNREFUSED;
+    for (struct addrinfo *a = addrs; a; a = a->ai_next) {
+        fd = bur_net_socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (fd < 0) { saved = errno; continue; }
+        if (connect(fd, a->ai_addr, a->ai_addrlen) < 0) {
+            if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+                saved = errno;
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            bur_wait_current_fd(fd, POLLOUT);
+            socklen_t n = sizeof saved;
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &saved, &n) < 0) saved = errno;
+            if (saved != 0) {
+                close(fd);
+                fd = -1;
+                continue;
+            }
+        }
+        break;
+    }
+    freeaddrinfo(addrs);
+    if (fd < 0) return bur_net_err("tcp_dial", strerror(saved));
+    return bur_ok(bur_int(bur_net_alloc(fd, BUR_NET_CONN)));
+}
+
+static Value nat_net_read(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT || args[1].t != VINT) bur_trap("net_read() needs (int, int)");
+    int64_t h = args[0].u.i, max = args[1].u.i;
+    if (max < 0) return bur_net_err("net_read", "max must not be negative");
+    if (max == 0) return bur_net_ok_str("", 0);
+    char *buf = (char *)malloc((size_t)max);
+    for (;;) {
+        BurNet *conn = bur_net_get(h, BUR_NET_CONN);
+        if (!conn) { free(buf); return bur_net_err("net_read", "invalid connection handle"); }
+        ssize_t n = recv(conn->fd, buf, (size_t)max, 0);
+        if (n >= 0) {
+            Value res = bur_net_ok_str(buf, (int64_t)n);
+            free(buf);
+            return res;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            int saved = errno;
+            free(buf);
+            return bur_net_err("net_read", strerror(saved));
+        }
+        bur_wait_current_fd(conn->fd, POLLIN);
+    }
+}
+
+static Value nat_net_write(Value *args, int argc) {
+    (void)argc;
+    const char *data; int64_t len;
+    if (args[0].t != VINT || !nat_as_str(args[1], &data, &len))
+        bur_trap("net_write() needs (int, str)");
+    int64_t h = args[0].u.i, off = 0;
+    while (off < len) {
+        BurNet *conn = bur_net_get(h, BUR_NET_CONN);
+        if (!conn) return bur_net_err("net_write", "invalid connection handle");
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(conn->fd, data + off, (size_t)(len - off), flags);
+        if (n > 0) { off += (int64_t)n; continue; }
+        if (n == 0) return bur_net_err("net_write", "write returned zero bytes");
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return bur_net_err("net_write", strerror(errno));
+        bur_wait_current_fd(conn->fd, POLLOUT);
+    }
+    return bur_ok(bur_unit());
+}
+
+static Value nat_net_close(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT) bur_trap("net_close() needs an int");
+    int64_t h = args[0].u.i;
+    if (h < 0 || h >= bur_nnets || !bur_nets[h].used)
+        bur_trap("net_close: invalid or closed handle %lld", (long long)h);
+    int fd = bur_nets[h].fd;
+    bur_nets[h].used = false;
+    bur_net_cancel_waiters(fd);
+    close(fd);
+    return bur_unit();
+}
+
 // ---- process, misc ----------------------------------------------------
 
 static Value nat_args(Value *args, int argc) {
@@ -688,6 +931,12 @@ static void bur_register_natives(void) {
     bur_register_native("sleep", 1, nat_sleep);
     bur_register_native("exec_start", 2, nat_exec_start);
     bur_register_native("exec_poll", 1, nat_exec_poll);
+    bur_register_native("tcp_listen", 2, nat_tcp_listen);
+    bur_register_native("tcp_accept", 1, nat_tcp_accept);
+    bur_register_native("tcp_dial", 2, nat_tcp_dial);
+    bur_register_native("net_read", 2, nat_net_read);
+    bur_register_native("net_write", 2, nat_net_write);
+    bur_register_native("net_close", 1, nat_net_close);
     bur_register_native("type_of", 1, nat_type_of);
     bur_register_native("assert", 2, nat_assert);
     bur_register_native("gc", 0, nat_gc);

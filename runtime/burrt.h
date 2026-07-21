@@ -31,6 +31,8 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #include <ucontext.h>
 
 // ---- Value ------------------------------------------------------------
@@ -197,6 +199,9 @@ struct Fiber {
     int budget;             // instructions remaining before a forced yield
     int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
     int64_t io_proc;        // process handle awaited while FBLOCKED_IO
+    int io_fd;              // descriptor awaited while FBLOCKED_IO
+    short io_events;        // poll events requested for io_fd
+    bool io_ready;          // scheduler observed readiness for io_fd
 
     Value *defers;          // registered defer closures; frames delimit their
     int ndefers, defercap;  // slice by watermark and pop it LIFO on exit
@@ -1314,6 +1319,14 @@ static void bur_park(FiberStatus st) {
     swapcontext(&bur_cur->ctx, &bur_sched_ctx);
     bur_cur->budget = BUR_TIMESLICE;
 }
+static void bur_wait_current_fd(int fd, short events) {
+    bur_cur->io_proc = -1;
+    bur_cur->io_fd = fd;
+    bur_cur->io_events = events;
+    bur_cur->io_ready = false;
+    bur_nio++;
+    bur_park(FBLOCKED_IO);
+}
 static void bur_switch_to_sched(void) {
     swapcontext(&bur_cur->ctx, &bur_sched_ctx);
     bur_cur->budget = BUR_TIMESLICE;
@@ -1338,6 +1351,8 @@ static Fiber *bur_new_fiber(OClosure *cl, Value *args, int argc, size_t stacksiz
     f->status = FREADY;
     f->sendVal = bur_unit();
     f->budget = BUR_TIMESLICE;
+    f->io_proc = -1;
+    f->io_fd = -1;
     f->entry = cl;
     f->trace_cap = 8;
     f->trace_fn = (OFunc **)calloc(8, sizeof(OFunc *));
@@ -1468,6 +1483,12 @@ static void bur_proc_ready(int64_t owner, short revents) {
     bur_proc_pump(&bur_procs[owner]);
 }
 
+static void bur_fiber_fd_ready(int64_t owner, short revents) {
+    (void)revents;
+    Fiber *f = bur_fibers[owner];
+    if (f->status == FBLOCKED_IO && f->io_fd >= 0) f->io_ready = true;
+}
+
 // Register every idle source through one wait set, then poll once. The
 // timer entry supplies poll's timeout; fd callbacks handle ready sources.
 static void bur_wait_poll(bool block) {
@@ -1482,6 +1503,8 @@ static void bur_wait_poll(bool block) {
     for (int64_t i = 0; i < bur_nfibers; i++) {
         Fiber *f = bur_fibers[i];
         if (f->status == FBLOCKED_TIMER) bur_wait_timer(f->wake_ns);
+        else if (f->status == FBLOCKED_IO && f->io_fd >= 0)
+            bur_wait_fd(f->io_fd, f->io_events, i, bur_fiber_fd_ready);
     }
     int timeout_ms = 0;
     if (block) {
@@ -1498,8 +1521,15 @@ static void bur_wait_poll(bool block) {
     if (bur_nio == 0) return;
     for (int64_t i = 0; i < bur_nfibers; i++) { // wake in fiber id order
         Fiber *f = bur_fibers[i];
-        if (f->status == FBLOCKED_IO && bur_procs[f->io_proc].complete) {
+        bool ready = f->io_ready;
+        if (!ready && f->status == FBLOCKED_IO && f->io_proc >= 0)
+            ready = bur_procs[f->io_proc].complete;
+        if (f->status == FBLOCKED_IO && ready) {
             bur_nio--;
+            f->io_proc = -1;
+            f->io_fd = -1;
+            f->io_events = 0;
+            f->io_ready = false;
             bur_schedule(f);
         }
     }
