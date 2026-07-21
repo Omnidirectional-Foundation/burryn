@@ -1,0 +1,53 @@
+// Net error paths: port-in-use, connection-refused, read-EOF.
+fn eof_server(lh) {
+    match tcp_accept(lh) {
+        Ok(conn) => {
+            net_close(conn) // close immediately: client sees EOF
+        },
+        Err(_) => {},
+    }
+}
+
+fn main_loop() {
+    // 1. port in use
+    let port = 19879
+    let lh = match tcp_listen("127.0.0.1", port) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln("first listen failed: " + e)
+            exit(1)
+        },
+    }
+    match tcp_listen("127.0.0.1", port) {
+        Ok(_) => println("unexpected: second listen succeeded"),
+        Err(_) => println("port in use: Err"),
+    }
+
+    // 2. connection refused (no listener on this port)
+    match tcp_dial("127.0.0.1", 19880) {
+        Ok(_) => println("unexpected: dial succeeded"),
+        Err(_) => println("connection refused: Err"),
+    }
+
+    // 3. read EOF
+    spawn eof_server(lh)
+    match tcp_dial("127.0.0.1", port) {
+        Ok(conn) => {
+            match net_read(conn, 1024) {
+                Ok(data) => {
+                    if str_len(data) == 0 {
+                        println("read EOF: empty string")
+                    } else {
+                        println("unexpected data: " + data)
+                    }
+                    net_close(conn)
+                },
+                Err(e) => println("read err: " + e),
+            }
+        },
+        Err(e) => eprintln("eof dial: " + e),
+    }
+    net_close(lh)
+}
+
+main_loop()
