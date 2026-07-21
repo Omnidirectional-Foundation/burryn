@@ -235,6 +235,204 @@ func typecheckModule(m *Module) []Diag {
 	return c.diags
 }
 
+// ---- free-name scan (dependency edges for SCC inference order) ----
+
+func scanBound(scope []map[string]bool, name string) bool {
+	for i := len(scope) - 1; i >= 0; i-- {
+		if scope[i][name] {
+			return true
+		}
+	}
+	return false
+}
+
+func pushScope(scope []map[string]bool) []map[string]bool {
+	s := make([]map[string]bool, len(scope)+1)
+	copy(s, scope)
+	s[len(scope)] = map[string]bool{}
+	return s
+}
+
+func (c *Checker) scanFreeExpr(e Expr, scope []map[string]bool, seen map[string]bool, out *[]string) {
+	switch ex := e.(type) {
+	case *Ident:
+		if !scanBound(scope, ex.Name) && !seen[ex.Name] {
+			seen[ex.Name] = true
+			*out = append(*out, ex.Name)
+		}
+	case *Unary:
+		c.scanFreeExpr(ex.Rhs, scope, seen, out)
+	case *Binary:
+		c.scanFreeExpr(ex.Lhs, scope, seen, out)
+		c.scanFreeExpr(ex.Rhs, scope, seen, out)
+	case *Logical:
+		c.scanFreeExpr(ex.Lhs, scope, seen, out)
+		c.scanFreeExpr(ex.Rhs, scope, seen, out)
+	case *Call:
+		c.scanFreeExpr(ex.Callee, scope, seen, out)
+		for _, a := range ex.Args {
+			c.scanFreeExpr(a, scope, seen, out)
+		}
+	case *Index:
+		c.scanFreeExpr(ex.Target, scope, seen, out)
+		c.scanFreeExpr(ex.Idx, scope, seen, out)
+	case *ListLit:
+		for _, el := range ex.Elems {
+			c.scanFreeExpr(el, scope, seen, out)
+		}
+	case *FnLit:
+		inner := pushScope(scope)
+		for _, p := range ex.Params {
+			inner[len(inner)-1][p] = true
+		}
+		c.scanFreeBlock(ex.Body, inner, seen, out)
+	case *Block:
+		c.scanFreeBlock(ex, scope, seen, out)
+	case *IfExpr:
+		c.scanFreeExpr(ex.Cond, scope, seen, out)
+		c.scanFreeBlock(ex.Then, scope, seen, out)
+		if ex.Else != nil {
+			c.scanFreeExpr(ex.Else, scope, seen, out)
+		}
+	case *MatchExpr:
+		c.scanFreeExpr(ex.Scrut, scope, seen, out)
+		for _, arm := range ex.Arms {
+			inner := pushScope(scope)
+			c.scanFreePat(arm.Pat, inner, seen, out)
+			c.scanFreeExpr(arm.Body, inner, seen, out)
+		}
+	case *TryExpr:
+		c.scanFreeExpr(ex.Inner, scope, seen, out)
+	case *RecvExpr:
+		c.scanFreeExpr(ex.Chan, scope, seen, out)
+	}
+}
+
+func (c *Checker) scanFreeBlock(b *Block, scope []map[string]bool, seen map[string]bool, out *[]string) {
+	inner := pushScope(scope)
+	for _, s := range b.Stmts {
+		c.scanFreeStmt(s, inner, seen, out)
+	}
+}
+
+func (c *Checker) scanFreeStmt(s Stmt, scope []map[string]bool, seen map[string]bool, out *[]string) {
+	switch st := s.(type) {
+	case *LetStmt:
+		c.scanFreeExpr(st.Init, scope, seen, out)
+		scope[len(scope)-1][st.Name] = true
+	case *AssignStmt:
+		c.scanFreeExpr(st.Target, scope, seen, out)
+		c.scanFreeExpr(st.Val, scope, seen, out)
+	case *ExprStmt:
+		c.scanFreeExpr(st.E, scope, seen, out)
+	case *WhileStmt:
+		c.scanFreeExpr(st.Cond, scope, seen, out)
+		c.scanFreeBlock(st.Body, scope, seen, out)
+	case *ForStmt:
+		c.scanFreeExpr(st.Iter, scope, seen, out)
+		inner := pushScope(scope)
+		inner[len(inner)-1][st.Var] = true
+		c.scanFreeBlock(st.Body, inner, seen, out)
+	case *ReturnStmt:
+		if st.Val != nil {
+			c.scanFreeExpr(st.Val, scope, seen, out)
+		}
+	case *FnDecl:
+		scope[len(scope)-1][st.Name] = true
+		c.scanFreeExpr(st.Fn, scope, seen, out)
+	case *SpawnStmt:
+		c.scanFreeExpr(st.CallE, scope, seen, out)
+	case *SendStmt:
+		c.scanFreeExpr(st.Chan, scope, seen, out)
+		c.scanFreeExpr(st.Val, scope, seen, out)
+	case *SelectStmt:
+		for _, arm := range st.Arms {
+			c.scanFreeExpr(arm.Chan, scope, seen, out)
+			if arm.Val != nil {
+				c.scanFreeExpr(arm.Val, scope, seen, out)
+			}
+			inner := pushScope(scope)
+			if !arm.IsSend && arm.Bind != "" && arm.Bind != "_" {
+				inner[len(inner)-1][arm.Bind] = true
+			}
+			c.scanFreeExpr(arm.Body, inner, seen, out)
+		}
+		if st.HasDefault && st.Default != nil {
+			c.scanFreeExpr(st.Default, scope, seen, out)
+		}
+	}
+}
+
+func (c *Checker) scanFreePat(p Pattern, scope []map[string]bool, seen map[string]bool, out *[]string) {
+	switch pat := p.(type) {
+	case *PatBinding:
+		if sig, _, amb := c.findVariantSig(pat.Name); sig == nil && !amb {
+			scope[len(scope)-1][pat.Name] = true
+		}
+	case *PatVariant:
+		for _, sub := range pat.Binds {
+			if pb, ok := sub.(*PatBinding); ok {
+				scope[len(scope)-1][pb.Name] = true
+			}
+		}
+	}
+}
+
+// sccGroups computes strongly connected components with Tarjan's algorithm.
+// Components come out in completion order (callees first).
+func sccGroups(adj [][]int) [][]int {
+	n := len(adj)
+	sidx := make([]int, n)
+	slow := make([]int, n)
+	onstk := make([]bool, n)
+	for i := range sidx {
+		sidx[i] = -1
+	}
+	var stk []int
+	counter := 0
+	var comps [][]int
+
+	var connect func(v int)
+	connect = func(v int) {
+		sidx[v] = counter
+		slow[v] = counter
+		counter++
+		stk = append(stk, v)
+		onstk[v] = true
+		for _, w := range adj[v] {
+			if sidx[w] < 0 {
+				connect(w)
+				if slow[w] < slow[v] {
+					slow[v] = slow[w]
+				}
+			} else if onstk[w] {
+				if sidx[w] < slow[v] {
+					slow[v] = sidx[w]
+				}
+			}
+		}
+		if slow[v] == sidx[v] {
+			var comp []int
+			for {
+				w := stk[len(stk)-1]
+				stk = stk[:len(stk)-1]
+				onstk[w] = false
+				comp = append(comp, w)
+				if w == v {
+					break
+				}
+			}
+			comps = append(comps, comp)
+		}
+	}
+	for i := 0; i < n; i++ {
+		if sidx[i] < 0 {
+			connect(i)
+		}
+	}
+	return comps
+}
+
 // checkPackage runs the two-pass top-level inference over all files of one
 // package sharing a single package scope, then snapshots its symbols for
 // importers.
@@ -259,7 +457,14 @@ func (c *Checker) checkPackage(pkg *Package, isEntry bool) {
 	// pass 1.5: pre-declare every package-level value name (monomorphic)
 	pre := map[string]*TV{}
 	top := c.scopes[len(c.scopes)-1]
-	for _, f := range pkg.Files {
+	type fnSlot struct {
+		name    string
+		decl    *FnDecl
+		fileIdx int
+	}
+	var fns []fnSlot
+	fnIdx := map[string]int{}
+	for fi, f := range pkg.Files {
 		c.curFile = f.Path
 		for _, s := range f.Stmts {
 			switch st := s.(type) {
@@ -269,6 +474,8 @@ func (c *Checker) checkPackage(pkg *Package, isEntry bool) {
 				c.declare(st.Name, &Scheme{t: tv}, false, "global", st.NameSpan)
 				top[st.Name].isFn = true
 				top[st.Name].pub = st.Pub
+				fnIdx[st.Name] = len(fns)
+				fns = append(fns, fnSlot{st.Name, st, fi})
 			case *LetStmt:
 				tv := c.fresh("")
 				pre[st.Name] = tv
@@ -277,19 +484,76 @@ func (c *Checker) checkPackage(pkg *Package, isEntry bool) {
 			}
 		}
 	}
-	// pass 2: infer file by file, in load order
+
+	// pass 1.7: fn dependency graph and SCC groups (callees first)
+	adj := make([][]int, len(fns))
+	for i := range adj {
+		adj[i] = []int{}
+	}
+	for i, fs := range fns {
+		c.curFile = pkg.Files[fs.fileIdx].Path
+		scope := []map[string]bool{{}}
+		seen := map[string]bool{}
+		var free []string
+		c.scanFreeExpr(fs.decl.Fn, scope, seen, &free)
+		for _, name := range free {
+			if j, ok := fnIdx[name]; ok && !slices.Contains(adj[i], j) {
+				adj[i] = append(adj[i], j)
+			}
+		}
+	}
+	groups := sccGroups(adj)
+	nameGroup := make([]int, len(fns))
+	for gi, g := range groups {
+		for _, n := range g {
+			nameGroup[n] = gi
+		}
+	}
+	gdecls := make([][]int, len(groups))
+	for i := range fns {
+		gi := nameGroup[i]
+		gdecls[gi] = append(gdecls[gi], i)
+	}
+
+	// pass 2a: infer fns group by group in dependency order; group
+	// placeholders live at the raised level so mutual references stay
+	// un-generalized inside the group; each member generalizes once the
+	// whole group is inferred
+	for gi := range groups {
+		c.level++
+		gtv := map[string]*TV{}
+		for _, n := range groups[gi] {
+			name := fns[n].name
+			tv := c.fresh("")
+			b := c.lookup(name)
+			b.scheme = &Scheme{t: tv}
+			gtv[name] = tv
+		}
+		gft := make([]Ty, len(gdecls[gi]))
+		for di, fni := range gdecls[gi] {
+			fs := fns[fni]
+			c.curFile = pkg.Files[fs.fileIdx].Path
+			ft := c.inferExpr(fs.decl.Fn)
+			if tv, ok := gtv[fs.name]; ok {
+				c.unifyAt(tv, ft, fs.decl.NameSpan, "in this function")
+			}
+			gft[di] = ft
+		}
+		c.level--
+		for di, fni := range gdecls[gi] {
+			b := c.lookup(fns[fni].name)
+			b.scheme = c.generalize(gft[di])
+		}
+	}
+
+	// pass 2b: infer remaining top-level statements file by file, in load
+	// order (matches the runtime initialization order of package-level lets)
 	for _, f := range pkg.Files {
 		c.curFile = f.Path
 		for _, s := range f.Stmts {
 			switch st := s.(type) {
 			case *FnDecl:
-				c.level++
-				ft := c.inferExpr(st.Fn)
-				c.level--
-				// generalize before linking the placeholder: see typecheck
-				b := c.lookup(st.Name)
-				b.scheme = c.generalize(ft)
-				c.unifyAt(pre[st.Name], ft, st.NameSpan, "in this function")
+				// inferred in pass 2a
 			case *LetStmt:
 				t := c.inferLetInit(st)
 				c.unifyAt(pre[st.Name], t, st.NameSpan, "in this binding")
