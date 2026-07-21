@@ -174,7 +174,7 @@
 S6.1 无剩余项。
 
 - S6.1 解析层(无网络)——**已落地**：`burc/lib/modgraph.bur` 构建依赖图跑 MVS(选满足约束的**最低**版本)；`bur.sum` lockfile(`path version hash`)；module loader 命中 require 图后从缓存加载跨模块 import；缓存目录 `$BURCACHE` 默认 `~/.burryn/pkg/<path>@<version>/`
-- S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native——**已落地(2026-07-10)**：shell-out 方案成立，零新 native；`bur mod init/tidy/download/verify` 与 `bur get` 全部接线；`bur get` 拉取失败回滚 bur.mod；树哈希输出已从 hex 纠正为定案的 `h1:<base64>`。**实现侧默认(2026-07-11 owner 追认为定案)**：clone URL = `https://<module path>`(Go 式「模块路径即仓库路径」，不支持子目录模块，真实需求出现再议 discovery)，环境变量 `$BURGITBASE` 可换 URL 前缀(镜像/离线测试)；`bur mod download` 在 bur.sum 存在时校验、缺失时写出
+- S6.2 网络拉取：倾向 shell-out `exec("git",["clone",...])` + `sha256sum` 校验(零新 native，延续 S5「simplify, no new natives」)；备选补最小 `http_get`/`sha256` native——**已落地(2026-07-10)**：shell-out 方案成立，零新 native；`bur mod init/tidy/download/verify` 与 `bur get` 全部接线；`bur get` 拉取失败回滚 bur.mod；树哈希输出已从 hex 纠正为定案的 `h1:<base64>`。**实现侧默认(2026-07-11 owner 追认为定案)**：clone URL = `https://<module path>`(Go 式「模块路径即仓库路径」，不支持子目录模块，真实需求出现再议 discovery)，环境变量 `$BURGITBASE` 可换 URL 前缀(镜像/离线测试)；`bur mod download` 在 bur.sum 存在时校验、缺失时写出。**测试限制**：网络拉取不可 golden 化——依赖外部网络与 git 远端，由 `bur mod download` / `bur mod verify` 手动验证
 - **CLI 布局已定(owner 2026-07-10，照搬 Go 词汇表)**，随 S6.1/S6.2 落地：
   - `bur mod init <module-path>`：写 `bur.mod`，module path 显式给出、不从目录名猜
   - `bur mod tidy`：离线重算 MVS、重写 `bur.sum`(按 import 增删 require 已落地，2026-07-18)。**增加侧版本语义已定(owner 2026-07-17)**：新直接 require 的版本取自现有 MVS 依赖图(间接依赖被直接 import 时提升为直接 require、沿用已选版本)；依赖图查无该模块则报错并指向 `bur get <path>@<version>`——不猜版本、不上网
