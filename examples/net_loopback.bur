@@ -1,0 +1,47 @@
+// TCP loopback: listener and dialer in two fibers exchange a message.
+fn server(lh) {
+    match tcp_accept(lh) {
+        Ok(conn) => {
+            match net_read(conn, 1024) {
+                Ok(data) => {
+                    let _ = net_write(conn, "reply:" + data)
+                    net_close(conn)
+                },
+                Err(e) => eprintln("server read: " + e),
+            }
+        },
+        Err(e) => eprintln("server accept: " + e),
+    }
+}
+
+fn main_loop() {
+    let port = 19876
+    let lh = match tcp_listen("127.0.0.1", port) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln("listen: " + e)
+            exit(1)
+        },
+    }
+
+    spawn server(lh)
+
+    match tcp_dial("127.0.0.1", port) {
+        Ok(conn) => {
+            match net_write(conn, "hello") {
+                Ok(_) => {
+                    match net_read(conn, 1024) {
+                        Ok(data) => println(data),
+                        Err(e) => eprintln("dial read: " + e),
+                    }
+                    net_close(conn)
+                },
+                Err(e) => eprintln("dial write: " + e),
+            }
+        },
+        Err(e) => eprintln("dial: " + e),
+    }
+    net_close(lh)
+}
+
+main_loop()
