@@ -6,6 +6,43 @@ All notable changes to this project are documented here.
 Versions use a 2-day date range. Latest first.
 版本号采用 2 天日期区间，最新在前。
 
+## v0.4 (2026-07-21 ~ 07-22)
+
+**Landed S7.6 `defer`** — `defer { ... }` registers a block on the enclosing
+function; deferred blocks run LIFO when the function exits normally.
+**落地 S7.6 `defer`** — `defer { ... }` 将块挂到包围函数上，函数正常退出时 LIFO 执行。
+
+- **Added:** `defer` keyword, DeferStmt across the full pipeline
+  (lexer/parser/checker/compiler/formatter/disassembler/constant folder).
+- **Added:** Blocks compile as zero-parameter closures; new opcode `DEFER`(49)
+  pushes onto a per-frame defer stack; `return`, tail expressions, and `?`
+  early exits run deferred blocks LIFO; traps do not run defers.
+- **Added:** VM frame-level defer stack with exit-value stash and C runtime
+  fiber-level defer array with dbase watermark; both GC roots covered.
+- **Added:** Checker validates defer blocks as closure bodies; discarded
+  Result/Option in defer blocks reports `unused_must_use`; missing block
+  produces E1119.
+
+**Landed S7.7 net** — minimal TCP networking with six natives and a `std/net`
+helper package; fiber-level blocking keeps the scheduler responsive.
+**落地 S7.7 net** — 最小 TCP 网络面，六个 native 加 `std/net` 辅助包；fiber 级阻塞保持调度器响应。
+
+- **Added:** `tcp_listen`, `tcp_accept`, `tcp_dial`, `net_read`, `net_write`,
+  `net_close` natives with non-blocking sockets and fiber-level IO parking in
+  both the C runtime scheduler and the VM.
+- **Added:** `net_nb` non-blocking multiplexed native for the VM scheduler's
+  park-and-retry loop (accept/read/write with `__eagain` sentinel).
+- **Added:** `std/net` package: `read_all` (read until EOF) and `write_line`
+  (write with trailing newline), distributed via `std_embed`.
+- **Added:** Go seed SCC-based package-level function inference, fixing
+  polymorphic forward references (e.g. `concat_lists` used with both `[[str]]`
+  and `[[int]]` before its definition).
+- **Added:** Loopback and error-path golden examples (port-in-use,
+  connection-refused, read-EOF); VM/native parity and `BUR_DETERMINISTIC=1`
+  stability verified.
+- **Known limitation:** DNS resolution (`getaddrinfo`) is synchronous and
+  blocks the entire scheduler; UDP, Unix sockets, and TLS are out of scope.
+
 ## v0.3 (2026-07-19 ~ 07-20)
 
 **Landed S7.5 compile-time constants** — `const` declarations fold supported
