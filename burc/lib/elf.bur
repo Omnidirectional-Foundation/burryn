@@ -1,0 +1,99 @@
+// ELF64 serialization (Linux x86-64 static executable).
+// Produces a minimal ET_EXEC with one PT_LOAD segment (R+X).
+
+// ---- ELF constants ----
+let et_exec = 2
+let em_x86_64 = 62
+let pt_load = 1
+let pf_x = 1
+let pf_r = 4
+
+// default base address for static executables
+pub let base_addr = 4194304 // 0x400000
+
+// ---- little-endian field emission ----
+fn u16(v) {
+    byte_chr(v % 256) + byte_chr(v / 256 % 256)
+}
+
+fn u32(v) {
+    byte_chr(v % 256) + byte_chr(v / 256 % 256) + byte_chr(v / 65536 % 256) + byte_chr(v / 16777216 % 256)
+}
+
+fn u64(v) {
+    u32(v % 4294967296) + u32(v / 4294967296)
+}
+
+// ---- ELF64 header (64 bytes) ----
+fn elf_header(entry, phnum) {
+    // e_ident: 16 bytes = 4 magic + 3 (class/data/version) + 9 padding
+    let ident = byte_chr(127) + "ELF" + byte_chr(2) + byte_chr(1) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0)
+    // EI_CLASS = ELFCLASS64
+    // EI_DATA = ELFDATA2LSB
+    // EI_VERSION
+
+    ident + u16(et_exec) + u16(em_x86_64) + u32(1) + u64(entry) + u64(64) + u64(0) + u32(0) + u16(64) + u16(56) + u16(phnum) + u16(64) + u16(0) + u16(0)
+    // e_type
+    // e_machine
+    // e_version
+    // e_entry
+    // e_phoff (right after ELF header)
+    // e_shoff (no section headers)
+    // e_flags
+    // e_ehsize
+    // e_phentsize
+    // e_phnum
+    // e_shentsize
+    // e_shnum
+    // e_shstrndx
+}
+
+// ---- program header (56 bytes, PT_LOAD R+X) ----
+fn phdr_load(offset, vaddr, filesz, memsz) {
+    u32(pt_load) + u32(pf_r + pf_x) + u64(offset) + u64(vaddr) + u64(vaddr) + u64(filesz) + u64(memsz) + u64(4096)
+    // p_type
+    // p_flags = PF_R | PF_X
+    // p_offset
+    // p_vaddr
+    // p_paddr
+    // p_filesz
+    // p_memsz
+    // p_align
+}
+
+// ---- complete ELF binary ----
+// code = raw machine code bytes; entry offset = base_addr + 120 (header + 1 phdr)
+pub fn emit_elf(code) {
+    let hdr_size = 64
+    let ph_size = 56
+    let code_offset = hdr_size + ph_size
+    let entry = base_addr + code_offset
+    let total = code_offset + str_len(code)
+    elf_header(entry, 1) + phdr_load(0, base_addr, total, total) + code
+}
+
+// ---- syscall helpers (Linux x86-64) ----
+// syscall number in rax, args in rdi/rsi/rdx/r10/r8/r9
+pub fn syscall() {
+    byte_chr(15) + byte_chr(5) // 0x0F 0x05
+}
+
+// mov rax, imm64 for syscall number
+pub fn sys_mov_rax(n) {
+    byte_chr(72) + byte_chr(184) + u64(n) // REX.W + 0xB8+rax + imm64
+}
+
+// mov rdi, imm64
+pub fn sys_mov_rdi(v) {
+    byte_chr(72) + byte_chr(191) + u64(v) // REX.W + 0xBF + imm64
+}
+
+// mov rsi, imm64
+pub fn sys_mov_rsi(v) {
+    byte_chr(72) + byte_chr(190) + u64(v) // REX.W + 0xBE + imm64
+}
+
+// mov rdx, imm64
+pub fn sys_mov_rdx(v) {
+    byte_chr(72) + byte_chr(186) + u64(v) // REX.W + 0xBA + imm64
+}
