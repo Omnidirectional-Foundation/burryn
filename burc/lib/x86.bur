@@ -1,0 +1,310 @@
+// x86-64 instruction encoder (System V AMD64 ABI).
+// Emits machine code as byte strings via byte_chr; concatenation builds code blocks.
+
+// ---- registers ----
+pub let rax = 0
+pub let rcx = 1
+pub let rdx = 2
+pub let rbx = 3
+pub let rsp = 4
+pub let rbp = 5
+pub let rsi = 6
+pub let rdi = 7
+pub let r8 = 8
+pub let r9 = 9
+pub let r10 = 10
+pub let r11 = 11
+pub let r12 = 12
+pub let r13 = 13
+pub let r14 = 14
+pub let r15 = 15
+
+// System V AMD64 argument registers in order
+pub fn arg_regs() {
+    [rdi, rsi, rdx, rcx, r8, r9]
+}
+
+// ---- byte emission ----
+pub fn e1(b) {
+    byte_chr(b)
+}
+
+pub fn e2(w) {
+    byte_chr(w % 256) + byte_chr(w / 256 % 256)
+}
+
+pub fn e4(v) {
+    byte_chr(v % 256) + byte_chr(v / 256 % 256) + byte_chr(v / 65536 % 256) + byte_chr(v / 16777216 % 256)
+}
+
+pub fn e8(v) {
+    e4(v % 4294967296) + e4(v / 4294967296)
+}
+
+// ---- REX prefix ----
+fn rex_needed(w, r, x, b) {
+    w != 0 || r >= 8 || x >= 8 || b >= 8
+}
+
+pub fn rex(w, r, x, b) {
+    if !rex_needed(w, r, x, b) {
+        ""
+    } else {
+        let mut v = 64 // 0x40
+        if w != 0 {
+            v = v + 8
+        }
+        if r >= 8 {
+            v = v + 4
+        }
+        if x >= 8 {
+            v = v + 2
+        }
+        if b >= 8 {
+            v = v + 1
+        }
+        e1(v)
+    }
+}
+
+// ---- ModRM ----
+pub fn modrm(mod, reg, rm) {
+    e1(mod % 4 * 64 + reg % 8 * 8 + rm % 8)
+}
+
+fn modrm_reg(reg, rm) {
+    modrm(3, reg, rm)
+}
+
+// ---- mov ----
+pub fn mov_rr(dst, src) {
+    rex(1, src, 0, dst) + e1(137) + modrm_reg(src, dst) // 0x89
+}
+
+pub fn mov_ri64(dst, imm) {
+    rex(1, 0, 0, dst) + e1(184 + dst % 8) + e8(imm) // 0xB8+rd
+}
+
+pub fn mov_ri32(dst, imm) {
+    if dst >= 8 {
+        rex(0, 0, 0, dst) + e1(184 + dst % 8) + e4(imm)
+    } else {
+        e1(184 + dst) + e4(imm)
+    }
+}
+
+pub fn mov_rm(dst, base, disp) {
+    if disp == 0 && base % 8 != 5 {
+        rex(1, dst, 0, base) + e1(139) + modrm(0, dst, base) // 0x8B
+    } else if disp >= -128 && disp <= 127 {
+        rex(1, dst, 0, base) + e1(139) + modrm(1, dst, base) + e1(disp % 256)
+    } else {
+        rex(1, dst, 0, base) + e1(139) + modrm(2, dst, base) + e4(disp)
+    }
+}
+
+pub fn mov_mr(base, disp, src) {
+    if disp == 0 && base % 8 != 5 {
+        rex(1, src, 0, base) + e1(137) + modrm(0, src, base) // 0x89
+    } else if disp >= -128 && disp <= 127 {
+        rex(1, src, 0, base) + e1(137) + modrm(1, src, base) + e1(disp % 256)
+    } else {
+        rex(1, src, 0, base) + e1(137) + modrm(2, src, base) + e4(disp)
+    }
+}
+
+// ---- push / pop ----
+pub fn push_r(reg) {
+    rex(0, 0, 0, reg) + e1(80 + reg % 8) // 0x50+rd
+}
+
+pub fn pop_r(reg) {
+    rex(0, 0, 0, reg) + e1(88 + reg % 8) // 0x58+rd
+}
+
+// ---- arithmetic ----
+pub fn add_rr(dst, src) {
+    rex(1, src, 0, dst) + e1(1) + modrm_reg(src, dst) // 0x01
+}
+
+pub fn sub_rr(dst, src) {
+    rex(1, src, 0, dst) + e1(41) + modrm_reg(src, dst) // 0x29
+}
+
+pub fn and_rr(dst, src) {
+    rex(1, src, 0, dst) + e1(33) + modrm_reg(src, dst) // 0x21
+}
+
+pub fn or_rr(dst, src) {
+    rex(1, src, 0, dst) + e1(9) + modrm_reg(src, dst) // 0x09
+}
+
+pub fn xor_rr(dst, src) {
+    rex(1, src, 0, dst) + e1(49) + modrm_reg(src, dst) // 0x31
+}
+
+pub fn cmp_rr(a, b) {
+    rex(1, b, 0, a) + e1(57) + modrm_reg(b, a) // 0x39
+}
+
+pub fn test_rr(a, b) {
+    rex(1, b, 0, a) + e1(133) + modrm_reg(b, a) // 0x85
+}
+
+pub fn neg_r(reg) {
+    rex(1, 0, 0, reg) + e1(247) + modrm_reg(3, reg) // 0xF7 /3
+}
+
+pub fn imul_rr(dst, src) {
+    rex(1, dst, 0, src) + e1(15) + e1(175) + modrm_reg(dst, src) // 0x0F 0xAF
+}
+
+pub fn add_ri32(dst, imm) {
+    if imm >= -128 && imm <= 127 {
+        rex(1, 0, 0, dst) + e1(131) + modrm_reg(0, dst) + e1(imm % 256) // 0x83 /0
+    } else {
+        rex(1, 0, 0, dst) + e1(129) + modrm_reg(0, dst) + e4(imm) // 0x81 /0
+    }
+}
+
+pub fn sub_ri32(dst, imm) {
+    if imm >= -128 && imm <= 127 {
+        rex(1, 0, 0, dst) + e1(131) + modrm_reg(5, dst) + e1(imm % 256) // 0x83 /5
+    } else {
+        rex(1, 0, 0, dst) + e1(129) + modrm_reg(5, dst) + e4(imm) // 0x81 /5
+    }
+}
+
+// ---- shifts (by CL) ----
+pub fn shl_rcl(dst) {
+    rex(1, 0, 0, dst) + e1(211) + modrm_reg(4, dst) // 0xD3 /4
+}
+
+pub fn shr_rcl(dst) {
+    rex(1, 0, 0, dst) + e1(211) + modrm_reg(5, dst) // 0xD3 /5
+}
+
+pub fn sar_rcl(dst) {
+    rex(1, 0, 0, dst) + e1(211) + modrm_reg(7, dst) // 0xD3 /7
+}
+
+// ---- lea ----
+pub fn lea(dst, base, disp) {
+    if disp == 0 && base % 8 != 5 {
+        rex(1, dst, 0, base) + e1(141) + modrm(0, dst, base) // 0x8D
+    } else if disp >= -128 && disp <= 127 {
+        rex(1, dst, 0, base) + e1(141) + modrm(1, dst, base) + e1(disp % 256)
+    } else {
+        rex(1, dst, 0, base) + e1(141) + modrm(2, dst, base) + e4(disp)
+    }
+}
+
+// ---- control flow ----
+pub fn ret() {
+    e1(195) // 0xC3
+}
+
+pub fn call_r(reg) {
+    rex(0, 0, 0, reg) + e1(255) + modrm_reg(2, reg) // 0xFF /2
+}
+
+pub fn jmp_r(reg) {
+    rex(0, 0, 0, reg) + e1(255) + modrm_reg(4, reg) // 0xFF /4
+}
+
+pub fn jmp_rel32(off) {
+    e1(233) + e4(off) // 0xE9
+}
+
+pub fn je_rel32(off) {
+    e1(15) + e1(132) + e4(off) // 0x0F 0x84
+}
+
+pub fn jne_rel32(off) {
+    e1(15) + e1(133) + e4(off) // 0x0F 0x85
+}
+
+pub fn jl_rel32(off) {
+    e1(15) + e1(140) + e4(off) // 0x0F 0x8C
+}
+
+pub fn jg_rel32(off) {
+    e1(15) + e1(143) + e4(off) // 0x0F 0x8F
+}
+
+pub fn jle_rel32(off) {
+    e1(15) + e1(142) + e4(off) // 0x0F 0x8E
+}
+
+pub fn jge_rel32(off) {
+    e1(15) + e1(141) + e4(off) // 0x0F 0x8D
+}
+
+pub fn ja_rel32(off) {
+    e1(15) + e1(135) + e4(off) // 0x0F 0x87
+}
+
+pub fn jb_rel32(off) {
+    e1(15) + e1(130) + e4(off) // 0x0F 0x82
+}
+
+pub fn jae_rel32(off) {
+    e1(15) + e1(131) + e4(off) // 0x0F 0x83
+}
+
+pub fn jbe_rel32(off) {
+    e1(15) + e1(134) + e4(off) // 0x0F 0x86
+}
+
+pub fn call_rel32(off) {
+    e1(232) + e4(off) // 0xE8
+}
+
+// ---- function prologue / epilogue ----
+pub fn prologue(frame_size) {
+    let code = push_r(rbp) + mov_rr(rbp, rsp)
+    if frame_size > 0 {
+        code + sub_ri32(rsp, frame_size)
+    } else {
+        code
+    }
+}
+
+pub fn epilogue() {
+    mov_rr(rsp, rbp) + pop_r(rbp) + ret()
+}
+
+// ---- nop / int3 ----
+pub fn nop() {
+    e1(144) // 0x90
+}
+
+pub fn int3() {
+    e1(204) // 0xCC
+}
+
+// ---- setcc (set byte on condition) ----
+pub fn sete(dst) {
+    rex(0, 0, 0, dst) + e1(15) + e1(148) + modrm_reg(0, dst) // 0x0F 0x94
+}
+
+pub fn setne(dst) {
+    rex(0, 0, 0, dst) + e1(15) + e1(149) + modrm_reg(0, dst) // 0x0F 0x95
+}
+
+pub fn setl(dst) {
+    rex(0, 0, 0, dst) + e1(15) + e1(156) + modrm_reg(0, dst) // 0x0F 0x9C
+}
+
+pub fn setg(dst) {
+    rex(0, 0, 0, dst) + e1(15) + e1(159) + modrm_reg(0, dst) // 0x0F 0x9F
+}
+
+// ---- idiv (signed divide rdx:rax by reg; quotient rax, remainder rdx) ----
+pub fn idiv_r(reg) {
+    rex(1, 0, 0, reg) + e1(247) + modrm_reg(7, reg) // 0xF7 /7
+}
+
+pub fn cqo() {
+    e1(72) + e1(153) // 0x48 0x99
+}
