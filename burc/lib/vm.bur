@@ -54,6 +54,7 @@ let fs_done = 4
 let fs_blocked_timer = 5
 let fs_blocked_io = 6
 let fs_blocked_net = 7
+let fs_blocked_stdin = 8
 
 let wait_timer = 1
 let wait_exec = 2
@@ -115,6 +116,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut fb_nethandle = [] // socket handle for the parked net operation
     let mut fb_netdata = [] // remaining write data while parked
     let mut fb_netmax = [] // read max while parked
+    let mut fb_stdinmax = [] // read_stdin max while fs_blocked_stdin
     let mut ready = [] // FIFO of ready fiber ids
     let mut main_fiber = 0
     let mut park_recv = -1 // set by the recv() native to ask OpCall to park
@@ -124,9 +126,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut park_nethandle = -1
     let mut park_netdata = ""
     let mut park_netmax = 0
+    let mut park_stdinmax = -1 // read_stdin max on EAGAIN
     let mut ntimers = 0 // fibers currently parked on a timer
     let mut nio = 0 // fibers currently parked on child-process IO
     let mut nio_net = 0 // fibers currently parked on net IO
+    let mut nio_stdin = 0 // fibers currently parked on stdin
     let mut wait_fiber = []
     let mut wait_kind = []
     let mut wait_deadline = []
@@ -835,6 +839,34 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // Retry non-blocking stdin reads for stdin-blocked fibers.
+    fn wait_poll_stdin() {
+        let mut i = 0
+        while i < len(fb_status) {
+            if fb_status[i] != fs_blocked_stdin {
+                i = i + 1
+                continue
+            }
+            let f = i
+            match stdin_nb(fb_stdinmax[f]) {
+                Ok(s) => {
+                    fb_iores[f] = VStr(s)
+                    fb_iohas[f] = true
+                    nio_stdin = nio_stdin - 1
+                    schedule(f)
+                },
+                Err(m) => {
+                    if m == "__eagain" {
+                        // still not ready
+                    } else {
+                        trap("read_stdin: " + m)
+                    }
+                },
+            }
+            i = i + 1
+        }
+    }
+
     fn wait_nearest_timer() {
         let mut nearest = -1.0
         let mut i = 0
@@ -878,7 +910,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     fn wait_idle() {
         while len(ready) == 0 {
             wait_register_all()
-            if nio > 0 || nio_net > 0 {
+            if nio > 0 || nio_net > 0 || nio_stdin > 0 {
                 sleep(1)
             } else {
                 let nearest = wait_nearest_timer()
@@ -890,6 +922,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             wait_poll_io()
             if nio_net > 0 {
                 wait_poll_net()
+            }
+            if nio_stdin > 0 {
+                wait_poll_stdin()
             }
             if ntimers > 0 {
                 wake_due_timers()
@@ -918,6 +953,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         push(fb_nethandle, -1)
         push(fb_netdata, "")
         push(fb_netmax, 0)
+        push(fb_stdinmax, 0)
         let f = len(fb_stack) - 1
         for a in args {
             push(fb_stack[f], a)
@@ -1673,6 +1709,38 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 Ok(s) => make_ok(f, VStr(s)),
                 Err(m) => make_err(f, VStr(m)),
             }
+        } else if nm == "read_stdin" {
+            if fb_iohas[f] {
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                if !is_int(fpeek(f, 0)) {
+                    trap("read_stdin() needs an int")
+                }
+                let max = int_of(fpeek(f, 0))
+                match stdin_nb(max) {
+                    Ok(s) => VStr(s),
+                    Err(m) => {
+                        if m == "__eagain" {
+                            park_stdinmax = max
+                            VUnit
+                        } else {
+                            trap("read_stdin: " + m)
+                            VUnit
+                        }
+                    },
+                }
+            }
+        } else if nm == "stdin_nb" {
+            if !is_int(fpeek(f, 0)) {
+                trap("stdin_nb() needs an int")
+            }
+            match stdin_nb(int_of(fpeek(f, 0))) {
+                Ok(s) => make_ok(f, VStr(s)),
+                Err(m) => make_err(f, VStr(m)),
+            }
         } else {
             trap("unknown native " + nm + " (VM bug)")
             VUnit
@@ -1704,7 +1772,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             push(fb_fr_dact[f], false)
         } else if t == ot_native {
             let res = do_native(f, o_i1[h], argc)
-            if park_recv < 0 && park_io < 0 && park_netop < 0 {
+            if park_recv < 0 && park_io < 0 && park_netop < 0 && park_stdinmax < 0 {
                 // otherwise leave callee+args: OpCall parks and retries
                 let mut i = 0
                 while i <= argc {
@@ -2080,6 +2148,14 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     park_netdata = ""
                     park_netmax = 0
                     nio_net = nio_net + 1
+                    fb_fr_ip[f][fi] = start_ip
+                    return false
+                }
+                if park_stdinmax >= 0 {
+                    fb_status[f] = fs_blocked_stdin
+                    fb_stdinmax[f] = park_stdinmax
+                    park_stdinmax = -1
+                    nio_stdin = nio_stdin + 1
                     fb_fr_ip[f][fi] = start_ip
                     return false
                 }
@@ -2734,8 +2810,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         if nio_net > 0 {
             wait_poll_net()
         }
+        if nio_stdin > 0 {
+            wait_poll_stdin()
+        }
         if len(ready) == 0 {
-            if nio > 0 || nio_net > 0 || ntimers > 0 {
+            if nio > 0 || nio_net > 0 || nio_stdin > 0 || ntimers > 0 {
                 wait_idle()
             } else {
                 // main finished => program over (checked below); otherwise deadlock
