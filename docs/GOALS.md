@@ -147,14 +147,16 @@
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
 | **S6 生态工具链** | S6.1 依赖解析 **已完成**(2026-07-18：MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(2026-07-10：mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(2026-07-10：全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(2026-07-10：子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；2026-07-15 补齐 std/testing)；S6.5 诊断/DX 批 **已完成**(2026-07-19：cgen `#line` + `-g`、runtime/VM trap 带 span stack trace、公开命令 rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议 + loader 诊断接线)；S6.6 std/json + std/testing **已完成**(2026-07-15 核心实现；2026-07-18 CI regen+cmp)；S6.7 runtime IO **已完成**(2026-07-10：sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(2026-07-10：SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成**(2026-07-15) | 已完成 |
 | **S7 语言特性扩展** | S7.1 字符串插值 **已完成**(2026-07-19)；S7.2 管道 `\|>` **已完成**(2026-07-19)；S7.3 match guard **已完成**(2026-07-19)；S7.4 命名参数 + 默认值(**已否决** 2026-07-10，编号保留)；S7.5 编译期常量 **已完成**(2026-07-19)；S7.6 `defer` **已完成**(2026-07-20)；S7.7 net stdlib **已完成**(2026-07-22)；S7.8 可选函数签名标注(**已为 S6.1 提前完成**，2026-07-16) | 已完成 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 **ELF** 后端；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代) | 未开工 |
+| **S8 后端与重型类型** | S8.1 手写 x86-64 后端：**ELF**(Linux) + **Mach-O**(macOS，同 System V ABI / POSIX 运行时，换序列化层)(前置：`byte_chr` 原始字节构造，见 §6.7)；S8.2 语法冻结 + grammar 文件；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植：ucontext 与 POSIX natives 全需替代)；S8.7 类型别名(`type Name = TypeExpr`，checker 透明展开)。**全部子项由 LLM 实现**(owner 2026-07-23 放权，取代 2026-07-12 分工意向) | 未开工 |
+| **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC 传输 + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段(不做专用插件，不支持 LSP 的编辑器不管)。前置 = S8.2 语法冻结 | 未开工 |
+| **S10 包生态** | S10.1 stdlib 扩展批(encoding/path/cli/log/datetime/regex/crypto/http)；S10.2 包模板 + 示例包；S10.3 `bur doc`(导出签名 + 注释 → Markdown)；S10.4 包质量基础设施(CI 模板、测试约定、版本规范)。原则：能纯 Burryn 就不加 native；每包带 bur.mod + *_test.bur，随 std_embed 分发 | 未开工 |
 
 - S1–S5 为自举闭环，已全部达成：`bur` 由本语言写成、经 cc 逐字节重建自身，main 上 Go 整棵树已清零
 - 自举判定标准：**编译器由本语言写成且能编译自己**；输出 C 再经 gcc/clang 落地，完全算自举
 - stdlib 按「够自举用 + owner 真实脚本需求」逐个生长(os/exec、fs、json、net 优先)，不追大而全
 - 编译速度是硬指标：任何特性提案先回答「是否显著拖慢编译」
 - 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S6.8、S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
-- **S8 内部推进顺序(owner 2026-07-10 定)**：S8.3 row poly → S8.4 封闭 records → S8.1 ELF 后端 → S8.5 PE。类型先行(日常效用高于第二后端)；手写后端是 owner 明确想做的目标，但不挡效用主线
+- **S8 内部推进顺序(owner 2026-07-10 定)**：S8.3 row poly → S8.4 封闭 records → S8.1 ELF 后端 → S8.5 PE。类型先行(日常效用高于第二后端)。**S8 全部子项由 LLM 实现**(owner 2026-07-23 放权)。S8 之后进 S9 LSP 与编辑器生态
 
 ## 6. 工程规范
 
@@ -327,9 +329,40 @@ S7.7 net API 已定(owner 2026-07-20 拍板)：v1 = 最小 TCP 面，6 个新 na
 
 **与原路线两大分歧**：(1) Refinement 成本被低估——无求解器地基，实为从零造子系统，明确排除；(2) Effects 价值被高估——CSP 已覆盖其大半实用场景，边际价值与代价不成比例，明确排除。
 
-**S8.1 大方向已定(owner 2026-07-12，作默认假设，S8 开工探查批可推翻)**：调用约定 = System V AMD64 ABI；GC 根扫描 = 沿用 C 后端的 shadow stack 精确 GC 语义(cgen 的根栈纪律照搬到手写代码生成)。该方向不阻塞 S6/S7 任何批次。
+**S8.1 大方向已定(owner 2026-07-12，作默认假设，S8 开工探查批可推翻)**：调用约定 = System V AMD64 ABI；GC 根扫描 = 沿用 C 后端的 shadow stack 精确 GC 语义(cgen 的根栈纪律照搬到手写代码生成)。该方向不阻塞 S6/S7 任何批次。**前置缺口(2026-07-23 盲区检查发现)**：语言目前无构造任意原始字节的能力——`chr(n)` 把 128–255 编为多字节 UTF-8，无法产出单字节 `0x80`–`0xFF`；ELF 发射(机器码、header、重定位表)需要全字节范围。修法 = 新增 `byte_chr(n: int) -> str`(0–255 → 单字节 str，越界 trap)，配合现有 `+` 拼接与 `write_file`(`fopen("wb")` + `fwrite`，已支持原始字节)即够。归 S8.1 前置小批，不触及类型系统核心。
 
-**S8 分工意向(owner 2026-07-12 口述)**：S8.3/S8.4 类型批仍由 LLM 实现；**S8.1/S8.5 手写后端本体由 owner 亲手写**(时间不定，数月至一年后、玩透语言且有空为前提)，届时 LLM 转为对齐语法与逻辑的辅导角色、不代写实现。LLM 推进到 S8 时以此为准，不要主动动手写后端。
+**S8 分工(owner 2026-07-23 修订，取代 2026-07-12 意向)**：S8 全部子项(S8.1–S8.5)由 LLM 实现，owner 审查设计与验收。原「S8.1/S8.5 由 owner 亲手写、LLM 转辅导角色」的分工意向作废。
+
+## 6.8 LSP 与编辑器生态(工程视角，对应 S9)
+
+**架构定案**：LSP 服务器用 Burryn 写(延续自举原则)，作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0(LSP 3.17 规范)。所有语言智能在服务器端；编辑器插件是**薄客户端**——只转发 LSP 消息 + 渲染 UI，不含语言逻辑。新增编辑器支持 = 实现 LSP client 协议，零服务器改动。
+
+**传输层**：Content-Length 帧分割 + JSON-RPC 消息解析/路由；消息体 JSON 序列化/反序列化走 `std/json`。
+
+**文档同步**：Full sync 模式(didOpen/didChange/didClose 全量内容)，服务器维护内存文档表，checker 读内存覆盖磁盘。增量 sync(delta)为后续优化，v1 不做。
+
+**诊断推送**：didOpen 与 didChange(防抖)后重跑 check 管线(lex → parse → check)，DiagT/DiagX 转 LSP Diagnostic 推送。需要 check 管线支持从内存源码运行(现只从磁盘读文件)——这是 LSP 的核心工程改造点。
+
+**语言特性(S9.2)**：
+- hover：显示推导类型/签名(复用 checker 推导结果)
+- go-to-definition：从名字使用处跳到绑定处(需 AST span → 定义 span 映射，跨文件走 module loader)
+- completion：作用域感知名字补全(局部变量、函数名、包成员 `pkg.`)
+- formatting：调 `bur fmt -`(stdin→stdout，已就绪)
+- signature-help：函数调用时显示参数信息
+
+**编辑器客户端**：
+
+| 编辑器 | 技术栈 | 备注 |
+|--------|--------|------|
+| VSCode | TypeScript + vscode-languageclient | 首个客户端；bundled `bur` 二进制或 PATH 探测；TextMate grammar 语法高亮；Marketplace + VSIX 分发 |
+| JetBrains | Kotlin + lsp4j | 单插件兼容 IDEA/CLion/PyCharm 等；IntelliJ 2023.2+ 内建 LSP API，旧版走 LSP4IJ |
+| Neovim | 用户配置 | 0.8+ 原生 LSP，提供 `bur lsp` 配置片段即可 |
+| Emacs | 用户配置 | lsp-mode 或 eglot 配置片段 |
+| 其他 | — | Helix / Zed / Sublime 等 LSP-capable 编辑器直连 |
+
+**实现顺序**：S9.1 核心服务器(JSON-RPC 传输 + 文档同步 + 诊断推送)→ S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)→ S9.3 VSCode 扩展(首个客户端，验证服务器)→ S9.4 JetBrains 插件 + 其他编辑器配置。
+
+**前置与依赖**：S9 前置 = S8.2 语法冻结(语法不再变，LSP 不追语法债)。S9.1 的 check 管线改造(内存源码)可与 S8.3/S8.4 并行，但 S9 整体排在 S8 之后。`std/json` 已就绪(S6.6)，JSON-RPC 层无需新 native。**前置缺口(2026-07-23 盲区检查发现)**：语言目前无 stdin 读取能力——全部 native 中无 `read_line`/`read_stdin`/`input` 等，LSP 服务器的 JSON-RPC Content-Length 帧需要精确读 N 字节。修法 = 新增 `read_stdin(max: int) -> str`(读至多 max 字节，EOF 返回 `""`，fiber 级阻塞)或更通用的 fd 读取接口；配合现有 `print`(stdout 写)即构成 LSP 传输层。归 S9.1 前置小批。
 
 ## 7. 当前待定项(动工前必须先问 owner)
 
@@ -346,3 +379,5 @@ S7.7 net API 已定(owner 2026-07-20 拍板)：v1 = 最小 TCP 面，6 个新 na
 2026-07-17 决策批(四项，全文散见对应章节)：seed 定基提前至 S6.5 动工前——S6.5 的 cgen `#line` 与 runtime 改动会破坏归档 seed 的 gen1 == gen2 判定，v0.3 发布判据(S6 全部收尾)不变、与定基解绑(§6.5 S6.8 条目与 S6.5 前置)；接口缓存五条实现侧细则(2026-07-16 随状态同步写入)追认为定案(§6.5 接口缓存条目)；`bur mod tidy` 增加侧版本 = MVS 依赖图推导、查无报错指向 `bur get`(§6.5 CLI 布局条目)；定基机制 = tag 基准 commit、三段重生链(§6.5 S6.8 条目)。
 
 2026-07-12 决策批(第二轮，路线清仓，全文散见对应章节)：v0.3 判据 = S6 全部收尾，seed 定基随 v0.3 发布(§6.5 S6.8 条目，**定基时点已被 2026-07-17 决策批修订**)；无 cc 兜底维持现状、议题关闭(VM 兜底 + 优雅降级，不引入 tcc)；bur test 子包发现归 S6.1 批、`-j` 并行归 backlog(§6.5 S6.4 条目)；诊断深度的多 span + 结构化建议并入 S6.5 成诊断/DX 批(§6.5 S6.5 条目)；S7.6 defer = 函数级 + 闭包块 + trap 不跑(§6.6)；S7.7 = 通用 fd 注册接口、poll 实现(§6.6)；S7.5 = `const` 声明(包级 + 块级，初始化限可折叠式，§6.6 表)；S8.1 大方向 = System V AMD64 ABI + shadow stack 精确 GC(§6.7，探查批可推翻)；§7 待定项清空(模块系统与 select 两条系已落地的过时项，移入已探查结论)。
+
+2026-07-23 决策批(四项，全文散见对应章节)：S8 分工放权——S8.1–S8.5 全部由 LLM 实现，原「S8.1/S8.5 由 owner 亲手写」意向作废(§6.7)；S8.1 前置缺口——`byte_chr(n: int) -> str` 原始字节构造，`chr` 只产 UTF-8 多字节、无法覆盖 0x80–0xFF 单字节(§6.7)；新增 S9 LSP 与编辑器生态阶段——LSP 服务器用 Burryn 写、`bur lsp` 子命令、薄客户端架构、VSCode/JetBrains/Neovim/Emacs 全覆盖、前置 = S8.2 语法冻结(§5 里程碑表、§6.8)；S9 前置缺口——语言无 stdin 读取能力，LSP JSON-RPC 传输层需 `read_stdin(max) -> str` 或等价 fd 读取接口(§6.8)。
