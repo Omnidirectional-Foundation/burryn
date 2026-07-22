@@ -323,6 +323,12 @@ static Value nat_chr(Value *args, int argc) {
     else { buf[0] = (char)(0xF0 | (cp >> 18)); buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); buf[3] = (char)(0x80 | (cp & 0x3F)); len = 4; }
     return bur_obj((Obj *)bur_new_string_n(buf, len));
 }
+static Value nat_byte_chr(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT || args[0].u.i < 0 || args[0].u.i > 255) bur_trap("byte_chr() needs an int in 0..255");
+    char buf[1]; buf[0] = (char)args[0].u.i;
+    return bur_obj((Obj *)bur_new_string_n(buf, 1));
+}
 static Value nat_ord(Value *args, int argc) {
     (void)argc;
     const char *s; int64_t n;
@@ -1016,6 +1022,7 @@ static void bur_register_natives(void) {
     bur_register_native("args", 0, nat_args);
     bur_register_native("exit", 1, nat_exit);
     bur_register_native("chr", 1, nat_chr);
+    bur_register_native("byte_chr", 1, nat_byte_chr);
     bur_register_native("ord", 1, nat_ord);
     bur_register_native("clock", 0, nat_clock);
     bur_register_native("sleep", 1, nat_sleep);
