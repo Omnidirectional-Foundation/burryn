@@ -61,7 +61,7 @@ A **burr** is what forging leaves on metal.
 ## Tour
 
 ```sh
-bur run examples/sieve.bur
+bur run examples/concurrency/sieve.bur
 ```
 
 ```text
@@ -105,19 +105,27 @@ for _i in range(0, 5) { sum = sum + <-ch }
 
 | file | description |
 | ------ | ------------- |
-| `examples/hello.bur` | basics, closures, loops |
-| `examples/shapes.bur` | enums + match |
-| `examples/errors.bur` | Result/Option and `?` |
-| `examples/sieve.bur` | the classic CSP prime sieve: one fiber per prime |
-| `examples/pipeline.bur` | buffered-channel producer/consumer |
-| `examples/gc_stress.bur` | watch the collector work |
-| `examples/fib.bur` | recursion micro-benchmark |
-| `examples/brainfuck.bur` | a Brainfuck interpreter written in Burryn |
-| `examples/multiplex.bur` | `select` over several channels |
-| `examples/streaming.bur` | channel close |
-| `examples/textproc.bur` | files, exec, argv: a small text tool |
-| `examples/wordcount.bur` | maps and string functions |
-| `examples/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
+| `examples/basics/hello.bur` | basics, closures, loops |
+| `examples/basics/fib.bur` | recursion micro-benchmark |
+| `examples/basics/textproc.bur` | string and list natives: split, trim, join, slice, concat |
+| `examples/basics/interpolation.bur` | string interpolation with `{expr}` |
+| `examples/basics/cleanup.bur` | defer: LIFO cleanup, closure capture |
+| `examples/types/shapes.bur` | enums + match |
+| `examples/types/errors.bur` | Result/Option and `?` |
+| `examples/types/constants.bur` | compile-time const folding |
+| `examples/types/match_guard.bur` | match arms with `if` guards |
+| `examples/types/pipeline_op.bur` | the `\|>` pipe operator |
+| `examples/concurrency/sieve.bur` | the classic CSP prime sieve: one fiber per prime |
+| `examples/concurrency/pipeline.bur` | buffered-channel producer/consumer |
+| `examples/concurrency/multiplex.bur` | `select` over several channels |
+| `examples/concurrency/streaming.bur` | channel close + for-in drain |
+| `examples/net/net_loopback.bur` | TCP listener + dialer echo exchange |
+| `examples/io/fs.bur` | read_file/write_file round-trip and error paths |
+| `examples/io/exec.bur` | synchronous exec: Output, exit codes |
+| `examples/programs/brainfuck.bur` | a Brainfuck interpreter written in Burryn |
+| `examples/programs/wordcount.bur` | maps and string functions |
+| `examples/programs/gc_stress.bur` | watch the collector work |
+| `examples/programs/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
 | `burc/` | the self-hosted compiler and `bur` CLI — the biggest Burryn program there is |
 
 ## Architecture
@@ -186,18 +194,18 @@ See [`SECURITY.md`](SECURITY.md) for the full policy and private reporting instr
 
 ## Honest Limitations
 
-Stages S1–S6, S7.1, S7.2, and S7.3 are done.
-They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, and a fully self-hosted compiler with the Go host removed.
+Stages S1–S7 are done.
+They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, compile-time constants (`const`), `defer`, TCP networking, and a fully self-hosted compiler with the Go host removed.
 Both backends produce byte-identical output for the whole language, concurrency included.
 
-Still missing: records/structs (model product types with single-variant enums), compile-time constants, `defer`, and the net stdlib.
+Still missing: records/structs (model product types with single-variant enums).
 Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.
 
 ## Documentation
 
 | Document | Purpose |
 | ----------------- | ---------------- |
-| [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language |
+| [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language ([中文](tutorial.zh-CN.md)) |
 | [`docs/GOALS.md`](docs/GOALS.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
