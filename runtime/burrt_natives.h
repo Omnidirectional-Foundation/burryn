@@ -969,6 +969,61 @@ static Value nat_sleep(Value *args, int argc) {
     return bur_unit();
 }
 
+// ---- stdin (LSP transport) --------------------------------------------
+
+static void bur_stdin_nonblock(void) {
+    static int done = 0;
+    if (done) return;
+    int flags = fcntl(0, F_GETFL, 0);
+    if (flags >= 0) fcntl(0, F_SETFL, flags | O_NONBLOCK);
+    done = 1;
+}
+
+static Value nat_read_stdin(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT) bur_trap("read_stdin() needs an int");
+    int64_t max = args[0].u.i;
+    if (max <= 0) return bur_obj((Obj *)bur_new_string_n("", 0));
+    bur_stdin_nonblock();
+    char *buf = (char *)malloc((size_t)max);
+    for (;;) {
+        ssize_t n = read(0, buf, (size_t)max);
+        if (n >= 0) {
+            Value v = bur_obj((Obj *)bur_new_string_n(buf, (int64_t)n));
+            free(buf);
+            return v;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            int saved = errno;
+            free(buf);
+            bur_trap("read_stdin: %s", strerror(saved));
+        }
+        bur_wait_current_fd(0, POLLIN);
+    }
+}
+
+static Value nat_stdin_nb(Value *args, int argc) {
+    (void)argc;
+    if (args[0].t != VINT) bur_trap("stdin_nb() needs an int");
+    int64_t max = args[0].u.i;
+    if (max <= 0) return bur_ok_str("", 0);
+    bur_stdin_nonblock();
+    char *buf = (char *)malloc((size_t)max);
+    ssize_t n = read(0, buf, (size_t)max);
+    if (n >= 0) {
+        bur_push(bur_obj((Obj *)bur_new_string_n(buf, (int64_t)n)));
+        Value res = bur_ok(bur_peek(0));
+        bur_pop();
+        free(buf);
+        return res;
+    }
+    free(buf);
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        return bur_err_str("__eagain");
+    return bur_err_str(strerror(errno));
+}
+
 static Value nat_gc(Value *args, int argc) { (void)args; (void)argc; bur_gc_collect(); return bur_int(bur_gc_last_freed); }
 static Value nat_heap_objects(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_count); }
 static Value nat_gc_cycles(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_cycles); }
@@ -1035,6 +1090,8 @@ static void bur_register_natives(void) {
     bur_register_native("net_write", 2, nat_net_write);
     bur_register_native("net_close", 1, nat_net_close);
     bur_register_native("net_nb", 4, nat_net_nb);
+    bur_register_native("read_stdin", 1, nat_read_stdin);
+    bur_register_native("stdin_nb", 1, nat_stdin_nb);
     bur_register_native("type_of", 1, nat_type_of);
     bur_register_native("assert", 2, nat_assert);
     bur_register_native("gc", 0, nat_gc);
