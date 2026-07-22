@@ -455,6 +455,12 @@ var nativeDefs = []nativeDef{
 		}
 		return ObjV(vm.gc.newString(string(rune(args[0].I)))), nil
 	}},
+	{"byte_chr", 1, func(vm *VM, args []Value) (Value, error) {
+		if args[0].T != VInt || args[0].I < 0 || args[0].I > 255 {
+			return Unit, fmt.Errorf("byte_chr() needs an int in 0..255")
+		}
+		return ObjV(vm.gc.newString(string([]byte{byte(args[0].I)}))), nil
+	}},
 	{"ord", 1, func(vm *VM, args []Value) (Value, error) {
 		if args[0].T == VObj {
 			if s, ok := args[0].O.(*OString); ok && len(s.S) > 0 {
@@ -566,6 +572,36 @@ var ioNativeDefs = []nativeDef{
 		opt := vm.some(f.peek(0))
 		f.pop()
 		return opt, nil
+	}},
+	// S7 net natives and S9 stdin natives. The seed VM never calls them;
+	// they exist so the type checker recognizes them when compiling
+	// current burc sources through the rebirth chain.
+	{"tcp_listen", 2, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("tcp_listen() not available in seed VM")
+	}},
+	{"tcp_accept", 1, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("tcp_accept() not available in seed VM")
+	}},
+	{"tcp_dial", 2, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("tcp_dial() not available in seed VM")
+	}},
+	{"net_read", 2, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("net_read() not available in seed VM")
+	}},
+	{"net_write", 2, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("net_write() not available in seed VM")
+	}},
+	{"net_close", 1, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("net_close() not available in seed VM")
+	}},
+	{"net_nb", 4, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("net_nb() not available in seed VM")
+	}},
+	{"read_stdin", 1, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("read_stdin() not available in seed VM")
+	}},
+	{"stdin_nb", 1, func(vm *VM, args []Value) (Value, error) {
+		return Unit, fmt.Errorf("stdin_nb() not available in seed VM")
 	}},
 }
 
