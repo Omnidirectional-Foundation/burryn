@@ -35,6 +35,9 @@ enum Node {
     QualVariantAccess(str, str, str, SpanT), // pkg, enum, variant
     TryExpr(Node, SpanT),
     RecvExpr(Node, SpanT),
+    RecordLit([str], [Node], SpanT), // field names, field values
+    RecordUpdate(Node, [str], [Node], SpanT), // base expr, field names, field values
+    FieldAccess(Node, str, SpanT), // base expr, field name
 
     // ---- patterns ----
     PatWildcard(SpanT),
@@ -61,11 +64,13 @@ enum Node {
     BreakStmt(SpanT),
     ContinueStmt(SpanT),
     DeferStmt(Node, SpanT), // the deferred block
+    TypeAliasDecl(str, Node, bool, SpanT), // name, type expr, pub
 
     // ---- type expressions ----
     TEName(str, str, str, [Node], SpanT), // pkg, name, constraint, args
     TEList(Node, SpanT),
     TEFn([Node], Node, SpanT), // params, ret
+    TERecord([str], [Node], Node, SpanT), // field names, field types, row var (or NoNode)
 
     NoNode,
 }
@@ -191,6 +196,18 @@ fn ast_eq(a, b) {
             RecvExpr(e2, _) => ast_eq(e1, e2),
             _ => false,
         },
+        RecordLit(n1, v1, _) => match b {
+            RecordLit(n2, v2, _) => ast_eq_strs(n1, n2) && ast_eq_list(v1, v2),
+            _ => false,
+        },
+        RecordUpdate(ba1, n1, v1, _) => match b {
+            RecordUpdate(ba2, n2, v2, _) => ast_eq(ba1, ba2) && ast_eq_strs(n1, n2) && ast_eq_list(v1, v2),
+            _ => false,
+        },
+        FieldAccess(e1, f1, _) => match b {
+            FieldAccess(e2, f2, _) => ast_eq(e1, e2) && f1 == f2,
+            _ => false,
+        },
         PatWildcard(_) => match b {
             PatWildcard(_) => true,
             _ => false,
@@ -279,6 +296,10 @@ fn ast_eq(a, b) {
             DeferStmt(b2, _) => ast_eq(b1, b2),
             _ => false,
         },
+        TypeAliasDecl(n1, t1, p1, _) => match b {
+            TypeAliasDecl(n2, t2, p2, _) => n1 == n2 && ast_eq(t1, t2) && p1 == p2,
+            _ => false,
+        },
         TEName(p1, n1, c1, a1, _) => match b {
             TEName(p2, n2, c2, a2, _) => p1 == p2 && n1 == n2 && c1 == c2 && ast_eq_list(a1, a2),
             _ => false,
@@ -289,6 +310,10 @@ fn ast_eq(a, b) {
         },
         TEFn(p1, r1, _) => match b {
             TEFn(p2, r2, _) => ast_eq_list(p1, p2) && ast_eq(r1, r2),
+            _ => false,
+        },
+        TERecord(n1, t1, r1, _) => match b {
+            TERecord(n2, t2, r2, _) => ast_eq_strs(n1, n2) && ast_eq_list(t1, t2) && ast_eq(r1, r2),
             _ => false,
         },
         NoNode => match b {
@@ -364,6 +389,9 @@ fn span_of(n) {
         QualVariantAccess(_, _, _, sp) => sp,
         TryExpr(_, sp) => sp,
         RecvExpr(_, sp) => sp,
+        RecordLit(_, _, sp) => sp,
+        RecordUpdate(_, _, _, sp) => sp,
+        FieldAccess(_, _, sp) => sp,
         PatWildcard(sp) => sp,
         PatLiteral(_, sp) => sp,
         PatBinding(_, sp) => sp,
@@ -386,9 +414,11 @@ fn span_of(n) {
         BreakStmt(sp) => sp,
         ContinueStmt(sp) => sp,
         DeferStmt(_, sp) => sp,
+        TypeAliasDecl(_, _, _, sp) => sp,
         TEName(_, _, _, _, sp) => sp,
         TEList(_, sp) => sp,
         TEFn(_, _, sp) => sp,
+        TERecord(_, _, _, sp) => sp,
         NoNode => Sp(0, 0),
     }
 }
@@ -455,6 +485,10 @@ fn lower_pipe_node(n) {
         SelectArm(is_send, bind, bsp, ch, val, body, sp) => SelectArm(is_send, bind, bsp, lower_pipe_node(ch), lower_pipe_node(val), lower_pipe_node(body), sp),
         SendStmt(ch, val, sp) => SendStmt(lower_pipe_node(ch), lower_pipe_node(val), sp),
         DeferStmt(body, sp) => DeferStmt(lower_pipe_node(body), sp),
+        RecordLit(names, vals, sp) => RecordLit(names, lower_pipe_nodes(vals), sp),
+        RecordUpdate(base, names, vals, sp) => RecordUpdate(lower_pipe_node(base), names, lower_pipe_nodes(vals), sp),
+        FieldAccess(base, field, sp) => FieldAccess(lower_pipe_node(base), field, sp),
+        TypeAliasDecl(name, te, is_pub, sp) => TypeAliasDecl(name, te, is_pub, sp),
         _ => n,
     }
 }

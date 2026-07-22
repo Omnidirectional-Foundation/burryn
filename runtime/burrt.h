@@ -62,7 +62,7 @@ static inline Value bur_obj(Obj *o)     { Value v; v.t = VOBJ; v.u.o = o; return
 typedef enum {
     OBJ_STRING, OBJ_LIST, OBJ_MAP, OBJ_FUNC, OBJ_CLOSURE,
     OBJ_UPVALUE, OBJ_ENUMTYPE, OBJ_VARIANTCTOR, OBJ_ENUMINST, OBJ_NATIVE,
-    OBJ_CHANNEL
+    OBJ_CHANNEL, OBJ_RECORD
 } ObjType;
 
 struct Obj {
@@ -156,6 +156,13 @@ typedef struct {
     Value *fields;
     int nfields;
 } OEnumInst;
+
+typedef struct {
+    Obj obj;
+    OString **names;
+    Value *fields;
+    int nfields;
+} ORecord;
 
 typedef Value (*NativeFn)(Value *args, int argc);
 
@@ -370,6 +377,89 @@ static OEnumInst *bur_new_inst(OEnumType *e, int variant, Value *fields, int nfi
     return o;
 }
 
+static ORecord *bur_new_record(OString **names, Value *fields, int nfields) {
+    ORecord *o = (ORecord *)bur_alloc(sizeof(ORecord), OBJ_RECORD);
+    o->nfields = nfields;
+    if (nfields > 0) {
+        o->names = (OString **)malloc(sizeof(OString *) * (size_t)nfields);
+        memcpy(o->names, names, sizeof(OString *) * (size_t)nfields);
+        o->fields = (Value *)malloc(sizeof(Value) * (size_t)nfields);
+        memcpy(o->fields, fields, sizeof(Value) * (size_t)nfields);
+    }
+    return o;
+}
+
+static void bur_push(Value v);
+static Value bur_pop(void);
+static void bur_trap(const char *fmt, ...);
+
+static void bur_record_make(int n, const char *names_enc) {
+    OString **names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    Value *fields = (Value *)malloc(sizeof(Value) * (size_t)n);
+    const char *p = names_enc;
+    for (int i = 0; i < n; i++) {
+        const char *end = strchr(p, '\n');
+        int64_t len = end ? (int64_t)(end - p) : (int64_t)strlen(p);
+        names[i] = bur_new_string_n(p, len);
+        fields[i] = bur_cur->stack[bur_cur->top - n + i];
+        p = end ? end + 1 : p + len;
+    }
+    bur_cur->top -= n;
+    ORecord *r = bur_new_record(names, fields, n);
+    free(names); free(fields);
+    bur_push(bur_obj((Obj *)r));
+}
+
+static void bur_record_get(const char *fname) {
+    Value rv = bur_pop();
+    if (rv.t != VOBJ || rv.u.o->type != OBJ_RECORD)
+        bur_trap("field access needs a record");
+    ORecord *r = (ORecord *)rv.u.o;
+    int64_t flen = (int64_t)strlen(fname);
+    for (int i = 0; i < r->nfields; i++) {
+        if (r->names[i]->len == flen && memcmp(r->names[i]->data, fname, (size_t)flen) == 0) {
+            bur_push(r->fields[i]);
+            return;
+        }
+    }
+    bur_trap("record has no field \"%s\"", fname);
+}
+
+static void bur_record_update(int n, const char *names_enc) {
+    Value *new_vals = (Value *)malloc(sizeof(Value) * (size_t)n);
+    for (int i = 0; i < n; i++)
+        new_vals[i] = bur_cur->stack[bur_cur->top - n + i];
+    bur_cur->top -= n;
+    Value base_v = bur_pop();
+    if (base_v.t != VOBJ || base_v.u.o->type != OBJ_RECORD)
+        bur_trap("record update needs a record");
+    ORecord *base = (ORecord *)base_v.u.o;
+    OString **upd_names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    const char *p = names_enc;
+    for (int i = 0; i < n; i++) {
+        const char *end = strchr(p, '\n');
+        int64_t len = end ? (int64_t)(end - p) : (int64_t)strlen(p);
+        upd_names[i] = bur_new_string_n(p, len);
+        p = end ? end + 1 : p + len;
+    }
+    OString **rnames = (OString **)malloc(sizeof(OString *) * (size_t)base->nfields);
+    Value *rvals = (Value *)malloc(sizeof(Value) * (size_t)base->nfields);
+    for (int i = 0; i < base->nfields; i++) {
+        rnames[i] = base->names[i];
+        rvals[i] = base->fields[i];
+        for (int j = 0; j < n; j++) {
+            if (upd_names[j]->len == base->names[i]->len &&
+                memcmp(upd_names[j]->data, base->names[i]->data, (size_t)base->names[i]->len) == 0) {
+                rvals[i] = new_vals[j];
+                break;
+            }
+        }
+    }
+    ORecord *r = bur_new_record(rnames, rvals, base->nfields);
+    free(new_vals); free(upd_names); free(rnames); free(rvals);
+    bur_push(bur_obj((Obj *)r));
+}
+
 // stack roots (declared here, used by the collector)
 static void bur_push(Value v);
 static Value bur_pop(void);
@@ -441,6 +531,14 @@ static void bur_gc_trace(Obj *o) {
         // blocked senders' pending values are marked via fiber roots
         break;
     }
+    case OBJ_RECORD: {
+        ORecord *r = (ORecord *)o;
+        for (int i = 0; i < r->nfields; i++) {
+            bur_gray_push((Obj *)r->names[i]);
+            bur_mark_value(r->fields[i]);
+        }
+        break;
+    }
     }
 }
 
@@ -507,6 +605,11 @@ static void bur_gc_collect(void) {
                 free(ch->buf); free(ch->sendq); free(ch->recvq); free(ch->waiters);
                 break;
             }
+            case OBJ_RECORD: {
+                ORecord *r = (ORecord *)o;
+                free(r->names); free(r->fields);
+                break;
+            }
             default: break;
             }
             free(o);
@@ -549,6 +652,7 @@ static const char *bur_typename(Value v) {
         case OBJ_ENUMINST: return ((OEnumInst *)v.u.o)->enm->name;
         case OBJ_NATIVE: return "native function";
         case OBJ_CHANNEL: return "channel";
+        case OBJ_RECORD: return "record";
         }
     }
     return "?";
@@ -604,6 +708,16 @@ static bool bur_obj_eq(Obj *a, Obj *b) {
         if (x->enm != y->enm || x->variant != y->variant) return false;
         for (int i = 0; i < x->nfields; i++)
             if (!bur_eq(x->fields[i], y->fields[i])) return false;
+        return true;
+    }
+    case OBJ_RECORD: {
+        ORecord *x = (ORecord *)a, *y = (ORecord *)b;
+        if (x->nfields != y->nfields) return false;
+        for (int i = 0; i < x->nfields; i++) {
+            OString *nx = x->names[i], *ny = y->names[i];
+            if (nx->len != ny->len || memcmp(nx->data, ny->data, (size_t)nx->len) != 0) return false;
+            if (!bur_eq(x->fields[i], y->fields[i])) return false;
+        }
         return true;
     }
     default: return a == b;
@@ -745,6 +859,18 @@ static void bur_format(Buf *b, Value v, bool quote) {
         char t[64];
         snprintf(t, sizeof t, "<chan cap=%d len=%d>", ch->cap, ch->buflen);
         buf_str(b, t);
+        return;
+    }
+    case OBJ_RECORD: {
+        ORecord *r = (ORecord *)o;
+        buf_str(b, "record { ");
+        for (int i = 0; i < r->nfields; i++) {
+            if (i > 0) buf_str(b, ", ");
+            buf_bytes(b, r->names[i]->data, r->names[i]->len);
+            buf_str(b, ": ");
+            bur_format(b, r->fields[i], true);
+        }
+        buf_str(b, " }");
         return;
     }
     default: return;

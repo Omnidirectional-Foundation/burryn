@@ -75,7 +75,7 @@ fn p_synchronize(toks, mut pos) {
 }
 
 fn p_starts_stmt(t) {
-    t == t_let || t == t_const || t == t_fn || t == t_enum || t == t_while || t == t_for || t == t_return || t == t_spawn || t == t_select || t == t_defer || t == t_break || t == t_continue || t == t_pub || t == t_import
+    t == t_let || t == t_const || t == t_fn || t == t_enum || t == t_type || t == t_while || t == t_for || t == t_return || t == t_spawn || t == t_select || t == t_defer || t == t_break || t == t_continue || t == t_pub || t == t_import
 }
 
 fn p_peek(toks, pos) {
@@ -142,6 +142,8 @@ fn p_statement(toks, mut pos) {
         p_fn_decl(toks, pos)
     } else if p_check(toks, pos, t_enum) {
         p_enum_decl(toks, pos)
+    } else if p_check(toks, pos, t_type) {
+        p_type_alias_decl(toks, pos, false)
     } else if p_check(toks, pos, t_pub) {
         p_pub_decl(toks, pos)
     } else if p_check(toks, pos, t_import) {
@@ -445,8 +447,10 @@ fn p_pub_decl(toks, mut pos) {
             EnumDecl(name, params, variants, _, sp) => Ok(EnumDecl(name, params, variants, true, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
+    } else if p_check(toks, pos, t_type) {
+        p_type_alias_decl(toks, pos, true)
     } else {
-        perr("E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, `pub let`, or `pub const`", "expected `fn`, `enum`, `let`, or `const` after `pub`, got \"" + tok_lex(p_peek(toks, pos)) + "\"", sp_of_tok(tok))
+        perr("E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, `pub let`, `pub const`, or `pub type`", "expected `fn`, `enum`, `let`, `const`, or `type` after `pub`, got \"" + tok_lex(p_peek(toks, pos)) + "\"", sp_of_tok(tok))
     }
 }
 
@@ -671,6 +675,37 @@ fn p_enum_decl(toks, mut pos) {
     Ok(EnumDecl(tok_lex(name), params, variants, false, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
+fn p_type_alias_decl(toks, mut pos, is_pub) {
+    let tok = p_advance(toks, pos) // type
+    let name = match p_expect(toks, pos, t_ident, "type alias name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            Tok(0, "", 0, 0)
+        },
+    }
+    match p_expect(toks, pos, t_eq, "'=' after type alias name") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let te = match p_type_expr(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    Ok(TypeAliasDecl(tok_lex(name), te, is_pub, sp_union(sp_of_tok(tok), span_of(te))))
+}
+
 // typeExpr := "[" typeExpr "]" | "fn" "(" list ")" "->" typeExpr | IDENT ["." IDENT] [":" IDENT] ["(" list ")"]
 fn p_type_expr(toks, mut pos) {
     let tok = p_peek(toks, pos)
@@ -692,6 +727,65 @@ fn p_type_expr(toks, mut pos) {
             },
         }
         Ok(TEList(el, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+    } else if t == t_record {
+        p_advance(toks, pos)
+        match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record` in type") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        let mut names = []
+        let mut types = []
+        let mut row_var = NoNode
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rbrace) {
+            if p_match(toks, pos, t_bar) {
+                let rv = match p_expect(toks, pos, t_ident, "row variable after '|'") {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        Tok(0, "", 0, 0)
+                    },
+                }
+                row_var = TEName("", tok_lex(rv), "", [], sp_of_tok(rv))
+                break
+            }
+            let fname = match p_expect(toks, pos, t_ident, "field name in record type") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    Tok(0, "", 0, 0)
+                },
+            }
+            match p_expect(toks, pos, t_colon, "':' after field name") {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            let ft = match p_type_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            push(names, tok_lex(fname))
+            push(types, ft)
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        let rb = match p_expect(toks, pos, t_rbrace, "'}' after record type fields") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                Tok(0, "", 0, 0)
+            },
+        }
+        Ok(TERecord(names, types, row_var, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     } else if t == t_fn {
         p_advance(toks, pos)
         match p_expect(toks, pos, t_lparen, "'(' in fn type") {
@@ -1370,7 +1464,7 @@ fn p_postfix(toks, mut pos) {
             let q = p_advance(toks, pos)
             e = TryExpr(e, sp_union(span_of(e), sp_of_tok(q)))
         } else if p_check(toks, pos, t_dot) {
-            let d = p_advance(toks, pos)
+            let _ = p_advance(toks, pos)
             e = match e {
                 Ident(name, hsp) => {
                     let v = match p_expect(toks, pos, t_ident, "a name after '.'") {
@@ -1394,8 +1488,14 @@ fn p_postfix(toks, mut pos) {
                     QualVariantAccess(en, vr, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
                 },
                 _ => {
-                    return perr("E1107", "", "'.' is only used for enum variants (Enum.Variant) and package members (pkg.name)", sp_of_tok(d))
-                    NoNode
+                    let v = match p_expect(toks, pos, t_ident, "a field name after '.'") {
+                        Ok(x) => x,
+                        Err(dg) => {
+                            return Err(dg)
+                            Tok(0, "", 0, 0)
+                        },
+                    }
+                    FieldAccess(e, tok_lex(v), sp_union(span_of(e), sp_of_tok(v)))
                 },
             }
         } else {
@@ -1431,6 +1531,122 @@ fn p_primary(toks, mut pos) {
     } else if t == t_false {
         p_advance(toks, pos)
         Ok(BoolLit(false, sp_of_tok(tok)))
+    } else if t == t_record {
+        p_advance(toks, pos)
+        match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record`") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        p_skip_semis(toks, pos)
+        if p_check(toks, pos, t_rbrace) {
+            let rb = p_advance(toks, pos)
+            return Ok(RecordLit([], [], sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+        }
+        let first_name = match p_expect(toks, pos, t_ident, "field name in record literal") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                Tok(0, "", 0, 0)
+            },
+        }
+        if p_match(toks, pos, t_bar) {
+            let base = Ident(tok_lex(first_name), sp_of_tok(first_name))
+            let mut names = []
+            let mut vals = []
+            p_skip_semis(toks, pos)
+            while !p_check(toks, pos, t_rbrace) {
+                let fname = match p_expect(toks, pos, t_ident, "field name in record update") {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        Tok(0, "", 0, 0)
+                    },
+                }
+                match p_expect(toks, pos, t_colon, "':' after field name") {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                let fv = match p_expression(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        NoNode
+                    },
+                }
+                push(names, tok_lex(fname))
+                push(vals, fv)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+                p_skip_semis(toks, pos)
+            }
+            let rb = match p_expect(toks, pos, t_rbrace, "'}' after record update fields") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    Tok(0, "", 0, 0)
+                },
+            }
+            return Ok(RecordUpdate(base, names, vals, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+        }
+        match p_expect(toks, pos, t_colon, "':' after field name") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        let first_val = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        let mut names = [tok_lex(first_name)]
+        let mut vals = [first_val]
+        if p_match(toks, pos, t_comma) {
+            p_skip_semis(toks, pos)
+            while !p_check(toks, pos, t_rbrace) {
+                let fname = match p_expect(toks, pos, t_ident, "field name in record literal") {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        Tok(0, "", 0, 0)
+                    },
+                }
+                match p_expect(toks, pos, t_colon, "':' after field name") {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                let fv = match p_expression(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        NoNode
+                    },
+                }
+                push(names, tok_lex(fname))
+                push(vals, fv)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+                p_skip_semis(toks, pos)
+            }
+        }
+        let rb = match p_expect(toks, pos, t_rbrace, "'}' after record fields") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                Tok(0, "", 0, 0)
+            },
+        }
+        Ok(RecordLit(names, vals, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     } else if t == t_ident {
         p_advance(toks, pos)
         Ok(Ident(tok_lex(tok), sp_of_tok(tok)))

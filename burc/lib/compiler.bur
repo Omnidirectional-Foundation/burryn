@@ -55,6 +55,9 @@ let op_recv = 46
 let op_chan_next = 47
 let op_select = 48
 let op_defer = 49
+let op_record = 50
+let op_get_field_name = 51
+let op_record_update = 52
 
 // native global names, mirroring nativeNames() in builtins.go
 let native_names = ["print", "println", "eprintln", "len", "map", "get", "put", "delete", "keys", "push", "pop", "str", "trunc", "to_float", "float_bits", "parse_int", "parse_float", "str_len", "char_at", "byte_at", "range", "split", "join", "substr", "str_contains", "str_index_of", "trim", "slice", "concat", "contains", "read_file", "write_file", "file_exists", "read_dir", "exec", "args", "exit", "chan", "close", "recv", "chr", "ord", "clock", "type_of", "assert", "gc", "heap_objects", "gc_cycles", "yield", "sleep", "exec_start", "exec_poll", "tcp_listen", "tcp_accept", "tcp_dial", "net_read", "net_write", "net_close", "net_nb"]
@@ -1570,9 +1573,19 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 } else {
                     let eh = local_enum(en)
                     if eh < 0 {
-                        return perr("E2015", "", "unknown enum \"" + en + "\"", sp)
+                        match cp_ident(ch, en, sp) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                        let cidx = add_const(ch, CStr(vr))
+                        emit(ch, op_get_field_name, sp)
+                        emit_u16(ch, cidx, sp)
+                        Ok(true)
+                    } else {
+                        emit_variant_of(ch, eh, vr, sp)
                     }
-                    emit_variant_of(ch, eh, vr, sp)
                 }
             },
             PkgAccess(pkg, name, sp) => {
@@ -1616,6 +1629,62 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     },
                 }
                 emit(ch, op_recv, sp)
+                Ok(true)
+            },
+            RecordLit(names, vals, sp) => {
+                for v in vals {
+                    match cp_expr(ch, v) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                }
+                let mut enc = ""
+                for n in names {
+                    enc = enc + n + "\n"
+                }
+                let cidx = add_const(ch, CStr(enc))
+                emit(ch, op_record, sp)
+                emit(ch, len(names), sp)
+                emit_u16(ch, cidx, sp)
+                Ok(true)
+            },
+            RecordUpdate(base, names, vals, sp) => {
+                match cp_expr(ch, base) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                for v in vals {
+                    match cp_expr(ch, v) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                }
+                let mut enc = ""
+                for n in names {
+                    enc = enc + n + "\n"
+                }
+                let cidx = add_const(ch, CStr(enc))
+                emit(ch, op_record_update, sp)
+                emit(ch, len(names), sp)
+                emit_u16(ch, cidx, sp)
+                Ok(true)
+            },
+            FieldAccess(base, field, sp) => {
+                match cp_expr(ch, base) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                let cidx = add_const(ch, CStr(field))
+                emit(ch, op_get_field_name, sp)
+                emit_u16(ch, cidx, sp)
                 Ok(true)
             },
             _ => Ok(true),
