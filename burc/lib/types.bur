@@ -275,6 +275,15 @@ fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
             "[" + ty_pretty(tk, tn, ta, tr, ta[x][0], names, cnt) + "]"
         } else if tn[x] == "chan" {
             "chan(" + ty_pretty(tk, tn, ta, tr, ta[x][0], names, cnt) + ")"
+        } else if str_len(tn[x]) > 4 && substr(tn[x], 0, 4) == "@rec" {
+            let fnames = rec_parse_names(tn[x])
+            let mut fields = []
+            let mut i = 0
+            while i < len(fnames) {
+                push(fields, fnames[i] + ": " + ty_pretty(tk, tn, ta, tr, ta[x][i], names, cnt))
+                i = i + 1
+            }
+            "record " + chr(123) + " " + join(fields, ", ") + " " + chr(125)
         } else if len(ta[x]) == 0 {
             tn[x]
         } else {
@@ -485,6 +494,34 @@ fn scc_groups(adj) {
 // (infer_expr <-> infer_stmt) go through mut fn cells assigned after both
 // sides are defined.
 //
+fn rec_type_name(names) {
+    let mut s = "@rec"
+    for n in names {
+        s = s + "|" + n
+    }
+    s
+}
+
+fn rec_parse_names(tname) {
+    let mut out = []
+    let mut i = 5
+    let mut cur = ""
+    while i < str_len(tname) {
+        let c = substr(tname, i, 1)
+        if c == "|" {
+            push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        push(out, cur)
+    }
+    out
+}
+
 // Returns Checked(diags, bind_lines, chan_fors):
 //   diags       sorted by span start (stable)
 //   bind_lines  "bind <name> :: <type>" for every top-level global, sorted
@@ -884,6 +921,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 validate_type_expr(ret, pm)
             },
+            TERecord(_, ftypes, row, _) => {
+                for ft in ftypes {
+                    validate_type_expr(ft, pm)
+                }
+                match row {
+                    NoNode => {},
+                    _ => validate_type_expr(row, pm),
+                }
+            },
             _ => {},
         }
     }
@@ -1004,6 +1050,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 tfn(phs, convert_type_expr(ret, subst, prefix))
             },
+            TERecord(fnames, ftypes, _, _) => {
+                let mut fhs = []
+                for ft in ftypes {
+                    push(fhs, convert_type_expr(ft, subst, prefix))
+                }
+                ty_new_con(tk, tn, ta, tr, tl, rec_type_name(fnames), fhs)
+            },
             _ => h_unit,
         }
     }
@@ -1049,6 +1102,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 collect_annotation_vars(ret, subst)
             },
+            TERecord(_, ftypes, row, _) => {
+                for ft in ftypes {
+                    collect_annotation_vars(ft, subst)
+                }
+                match row {
+                    NoNode => {},
+                    _ => collect_annotation_vars(row, subst),
+                }
+            },
             _ => {},
         }
     }
@@ -1058,6 +1120,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             TEName(_, _, _, _, _) => true,
             TEList(_, _) => true,
             TEFn(_, _, _) => true,
+            TERecord(_, _, _, _) => true,
             _ => false,
         }
     }
@@ -1130,6 +1193,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 iface_collect_te(ret, local_enums, external_pkgs)
             },
+            TERecord(_, ftypes, row, _) => {
+                for ft in ftypes {
+                    iface_collect_te(ft, local_enums, external_pkgs)
+                }
+                match row {
+                    NoNode => {},
+                    _ => iface_collect_te(row, local_enums, external_pkgs),
+                }
+            },
             _ => {},
         }
     }
@@ -1164,6 +1236,18 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     push(ps, iface_render_te(p, aliases))
                 }
                 "fn(" + join(ps, ", ") + ") -> " + iface_render_te(ret, aliases)
+            },
+            TERecord(fnames, ftypes, row, _) => {
+                let mut fields = []
+                let mut i = 0
+                while i < len(fnames) {
+                    push(fields, fnames[i] + ": " + iface_render_te(ftypes[i], aliases))
+                    i = i + 1
+                }
+                match row {
+                    NoNode => "record " + chr(123) + " " + join(fields, ", ") + " " + chr(125),
+                    _ => "record " + chr(123) + " " + join(fields, ", ") + " | " + iface_render_te(row, aliases) + " " + chr(125),
+                }
             },
             _ => "unit",
         }
@@ -1475,6 +1559,19 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             Unary(_, e, _) => scan_free(e, sc, seen, out),
             TryExpr(e, _) => scan_free(e, sc, seen, out),
             RecvExpr(e, _) => scan_free(e, sc, seen, out),
+            RecordLit(_, vals, _) => {
+                for v in vals {
+                    scan_free(v, sc, seen, out)
+                }
+            },
+            RecordUpdate(base, _, vals, _) => {
+                scan_free(base, sc, seen, out)
+                for v in vals {
+                    scan_free(v, sc, seen, out)
+                }
+            },
+            FieldAccess(base, _, _) => scan_free(base, sc, seen, out),
+            TypeAliasDecl(_, _, _, _) => {},
             ExprStmt(e, _) => scan_free(e, sc, seen, out),
             SpawnStmt(e, _) => scan_free(e, sc, seen, out),
             DeferStmt(e, _) => scan_free(e, sc, seen, out),
@@ -2216,8 +2313,35 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                             }
                         },
                         None => {
-                            cerr(vsp, "E0412", "", "cannot find enum `" + en + "`")
-                            fresh("")
+                            let b = lookup(en)
+                            if b >= 0 {
+                                b_used[b] = true
+                                let bt = instantiate(b_scheme[b])
+                                let resolved = ty_resolve(tk, tr, bt)
+                                if tk[resolved] == 0 && str_len(tn[resolved]) > 4 && substr(tn[resolved], 0, 4) == "@rec" {
+                                    let fnames = rec_parse_names(tn[resolved])
+                                    let mut result = -1
+                                    let mut j = 0
+                                    while j < len(fnames) {
+                                        if fnames[j] == vr {
+                                            result = j
+                                        }
+                                        j = j + 1
+                                    }
+                                    if result >= 0 {
+                                        ta[resolved][result]
+                                    } else {
+                                        cerr(vsp, "E0609", "", "record has no field `" + vr + "`")
+                                        fresh("")
+                                    }
+                                } else {
+                                    cerr(vsp, "E0609", "only records support `.field` access", "cannot access field `" + vr + "` on a non-record type")
+                                    fresh("")
+                                }
+                            } else {
+                                cerr(vsp, "E0412", "", "cannot find enum `" + en + "`")
+                                fresh("")
+                            }
                         },
                     }
                 }
@@ -2388,6 +2512,67 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 let ct = infer_expr(ch)
                 unify_at(ct, con1("chan", el), rsp, "with `<-` (need a channel)")
                 el
+            },
+            RecordLit(names, vals, _) => {
+                let mut field_types = []
+                let mut i = 0
+                while i < len(names) {
+                    let ft = infer_expr(vals[i])
+                    push(field_types, ft)
+                    i = i + 1
+                }
+                ty_new_con(tk, tn, ta, tr, tl, rec_type_name(names), field_types)
+            },
+            RecordUpdate(base, names, vals, _) => {
+                let bt = infer_expr(base)
+                let mut i = 0
+                while i < len(names) {
+                    let ft = infer_expr(vals[i])
+                    let resolved = ty_resolve(tk, tr, bt)
+                    if tk[resolved] == 0 && str_len(tn[resolved]) > 4 && substr(tn[resolved], 0, 4) == "@rec" {
+                        let fnames = rec_parse_names(tn[resolved])
+                        let mut found = false
+                        let mut j = 0
+                        while j < len(fnames) {
+                            if fnames[j] == names[i] {
+                                unify_at(ta[resolved][j], ft, span_of(vals[i]), "in record update field `" + names[i] + "`")
+                                found = true
+                            }
+                            j = j + 1
+                        }
+                        if !found {
+                            cerr(span_of(vals[i]), "E0609", "", "record has no field `" + names[i] + "`")
+                        }
+                    }
+                    i = i + 1
+                }
+                bt
+            },
+            FieldAccess(base, field, fsp) => {
+                let bt = infer_expr(base)
+                let resolved = ty_resolve(tk, tr, bt)
+                if tk[resolved] == 0 && str_len(tn[resolved]) > 4 && substr(tn[resolved], 0, 4) == "@rec" {
+                    let fnames = rec_parse_names(tn[resolved])
+                    let mut result = -1
+                    let mut j = 0
+                    while j < len(fnames) {
+                        if fnames[j] == field {
+                            result = j
+                        }
+                        j = j + 1
+                    }
+                    if result >= 0 {
+                        ta[resolved][result]
+                    } else {
+                        cerr(fsp, "E0609", "", "record has no field `" + field + "`")
+                        fresh("")
+                    }
+                } else {
+                    let ft = fresh("")
+                    unify_at(bt, ft, fsp, "field access requires a record")
+                    cerr(fsp, "E0609", "only records support `.field` access", "cannot access field `" + field + "` on a non-record type")
+                    fresh("")
+                }
             },
             _ => fresh(""),
         }

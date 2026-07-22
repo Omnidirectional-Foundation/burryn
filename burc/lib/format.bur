@@ -203,6 +203,15 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push(buf, "defer ")
             fmt_expr(body, src, comments, cc, indent, buf)
         },
+        TypeAliasDecl(name, te, is_pub, _) => {
+            if is_pub {
+                push(buf, "pub ")
+            }
+            push(buf, "type ")
+            push(buf, name)
+            push(buf, " = ")
+            fmt_expr(te, src, comments, cc, indent, buf)
+        },
         SendStmt(ch, val, _) => {
             fmt_expr(ch, src, comments, cc, indent, buf)
             push(buf, " <- ")
@@ -357,6 +366,35 @@ fn fmt_type(n, mut buf) {
             push(buf, ") -> ")
             fmt_type(ret, buf)
         },
+        TERecord(fnames, ftypes, row, _) => {
+            push(buf, "record ")
+            push(buf, chr(123))
+            let mut i = 0
+            while i < len(fnames) {
+                if i > 0 {
+                    push(buf, ",")
+                }
+                push(buf, " ")
+                push(buf, fnames[i])
+                push(buf, ": ")
+                fmt_type(ftypes[i], buf)
+                i = i + 1
+            }
+            match row {
+                NoNode => {},
+                _ => {
+                    if len(fnames) > 0 {
+                        push(buf, ",")
+                    }
+                    push(buf, " | ")
+                    fmt_type(row, buf)
+                },
+            }
+            if len(fnames) > 0 {
+                push(buf, " ")
+            }
+            push(buf, chr(125))
+        },
         _ => fmt_internal("unhandled type expression node"),
     }
 }
@@ -499,6 +537,50 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
         TryExpr(e, _) => {
             fmt_child(e, 9, src, comments, cc, indent, buf)
             push(buf, "?")
+        },
+        RecordLit(names, vals, _) => {
+            push(buf, "record ")
+            push(buf, chr(123))
+            let mut i = 0
+            while i < len(names) {
+                if i > 0 {
+                    push(buf, ",")
+                }
+                push(buf, " ")
+                push(buf, names[i])
+                push(buf, ": ")
+                fmt_expr(vals[i], src, comments, cc, indent, buf)
+                i = i + 1
+            }
+            if len(names) > 0 {
+                push(buf, " ")
+            }
+            push(buf, chr(125))
+        },
+        RecordUpdate(base, names, vals, _) => {
+            push(buf, "record ")
+            push(buf, chr(123))
+            push(buf, " ")
+            fmt_expr(base, src, comments, cc, indent, buf)
+            push(buf, " |")
+            let mut i = 0
+            while i < len(names) {
+                push(buf, " ")
+                push(buf, names[i])
+                push(buf, ": ")
+                fmt_expr(vals[i], src, comments, cc, indent, buf)
+                if i < len(names) - 1 {
+                    push(buf, ",")
+                }
+                i = i + 1
+            }
+            push(buf, " ")
+            push(buf, chr(125))
+        },
+        FieldAccess(base, field, _) => {
+            fmt_child(base, 9, src, comments, cc, indent, buf)
+            push(buf, ".")
+            push(buf, field)
         },
         Index(target, idx, _) => {
             fmt_child(target, 9, src, comments, cc, indent, buf)
@@ -699,6 +781,7 @@ fn node_prec(n) {
         Call(_, _, _) => 9,
         Index(_, _, _) => 9,
         TryExpr(_, _) => 9,
+        FieldAccess(_, _, _) => 9,
         FnLit(_, _, _, _, _, _, _, _) => 0,
         Block(_, _) => 0,
         IfExpr(_, _, _, _) => 0,

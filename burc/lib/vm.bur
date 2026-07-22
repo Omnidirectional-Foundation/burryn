@@ -43,6 +43,7 @@ let ot_channel = 6
 let ot_native = 7
 let ot_enumtype = 8
 let ot_ctor = 9
+let ot_record = 10
 
 // fiber status (vm.go FiberStatus)
 let fs_ready = 0
@@ -286,6 +287,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     "native function"
                 } else if t == ot_enumtype {
                     "enum"
+                } else if t == ot_record {
+                    "record"
                 } else {
                     "variant constructor"
                 }
@@ -348,6 +351,18 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                 } else if t == ot_channel {
                     "<chan cap=" + str(o_i1[h]) + " len=" + str(len(o_vals[h])) + ">"
+                } else if t == ot_record {
+                    let mut parts = []
+                    let mut i = 0
+                    while i < len(o_keys[h]) {
+                        let kname = match o_keys[h][i] {
+                            VStr(s) => s,
+                            _ => "?",
+                        }
+                        push(parts, kname + ": " + format_val(o_vals[h][i], true))
+                        i = i + 1
+                    }
+                    "record " + chr(123) + " " + join(parts, ", ") + " " + chr(125)
                 } else {
                     "?"
                 }
@@ -446,6 +461,21 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                             }
                             same
                         }
+                    } else if tx == ot_record && ty == ot_record {
+                        if len(o_keys[x]) != len(o_keys[y]) {
+                            false
+                        } else {
+                            let mut same = true
+                            let mut i = 0
+                            while i < len(o_keys[x]) {
+                                if o_keys[x][i] != o_keys[y][i] || !eq_val(o_vals[x][i], o_vals[y][i]) {
+                                    same = false
+                                    i = len(o_keys[x])
+                                }
+                                i = i + 1
+                            }
+                            same
+                        }
                     } else {
                         x == y
                     }
@@ -522,6 +552,13 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             let t = o_tag[h]
             if t == ot_list || t == ot_enuminst || t == ot_channel {
                 for e in o_vals[h] {
+                    mark_val(e)
+                }
+            } else if t == ot_record {
+                for e in o_vals[h] {
+                    mark_val(e)
+                }
+                for e in o_keys[h] {
                     mark_val(e)
                 }
             } else if t == ot_map {
@@ -2501,6 +2538,112 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     fb_fr_ip[f][fi] = start_ip
                     return false
                 }
+            } else if op == op_record {
+                let n = code[start_ip + 1]
+                let cidx = rd_u16(code, start_ip + 2)
+                fb_fr_ip[f][fi] = start_ip + 4
+                let names_str = match k_vals[fnh][cidx] {
+                    VStr(s) => s,
+                    _ => "",
+                }
+                let fnames = split(names_str, "\n")
+                let h = alloc_obj(ot_record)
+                let mut vals = []
+                let mut i = 0
+                while i < n {
+                    push(vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
+                fsettop(f, ftop(f) - n)
+                let mut keys = []
+                let mut j = 0
+                while j < len(fnames) {
+                    if fnames[j] != "" {
+                        push(keys, VStr(fnames[j]))
+                    }
+                    j = j + 1
+                }
+                o_vals[h] = vals
+                o_keys[h] = keys
+                fpush(f, VObj(h))
+            } else if op == op_get_field_name {
+                let cidx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                let fname = match k_vals[fnh][cidx] {
+                    VStr(s) => s,
+                    _ => "",
+                }
+                let rv = fpop(f)
+                let rh = tagged_h(rv, ot_record)
+                if rh < 0 {
+                    trap("field access needs a record, got " + type_name(rv))
+                }
+                let mut found = false
+                let mut i = 0
+                while i < len(o_keys[rh]) {
+                    if o_keys[rh][i] == VStr(fname) {
+                        fpush(f, o_vals[rh][i])
+                        found = true
+                        i = len(o_keys[rh])
+                    }
+                    i = i + 1
+                }
+                if !found {
+                    trap("record has no field \"" + fname + "\"")
+                }
+            } else if op == op_record_update {
+                let n = code[start_ip + 1]
+                let cidx = rd_u16(code, start_ip + 2)
+                fb_fr_ip[f][fi] = start_ip + 4
+                let names_str = match k_vals[fnh][cidx] {
+                    VStr(s) => s,
+                    _ => "",
+                }
+                let fnames = split(names_str, "\n")
+                let mut update_names = []
+                let mut j = 0
+                while j < len(fnames) {
+                    if fnames[j] != "" {
+                        push(update_names, fnames[j])
+                    }
+                    j = j + 1
+                }
+                let mut new_vals = []
+                let mut i = 0
+                while i < n {
+                    push(new_vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
+                fsettop(f, ftop(f) - n)
+                let base_v = fpop(f)
+                let bh = tagged_h(base_v, ot_record)
+                if bh < 0 {
+                    trap("record update needs a record, got " + type_name(base_v))
+                }
+                let h = alloc_obj(ot_record)
+                let mut rkeys = []
+                let mut rvals = []
+                let mut k = 0
+                while k < len(o_keys[bh]) {
+                    push(rkeys, o_keys[bh][k])
+                    let mut overwritten = false
+                    let mut m = 0
+                    while m < len(update_names) {
+                        if VStr(update_names[m]) == o_keys[bh][k] {
+                            push(rvals, new_vals[m])
+                            overwritten = true
+                            m = len(update_names)
+                        }
+                        m = m + 1
+                    }
+                    if !overwritten {
+                        push(rvals, o_vals[bh][k])
+                    }
+                    k = k + 1
+                }
+                o_vals[h] = rvals
+                o_keys[h] = rkeys
+                fpush(f, VObj(h))
             } else {
                 trap("bad opcode " + str(op) + " (VM bug)")
             }
