@@ -62,7 +62,7 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 ## 语言速览
 
 ```sh
-bur run examples/sieve.bur
+bur run examples/concurrency/sieve.bur
 ```
 
 ```text
@@ -106,19 +106,27 @@ for _i in range(0, 5) { sum = sum + <-ch }
 
 | 文件 | 说明 |
 | ------ | ------ |
-| `examples/hello.bur` | 基础、闭包、循环 |
-| `examples/shapes.bur` | 枚举与 match |
-| `examples/errors.bur` | Result、Option 与 `?` |
-| `examples/sieve.bur` | 经典 CSP 素数筛：每个素数一个 fiber |
-| `examples/pipeline.bur` | 带缓冲 channel 的生产者/消费者 |
-| `examples/gc_stress.bur` | 观察垃圾回收器工作 |
-| `examples/fib.bur` | 递归微基准 |
-| `examples/brainfuck.bur` | 用 Burryn 写的 Brainfuck 解释器 |
-| `examples/multiplex.bur` | 多 channel 的 `select` |
-| `examples/streaming.bur` | channel 关闭与 for-in 排空 |
-| `examples/textproc.bur` | 文件、exec、argv：小型文本工具 |
-| `examples/wordcount.bur` | map 与字符串函数 |
-| `examples/geometry/` | 多包模块示例（`bur.mod`、`import`、`pub`） |
+| `examples/basics/hello.bur` | 基础、闭包、循环 |
+| `examples/basics/fib.bur` | 递归微基准 |
+| `examples/basics/textproc.bur` | 字符串与列表原语：split、trim、join、slice、concat |
+| `examples/basics/interpolation.bur` | 字符串插值 `{expr}` |
+| `examples/basics/cleanup.bur` | defer：LIFO 清理、闭包捕获 |
+| `examples/types/shapes.bur` | 枚举与 match |
+| `examples/types/errors.bur` | Result、Option 与 `?` |
+| `examples/types/constants.bur` | 编译期 const 折叠 |
+| `examples/types/match_guard.bur` | 带 `if` guard 的 match 臂 |
+| `examples/types/pipeline_op.bur` | 管道操作符 `\|>` |
+| `examples/concurrency/sieve.bur` | 经典 CSP 素数筛：每个素数一个 fiber |
+| `examples/concurrency/pipeline.bur` | 带缓冲 channel 的生产者/消费者 |
+| `examples/concurrency/multiplex.bur` | 多 channel 的 `select` |
+| `examples/concurrency/streaming.bur` | channel 关闭与 for-in 排空 |
+| `examples/net/net_loopback.bur` | TCP 监听 + 拨号回显交换 |
+| `examples/io/fs.bur` | read_file/write_file 往返与错误路径 |
+| `examples/io/exec.bur` | 同步 exec：Output、退出码 |
+| `examples/programs/brainfuck.bur` | 用 Burryn 写的 Brainfuck 解释器 |
+| `examples/programs/wordcount.bur` | map 与字符串函数 |
+| `examples/programs/gc_stress.bur` | 观察垃圾回收器工作 |
+| `examples/programs/geometry/` | 多包模块示例（`bur.mod`、`import`、`pub`） |
 | `burc/` | 自举编译器与 `bur` CLI——现存最大的 Burryn 程序 |
 
 ## 架构
@@ -187,18 +195,18 @@ Burryn 是自举编译器与运行时。
 
 ## 诚实局限
 
-S1–S6、S7.1、S7.2 与 S7.3 已完成。
-覆盖范围包括语义内核、C 后端、模块、map、`select`/`close`、`mut` 参数、依赖工具、诊断、字符串插值、管道操作符 `|>`、match guard，以及移除 Go 宿主后的完全自举编译器。
+S1–S7 已全部完成。
+覆盖范围包括语义内核、C 后端、模块、map、`select`/`close`、`mut` 参数、依赖工具、诊断、字符串插值、管道操作符 `|>`、match guard、编译期常量（`const`）、`defer`、TCP 网络，以及移除 Go 宿主后的完全自举编译器。
 两个后端对整门语言（含并发）都能产生逐字节一致的输出。
 
-仍缺失：records/structs（可用单变体枚举建模乘积类型）、编译期常量、`defer` 与 net stdlib。
+仍缺失：records/structs（可用单变体枚举建模乘积类型）。
 深 `mut` 是绑定级别的规则，不是借用检查器：两个 `mut` 绑定仍可能别名同一个列表。
 
 ## 文档
 
 | 文档 | 用途 |
 | ----------------- | ---------------- |
-| [`tutorial.md`](tutorial.md) | 用户 —— 语言实践导览 |
+| [`tutorial.zh-CN.md`](tutorial.zh-CN.md) | 用户 —— 语言实践导览（[English](tutorial.md)） |
 | [`docs/GOALS.md`](docs/GOALS.md) | 设计权威 —— 语言设计、路线图与分阶段里程碑 |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | 贡献者 —— 旧 `v`/`L` 标签到新 `S` 编号的历史对照 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献者 —— 分支策略、提交规范与自举定点要求 |
