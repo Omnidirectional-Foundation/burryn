@@ -175,7 +175,10 @@ fn lsp_diag_severity(is_err) {
 }
 
 fn lsp_convert_diags(diags, src) {
-    let starts = lsp_line_starts(src)
+    lsp_convert_diags_starts(diags, lsp_line_starts(src))
+}
+
+fn lsp_convert_diags_starts(diags, starts) {
     let mut out = []
     for d in diags {
         match d {
@@ -232,10 +235,206 @@ fn lsp_publish_diagnostics(uri, diags) {
     lsp_write_message(jobj(["jsonrpc", "method", "params"], [json.Json.JStr("2.0"), json.Json.JStr("textDocument/publishDiagnostics"), jobj(["uri", "diagnostics"], [json.Json.JStr(uri), json.Json.JArr(diags)])]))
 }
 
+// ---- module pipeline ----
+
+// lsp_uri_to_path strips the "file://" scheme prefix from a file URI, leaving
+// the absolute path. "file:///abs" -> "/abs". Non-file URIs pass through.
+fn lsp_uri_to_path(uri) {
+    let p = "file://"
+    let pn = str_len(p)
+    if str_len(uri) > pn && substr(uri, 0, pn) == p {
+        substr(uri, pn, str_len(uri) - pn)
+    } else {
+        uri
+    }
+}
+
+fn lsp_path_to_uri(path) {
+    "file://" + path
+}
+
+// lsp_normalize_root strips a single trailing slash so the workspace root
+// compares equal to parent-dir walk candidates (which never carry one).
+fn lsp_normalize_root(p) {
+    let n = str_len(p)
+    if n > 1 && byte_at(p, n - 1) == 47 {
+        substr(p, 0, n - 1)
+    } else {
+        p
+    }
+}
+
+// lsp_parent_dir returns the directory holding path (no trailing slash), or
+// "" for a root-level or empty path.
+fn lsp_parent_dir(path) {
+    let mut i = str_len(path) - 1
+    while i > 0 && byte_at(path, i) != 47 {
+        i = i - 1
+    }
+    if i <= 0 {
+        ""
+    } else {
+        substr(path, 0, i)
+    }
+}
+
+// lsp_find_module_root walks up from the open file's directory until it finds
+// a bur.mod, returning that module root. Returns "" when no bur.mod is found,
+// in which case the caller falls back to single-file diagnostics.
+fn lsp_find_module_root(file_path) {
+    let mut dir = lsp_parent_dir(file_path)
+    let mut steps = 0
+    while dir != "" && steps < 100 {
+        if file_exists(dir + "/bur.mod") {
+            return dir
+        }
+        if lsp_root_path != "" && dir == lsp_root_path {
+            return ""
+        }
+        dir = lsp_parent_dir(dir)
+        steps = steps + 1
+    }
+    ""
+}
+
+// lsp_line_starts_for resolves the line-start table for a file path: from the
+// open-doc text (live editor content), else the loaded module tables, else a
+// fresh overlay read. Diagnostic offsets were computed against this source.
+fn lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts) {
+    match lsp_doc_get(lsp_path_to_uri(path)) {
+        Some(text) => {
+            return lsp_line_starts(text)
+        },
+        None => {},
+    }
+    let mut pi = 0
+    while pi < len(pkgs_fpaths) {
+        let mut fi = 0
+        while fi < len(pkgs_fpaths[pi]) {
+            if pkgs_fpaths[pi][fi] == path {
+                return pkgs_lstarts[pi][fi]
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    match lsp_overlay_read(path) {
+        Ok(s) => lsp_line_starts(s),
+        Err(_) => [0],
+    }
+}
+
+// lsp_publish_one emits the diagnostics attributed to path, converting byte
+// offsets to LSP positions with that file's line-start table.
+fn lsp_publish_one(path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
+    let mut file_diags = []
+    let mut dj = 0
+    while dj < len(all_diags) {
+        if all_files[dj] == path {
+            push(file_diags, all_diags[dj])
+        }
+        dj = dj + 1
+    }
+    let starts = lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts)
+    lsp_publish_diagnostics(lsp_path_to_uri(path), lsp_convert_diags_starts(file_diags, starts))
+}
+
+// lsp_publish_module_diags groups diagnostics by file and publishes a
+// publishDiagnostics per affected URI. Files in the module with no
+// diagnostics get an empty list to clear stale markers; the open file is
+// always published even if load dropped it (parse errors). Bundled std paths
+// ("<std:...>") are skipped: they have no real file URI.
+fn lsp_publish_module_diags(open_path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
+    let mut pub_files = []
+    let mut seen = map()
+    let mut pi = 0
+    while pi < len(pkgs_fpaths) {
+        let mut fi = 0
+        while fi < len(pkgs_fpaths[pi]) {
+            let f = pkgs_fpaths[pi][fi]
+            match get(seen, f) {
+                None => {
+                    put(seen, f, true)
+                    push(pub_files, f)
+                },
+                _ => {},
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    let mut di = 0
+    while di < len(all_files) {
+        let f = all_files[di]
+        match get(seen, f) {
+            None => {
+                put(seen, f, true)
+                push(pub_files, f)
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+    match get(seen, open_path) {
+        None => {
+            put(seen, open_path, true)
+            push(pub_files, open_path)
+        },
+        _ => {},
+    }
+    for f in pub_files {
+        if !str_has_prefix(f, "<std:") {
+            lsp_publish_one(f, all_diags, all_files, pkgs_fpaths, pkgs_lstarts)
+        }
+    }
+}
+
+// lsp_check_module runs the full module check pipeline (load -> fold ->
+// typecheck) and publishes diagnostics for every file in the module. Falls
+// back to single-file check when the open file is not inside a module.
+fn lsp_check_module(open_uri) {
+    let open_path = lsp_uri_to_path(open_uri)
+    let root = lsp_find_module_root(open_path)
+    if root == "" {
+        match lsp_doc_get(open_uri) {
+            Some(text) => lsp_publish_diagnostics(open_uri, lsp_check_document(open_uri, text)),
+            None => {},
+        }
+        return
+    }
+    match load_module(root) {
+        ModOut.ModFailed(diags, dfiles) => {
+            lsp_publish_module_diags(open_path, diags, dfiles, [], [])
+        },
+        ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let mut all_diags = ldiags
+            let mut all_files = lfiles
+            match fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                FoldOut.FoldedPkgs(folded, fdiags, ffiles) => {
+                    all_diags = concat(all_diags, fdiags)
+                    all_files = concat(all_files, ffiles)
+                    match typecheck_cached(folded, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                        CheckOut.Checked(cdiags, cfiles, _, _, _) => {
+                            all_diags = concat(all_diags, cdiags)
+                            all_files = concat(all_files, cfiles)
+                        },
+                    }
+                },
+                _ => {},
+            }
+            lsp_publish_module_diags(open_path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts)
+        },
+    }
+}
+
 // ---- document table ----
 
 let mut lsp_docs_keys = []
 let mut lsp_docs_vals = []
+
+// lsp_root_path is the workspace root (absolute, from initialize rootUri);
+// "" until initialize. Bounds module-root discovery for open files.
+let mut lsp_root_path = ""
 
 fn lsp_doc_get(uri) {
     let mut i = 0
@@ -290,7 +489,16 @@ fn lsp_respond(id, result) {
     lsp_write_message(jobj(["jsonrpc", "id", "result"], [json.Json.JStr("2.0"), id, result]))
 }
 
-fn lsp_handle_initialize(id, _params) {
+fn lsp_handle_initialize(id, params) {
+    let root_uri = jstr_field(params, "rootUri")
+    if root_uri != "" {
+        lsp_root_path = lsp_normalize_root(lsp_uri_to_path(root_uri))
+    } else {
+        let root_path = jstr_field(params, "rootPath")
+        if root_path != "" {
+            lsp_root_path = lsp_normalize_root(root_path)
+        }
+    }
     lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding"], [json.Json.JInt(1), json.Json.JStr("utf-8")]), jobj(["name", "version"], [json.Json.JStr("bur-lsp"), json.Json.JStr("0.4.0")])]))
 }
 
@@ -299,8 +507,7 @@ fn lsp_handle_did_open(params) {
     let uri = jstr_field(td, "uri")
     let text = jstr_field(td, "text")
     lsp_doc_set(uri, text)
-    let diags = lsp_check_document(uri, text)
-    lsp_publish_diagnostics(uri, diags)
+    lsp_check_module(uri)
 }
 
 fn lsp_handle_did_change(params) {
@@ -310,8 +517,7 @@ fn lsp_handle_did_change(params) {
     if len(changes) > 0 {
         let text = jstr_field(changes[len(changes) - 1], "text")
         lsp_doc_set(uri, text)
-        let diags = lsp_check_document(uri, text)
-        lsp_publish_diagnostics(uri, diags)
+        lsp_check_module(uri)
     }
 }
 
