@@ -11,6 +11,58 @@
 // explicitly; the checker itself is one big function whose helpers close
 // over the arena and the checker state (see typecheck_script below).
 
+// LSP hover side-channel: the last typecheck_program run snapshots the type
+// arena plus a per-node span->handle table so the LSP can answer "what is
+// the inferred type at offset N in file F". Reset at the start of each
+// check; populated only while lsp_recording is true (LSP only, so `bur
+// check`/`build` pay just one bool check per expression). Mirrors the
+// chan_fors side-list pattern: nodes are immutable, so type info is emitted
+// to a parallel table during inference.
+let mut lsp_recording = false
+let mut lsp_ty_starts = []
+let mut lsp_ty_ends = []
+let mut lsp_ty_handles = []
+let mut lsp_ty_files = []
+let mut lsp_arena_tk = []
+let mut lsp_arena_tn = []
+let mut lsp_arena_ta = []
+let mut lsp_arena_tr = []
+
+fn lsp_record_type(sp, h, file) {
+    match sp {
+        Sp(s, e) => {
+            push(lsp_ty_starts, s)
+            push(lsp_ty_ends, e)
+            push(lsp_ty_handles, h)
+            push(lsp_ty_files, file)
+        },
+    }
+}
+
+// lsp_type_at returns the rendered type of the innermost recorded node whose
+// span contains (file, offset), or "" if none. Innermost wins so hovering
+// `foo` inside `foo(x)` reports foo's type, not the call's.
+pub fn lsp_type_at(file, offset) {
+    let mut best = -1
+    let mut best_len = -1
+    let mut i = 0
+    while i < len(lsp_ty_handles) {
+        if lsp_ty_files[i] == file && offset >= lsp_ty_starts[i] && offset < lsp_ty_ends[i] {
+            let span_len = lsp_ty_ends[i] - lsp_ty_starts[i]
+            if best < 0 || span_len < best_len {
+                best = i
+                best_len = span_len
+            }
+        }
+        i = i + 1
+    }
+    if best < 0 {
+        ""
+    } else {
+        ty_pretty1(lsp_arena_tk, lsp_arena_tn, lsp_arena_ta, lsp_arena_tr, lsp_ty_handles[best])
+    }
+}
+
 fn ty_new_con(mut tk, mut tn, mut ta, mut tr, mut tl, name, cargs) {
     push(tk, 0)
     push(tn, name)
@@ -595,6 +647,12 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut cur_aliases = map() // current file's import aliases (alias -> path)
     let mut pkg_vals = map() // "path.name" -> binding handle, for importers
     let mut pkg_seen = map() // import path -> checked
+
+    // reset the LSP hover side-channel for this check run
+    lsp_ty_starts = []
+    lsp_ty_ends = []
+    lsp_ty_handles = []
+    lsp_ty_files = []
 
     // ---- type helpers ----
     fn fresh(con) {
@@ -2254,7 +2312,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     }
 
     fn infer_expr(e) {
-        match e {
+        let h = match e {
             IntLit(_, _) => h_int,
             FloatLit(_, _) => h_float,
             StrLit(_, _) => h_str,
@@ -2576,6 +2634,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
             _ => fresh(""),
         }
+        if lsp_recording {
+            lsp_record_type(span_of(e), h, cur_file)
+        }
+        h
     }
     infer_expr_ref = infer_expr
 
@@ -3279,6 +3341,12 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         push(sorted_files, diag_files[oidx])
     }
 
+    if lsp_recording {
+        lsp_arena_tk = tk
+        lsp_arena_tn = tn
+        lsp_arena_ta = ta
+        lsp_arena_tr = tr
+    }
     Checked(sorted_diags, sorted_files, bind_lines, chan_fors, interface_sources)
 }
 

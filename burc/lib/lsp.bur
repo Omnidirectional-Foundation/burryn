@@ -413,12 +413,14 @@ fn lsp_check_module(open_uri) {
                 FoldOut.FoldedPkgs(folded, fdiags, ffiles) => {
                     all_diags = concat(all_diags, fdiags)
                     all_files = concat(all_files, ffiles)
+                    lsp_recording = true
                     match typecheck_cached(folded, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                         CheckOut.Checked(cdiags, cfiles, _, _, _) => {
                             all_diags = concat(all_diags, cdiags)
                             all_files = concat(all_files, cfiles)
                         },
                     }
+                    lsp_recording = false
                 },
                 _ => {},
             }
@@ -499,7 +501,7 @@ fn lsp_handle_initialize(id, params) {
             lsp_root_path = lsp_normalize_root(root_path)
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding"], [json.Json.JInt(1), json.Json.JStr("utf-8")]), jobj(["name", "version"], [json.Json.JStr("bur-lsp"), json.Json.JStr("0.4.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider"], [json.Json.JInt(1), json.Json.JStr("utf-8"), json.Json.JBool(true)]), jobj(["name", "version"], [json.Json.JStr("bur-lsp"), json.Json.JStr("0.4.0")])]))
 }
 
 fn lsp_handle_did_open(params) {
@@ -526,6 +528,35 @@ fn lsp_handle_did_close(params) {
     let uri = jstr_field(td, "uri")
     lsp_doc_remove(uri)
     lsp_publish_diagnostics(uri, [])
+}
+
+fn lsp_handle_hover(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match lsp_doc_get(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json.Json.JNull)
+        return
+    }
+    let ty = lsp_type_at(path, offset)
+    if ty == "" {
+        lsp_respond(id, json.Json.JNull)
+    } else {
+        lsp_respond(id, jobj(["contents"], [jobj(["kind", "value"], [json.Json.JStr("markdown"), json.Json.JStr("```bur\n" + ty + "\n```")])]))
+    }
 }
 
 // ---- server main loop ----
@@ -565,6 +596,8 @@ pub fn lsp_serve() {
                     lsp_handle_did_change(params)
                 } else if method == "textDocument/didClose" {
                     lsp_handle_did_close(params)
+                } else if method == "textDocument/hover" {
+                    lsp_handle_hover(id, params)
                 } else if has_id {
                     lsp_write_message(jobj(["jsonrpc", "id", "error"], [json.Json.JStr("2.0"), id, jobj(["code", "message"], [json.Json.JInt(-32601), json.Json.JStr("Method not found")])]))
                 }
