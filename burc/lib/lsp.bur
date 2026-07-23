@@ -1,0 +1,84 @@
+// LSP transport: JSON-RPC 2.0 Content-Length framing over stdin/stdout.
+
+import json "std/json"
+
+fn lsp_read_exact(n) {
+    let mut buf = ""
+    let mut remaining = n
+    while remaining > 0 {
+        let chunk = read_stdin(remaining)
+        if str_len(chunk) == 0 {
+            return ""
+        }
+        buf = buf + chunk
+        remaining = remaining - str_len(chunk)
+    }
+    buf
+}
+
+fn lsp_read_headers() {
+    let header_end = chr(13) + "\n" + chr(13) + "\n"
+    let mut buf = ""
+    let mut tail = ""
+    while true {
+        let b = read_stdin(1)
+        if str_len(b) == 0 {
+            return ""
+        }
+        buf = buf + b
+        tail = tail + b
+        if str_len(tail) > 4 {
+            tail = substr(tail, str_len(tail) - 4, 4)
+        }
+        if tail == header_end {
+            return substr(buf, 0, str_len(buf) - 4)
+        }
+    }
+    ""
+}
+
+fn lsp_parse_content_length(headers) {
+    let crlf = chr(13) + "\n"
+    let lines = split(headers, crlf)
+    let mut result = -1
+    for line in lines {
+        if result < 0 && str_contains(line, "Content-Length:") {
+            let val = trim(substr(line, 15, str_len(line) - 15))
+            match parse_int(val) {
+                Some(n) => {
+                    result = n
+                },
+                None => {},
+            }
+        }
+    }
+    result
+}
+
+// lsp_read_message reads one Content-Length framed message from stdin.
+// Returns None on EOF or malformed input.
+pub fn lsp_read_message() {
+    let headers = lsp_read_headers()
+    if str_len(headers) == 0 {
+        return None
+    }
+    let clen = lsp_parse_content_length(headers)
+    if clen <= 0 {
+        return None
+    }
+    let body = lsp_read_exact(clen)
+    if str_len(body) == 0 {
+        return None
+    }
+    match json.parse(body) {
+        Ok(v) => Some(v),
+        Err(_) => None,
+    }
+}
+
+// lsp_write_message writes a Content-Length framed message to stdout.
+pub fn lsp_write_message(v) {
+    let crlf = chr(13) + "\n"
+    let body = json.render(v)
+    print("Content-Length: " + str(str_len(body)) + crlf + crlf + body)
+}
