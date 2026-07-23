@@ -1,6 +1,8 @@
-// LSP transport: JSON-RPC 2.0 Content-Length framing over stdin/stdout.
+// LSP server: JSON-RPC 2.0 transport, document sync, diagnostics push.
 
 import json "std/json"
+
+// ---- transport ----
 
 fn lsp_read_exact(n) {
     let mut buf = ""
@@ -55,8 +57,6 @@ fn lsp_parse_content_length(headers) {
     result
 }
 
-// lsp_read_message reads one Content-Length framed message from stdin.
-// Returns None on EOF or malformed input.
 pub fn lsp_read_message() {
     let headers = lsp_read_headers()
     if str_len(headers) == 0 {
@@ -76,9 +76,285 @@ pub fn lsp_read_message() {
     }
 }
 
-// lsp_write_message writes a Content-Length framed message to stdout.
 pub fn lsp_write_message(v) {
     let crlf = chr(13) + "\n"
     let body = json.render(v)
     print("Content-Length: " + str(str_len(body)) + crlf + crlf + body)
+}
+
+// ---- JSON helpers ----
+
+fn jobj_get(v, key) {
+    match v {
+        json.Json.JObj(keys, vals) => json.get(keys, vals, key),
+        _ => None,
+    }
+}
+
+fn jstr(v) {
+    match v {
+        json.Json.JStr(s) => s,
+        _ => "",
+    }
+}
+
+fn jint(v) {
+    match v {
+        json.Json.JInt(n) => n,
+        _ => 0,
+    }
+}
+
+fn jstr_field(v, key) {
+    match jobj_get(v, key) {
+        Some(x) => jstr(x),
+        None => "",
+    }
+}
+
+fn jobj_field(v, key) {
+    match jobj_get(v, key) {
+        Some(x) => x,
+        _ => json.Json.JNull,
+    }
+}
+
+fn jarr_field(v, key) {
+    match jobj_get(v, key) {
+        Some(x) => {
+            match x {
+                json.Json.JArr(items) => items,
+                _ => [],
+            }
+        },
+        None => [],
+    }
+}
+
+fn jobj(keys, vals) {
+    json.Json.JObj(keys, vals)
+}
+
+// ---- position conversion ----
+
+fn lsp_line_starts(src) {
+    let mut starts = [0]
+    let mut i = 0
+    let n = str_len(src)
+    while i < n {
+        if byte_at(src, i) == 10 {
+            push(starts, i + 1)
+        }
+        i = i + 1
+    }
+    starts
+}
+
+fn lsp_offset_to_pos(starts, offset) {
+    let mut lo = 0
+    let mut hi = len(starts) - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= offset {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    [lo, offset - starts[lo]]
+}
+
+// ---- diagnostics ----
+
+fn lsp_diag_severity(is_err) {
+    if is_err {
+        1
+    } else {
+        2
+    }
+}
+
+fn lsp_convert_diags(diags, src) {
+    let starts = lsp_line_starts(src)
+    let mut out = []
+    for d in diags {
+        match d {
+            DiagT.Diag(ie, code, msg, help, s, e) => {
+                let sp = lsp_offset_to_pos(starts, s)
+                let ep = lsp_offset_to_pos(starts, e)
+                let mut message = msg
+                if str_len(help) > 0 {
+                    message = msg + "\n= help: " + help
+                }
+                push(out, jobj(["range", "severity", "source", "message"], [jobj(["start", "end"], [jobj(["line", "character"], [json.Json.JInt(sp[0]), json.Json.JInt(sp[1])]), jobj(["line", "character"], [json.Json.JInt(ep[0]), json.Json.JInt(ep[1])])]), json.Json.JInt(lsp_diag_severity(ie)), json.Json.JStr("bur"), json.Json.JStr(message)]))
+            },
+            DiagT.DiagX(ie, code, msg, help, s, e, _, _) => {
+                let sp = lsp_offset_to_pos(starts, s)
+                let ep = lsp_offset_to_pos(starts, e)
+                let mut message = msg
+                if str_len(help) > 0 {
+                    message = msg + "\n= help: " + help
+                }
+                push(out, jobj(["range", "severity", "source", "message"], [jobj(["start", "end"], [jobj(["line", "character"], [json.Json.JInt(sp[0]), json.Json.JInt(sp[1])]), jobj(["line", "character"], [json.Json.JInt(ep[0]), json.Json.JInt(ep[1])])]), json.Json.JInt(lsp_diag_severity(ie)), json.Json.JStr("bur"), json.Json.JStr(message)]))
+            },
+        }
+    }
+    out
+}
+
+fn lsp_check_document(uri, src) {
+    let mut all_diags = []
+    match lex(src) {
+        LexOut.Lexed(toks, ldiags, _) => {
+            all_diags = concat(all_diags, ldiags)
+            match parse(toks) {
+                ParseOut.Parsed(stmts, pdiags) => {
+                    all_diags = concat(all_diags, pdiags)
+                    match fold_consts(stmts) {
+                        FoldOut.FoldedScript(folded, fdiags) => {
+                            all_diags = concat(all_diags, fdiags)
+                            match typecheck_script(folded) {
+                                CheckOut.Checked(cdiags, _, _, _, _) => {
+                                    all_diags = concat(all_diags, cdiags)
+                                },
+                            }
+                        },
+                        _ => {},
+                    }
+                },
+            }
+        },
+    }
+    lsp_convert_diags(all_diags, src)
+}
+
+fn lsp_publish_diagnostics(uri, diags) {
+    lsp_write_message(jobj(["jsonrpc", "method", "params"], [json.Json.JStr("2.0"), json.Json.JStr("textDocument/publishDiagnostics"), jobj(["uri", "diagnostics"], [json.Json.JStr(uri), json.Json.JArr(diags)])]))
+}
+
+// ---- document table ----
+
+let mut lsp_docs_keys = []
+let mut lsp_docs_vals = []
+
+fn lsp_doc_get(uri) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            return Some(lsp_docs_vals[i])
+        }
+        i = i + 1
+    }
+    None
+}
+
+fn lsp_doc_set(uri, text) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            lsp_docs_vals[i] = text
+            return
+        }
+        i = i + 1
+    }
+    push(lsp_docs_keys, uri)
+    push(lsp_docs_vals, text)
+}
+
+fn lsp_doc_remove(uri) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            lsp_docs_keys = concat(slice(lsp_docs_keys, 0, i), slice(lsp_docs_keys, i + 1, len(lsp_docs_keys)))
+            lsp_docs_vals = concat(slice(lsp_docs_vals, 0, i), slice(lsp_docs_vals, i + 1, len(lsp_docs_vals)))
+            return
+        }
+        i = i + 1
+    }
+}
+
+// ---- message handlers ----
+
+fn lsp_respond(id, result) {
+    lsp_write_message(jobj(["jsonrpc", "id", "result"], [json.Json.JStr("2.0"), id, result]))
+}
+
+fn lsp_handle_initialize(id, _params) {
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding"], [json.Json.JInt(1), json.Json.JStr("utf-8")]), jobj(["name", "version"], [json.Json.JStr("bur-lsp"), json.Json.JStr("0.4.0")])]))
+}
+
+fn lsp_handle_did_open(params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let text = jstr_field(td, "text")
+    lsp_doc_set(uri, text)
+    let diags = lsp_check_document(uri, text)
+    lsp_publish_diagnostics(uri, diags)
+}
+
+fn lsp_handle_did_change(params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let changes = jarr_field(params, "contentChanges")
+    if len(changes) > 0 {
+        let text = jstr_field(changes[len(changes) - 1], "text")
+        lsp_doc_set(uri, text)
+        let diags = lsp_check_document(uri, text)
+        lsp_publish_diagnostics(uri, diags)
+    }
+}
+
+fn lsp_handle_did_close(params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    lsp_doc_remove(uri)
+    lsp_publish_diagnostics(uri, [])
+}
+
+// ---- server main loop ----
+
+pub fn lsp_serve() {
+    let mut shutdown_requested = false
+    let mut running = true
+    while running {
+        match lsp_read_message() {
+            Some(msg) => {
+                let method = jstr_field(msg, "method")
+                let has_id = match jobj_get(msg, "id") {
+                    Some(_) => true,
+                    None => false,
+                }
+                let id = match jobj_get(msg, "id") {
+                    Some(x) => x,
+                    None => json.Json.JNull,
+                }
+                let params = jobj_field(msg, "params")
+                if method == "initialize" {
+                    lsp_handle_initialize(id, params)
+                } else if method == "initialized" {
+                    // notification, no response
+                } else if method == "shutdown" {
+                    shutdown_requested = true
+                    lsp_respond(id, json.Json.JNull)
+                } else if method == "exit" {
+                    if shutdown_requested {
+                        exit(0)
+                    } else {
+                        exit(1)
+                    }
+                } else if method == "textDocument/didOpen" {
+                    lsp_handle_did_open(params)
+                } else if method == "textDocument/didChange" {
+                    lsp_handle_did_change(params)
+                } else if method == "textDocument/didClose" {
+                    lsp_handle_did_close(params)
+                } else if has_id {
+                    lsp_write_message(jobj(["jsonrpc", "id", "error"], [json.Json.JStr("2.0"), id, jobj(["code", "message"], [json.Json.JInt(-32601), json.Json.JStr("Method not found")])]))
+                }
+            },
+            None => {
+                running = false
+            },
+        }
+    }
 }
