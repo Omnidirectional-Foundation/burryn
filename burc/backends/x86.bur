@@ -1,4 +1,5 @@
 // x86-64 instruction encoder (System V AMD64 ABI).
+import "burryn.dev/burc/lib"
 // Emits machine code as byte strings via byte_chr; concatenation builds code blocks.
 
 // ---- registers ----
@@ -427,13 +428,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     fn const_str(fh, idx) {
         match f_consts[fh][idx] {
-            CStr(s) => s,
+            lib.CVal.CStr(s) => s,
             _ => "",
         }
     }
     fn fn_const(fh, idx) {
         match f_consts[fh][idx] {
-            CFn(sub) => sub,
+            lib.CVal.CFn(sub) => sub,
             _ => 0,
         }
     }
@@ -442,15 +443,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // Phase 1 never emits).
     fn inst_len(fh, code, ip) {
         let op = code[ip]
-        if op == op_const || op == op_get_local || op == op_set_local || op == op_get_global || op == op_def_global || op == op_set_global || op == op_get_upval || op == op_set_upval || op == op_jump || op == op_jump_if_false || op == op_jump_if_true || op == op_jump_if_false_pop || op == op_loop || op == op_list || op == op_chan_next || op == op_get_field_name {
+        if op == lib.op_const || op == lib.op_get_local || op == lib.op_set_local || op == lib.op_get_global || op == lib.op_def_global || op == lib.op_set_global || op == lib.op_get_upval || op == lib.op_set_upval || op == lib.op_jump || op == lib.op_jump_if_false || op == lib.op_jump_if_true || op == lib.op_jump_if_false_pop || op == lib.op_loop || op == lib.op_list || op == lib.op_chan_next || op == lib.op_get_field_name {
             3
-        } else if op == op_pop_n || op == op_call || op == op_spawn || op == op_end_block || op == op_test_variant || op == op_get_field {
+        } else if op == lib.op_pop_n || op == lib.op_call || op == lib.op_spawn || op == lib.op_end_block || op == lib.op_test_variant || op == lib.op_get_field {
             2
-        } else if op == op_record || op == op_record_update {
+        } else if op == lib.op_record || op == lib.op_record_update {
             4
-        } else if op == op_closure {
+        } else if op == lib.op_closure {
             3 + f_nupvals[fn_const(fh, read_u16(code, ip + 1))] * 3
-        } else if op == op_select {
+        } else if op == lib.op_select {
             let n_arms = code[ip + 1]
             let has_default = code[ip + 2] != 0
             3 + n_arms * 3 + (if has_default {
@@ -471,16 +472,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut ip = 0
         while ip < len(code) {
             let op = code[ip]
-            if op == op_jump || op == op_jump_if_false || op == op_jump_if_true || op == op_jump_if_false_pop {
+            if op == lib.op_jump || op == lib.op_jump_if_false || op == lib.op_jump_if_true || op == lib.op_jump_if_false_pop {
                 put(targets, ip + 3 + read_u16(code, ip + 1), true)
                 ip = ip + 3
-            } else if op == op_loop {
+            } else if op == lib.op_loop {
                 put(targets, ip + 3 - read_u16(code, ip + 1), true)
                 ip = ip + 3
-            } else if op == op_chan_next {
+            } else if op == lib.op_chan_next {
                 put(targets, ip + 3 + read_u16(code, ip + 1), true)
                 ip = ip + 3
-            } else if op == op_select {
+            } else if op == lib.op_select {
                 let mut p = ip + 1
                 let n_arms = code[p]
                 let has_default = code[p + 1] != 0
@@ -510,7 +511,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut ip = 0
         while ip < len(code) {
             let op = code[ip]
-            if op == op_get_local || op == op_set_local {
+            if op == lib.op_get_local || op == lib.op_set_local {
                 let slot = read_u16(code, ip + 1)
                 if slot > max_slot {
                     max_slot = slot
@@ -564,34 +565,34 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
 
         fn emit_inst(ip) {
             let op = code[ip]
-            if op == op_const {
+            if op == lib.op_const {
                 let idx = read_u16(code, ip + 1)
                 match f_consts[fh][idx] {
-                    CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
+                    lib.CVal.CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
                     _ => w(int3()),
                 }
                 push(shadow, "")
-            } else if op == op_unit {
+            } else if op == lib.op_unit {
                 w(vs_push_zero())
                 push(shadow, "")
-            } else if op == op_true {
+            } else if op == lib.op_true {
                 w(e1(73) + e1(199) + modrm(0, 0, r15) + e4(1) + add_ri32(r15, 8))
                 push(shadow, "")
-            } else if op == op_false {
+            } else if op == lib.op_false {
                 w(vs_push_zero())
                 push(shadow, "")
-            } else if op == op_pop {
+            } else if op == lib.op_pop {
                 w(vs_pop_n(1))
                 shadow_pop(shadow, 1)
-            } else if op == op_pop_n {
+            } else if op == lib.op_pop_n {
                 let n = code[ip + 1]
                 w(vs_pop_n(n))
                 shadow_pop(shadow, n)
-            } else if op == op_end_block {
+            } else if op == lib.op_end_block {
                 let n = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 8) + sub_ri32(r15, 8 * (n + 1)) + mov_mr(r15, 0, rax) + add_ri32(r15, 8))
                 shadow_pop(shadow, n)
-            } else if op == op_get_local {
+            } else if op == lib.op_get_local {
                 let slot = read_u16(code, ip + 1)
                 if slot == 0 {
                     w(vs_push_zero())
@@ -600,93 +601,93 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
                     push(shadow, "")
                 }
-            } else if op == op_set_local {
+            } else if op == lib.op_set_local {
                 let slot = read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
-            } else if op == op_get_global {
+            } else if op == lib.op_get_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
                 w(vs_push_zero())
                 push(shadow, name)
-            } else if op == op_def_global {
+            } else if op == lib.op_def_global {
                 w(vs_pop_n(1))
                 shadow_pop(shadow, 1)
-            } else if op == op_set_global {
+            } else if op == lib.op_set_global {
                 w(vs_pop_n(1))
                 shadow_pop(shadow, 1)
-            } else if op == op_eq {
+            } else if op == lib.op_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_neq {
+            } else if op == lib.op_neq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_gt {
+            } else if op == lib.op_gt {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_gt_eq {
+            } else if op == lib.op_gt_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_lt {
+            } else if op == lib.op_lt {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_lt_eq {
+            } else if op == lib.op_lt_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_add {
+            } else if op == lib.op_add {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + add_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_sub {
+            } else if op == lib.op_sub {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + sub_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_mul {
+            } else if op == lib.op_mul {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + imul_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_div {
+            } else if op == lib.op_div {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_mod {
+            } else if op == lib.op_mod {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
-            } else if op == op_neg {
+            } else if op == lib.op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
-            } else if op == op_not {
+            } else if op == lib.op_not {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 8) + cmp_rr(rax, rdx) + sete(rdx) + mov_mr(r15, 0 - 8, rdx))
-            } else if op == op_jump {
+            } else if op == lib.op_jump {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 push(patches, [cur_byte() + 1, target])
                 w(jmp_rel32(0))
-            } else if op == op_jump_if_false {
+            } else if op == lib.op_jump_if_false {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax))
                 push(patches, [cur_byte() + 2, target])
                 w(je_rel32(0))
-            } else if op == op_jump_if_true {
+            } else if op == lib.op_jump_if_true {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax))
                 push(patches, [cur_byte() + 2, target])
                 w(jne_rel32(0))
-            } else if op == op_jump_if_false_pop {
+            } else if op == lib.op_jump_if_false_pop {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + lea(r15, r15, 0 - 8))
                 shadow_pop(shadow, 1)
                 push(patches, [cur_byte() + 2, target])
                 w(je_rel32(0))
-            } else if op == op_loop {
+            } else if op == lib.op_loop {
                 let target = ip + 3 - read_u16(code, ip + 1)
                 push(patches, [cur_byte() + 1, target])
                 w(jmp_rel32(0))
-            } else if op == op_call {
+            } else if op == lib.op_call {
                 let n = code[ip + 1]
                 let callee = shadow[len(shadow) - n - 1]
                 let handle = find_fn_by_name(callee)
@@ -699,9 +700,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 shadow_pop(shadow, n + 1)
                 push(shadow, "")
-            } else if op == op_return {
+            } else if op == lib.op_return {
                 w(x86gen_epilogue())
-            } else if op == op_closure {
+            } else if op == lib.op_closure {
                 w(vs_push_zero())
                 push(shadow, "")
             } else {
