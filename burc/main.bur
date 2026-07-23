@@ -574,30 +574,60 @@ fn build_input(input, emit_c, out, backend) {
         eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
         exit(exit_usage)
     }
-    if backend != "c" {
-        eprintln("error: backend '" + backend + "' is not yet implemented")
-        exit(exit_static)
-    }
-    let csrc = compile_to_c(input)
-    if emit_c {
-        if out == "" || out == "-" {
-            print(csrc)
-        } else {
-            match write_file(out, csrc) {
-                Ok(_) => {},
-                Err(msg) => {
-                    eprintln("error: " + msg)
-                    exit(exit_no_input)
-                },
+    if backend == "c" {
+        let csrc = compile_to_c(input)
+        if emit_c {
+            if out == "" || out == "-" {
+                print(csrc)
+            } else {
+                match write_file(out, csrc) {
+                    Ok(_) => {},
+                    Err(msg) => {
+                        eprintln("error: " + msg)
+                        exit(exit_no_input)
+                    },
+                }
             }
+        } else {
+            let dst = if out == "" {
+                default_out_name(input)
+            } else {
+                out
+            }
+            build_native(csrc, dst)
         }
-    } else {
+    } else if backend == "x86" {
+        let bytes = compile_to_x86(input)
         let dst = if out == "" {
             default_out_name(input)
         } else {
             out
         }
-        build_native(csrc, dst)
+        match write_file(dst, bytes) {
+            Ok(_) => {
+                match exec("chmod", ["+x", dst]) {
+                    Ok(o) => match o {
+                        Output(code, _, _) => {
+                            if code != 0 {
+                                eprintln("error: chmod +x failed for " + dst)
+                                exit(exit_static)
+                            }
+                        },
+                    },
+                    Err(msg) => {
+                        eprintln("error: chmod failed: " + msg)
+                        exit(exit_static)
+                    },
+                }
+            },
+            Err(msg) => {
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+    } else {
+        eprintln("error: backend '" + backend + "' is not yet implemented")
+        exit(exit_static)
     }
 }
 
@@ -608,6 +638,56 @@ fn compile_to_c(input) {
         compile_module_to_c(strip_trailing_slash(input))
     } else {
         compile_file_to_c(input)
+    }
+}
+
+// compile_to_x86 runs the front end for a file and returns the ELF
+// executable bytes, exiting on errors. Module mode is not yet supported.
+fn compile_to_x86(input) {
+    if is_dir(input) {
+        eprintln("error: x86 backend does not support modules yet")
+        exit(exit_static)
+    } else {
+        compile_file_to_x86(input)
+    }
+}
+
+fn compile_file_to_x86(path) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match lib.lex(src) {
+        lib.LexOut.Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match lib.parse(toks) {
+                lib.ParseOut.Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match lib.typecheck_script(checked_stmts) {
+                        lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match lib.compile_script(checked_stmts, chan_fors) {
+                                lib.CompileOut.CompileFailed(d, _) => {
+                                    eprintln(lib.render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => lib.x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
+                            }
+                        },
+                    }
+                },
+            }
+        },
     }
 }
 

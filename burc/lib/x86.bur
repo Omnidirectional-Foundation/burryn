@@ -388,3 +388,362 @@ pub fn vs_push_zero() {
 pub fn vs_pop_n(n) {
     sub_ri32(r15, 8 * n)
 }
+
+// ================================================================
+// Phase 1 native x86-64 code generator.
+// Mirrors cgen.bur's structure (inst_len / jump_targets / emit_inst)
+// but emits raw machine code instead of C strings. Values are raw
+// int64 (8 bytes/slot, no tagging). r15 = value stack top (grows up),
+// r14 = frame base, r13 = jump table base (set once by _start),
+// rbp = saved caller r14, rsp = native call stack.
+// ================================================================
+
+// x86gen_prologue: save caller base, set callee base to the self slot.
+// Locals live on the value stack (pushed by declarations), not in a reserved
+// frame area — mirroring the C backend's `base = top - arity - 1`.
+fn x86gen_prologue(arity, _locals) {
+    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1))
+}
+
+// x86gen_epilogue: peek the return value, collapse the frame to the
+// base, drop the result at the base slot, restore caller r14, ret.
+fn x86gen_epilogue() {
+    mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + pop_r(rbp) + ret()
+}
+
+// x86gen_start: program entry. nfn = number of functions.
+// Layout: [funcs][jumptable 8*nfn][_start]. The lea reaches back past
+// itself (7 bytes) and past the jump table (8*nfn) to the table base.
+fn x86gen_start(nfn) {
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
+}
+
+// x86gen_program_to_buf: compile a program to a self-contained ELF64
+// static executable (byte string). Takes the 10 Compiled-variant
+// fields; no line tables (Phase 1 has no source debug info).
+pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, _en_qual, _en_vnames, _en_varities) {
+    fn read_u16(code, at) {
+        code[at] * 256 + code[at + 1]
+    }
+    fn const_str(fh, idx) {
+        match f_consts[fh][idx] {
+            CStr(s) => s,
+            _ => "",
+        }
+    }
+    fn fn_const(fh, idx) {
+        match f_consts[fh][idx] {
+            CFn(sub) => sub,
+            _ => 0,
+        }
+    }
+    // inst_len: bytecode length of the instruction at ip (copied from
+    // cgen.bur; needed to walk the stream correctly even for opcodes
+    // Phase 1 never emits).
+    fn inst_len(fh, code, ip) {
+        let op = code[ip]
+        if op == op_const || op == op_get_local || op == op_set_local || op == op_get_global || op == op_def_global || op == op_set_global || op == op_get_upval || op == op_set_upval || op == op_jump || op == op_jump_if_false || op == op_jump_if_true || op == op_jump_if_false_pop || op == op_loop || op == op_list || op == op_chan_next || op == op_get_field_name {
+            3
+        } else if op == op_pop_n || op == op_call || op == op_spawn || op == op_end_block || op == op_test_variant || op == op_get_field {
+            2
+        } else if op == op_record || op == op_record_update {
+            4
+        } else if op == op_closure {
+            3 + f_nupvals[fn_const(fh, read_u16(code, ip + 1))] * 3
+        } else if op == op_select {
+            let n_arms = code[ip + 1]
+            let has_default = code[ip + 2] != 0
+            3 + n_arms * 3 + (if has_default {
+                2
+            } else {
+                0
+            })
+        } else {
+            1
+        }
+    }
+    // jump_targets: collect the set of IPs that are jump destinations
+    // (copied from cgen.bur; used only for labels, which x86 does not
+    // need — kept for parity / future use).
+    fn jump_targets(fh) {
+        let code = f_code[fh]
+        let mut targets = map()
+        let mut ip = 0
+        while ip < len(code) {
+            let op = code[ip]
+            if op == op_jump || op == op_jump_if_false || op == op_jump_if_true || op == op_jump_if_false_pop {
+                put(targets, ip + 3 + read_u16(code, ip + 1), true)
+                ip = ip + 3
+            } else if op == op_loop {
+                put(targets, ip + 3 - read_u16(code, ip + 1), true)
+                ip = ip + 3
+            } else if op == op_chan_next {
+                put(targets, ip + 3 + read_u16(code, ip + 1), true)
+                ip = ip + 3
+            } else if op == op_select {
+                let mut p = ip + 1
+                let n_arms = code[p]
+                let has_default = code[p + 1] != 0
+                p = p + 2
+                let mut i = 0
+                while i < n_arms {
+                    p = p + 1
+                    put(targets, p + 2 + read_u16(code, p), true)
+                    p = p + 2
+                    i = i + 1
+                }
+                if has_default {
+                    put(targets, p + 2 + read_u16(code, p), true)
+                    p = p + 2
+                }
+                ip = p
+            } else {
+                ip = ip + inst_len(fh, code, ip)
+            }
+        }
+        targets
+    }
+    // count_locals: max local slot referenced (+1) for frame sizing.
+    fn count_locals(fh) {
+        let code = f_code[fh]
+        let mut max_slot = f_arity[fh]
+        let mut ip = 0
+        while ip < len(code) {
+            let op = code[ip]
+            if op == op_get_local || op == op_set_local {
+                let slot = read_u16(code, ip + 1)
+                if slot > max_slot {
+                    max_slot = slot
+                }
+            }
+            ip = ip + inst_len(fh, code, ip)
+        }
+        max_slot + 1
+    }
+    // find_fn_by_name: linear-search the function arena for a name.
+    fn find_fn_by_name(name) {
+        let mut i = 0
+        while i < len(f_name) {
+            if f_name[i] == name {
+                return i
+            }
+            i = i + 1
+        }
+        0 - 1
+    }
+    // shadow_pop: remove the last n entries from the shadow list.
+    fn shadow_pop(mut lst, n) {
+        let mut k = 0
+        while k < n {
+            pop(lst)
+            k = k + 1
+        }
+    }
+
+    let nfn = len(f_name)
+    let mut funcs_bytes = ""
+    let mut func_offsets = []
+    let mut fh = 0
+    while fh < nfn {
+        push(func_offsets, str_len(funcs_bytes))
+        let code = f_code[fh]
+        let arity = f_arity[fh]
+        let locals = count_locals(fh)
+
+        // Per-function mutable state captured by emit_inst.
+        let mut out = []
+        let mut patches = []
+        let mut shadow = []
+        let mut ip_to_byte = map()
+        fn w(s) {
+            push(out, s)
+        }
+        fn cur_byte() {
+            str_len(join(out, ""))
+        }
+
+        fn emit_inst(ip) {
+            let op = code[ip]
+            if op == op_const {
+                let idx = read_u16(code, ip + 1)
+                match f_consts[fh][idx] {
+                    CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
+                    _ => w(int3()),
+                }
+                push(shadow, "")
+            } else if op == op_unit {
+                w(vs_push_zero())
+                push(shadow, "")
+            } else if op == op_true {
+                w(e1(73) + e1(199) + modrm(0, 0, r15) + e4(1) + add_ri32(r15, 8))
+                push(shadow, "")
+            } else if op == op_false {
+                w(vs_push_zero())
+                push(shadow, "")
+            } else if op == op_pop {
+                w(vs_pop_n(1))
+                shadow_pop(shadow, 1)
+            } else if op == op_pop_n {
+                let n = code[ip + 1]
+                w(vs_pop_n(n))
+                shadow_pop(shadow, n)
+            } else if op == op_end_block {
+                let n = code[ip + 1]
+                w(mov_rm(rax, r15, 0 - 8) + sub_ri32(r15, 8 * (n + 1)) + mov_mr(r15, 0, rax) + add_ri32(r15, 8))
+                shadow_pop(shadow, n)
+            } else if op == op_get_local {
+                let slot = read_u16(code, ip + 1)
+                if slot == 0 {
+                    w(vs_push_zero())
+                    push(shadow, f_name[fh])
+                } else {
+                    w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
+                    push(shadow, "")
+                }
+            } else if op == op_set_local {
+                let slot = read_u16(code, ip + 1)
+                w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
+            } else if op == op_get_global {
+                let idx = read_u16(code, ip + 1)
+                let name = const_str(fh, idx)
+                w(vs_push_zero())
+                push(shadow, name)
+            } else if op == op_def_global {
+                w(vs_pop_n(1))
+                shadow_pop(shadow, 1)
+            } else if op == op_set_global {
+                w(vs_pop_n(1))
+                shadow_pop(shadow, 1)
+            } else if op == op_eq {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_neq {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_gt {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_gt_eq {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_lt {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_lt_eq {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_add {
+                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + add_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_sub {
+                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + sub_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_mul {
+                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + imul_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_div {
+                w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_mod {
+                w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == op_neg {
+                w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
+            } else if op == op_not {
+                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 8) + cmp_rr(rax, rdx) + sete(rdx) + mov_mr(r15, 0 - 8, rdx))
+            } else if op == op_jump {
+                let target = ip + 3 + read_u16(code, ip + 1)
+                push(patches, [cur_byte() + 1, target])
+                w(jmp_rel32(0))
+            } else if op == op_jump_if_false {
+                let target = ip + 3 + read_u16(code, ip + 1)
+                w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax))
+                push(patches, [cur_byte() + 2, target])
+                w(je_rel32(0))
+            } else if op == op_jump_if_true {
+                let target = ip + 3 + read_u16(code, ip + 1)
+                w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax))
+                push(patches, [cur_byte() + 2, target])
+                w(jne_rel32(0))
+            } else if op == op_jump_if_false_pop {
+                let target = ip + 3 + read_u16(code, ip + 1)
+                w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + lea(r15, r15, 0 - 8))
+                shadow_pop(shadow, 1)
+                push(patches, [cur_byte() + 2, target])
+                w(je_rel32(0))
+            } else if op == op_loop {
+                let target = ip + 3 - read_u16(code, ip + 1)
+                push(patches, [cur_byte() + 1, target])
+                w(jmp_rel32(0))
+            } else if op == op_call {
+                let n = code[ip + 1]
+                let callee = shadow[len(shadow) - n - 1]
+                let handle = find_fn_by_name(callee)
+                if callee == "exit" {
+                    w(mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(60) + syscall())
+                } else if handle >= 0 {
+                    w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
+                } else {
+                    w(int3())
+                }
+                shadow_pop(shadow, n + 1)
+                push(shadow, "")
+            } else if op == op_return {
+                w(x86gen_epilogue())
+            } else if op == op_closure {
+                w(vs_push_zero())
+                push(shadow, "")
+            } else {
+                w(int3())
+            }
+        }
+
+        w(x86gen_prologue(arity, locals))
+        let mut ip = 0
+        while ip < len(code) {
+            put(ip_to_byte, ip, cur_byte())
+            emit_inst(ip)
+            ip = ip + inst_len(fh, code, ip)
+        }
+        // Patch every recorded jump with the real rel32.
+        let mut fbytes = join(out, "")
+        let mut pi = 0
+        while pi < len(patches) {
+            let p = patches[pi]
+            let rel32_pos = p[0]
+            let target_ip = p[1]
+            let target_byte = match get(ip_to_byte, target_ip) {
+                Some(v) => v,
+                None => 0,
+            }
+            let rel32 = target_byte - (rel32_pos + 4)
+            fbytes = substr(fbytes, 0, rel32_pos) + e4s(rel32) + substr(fbytes, rel32_pos + 4, str_len(fbytes) - rel32_pos - 4)
+            pi = pi + 1
+        }
+        funcs_bytes = funcs_bytes + fbytes
+        fh = fh + 1
+    }
+
+    // Jump table: 8-byte absolute address per function.
+    let mut jt_bytes = ""
+    let mut jh = 0
+    while jh < nfn {
+        jt_bytes = jt_bytes + e8(base_addr + 120 + func_offsets[jh])
+        jh = jh + 1
+    }
+    // _start is the entry, placed last.
+    let start_off = str_len(funcs_bytes) + str_len(jt_bytes)
+    let start_bytes = x86gen_start(nfn)
+    emit_elf(funcs_bytes + jt_bytes + start_bytes, start_off)
+}
