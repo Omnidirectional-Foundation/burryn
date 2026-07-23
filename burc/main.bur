@@ -92,6 +92,7 @@ fn usage() {
     println("bur build flags:")
     println("  -o <path>              output path (binary, or C file with --emit c)")
     println("  --emit c               emit generated C instead of a binary")
+    println("  --backend <name>       code backend: c (default), x86, llvm, cranelift, wasm")
     println("")
     println("bur fmt flags:")
     println("  --check                list files that would change; exit 1 if any")
@@ -516,11 +517,12 @@ fn run_check_f(cdiags, cfiles, binds) {
     has_err
 }
 
-// build_cmd parses build flags (-o <path>, --emit c) then compiles the input
-// to C or a native binary. CLI misuse exits 2.
+// build_cmd parses build flags (-o <path>, --emit c, --backend <name>) then
+// compiles the input via the selected backend. CLI misuse exits 2.
 fn build_cmd(rest) {
     let mut out = ""
     let mut emit_c = false
+    let mut backend = "c"
     let mut input = ""
     let mut i = 0
     while i < len(rest) {
@@ -539,6 +541,13 @@ fn build_cmd(rest) {
             }
             emit_c = true
             i = i + 2
+        } else if arg == "--backend" {
+            if i + 1 >= len(rest) {
+                usage()
+                exit(exit_usage)
+            }
+            backend = rest[i + 1]
+            i = i + 2
         } else if starts_with(arg, "-") {
             usage()
             exit(exit_usage)
@@ -555,12 +564,20 @@ fn build_cmd(rest) {
         usage()
         exit(exit_usage)
     }
-    build_input(input, emit_c, out)
+    build_input(input, emit_c, out, backend)
 }
 
-// build_input compiles a file or module to a C translation unit, then either
-// prints/writes the C (emit_c) or hands it to the native C toolchain.
-fn build_input(input, emit_c, out) {
+// build_input compiles a file or module via the selected backend.
+// "c" is the default production backend; others are stubs until implemented.
+fn build_input(input, emit_c, out, backend) {
+    if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
+        eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
+        exit(exit_usage)
+    }
+    if backend != "c" {
+        eprintln("error: backend '" + backend + "' is not yet implemented")
+        exit(exit_static)
+    }
     let csrc = compile_to_c(input)
     if emit_c {
         if out == "" || out == "-" {
