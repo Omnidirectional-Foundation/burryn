@@ -822,6 +822,14 @@ fn dev_cmd(rest) {
         run_test_target(strip_trailing_slash(rest[1]), rest[2])
         return
     }
+    if sub == "hover" {
+        if len(rest) < 4 {
+            eprintln("usage: bur dev hover <dir> <file> <offset>")
+            exit(exit_usage)
+        }
+        dev_hover(strip_trailing_slash(rest[1]), rest[2], rest[3])
+        return
+    }
     let src = match read_file(rest[1]) {
         Ok(s) => s,
         Err(msg) => {
@@ -866,6 +874,38 @@ fn dev_interface(dir) {
                     }
                 },
             }
+        },
+    }
+}
+
+// dev_hover runs the full module check pipeline with the LSP hover
+// side-channel recording on, then prints the inferred type at (file, offset).
+// It is the testable surface for the span->type query that the LSP itself
+// only exercises interactively (so `bur test` cannot reach it).
+fn dev_hover(dir, file, offset_str) {
+    let offset = match parse_int(offset_str) {
+        Some(n) => n,
+        None => {
+            eprintln("error: offset must be an integer")
+            exit(exit_usage)
+        },
+    }
+    match lib.load_module(dir) {
+        lib.ModOut.ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        lib.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, _pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            lib.lsp_set_recording(true)
+            match lib.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib.CheckOut.Checked(_, _, _, _, _) => {},
+            }
+            lib.lsp_set_recording(false)
+            println(lib.lsp_type_at(file, offset))
         },
     }
 }
