@@ -567,8 +567,8 @@ fn build_cmd(rest) {
     build_input(input, emit_c, out, backend)
 }
 
-// build_input compiles a file or module via the selected backend.
-// "c" is the default production backend; others are stubs until implemented.
+// build_input runs the shared front end then dispatches to the selected
+// backend. "c" is the production backend; others are stubs.
 fn build_input(input, emit_c, out, backend) {
     if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
         eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
@@ -578,40 +578,50 @@ fn build_input(input, emit_c, out, backend) {
         eprintln("error: backend '" + backend + "' is not yet implemented")
         exit(exit_static)
     }
-    let csrc = compile_to_c(input)
-    if emit_c {
-        if out == "" || out == "-" {
-            print(csrc)
-        } else {
-            match write_file(out, csrc) {
-                Ok(_) => {},
-                Err(msg) => {
-                    eprintln("error: " + msg)
-                    exit(exit_no_input)
-                },
+    match compile_to_ir(input) {
+        BuildIR.IRReady(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ir_f1, ir_f2, ir_ls) => {
+            let csrc = lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ir_f1, ir_f2, ir_ls)
+            if emit_c {
+                if out == "" || out == "-" {
+                    print(csrc)
+                } else {
+                    match write_file(out, csrc) {
+                        Ok(_) => {},
+                        Err(msg) => {
+                            eprintln("error: " + msg)
+                            exit(exit_no_input)
+                        },
+                    }
+                }
+            } else {
+                let dst = if out == "" {
+                    default_out_name(input)
+                } else {
+                    out
+                }
+                build_native(csrc, dst)
             }
-        }
-    } else {
-        let dst = if out == "" {
-            default_out_name(input)
-        } else {
-            out
-        }
-        build_native(csrc, dst)
+        },
     }
 }
 
-// compile_to_c runs the front end for a file or module and returns the C
-// source, exiting 1 on static errors and 3 on unreadable input.
-fn compile_to_c(input) {
+// BuildIR carries the shared front-end result (backend-agnostic compiled IR
+// plus source-location metadata) so each backend can consume it independently.
+enum BuildIR {
+    IRReady(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ir_f1, ir_f2, ir_ls)
+}
+
+// compile_to_ir runs the front end for a file or module and returns the
+// backend-agnostic IR, exiting 1 on static errors and 3 on unreadable input.
+fn compile_to_ir(input) {
     if is_dir(input) {
-        compile_module_to_c(strip_trailing_slash(input))
+        compile_module_to_ir(strip_trailing_slash(input))
     } else {
-        compile_file_to_c(input)
+        compile_file_to_ir(input)
     }
 }
 
-fn compile_file_to_c(path) {
+fn compile_file_to_ir(path) {
     let src = match read_file(path) {
         Ok(s) => s,
         Err(msg) => {
@@ -640,7 +650,7 @@ fn compile_file_to_c(path) {
                                     eprintln(lib.render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)]),
+                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => BuildIR.IRReady(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)]),
                             }
                         },
                     }
@@ -650,7 +660,7 @@ fn compile_file_to_c(path) {
     }
 }
 
-fn compile_module_to_c(dir) {
+fn compile_module_to_ir(dir) {
     if !file_exists(dir + "/bur.mod") {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
@@ -677,7 +687,7 @@ fn compile_module_to_c(dir) {
                             eprintln(lib.render_diag(d, f))
                             exit(exit_static)
                         },
-                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
+                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => BuildIR.IRReady(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
                     }
                 },
             }
