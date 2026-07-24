@@ -542,6 +542,44 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
 
     let nfn = len(f_name)
+    // Collect string constants into a data section emitted before the code,
+    // so addresses are known during codegen (no patching). Each string:
+    // [8-byte length][content bytes], padded to 8-byte alignment.
+    let mut str_data = ""
+    let mut str_map = map()
+    let mut sf = 0
+    while sf < nfn {
+        let consts = f_consts[sf]
+        let mut ci = 0
+        while ci < len(consts) {
+            match consts[ci] {
+                lib.CVal.CStr(s) => {
+                    let key = sf * 100000 + ci
+                    let dup = match get(str_map, key) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if !dup {
+                        put(str_map, key, str_len(str_data))
+                        str_data = str_data + e8(str_len(s)) + s
+                        while str_len(str_data) % 8 != 0 {
+                            str_data = str_data + byte_chr(0)
+                        }
+                    }
+                },
+                _ => {},
+            }
+            ci = ci + 1
+        }
+        sf = sf + 1
+    }
+    let str_data_len = str_len(str_data)
+    fn str_addr(f, i) {
+        match get(str_map, f * 100000 + i) {
+            Some(off) => base_addr + 120 + off,
+            None => 0,
+        }
+    }
     let mut funcs_bytes = ""
     let mut func_offsets = []
     let mut fh = 0
@@ -569,6 +607,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let idx = read_u16(code, ip + 1)
                 match f_consts[fh][idx] {
                     lib.CVal.CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
+                    lib.CVal.CStr(_) => w(mov_ri64(rax, str_addr(fh, idx)) + vs_push(rax)),
                     _ => w(int3()),
                 }
                 push(shadow, "")
@@ -693,6 +732,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let handle = find_fn_by_name(callee)
                 if callee == "exit" {
                     w(mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(60) + syscall())
+                } else if callee == "print" {
+                    w(mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall())
+                } else if callee == "println" {
+                    w(mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax))
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                 } else {
@@ -740,11 +783,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
-        jt_bytes = jt_bytes + e8(base_addr + 120 + func_offsets[jh])
+        jt_bytes = jt_bytes + e8(base_addr + 120 + str_data_len + func_offsets[jh])
         jh = jh + 1
     }
     // _start is the entry, placed last.
-    let start_off = str_len(funcs_bytes) + str_len(jt_bytes)
+    let start_off = str_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn)
-    emit_elf(funcs_bytes + jt_bytes + start_bytes, start_off)
+    emit_elf(str_data + funcs_bytes + jt_bytes + start_bytes, start_off)
 }
