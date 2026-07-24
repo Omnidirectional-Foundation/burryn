@@ -419,11 +419,13 @@ fn x86gen_epilogue() {
 // x86gen_start: program entry. nfn = number of functions.
 // Layout: [funcs][jumptable 8*nfn][_start]. The lea reaches back past
 // itself (7 bytes) and past the jump table (8*nfn) to the table base.
-fn x86gen_start(nfn) {
+fn x86gen_start(nfn, n_globals) {
     // lea must be first: its RIP-relative offset assumes position 0 in _start
     lea_rip_rel32(r13, 0 - 8 * nfn - 7) +
     // mmap(0, 16MB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0) -> r12
     mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) +
+    // globals array: rbx = heap base, bump r12 past it (zero-filled by mmap)
+    mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) +
     mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
 }
 
@@ -588,6 +590,31 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             None => 0,
         }
     }
+    // Pre-scan: collect global variable names and assign slots.
+    let mut globals_map = map()
+    let mut n_globals = 0
+    let mut gf = 0
+    while gf < nfn {
+        let gcode = f_code[gf]
+        let mut gip = 0
+        while gip < len(gcode) {
+            let gop = gcode[gip]
+            if gop == lib.op_def_global {
+                let gidx = read_u16(gcode, gip + 1)
+                let gname = const_str(gf, gidx)
+                let exists = match get(globals_map, gname) {
+                    Some(_) => true,
+                    None => false,
+                }
+                if !exists {
+                    put(globals_map, gname, n_globals)
+                    n_globals = n_globals + 1
+                }
+            }
+            gip = gip + inst_len(gf, gcode, gip)
+        }
+        gf = gf + 1
+    }
     let mut funcs_bytes = ""
     let mut func_offsets = []
     let mut fh = 0
@@ -657,13 +684,28 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else if op == lib.op_get_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
-                w(vs_push_zero())
+                match get(globals_map, name) {
+                    Some(slot) => w(mov_rm(rax, rbx, 8 * slot) + vs_push(rax)),
+                    None => w(vs_push_zero()),
+                }
                 push(shadow, name)
             } else if op == lib.op_def_global {
-                w(vs_pop_n(1))
+                let idx = read_u16(code, ip + 1)
+                let name = const_str(fh, idx)
+                let slot = match get(globals_map, name) {
+                    Some(s) => s,
+                    None => 0,
+                }
+                w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 1)
             } else if op == lib.op_set_global {
-                w(vs_pop_n(1))
+                let idx = read_u16(code, ip + 1)
+                let name = const_str(fh, idx)
+                let slot = match get(globals_map, name) {
+                    Some(s) => s,
+                    None => 0,
+                }
+                w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 1)
             } else if op == lib.op_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
@@ -810,6 +852,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // _start is the entry, placed last.
     let start_off = str_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
-    let start_bytes = x86gen_start(nfn)
+    let start_bytes = x86gen_start(nfn, n_globals)
     emit_elf(str_data + funcs_bytes + jt_bytes + start_bytes, start_off)
 }
