@@ -792,6 +792,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let n = code[ip + 1]
                 let callee = shadow[len(shadow) - n - 1]
                 let handle = find_fn_by_name(callee)
+                let mut ret_type = ""
                 if callee == "exit" {
                     w(mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(60) + syscall())
                 } else if callee == "print" {
@@ -800,13 +801,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax))
                 } else if callee == "str_len" {
                     w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                } else if callee == "substr" {
+                    w(mov_rm(rax, r15, 0 - 24) + mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rr(r11, r12) + mov_mr(r11, 0, r10) + mov_rr(rcx, r10) + add_ri32(rcx, 8) + add_rr(r12, rcx) + lea(rsi, rax, 8) + add_rr(rsi, r9) + lea(rdi, r11, 8) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(r15, 0 - 32, r11) + vs_pop_n(3))
+                    ret_type = "str"
+                } else if callee == "byte_chr" {
+                    w(mov_rm(rax, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(rcx, rcx) + add_ri32(rcx, 1) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rax) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
+                    ret_type = "str"
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                 } else {
                     w(int3())
                 }
                 shadow_pop(shadow, n + 1)
-                push(shadow, "")
+                push(shadow, ret_type)
             } else if op == lib.op_return {
                 w(x86gen_epilogue())
             } else if op == lib.op_closure {
