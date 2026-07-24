@@ -11,7 +11,7 @@ fn str_ends_with(s, suffix) {
     n >= m && substr(s, n - m, m) == suffix
 }
 
-fn str_has_prefix(s, prefix) {
+pub fn str_has_prefix(s, prefix) {
     let n = str_len(s)
     let m = str_len(prefix)
     n >= m && substr(s, 0, m) == prefix
@@ -1160,4 +1160,74 @@ pub fn test_discover(dir) {
         }
     }
     Ok(names)
+}
+
+// ---- LSP document overlay store ----
+// Shared between the module loader (lsp_overlay_read, called during check)
+// and the LSP server (tooling/lsp.bur, which sets/clears documents via the
+// pub accessors). Lives in lib to avoid a circular import: tooling imports
+// lib, never the reverse.
+
+let mut lsp_docs_keys = []
+let mut lsp_docs_vals = []
+
+// lsp_root_path is the workspace root (absolute, from initialize rootUri);
+// "" until initialize. Bounds module-root discovery for open files.
+// Stored in a 1-element list so the pub setter can mutate it without
+// tripping the E0597 "aliased heap value" check on bare str reassignment.
+let mut lsp_root_path_box = [""]
+
+pub fn lsp_doc_get(uri) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            return Some(lsp_docs_vals[i])
+        }
+        i = i + 1
+    }
+    None
+}
+
+pub fn lsp_doc_set(uri, text) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            lsp_docs_vals[i] = text
+            return
+        }
+        i = i + 1
+    }
+    push(lsp_docs_keys, uri)
+    push(lsp_docs_vals, text)
+}
+
+pub fn lsp_doc_remove(uri) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            lsp_docs_keys = concat(slice(lsp_docs_keys, 0, i), slice(lsp_docs_keys, i + 1, len(lsp_docs_keys)))
+            lsp_docs_vals = concat(slice(lsp_docs_vals, 0, i), slice(lsp_docs_vals, i + 1, len(lsp_docs_vals)))
+            return
+        }
+        i = i + 1
+    }
+}
+
+// lsp_overlay_read is the memory-overlay entry point for the check pipeline.
+// Module loader calls this instead of read_file for source files: LSP open
+// documents are served from memory, everything else falls through to disk.
+pub fn lsp_overlay_read(path) {
+    let uri = "file://" + path
+    match lsp_doc_get(uri) {
+        Some(text) => Ok(text),
+        None => read_file(path),
+    }
+}
+
+pub fn lsp_get_root_path() {
+    lsp_root_path_box[0]
+}
+
+pub fn lsp_set_root_path(p) {
+    lsp_root_path_box[0] = p
 }
