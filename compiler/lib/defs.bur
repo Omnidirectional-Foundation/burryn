@@ -6,7 +6,7 @@
 // file that sorts before its own ("defs.bur" sorts before every stage file).
 
 // Token: type, lexeme, start, end (half-open byte offsets into the source)
-enum Token {
+pub enum Token {
     Tok(int, str, int, int),
 }
 
@@ -82,4 +82,84 @@ pub enum CVal {
 pub enum CompileOut {
     Compiled([str], [str], [int], [int], [[int]], [[SpanT]], [[CVal]], [str], [[str]], [[int]]),
     CompileFailed(DiagT, str), // diag plus the file being compiled
+}
+
+// hex_digit returns the lowercase hex character for 0..15
+fn hex_digit(n) {
+    if n < 10 {
+        str(n)
+    } else {
+        chr(97 + n - 10) // a-f
+    }
+}
+
+// go_quote mirrors strconv.Quote for the byte values our sources contain:
+// the common escapes, \xNN for other control bytes, everything else raw
+pub fn go_quote(s) {
+    let mut parts = ["\""]
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        // raw byte value: ord()/char_at() are not byte-exact past ASCII
+        let o = byte_at(s, i)
+        let esc = if o == 34 {
+            // '"'
+            "\\\""
+        } else if o == 92 {
+            // '\'
+            "\\\\"
+        } else if o == 10 {
+            // '\n'
+            "\\n"
+        } else if o == 9 {
+            // '\t'
+            "\\t"
+        } else if o == 13 {
+            "\\r"
+        } else if o < 32 || o == 127 {
+            "\\x" + hex_digit(o / 16) + hex_digit(o % 16)
+        } else {
+            ""
+        }
+        if esc != "" {
+            push(parts, substr(s, seg, i - seg))
+            push(parts, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(s, seg, str_len(s) - seg))
+    push(parts, "\"")
+    join(parts, "")
+}
+
+// line_starts precomputes the byte offset of each line start (diag.go's
+// lineIndex); line_of is 1-based, mirroring lineIndex.line
+pub fn line_starts(src) {
+    let mut ix = [0]
+    let mut i = 0
+    while i < str_len(src) {
+        if char_at(src, i) == "\n" {
+            push(ix, i + 1)
+        }
+        i = i + 1
+    }
+    ix
+}
+
+pub fn line_of(starts, off) {
+    let o = if off < 0 {
+        0
+    } else {
+        off
+    }
+    let mut line = 0
+    let mut i = 0
+    while i < len(starts) {
+        if starts[i] <= o {
+            line = i + 1
+        }
+        i = i + 1
+    }
+    line
 }
