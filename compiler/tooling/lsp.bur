@@ -1,4 +1,6 @@
 import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/module"
 // LSP server: JSON-RPC 2.0 transport, document sync, diagnostics push.
 
 import json "std/json"
@@ -183,7 +185,7 @@ fn lsp_convert_diags_starts(diags, starts) {
     let mut out = []
     for d in diags {
         match d {
-            lib.DiagT.Diag(ie, code, msg, help, s, e) => {
+            lib.DiagT.Diag(ie, _code, msg, help, s, e) => {
                 let sp = lsp_offset_to_pos(starts, s)
                 let ep = lsp_offset_to_pos(starts, e)
                 let mut message = msg
@@ -192,7 +194,7 @@ fn lsp_convert_diags_starts(diags, starts) {
                 }
                 push(out, jobj(["range", "severity", "source", "message"], [jobj(["start", "end"], [jobj(["line", "character"], [json.Json.JInt(sp[0]), json.Json.JInt(sp[1])]), jobj(["line", "character"], [json.Json.JInt(ep[0]), json.Json.JInt(ep[1])])]), json.Json.JInt(lsp_diag_severity(ie)), json.Json.JStr("bur"), json.Json.JStr(message)]))
             },
-            lib.DiagT.DiagX(ie, code, msg, help, s, e, _, _) => {
+            lib.DiagT.DiagX(ie, _code, msg, help, s, e, _, _) => {
                 let sp = lsp_offset_to_pos(starts, s)
                 let ep = lsp_offset_to_pos(starts, e)
                 let mut message = msg
@@ -206,18 +208,18 @@ fn lsp_convert_diags_starts(diags, starts) {
     out
 }
 
-fn lsp_check_document(uri, src) {
+fn lsp_check_document(_uri, src) {
     let mut all_diags = []
-    match lib.lex(src) {
+    match frontend.lex(src) {
         lib.LexOut.Lexed(toks, ldiags, _) => {
             all_diags = concat(all_diags, ldiags)
-            match lib.parse(toks) {
-                lib.ParseOut.Parsed(stmts, pdiags) => {
+            match frontend.parse(toks) {
+                frontend.ParseOut.Parsed(stmts, pdiags) => {
                     all_diags = concat(all_diags, pdiags)
-                    match lib.fold_consts(stmts) {
-                        lib.FoldOut.FoldedScript(folded, fdiags) => {
+                    match frontend.fold_consts(stmts) {
+                        frontend.FoldOut.FoldedScript(folded, fdiags) => {
                             all_diags = concat(all_diags, fdiags)
-                            match lib.typecheck_script(folded) {
+                            match frontend.typecheck_script(folded) {
                                 lib.CheckOut.Checked(cdiags, _, _, _, _) => {
                                     all_diags = concat(all_diags, cdiags)
                                 },
@@ -289,7 +291,7 @@ fn lsp_find_module_root(file_path) {
         if file_exists(dir + "/bur.mod") {
             return dir
         }
-        if lib.lsp_get_root_path() != "" && dir == lib.lsp_get_root_path() {
+        if module.lsp_get_root_path() != "" && dir == module.lsp_get_root_path() {
             return ""
         }
         dir = lsp_parent_dir(dir)
@@ -302,7 +304,7 @@ fn lsp_find_module_root(file_path) {
 // open-doc text (live editor content), else the loaded module tables, else a
 // fresh overlay read. Diagnostic offsets were computed against this source.
 fn lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts) {
-    match lib.lsp_doc_get(lsp_path_to_uri(path)) {
+    match module.lsp_doc_get(lsp_path_to_uri(path)) {
         Some(text) => {
             return lsp_line_starts(text)
         },
@@ -319,7 +321,7 @@ fn lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts) {
         }
         pi = pi + 1
     }
-    match lib.lsp_overlay_read(path) {
+    match module.lsp_overlay_read(path) {
         Ok(s) => lsp_line_starts(s),
         Err(_) => [0],
     }
@@ -397,31 +399,31 @@ fn lsp_check_module(open_uri) {
     let open_path = lsp_uri_to_path(open_uri)
     let root = lsp_find_module_root(open_path)
     if root == "" {
-        match lib.lsp_doc_get(open_uri) {
+        match module.lsp_doc_get(open_uri) {
             Some(text) => lsp_publish_diagnostics(open_uri, lsp_check_document(open_uri, text)),
             None => {},
         }
         return
     }
-    match lib.load_module(root) {
-        lib.ModOut.ModFailed(diags, dfiles) => {
+    match module.load_module(root) {
+        module.ModOut.ModFailed(diags, dfiles) => {
             lsp_publish_module_diags(open_path, diags, dfiles, [], [])
         },
-        lib.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        module.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
             let mut all_diags = concat(ldiags, [])
             let mut all_files = concat(lfiles, [])
-            match lib.fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
-                lib.FoldOut.FoldedPkgs(folded, fdiags, ffiles) => {
+            match frontend.fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                frontend.FoldOut.FoldedPkgs(folded, fdiags, ffiles) => {
                     all_diags = concat(all_diags, fdiags)
                     all_files = concat(all_files, ffiles)
-                    lib.lsp_set_recording(true)
-                    match lib.typecheck_cached(folded, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                    frontend.lsp_set_recording(true)
+                    match module.typecheck_cached(folded, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
                         lib.CheckOut.Checked(cdiags, cfiles, _, _, _) => {
                             all_diags = concat(all_diags, cdiags)
                             all_files = concat(all_files, cfiles)
                         },
                     }
-                    lib.lsp_set_recording(false)
+                    frontend.lsp_set_recording(false)
                 },
                 _ => {},
             }
@@ -439,11 +441,11 @@ fn lsp_respond(id, result) {
 fn lsp_handle_initialize(id, params) {
     let root_uri = jstr_field(params, "rootUri")
     if root_uri != "" {
-        lib.lsp_set_root_path(lsp_normalize_root(lsp_uri_to_path(root_uri)))
+        module.lsp_set_root_path(lsp_normalize_root(lsp_uri_to_path(root_uri)))
     } else {
         let root_path = jstr_field(params, "rootPath")
         if root_path != "" {
-            lib.lsp_set_root_path(lsp_normalize_root(root_path))
+            module.lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
     lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider"], [json.Json.JInt(1), json.Json.JStr("utf-8"), json.Json.JBool(true)]), jobj(["name", "version"], [json.Json.JStr("bur-lsp"), json.Json.JStr("0.4.0")])]))
@@ -453,7 +455,7 @@ fn lsp_handle_did_open(params) {
     let td = jobj_field(params, "textDocument")
     let uri = jstr_field(td, "uri")
     let text = jstr_field(td, "text")
-    lib.lsp_doc_set(uri, text)
+    module.lsp_doc_set(uri, text)
     lsp_check_module(uri)
 }
 
@@ -463,7 +465,7 @@ fn lsp_handle_did_change(params) {
     let changes = jarr_field(params, "contentChanges")
     if len(changes) > 0 {
         let text = jstr_field(changes[len(changes) - 1], "text")
-        lib.lsp_doc_set(uri, text)
+        module.lsp_doc_set(uri, text)
         lsp_check_module(uri)
     }
 }
@@ -471,7 +473,7 @@ fn lsp_handle_did_change(params) {
 fn lsp_handle_did_close(params) {
     let td = jobj_field(params, "textDocument")
     let uri = jstr_field(td, "uri")
-    lib.lsp_doc_remove(uri)
+    module.lsp_doc_remove(uri)
     lsp_publish_diagnostics(uri, [])
 }
 
@@ -483,7 +485,7 @@ fn lsp_handle_hover(id, params) {
     let ch = jint(jobj_field(pos, "character"))
     let path = lsp_uri_to_path(uri)
     let mut offset = -1
-    match lib.lsp_doc_get(uri) {
+    match module.lsp_doc_get(uri) {
         Some(text) => {
             let starts = lsp_line_starts(text)
             if line >= 0 && line < len(starts) {
@@ -496,7 +498,7 @@ fn lsp_handle_hover(id, params) {
         lsp_respond(id, json.Json.JNull)
         return
     }
-    let ty = lib.lsp_type_at(path, offset)
+    let ty = frontend.lsp_type_at(path, offset)
     if ty == "" {
         lsp_respond(id, json.Json.JNull)
     } else {

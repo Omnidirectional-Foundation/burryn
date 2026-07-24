@@ -16,6 +16,9 @@
 // print to stderr and exit(4) directly: a trap always ends the program, so
 // nothing needs to unwind.
 
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
 // interpreted runtime value
 enum Val {
     VUnit,
@@ -181,7 +184,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     // synthetic glue (module entry) has no source to point at
                     let ln = if li >= 0 && ip < len(f_spans[fnh]) {
                         match f_spans[fnh][ip] {
-                            Sp(s0, _) => line_of(ls_tables[li], s0),
+                            frontend.SpanT.Sp(s0, _) => lib.line_of(ls_tables[li], s0),
                         }
                     } else {
                         0
@@ -309,7 +312,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             VInt(n) => str(n),
             VFloat(x) => str(x),
             VStr(s) => if quote {
-                go_quote(s)
+                lib.go_quote(s)
             } else {
                 s
             },
@@ -337,7 +340,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         "<fn " + name + ">"
                     }
                 } else if t == ot_native {
-                    "<native " + native_names[o_i1[h]] + ">"
+                    "<native " + lib.native_names[o_i1[h]] + ">"
                 } else if t == ot_enumtype {
                     "<enum " + en_qual[o_i1[h]] + ">"
                 } else if t == ot_ctor {
@@ -1090,7 +1093,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     // pops. Allocating natives root fresh handles before any further
     // allocation, mirroring the Go implementations.
     fn do_native(f, id, argc) {
-        let nm = native_names[id]
+        let nm = lib.native_names[id]
         if nm == "print" || nm == "println" || nm == "eprintln" {
             let mut parts = []
             let mut i = 0
@@ -1808,13 +1811,13 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
 
     // ---- arithmetic and comparison (vm.go arith/compare) ----
     fn arith_name(op) {
-        if op == op_add {
+        if op == lib.op_add {
             "+"
-        } else if op == op_sub {
+        } else if op == lib.op_sub {
             "-"
-        } else if op == op_mul {
+        } else if op == lib.op_mul {
             "*"
-        } else if op == op_div {
+        } else if op == lib.op_div {
             "/"
         } else {
             "%"
@@ -1824,8 +1827,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         let b = fpeek(f, 0)
         let a = fpeek(f, 1)
         if is_str(a) && is_str(b) {
-            if op != op_add {
-                trap("cannot apply " + go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
+            if op != lib.op_add {
+                trap("cannot apply " + lib.go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
             }
             let s = str_of(a) + str_of(b)
             let _ = fpop(f)
@@ -1838,7 +1841,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             let _ = fpop(f)
             // integer overflow always traps — never wraps silently (GOALS);
             // checks run before the host operation, which would trap itself
-            if op == op_add {
+            if op == lib.op_add {
                 if y > 0 && x > max_int - y {
                     trap("integer overflow: " + str(x) + " + " + str(y))
                 }
@@ -1846,7 +1849,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("integer overflow: " + str(x) + " + " + str(y))
                 }
                 fpush(f, VInt(x + y))
-            } else if op == op_sub {
+            } else if op == lib.op_sub {
                 if y > 0 && x < min_int + y {
                     trap("integer overflow: " + str(x) + " - " + str(y))
                 }
@@ -1854,7 +1857,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("integer overflow: " + str(x) + " - " + str(y))
                 }
                 fpush(f, VInt(x - y))
-            } else if op == op_mul {
+            } else if op == lib.op_mul {
                 let mut over = false
                 if x > 0 && y > 0 && x > max_int / y {
                     over = true
@@ -1872,7 +1875,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("integer overflow: " + str(x) + " * " + str(y))
                 }
                 fpush(f, VInt(x * y))
-            } else if op == op_div {
+            } else if op == lib.op_div {
                 if y == 0 {
                     trap("integer division by zero")
                 }
@@ -1886,22 +1889,22 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 }
                 fpush(f, VInt(x % y))
             }
-        } else if is_num(a) && is_num(b) && op != op_mod {
+        } else if is_num(a) && is_num(b) && op != lib.op_mod {
             let x = num_f(a)
             let y = num_f(b)
             let _ = fpop(f)
             let _ = fpop(f)
-            if op == op_add {
+            if op == lib.op_add {
                 fpush(f, VFloat(x + y))
-            } else if op == op_sub {
+            } else if op == lib.op_sub {
                 fpush(f, VFloat(x - y))
-            } else if op == op_mul {
+            } else if op == lib.op_mul {
                 fpush(f, VFloat(x * y))
             } else {
                 fpush(f, VFloat(x / y))
             }
         } else {
-            trap("cannot apply " + go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
+            trap("cannot apply " + lib.go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
         }
     }
     fn do_compare(f, op) {
@@ -1910,11 +1913,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         if is_str(a) && is_str(b) {
             let x = str_of(a)
             let y = str_of(b)
-            let r = if op == op_gt {
+            let r = if op == lib.op_gt {
                 x > y
-            } else if op == op_gt_eq {
+            } else if op == lib.op_gt_eq {
                 x >= y
-            } else if op == op_lt {
+            } else if op == lib.op_lt {
                 x < y
             } else {
                 x <= y
@@ -1923,11 +1926,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         } else if is_int(a) && is_int(b) {
             let x = int_of(a)
             let y = int_of(b)
-            let r = if op == op_gt {
+            let r = if op == lib.op_gt {
                 x > y
-            } else if op == op_gt_eq {
+            } else if op == lib.op_gt_eq {
                 x >= y
-            } else if op == op_lt {
+            } else if op == lib.op_lt {
                 x < y
             } else {
                 x <= y
@@ -1936,11 +1939,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         } else if is_num(a) && is_num(b) {
             let x = num_f(a)
             let y = num_f(b)
-            let r = if op == op_gt {
+            let r = if op == lib.op_gt {
                 x > y
-            } else if op == op_gt_eq {
+            } else if op == lib.op_gt_eq {
                 x >= y
-            } else if op == op_lt {
+            } else if op == lib.op_lt {
                 x < y
             } else {
                 x <= y
@@ -1971,41 +1974,41 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             let op = code[start_ip]
             fb_fr_ip[f][fi] = start_ip + 1
 
-            if op == op_const {
+            if op == lib.op_const {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 fpush(f, k_vals[fnh][idx])
-            } else if op == op_unit {
+            } else if op == lib.op_unit {
                 fpush(f, VUnit)
-            } else if op == op_true {
+            } else if op == lib.op_true {
                 fpush(f, VBool(true))
-            } else if op == op_false {
+            } else if op == lib.op_false {
                 fpush(f, VBool(false))
-            } else if op == op_pop {
+            } else if op == lib.op_pop {
                 let _ = fpop(f)
-            } else if op == op_pop_n {
+            } else if op == lib.op_pop_n {
                 let n = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 fsettop(f, ftop(f) - n)
-            } else if op == op_close_upvalue {
+            } else if op == lib.op_close_upvalue {
                 close_upvalues(f, ftop(f) - 1)
                 let _ = fpop(f)
-            } else if op == op_end_block {
+            } else if op == lib.op_end_block {
                 let n = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 let v = fpop(f)
                 close_upvalues(f, ftop(f) - n)
                 fsettop(f, ftop(f) - n)
                 fpush(f, v)
-            } else if op == op_get_local {
+            } else if op == lib.op_get_local {
                 let slot = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 fpush(f, fb_stack[f][fb_fr_base[f][fi] + slot])
-            } else if op == op_set_local {
+            } else if op == lib.op_set_local {
                 let slot = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 fb_stack[f][fb_fr_base[f][fi] + slot] = fpeek(f, 0)
-            } else if op == op_get_global {
+            } else if op == lib.op_get_global {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 let name = match k_vals[fnh][idx] {
@@ -2017,9 +2020,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 }
                 match get(globals, name) {
                     Some(v) => fpush(f, v),
-                    None => trap("undefined variable " + go_quote(name)),
+                    None => trap("undefined variable " + lib.go_quote(name)),
                 }
-            } else if op == op_def_global {
+            } else if op == lib.op_def_global {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 let name = match k_vals[fnh][idx] {
@@ -2030,7 +2033,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     },
                 }
                 put(globals, name, fpop(f))
-            } else if op == op_set_global {
+            } else if op == lib.op_set_global {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 let name = match k_vals[fnh][idx] {
@@ -2042,29 +2045,29 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 }
                 match get(globals, name) {
                     Some(_) => put(globals, name, fpeek(f, 0)),
-                    None => trap("undefined variable " + go_quote(name)),
+                    None => trap("undefined variable " + lib.go_quote(name)),
                 }
-            } else if op == op_get_upval {
+            } else if op == lib.op_get_upval {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 fpush(f, uv_get(o_h1[clh][idx]))
-            } else if op == op_set_upval {
+            } else if op == lib.op_set_upval {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 uv_set(o_h1[clh][idx], fpeek(f, 0))
-            } else if op == op_eq {
+            } else if op == lib.op_eq {
                 let b = fpop(f)
                 let a = fpop(f)
                 fpush(f, VBool(eq_val(a, b)))
-            } else if op == op_neq {
+            } else if op == lib.op_neq {
                 let b = fpop(f)
                 let a = fpop(f)
                 fpush(f, VBool(!eq_val(a, b)))
-            } else if op == op_gt || op == op_gt_eq || op == op_lt || op == op_lt_eq {
+            } else if op == lib.op_gt || op == lib.op_gt_eq || op == lib.op_lt || op == lib.op_lt_eq {
                 do_compare(f, op)
-            } else if op == op_add || op == op_sub || op == op_mul || op == op_div || op == op_mod {
+            } else if op == lib.op_add || op == lib.op_sub || op == lib.op_mul || op == lib.op_div || op == lib.op_mod {
                 do_arith(f, op)
-            } else if op == op_neg {
+            } else if op == lib.op_neg {
                 let v = fpop(f)
                 match v {
                     VInt(n) => {
@@ -2076,25 +2079,25 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     VFloat(x) => fpush(f, VFloat(0.0 - x)),
                     _ => trap("operand of '-' must be a number, got " + type_name(v)),
                 }
-            } else if op == op_not {
+            } else if op == lib.op_not {
                 let v = fpop(f)
                 if !is_bool(v) {
                     trap("operand of '!' must be a bool, got " + type_name(v))
                 }
                 fpush(f, VBool(!bool_of(v)))
-            } else if op == op_jump {
+            } else if op == lib.op_jump {
                 fb_fr_ip[f][fi] = start_ip + 3 + rd_u16(code, start_ip + 1)
-            } else if op == op_jump_if_false || op == op_jump_if_true || op == op_jump_if_false_pop {
+            } else if op == lib.op_jump_if_false || op == lib.op_jump_if_true || op == lib.op_jump_if_false_pop {
                 let cond = fpeek(f, 0)
                 if !is_bool(cond) {
                     trap("condition must be a bool, got " + type_name(cond))
                 }
                 let dist = rd_u16(code, start_ip + 1)
                 let mut nip = start_ip + 3
-                if op == op_jump_if_false_pop {
+                if op == lib.op_jump_if_false_pop {
                     let _ = fpop(f)
                 }
-                if op == op_jump_if_true {
+                if op == lib.op_jump_if_true {
                     if bool_of(cond) {
                         nip = nip + dist
                     }
@@ -2104,9 +2107,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                 }
                 fb_fr_ip[f][fi] = nip
-            } else if op == op_loop {
+            } else if op == lib.op_loop {
                 fb_fr_ip[f][fi] = start_ip + 3 - rd_u16(code, start_ip + 1)
-            } else if op == op_call {
+            } else if op == lib.op_call {
                 let argc = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 call_value(f, argc)
@@ -2165,11 +2168,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     schedule(f)
                     return false
                 }
-            } else if op == op_closure {
+            } else if op == lib.op_closure {
                 let idx = rd_u16(code, start_ip + 1)
                 let mut ip = start_ip + 3
                 let sub = match f_consts[fnh][idx] {
-                    CFn(x) => x,
+                    lib.CVal.CFn(x) => x,
                     _ => {
                         trap("bad closure const (VM bug)")
                         0
@@ -2191,7 +2194,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     i = i + 1
                 }
                 fb_fr_ip[f][fi] = ip
-            } else if op == op_return {
+            } else if op == lib.op_return {
                 if len(fb_fr_defers[f][fi]) > 0 || fb_fr_dact[f][fi] {
                     // registered defers: stash the exit value once, then run
                     // each deferred block by re-executing this return after
@@ -2229,7 +2232,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     fsettop(f, base)
                     fpush(f, result)
                 }
-            } else if op == op_list {
+            } else if op == lib.op_list {
                 let n = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 // alloc before popping: elements stay rooted on the stack
@@ -2242,7 +2245,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 }
                 fsettop(f, top - n)
                 fpush(f, VObj(lh))
-            } else if op == op_index_get {
+            } else if op == lib.op_index_get {
                 let idx = fpop(f)
                 let target = fpop(f)
                 let lh = tagged_h(target, ot_list)
@@ -2268,7 +2271,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 } else {
                     trap("cannot index " + type_name(target))
                 }
-            } else if op == op_index_set {
+            } else if op == lib.op_index_set {
                 let v = fpop(f)
                 let idx = fpop(f)
                 let target = fpop(f)
@@ -2284,7 +2287,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("list index " + str(i) + " out of bounds (len " + str(len(o_vals[lh])) + ")")
                 }
                 o_vals[lh][i] = v
-            } else if op == op_len {
+            } else if op == lib.op_len {
                 let v = fpop(f)
                 let lh = tagged_h(v, ot_list)
                 if lh >= 0 {
@@ -2294,7 +2297,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 } else {
                     trap("len() needs a list or string, got " + type_name(v))
                 }
-            } else if op == op_test_variant {
+            } else if op == lib.op_test_variant {
                 let vidx = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 let etv = fpop(f)
@@ -2308,7 +2311,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     _ => false,
                 }
                 fpush(f, VBool(m))
-            } else if op == op_get_field {
+            } else if op == lib.op_get_field {
                 let fidx = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 let inst = fpop(f)
@@ -2317,9 +2320,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("bad GetField operand (VM bug)")
                 }
                 fpush(f, o_vals[ih][fidx])
-            } else if op == op_no_match {
+            } else if op == lib.op_no_match {
                 trap("no pattern matched value " + format_val(fpeek(f, 0), true))
-            } else if op == op_try {
+            } else if op == lib.op_try {
                 if fb_fr_dact[f][fi] {
                     // mid defer-exit re-entry: drop the deferred block's
                     // result and continue unwinding with the stashed None/Err
@@ -2391,14 +2394,14 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         fpush(f, v)
                     }
                 }
-            } else if op == op_defer {
+            } else if op == lib.op_defer {
                 let v = fpop(f)
                 let dh = tagged_h(v, ot_closure)
                 if dh < 0 {
                     trap("defer needs a function, got " + type_name(v) + " (VM bug)")
                 }
                 push(fb_fr_defers[f][fi], dh)
-            } else if op == op_spawn {
+            } else if op == lib.op_spawn {
                 let argc = code[start_ip + 1]
                 fb_fr_ip[f][fi] = start_ip + 2
                 let callee = fpeek(f, argc)
@@ -2418,7 +2421,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 let nf = new_fiber(ch2, sargs)
                 schedule(nf)
                 fsettop(f, ftop(f) - argc - 1)
-            } else if op == op_send {
+            } else if op == lib.op_send {
                 let v = fpop(f)
                 let chv = fpop(f)
                 let ch = tagged_h(chv, ot_channel)
@@ -2446,7 +2449,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     wake_waiters(ch) // a select receive arm can now proceed
                     return false
                 }
-            } else if op == op_recv {
+            } else if op == lib.op_recv {
                 let chv = fpeek(f, 0) // keep the channel on the stack in case we park
                 let ch = tagged_h(chv, ot_channel)
                 if ch < 0 {
@@ -2471,7 +2474,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         return false
                     },
                 }
-            } else if op == op_chan_next {
+            } else if op == lib.op_chan_next {
                 let chv = fpeek(f, 0)
                 let ch = tagged_h(chv, ot_channel)
                 if ch < 0 {
@@ -2500,7 +2503,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         }
                     },
                 }
-            } else if op == op_select {
+            } else if op == lib.op_select {
                 // on re-entry after a park, drop stale waiter registrations
                 if len(fb_selectch[f]) > 0 {
                     for pch in fb_selectch[f] {
@@ -2619,7 +2622,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     fb_fr_ip[f][fi] = start_ip
                     return false
                 }
-            } else if op == op_record {
+            } else if op == lib.op_record {
                 let n = code[start_ip + 1]
                 let cidx = rd_u16(code, start_ip + 2)
                 fb_fr_ip[f][fi] = start_ip + 4
@@ -2647,7 +2650,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 o_vals[h] = vals
                 o_keys[h] = keys
                 fpush(f, VObj(h))
-            } else if op == op_get_field_name {
+            } else if op == lib.op_get_field_name {
                 let cidx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
                 let fname = match k_vals[fnh][cidx] {
@@ -2672,7 +2675,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 if !found {
                     trap("record has no field \"" + fname + "\"")
                 }
-            } else if op == op_record_update {
+            } else if op == lib.op_record_update {
                 let n = code[start_ip + 1]
                 let cidx = rd_u16(code, start_ip + 2)
                 fb_fr_ip[f][fi] = start_ip + 4
@@ -2756,19 +2759,19 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         let mut kv = []
         for cv in f_consts[fh] {
             push(kv, match cv {
-                CInt(n) => VInt(n),
-                CFloat(x) => VFloat(x),
-                CStr(s) => VStr(s),
-                CFn(_) => VUnit, // only reached through OpClosure, which reads the CVal
-                CEnumType(eh) => VObj(et_obj[eh]),
-                CSingleton(eh, vi) => {
+                lib.CVal.CInt(n) => VInt(n),
+                lib.CVal.CFloat(x) => VFloat(x),
+                lib.CVal.CStr(s) => VStr(s),
+                lib.CVal.CFn(_) => VUnit, // only reached through OpClosure, which reads the CVal
+                lib.CVal.CEnumType(eh) => VObj(et_obj[eh]),
+                lib.CVal.CSingleton(eh, vi) => {
                     let h = alloc_obj(ot_enuminst)
                     o_i1[h] = eh
                     o_i2[h] = vi
                     push(pinned, h)
                     VObj(h)
                 },
-                CCtor(eh, vi) => {
+                lib.CVal.CCtor(eh, vi) => {
                     let h = alloc_obj(ot_ctor)
                     o_i1[h] = eh
                     o_i2[h] = vi
@@ -2781,11 +2784,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         fh = fh + 1
     }
     let mut ni = 0
-    while ni < len(native_names) {
+    while ni < len(lib.native_names) {
         let h = alloc_obj(ot_native)
         o_i1[h] = ni
         push(pinned, h)
-        put(globals, native_names[ni], VObj(h))
+        put(globals, lib.native_names[ni], VObj(h))
         ni = ni + 1
     }
     put(globals, "Option", VObj(et_obj[opt_enum]))

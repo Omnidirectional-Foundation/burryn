@@ -6,6 +6,8 @@
 // with the span last. NoNode stands in for Go's nil (missing else branch,
 // bare return, absent select default).
 
+import "burryn.dev/compiler/lib"
+
 // Span: half-open byte range [start, end) into the source
 pub enum SpanT {
     Sp(int, int),
@@ -75,14 +77,19 @@ pub enum Node {
     NoNode,
 }
 
+// parse() result: top-level statements plus parse diagnostics
+pub enum ParseOut {
+    Parsed([Node], [lib.DiagT]),
+}
+
 // perr builds an Err(diag) — the stand-in for Go's panic-fail used by the
 // parser and compiler. The checker now infers package fns in SCC dependency
 // order, so placement no longer matters to it; perr stays in this early
 // file so the archived Go seed (file-order inference, which pins a
 // forward-used fn's type variable monomorphically) can still compile burc.
-fn perr(code, help, msg, sp) {
+pub fn perr(code, help, msg, sp) {
     match sp {
-        Sp(s, e) => Err(Diag(true, code, msg, help, s, e)),
+        Sp(s, e) => Err(lib.DiagT.Diag(true, code, msg, help, s, e)),
     }
 }
 
@@ -491,4 +498,36 @@ fn lower_pipe_node(n) {
         TypeAliasDecl(name, te, is_pub, sp) => TypeAliasDecl(name, te, is_pub, sp),
         _ => n,
     }
+}
+
+// import_alias mirrors module.go importAlias: the explicit alias, else the
+// last path segment
+pub fn import_alias(alias, path) {
+    if alias != "" {
+        alias
+    } else {
+        let mut cut = 0
+        let mut i = 0
+        while i < str_len(path) {
+            if char_at(path, i) == "/" {
+                cut = i + 1
+            }
+            i = i + 1
+        }
+        substr(path, cut, str_len(path) - cut)
+    }
+}
+
+// aliases_of builds alias -> import path from one file's ImportDecl nodes,
+// which the loader has already validated; the checker and compiler consume
+// this to resolve qualified names on the fly
+pub fn aliases_of(imports) {
+    let mut am = map()
+    for imp in imports {
+        match imp {
+            Node.ImportDecl(alias, _, path, _, _) => put(am, import_alias(alias, path), path),
+            _ => {},
+        }
+    }
+    am
 }

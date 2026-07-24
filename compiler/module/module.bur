@@ -5,16 +5,26 @@
 // their package qualifiers resolved in place, and the checker and compiler
 // resolve value/variant aliases on the fly from each file's ImportDecls.
 
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// load_module() result: packages in dependency order (imports first, entry
+// last). ModLoaded carries the loader's warnings and their files, then the
+// package import paths, statements per package per file, display paths per
+// package, each file's leading ImportDecl nodes (alias source of truth
+// for the checker and compiler), each package's interface-cache
+// identity ("" = not cacheable: local, std, or no bur.sum entry), and
+// each file's line-start byte offsets (span-to-line mapping for cgen
+// `#line` emission and runtime traces). Any loader error means ModFailed.
+pub enum ModOut {
+    ModLoaded([lib.DiagT], [str], [str], [[[frontend.Node]]], [[str]], [[[frontend.Node]]], [str], [[[int]]]),
+    ModFailed([lib.DiagT], [str]),
+}
+
 fn str_ends_with(s, suffix) {
     let n = str_len(s)
     let m = str_len(suffix)
     n >= m && substr(s, n - m, m) == suffix
-}
-
-pub fn str_has_prefix(s, prefix) {
-    let n = str_len(s)
-    let m = str_len(prefix)
-    n >= m && substr(s, 0, m) == prefix
 }
 
 // str_fields splits on runs of spaces and tabs (strings.Fields subset)
@@ -57,11 +67,11 @@ fn iface_id_of(hash) {
         }
         i = i + 1
     }
-    toolchain_version + "-" + out
+    lib.toolchain_version + "-" + out
 }
 
 fn valid_import_path(p) {
-    if p == "" || str_has_prefix(p, "/") || str_ends_with(p, "/") {
+    if p == "" || lib.str_has_prefix(p, "/") || str_ends_with(p, "/") {
         false
     } else {
         let mut ok = true
@@ -80,15 +90,15 @@ fn valid_import_path(p) {
 // is_const_expr: what may initialize a package-level let (mirrors module.go)
 fn is_const_expr(e) {
     match e {
-        IntLit(_, _) => true,
-        FloatLit(_, _) => true,
-        StrLit(_, _) => true,
-        BoolLit(_, _) => true,
-        FnLit(_, _, _, _, _, _, _, _) => true,
-        Unary(_, rhs, _) => is_const_expr(rhs),
-        Binary(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
-        Logical(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
-        ListLit(elems, _) => {
+        frontend.Node.IntLit(_, _) => true,
+        frontend.Node.FloatLit(_, _) => true,
+        frontend.Node.StrLit(_, _) => true,
+        frontend.Node.BoolLit(_, _) => true,
+        frontend.Node.FnLit(_, _, _, _, _, _, _, _) => true,
+        frontend.Node.Unary(_, rhs, _) => is_const_expr(rhs),
+        frontend.Node.Binary(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
+        frontend.Node.Logical(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
+        frontend.Node.ListLit(elems, _) => {
             let mut ok = true
             for el in elems {
                 if !is_const_expr(el) {
@@ -118,66 +128,34 @@ fn parse_bur_mod(file, src, mut diags, mut dfiles) {
             let sp_end = line_off + str_len(text)
             if fields[0] == "module" {
                 if len(fields) != 2 {
-                    push(diags, Diag(true, "E0432", "malformed module directive", "write `module <path>`, e.g. `module example.com/you/hello`", sp_start, sp_end))
+                    push(diags, lib.DiagT.Diag(true, "E0432", "malformed module directive", "write `module <path>`, e.g. `module example.com/you/hello`", sp_start, sp_end))
                     push(dfiles, file)
                 } else if path != "" {
-                    push(diags, Diag(true, "E0432", "duplicate module directive", "", sp_start, sp_end))
+                    push(diags, lib.DiagT.Diag(true, "E0432", "duplicate module directive", "", sp_start, sp_end))
                     push(dfiles, file)
                 } else if !valid_import_path(fields[1]) {
-                    push(diags, Diag(true, "E0432", "invalid module path \"" + fields[1] + "\"", "", sp_start, sp_end))
+                    push(diags, lib.DiagT.Diag(true, "E0432", "invalid module path \"" + fields[1] + "\"", "", sp_start, sp_end))
                     push(dfiles, file)
                 } else {
                     path = fields[1]
                 }
             } else if fields[0] == "require" {
                 // parsed and tolerated; resolution is a later milestone
-                if len(fields) != 3 || !valid_import_path(fields[1]) || !str_has_prefix(fields[2], "v") {
-                    push(diags, Diag(true, "E0432", "malformed require directive", "write `require <path> <version>`", sp_start, sp_end))
+                if len(fields) != 3 || !valid_import_path(fields[1]) || !lib.str_has_prefix(fields[2], "v") {
+                    push(diags, lib.DiagT.Diag(true, "E0432", "malformed require directive", "write `require <path> <version>`", sp_start, sp_end))
                     push(dfiles, file)
                 }
             } else {
-                push(diags, Diag(true, "E0432", "unknown directive \"" + fields[0] + "\"", "bur.mod knows the directives `module` and `require`", sp_start, sp_end))
+                push(diags, lib.DiagT.Diag(true, "E0432", "unknown directive \"" + fields[0] + "\"", "bur.mod knows the directives `module` and `require`", sp_start, sp_end))
                 push(dfiles, file)
             }
         }
     }
     if path == "" && len(diags) == 0 {
-        push(diags, Diag(true, "E0432", "missing module directive in " + file, "add a module directive, e.g. `module example.com/you/hello`", 0, 0))
+        push(diags, lib.DiagT.Diag(true, "E0432", "missing module directive in " + file, "add a module directive, e.g. `module example.com/you/hello`", 0, 0))
         push(dfiles, file)
     }
     path
-}
-
-// import_alias mirrors module.go importAlias: the explicit alias, else the
-// last path segment
-fn import_alias(alias, path) {
-    if alias != "" {
-        alias
-    } else {
-        let mut cut = 0
-        let mut i = 0
-        while i < str_len(path) {
-            if char_at(path, i) == "/" {
-                cut = i + 1
-            }
-            i = i + 1
-        }
-        substr(path, cut, str_len(path) - cut)
-    }
-}
-
-// aliases_of builds alias -> import path from one file's ImportDecl nodes,
-// which the loader has already validated; the checker and compiler consume
-// this to resolve qualified names on the fly
-fn aliases_of(imports) {
-    let mut am = map()
-    for imp in imports {
-        match imp {
-            ImportDecl(alias, _, path, _, _) => put(am, import_alias(alias, path), path),
-            _ => {},
-        }
-    }
-    am
 }
 
 // ---- alias usage scan ----
@@ -187,7 +165,7 @@ fn aliases_of(imports) {
 
 fn mark_pattern(p, aliases, mut used) {
     match p {
-        PatVariant(ppkg, _, _, binds, _) => {
+        frontend.Node.PatVariant(ppkg, _, _, binds, _) => {
             if ppkg != "" {
                 match get(aliases, ppkg) {
                     Some(_) => put(used, ppkg, true),
@@ -204,7 +182,7 @@ fn mark_pattern(p, aliases, mut used) {
 
 fn mark_te(te, aliases, mut used) {
     match te {
-        TEName(pkg, _, _, targs, _) => {
+        frontend.Node.TEName(pkg, _, _, targs, _) => {
             if pkg != "" {
                 match get(aliases, pkg) {
                     Some(_) => put(used, pkg, true),
@@ -215,8 +193,8 @@ fn mark_te(te, aliases, mut used) {
                 mark_te(a, aliases, used)
             }
         },
-        TEList(elem, _) => mark_te(elem, aliases, used),
-        TEFn(ps, ret, _) => {
+        frontend.Node.TEList(elem, _) => mark_te(elem, aliases, used),
+        frontend.Node.TEFn(ps, ret, _) => {
             for p2 in ps {
                 mark_te(p2, aliases, used)
             }
@@ -228,71 +206,71 @@ fn mark_te(te, aliases, mut used) {
 
 fn mark_expr(e, aliases, mut used) {
     match e {
-        VariantAccess(en, _, _) => {
+        frontend.Node.VariantAccess(en, _, _) => {
             match get(aliases, en) {
                 Some(_) => put(used, en, true),
                 None => {},
             }
         },
-        QualVariantAccess(pkg, _, _, _) => {
+        frontend.Node.QualVariantAccess(pkg, _, _, _) => {
             match get(aliases, pkg) {
                 Some(_) => put(used, pkg, true),
                 None => {},
             }
         },
-        Unary(_, rhs, _) => mark_expr(rhs, aliases, used),
-        Binary(_, lhs, rhs, _) => {
+        frontend.Node.Unary(_, rhs, _) => mark_expr(rhs, aliases, used),
+        frontend.Node.Binary(_, lhs, rhs, _) => {
             mark_expr(lhs, aliases, used)
             mark_expr(rhs, aliases, used)
         },
-        Logical(_, lhs, rhs, _) => {
+        frontend.Node.Logical(_, lhs, rhs, _) => {
             mark_expr(lhs, aliases, used)
             mark_expr(rhs, aliases, used)
         },
-        Call(callee, cargs, _) => {
+        frontend.Node.Call(callee, cargs, _) => {
             mark_expr(callee, aliases, used)
             for a in cargs {
                 mark_expr(a, aliases, used)
             }
         },
-        Pipe(lhs, target, args, _) => {
+        frontend.Node.Pipe(lhs, target, args, _) => {
             mark_expr(lhs, aliases, used)
             mark_expr(target, aliases, used)
             for a in args {
                 mark_expr(a, aliases, used)
             }
         },
-        Index(target, idx, _) => {
+        frontend.Node.Index(target, idx, _) => {
             mark_expr(target, aliases, used)
             mark_expr(idx, aliases, used)
         },
-        ListLit(elems, _) => {
+        frontend.Node.ListLit(elems, _) => {
             for el in elems {
                 mark_expr(el, aliases, used)
             }
         },
-        FnLit(_, _, _, param_tys, ret_ty, body, _, _) => {
+        frontend.Node.FnLit(_, _, _, param_tys, ret_ty, body, _, _) => {
             for te in param_tys {
                 mark_te(te, aliases, used)
             }
             mark_te(ret_ty, aliases, used)
             mark_expr(body, aliases, used)
         },
-        Block(stmts, _) => {
+        frontend.Node.Block(stmts, _) => {
             for s in stmts {
                 mark_stmt(s, aliases, used)
             }
         },
-        IfExpr(cond, then, els, _) => {
+        frontend.Node.IfExpr(cond, then, els, _) => {
             mark_expr(cond, aliases, used)
             mark_expr(then, aliases, used)
-            mark_expr(els, aliases, used) // NoNode falls through below
+            mark_expr(els, aliases, used) // frontend.Node.NoNode falls through below
         },
-        MatchExpr(scrut, arms, _) => {
+        frontend.Node.MatchExpr(scrut, arms, _) => {
             mark_expr(scrut, aliases, used)
             for arm in arms {
                 match arm {
-                    MatchArm(pat, guard, body, _) => {
+                    frontend.Node.MatchArm(pat, guard, body, _) => {
                         mark_pattern(pat, aliases, used)
                         mark_expr(guard, aliases, used)
                         mark_expr(body, aliases, used)
@@ -301,35 +279,35 @@ fn mark_expr(e, aliases, mut used) {
                 }
             }
         },
-        TryExpr(inner, _) => mark_expr(inner, aliases, used),
-        RecvExpr(chexpr, _) => mark_expr(chexpr, aliases, used),
+        frontend.Node.TryExpr(inner, _) => mark_expr(inner, aliases, used),
+        frontend.Node.RecvExpr(chexpr, _) => mark_expr(chexpr, aliases, used),
         _ => {},
     }
 }
 
 fn mark_stmt(s, aliases, mut used) {
     match s {
-        LetStmt(_, _, _, _, init, _) => mark_expr(init, aliases, used),
-        ConstDecl(_, _, _, init, _) => mark_expr(init, aliases, used),
-        AssignStmt(target, val, _) => {
+        frontend.Node.LetStmt(_, _, _, _, init, _) => mark_expr(init, aliases, used),
+        frontend.Node.ConstDecl(_, _, _, init, _) => mark_expr(init, aliases, used),
+        frontend.Node.AssignStmt(target, val, _) => {
             mark_expr(target, aliases, used)
             mark_expr(val, aliases, used)
         },
-        ExprStmt(e, _) => mark_expr(e, aliases, used),
-        WhileStmt(cond, body, _) => {
+        frontend.Node.ExprStmt(e, _) => mark_expr(e, aliases, used),
+        frontend.Node.WhileStmt(cond, body, _) => {
             mark_expr(cond, aliases, used)
             mark_expr(body, aliases, used)
         },
-        ForStmt(_, _, iter, _, body, _) => {
+        frontend.Node.ForStmt(_, _, iter, _, body, _) => {
             mark_expr(iter, aliases, used)
             mark_expr(body, aliases, used)
         },
-        ReturnStmt(v, _) => mark_expr(v, aliases, used),
-        FnDecl(_, _, _, lit, _) => mark_expr(lit, aliases, used),
-        EnumDecl(_, _, variants, _, _) => {
+        frontend.Node.ReturnStmt(v, _) => mark_expr(v, aliases, used),
+        frontend.Node.FnDecl(_, _, _, lit, _) => mark_expr(lit, aliases, used),
+        frontend.Node.EnumDecl(_, _, variants, _, _) => {
             for vd in variants {
                 match vd {
-                    EnumVariantDecl(_, _, vtypes, _) => {
+                    frontend.Node.EnumVariantDecl(_, _, vtypes, _) => {
                         for te in vtypes {
                             mark_te(te, aliases, used)
                         }
@@ -338,9 +316,9 @@ fn mark_stmt(s, aliases, mut used) {
                 }
             }
         },
-        SpawnStmt(call, _) => mark_expr(call, aliases, used),
-        DeferStmt(body, _) => mark_expr(body, aliases, used),
-        SendStmt(chexpr, val, _) => {
+        frontend.Node.SpawnStmt(call, _) => mark_expr(call, aliases, used),
+        frontend.Node.DeferStmt(body, _) => mark_expr(body, aliases, used),
+        frontend.Node.SendStmt(chexpr, val, _) => {
             mark_expr(chexpr, aliases, used)
             mark_expr(val, aliases, used)
         },
@@ -353,7 +331,7 @@ fn mark_stmt(s, aliases, mut used) {
 // later use site no longer needs the defining file's imports
 fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
     match te {
-        TEName(pkg, name, constraint, targs, sp) => {
+        frontend.Node.TEName(pkg, name, constraint, targs, sp) => {
             let mut rargs = []
             for a in targs {
                 push(rargs, resolve_te(a, aliases, mod_path, disp, diags, dfiles))
@@ -365,8 +343,8 @@ fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
                     Some(path) => path,
                     None => {
                         match sp {
-                            Sp(s0, e0) => {
-                                push(diags, Diag(true, "E0433", "cannot find package `" + pkg + "`", "import it first: `import \"" + mod_path + "/" + pkg + "\"`", s0, e0))
+                            frontend.SpanT.Sp(s0, e0) => {
+                                push(diags, lib.DiagT.Diag(true, "E0433", "cannot find package `" + pkg + "`", "import it first: `import \"" + mod_path + "/" + pkg + "\"`", s0, e0))
                                 push(dfiles, disp)
                             },
                         }
@@ -374,15 +352,15 @@ fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
                     },
                 }
             }
-            TEName(rpkg, name, constraint, rargs, sp)
+            frontend.Node.TEName(rpkg, name, constraint, rargs, sp)
         },
-        TEList(elem, sp) => TEList(resolve_te(elem, aliases, mod_path, disp, diags, dfiles), sp),
-        TEFn(ps, ret, sp) => {
+        frontend.Node.TEList(elem, sp) => frontend.Node.TEList(resolve_te(elem, aliases, mod_path, disp, diags, dfiles), sp),
+        frontend.Node.TEFn(ps, ret, sp) => {
             let mut rps = []
             for p2 in ps {
                 push(rps, resolve_te(p2, aliases, mod_path, disp, diags, dfiles))
             }
-            TEFn(rps, resolve_te(ret, aliases, mod_path, disp, diags, dfiles), sp)
+            frontend.Node.TEFn(rps, resolve_te(ret, aliases, mod_path, disp, diags, dfiles), sp)
         },
         _ => te,
     }
@@ -394,43 +372,43 @@ fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
     let mut out = []
     for s in stmts {
         match s {
-            EnumDecl(name, params, variants, is_pub, sp) => {
+            frontend.Node.EnumDecl(name, params, variants, is_pub, sp) => {
                 let mut rvars = []
                 for vd in variants {
                     match vd {
-                        EnumVariantDecl(vn, ar, vtypes, vsp) => {
+                        frontend.Node.EnumVariantDecl(vn, ar, vtypes, vsp) => {
                             let mut rts = []
                             for te in vtypes {
                                 push(rts, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
                             }
-                            push(rvars, EnumVariantDecl(vn, ar, rts, vsp))
+                            push(rvars, frontend.Node.EnumVariantDecl(vn, ar, rts, vsp))
                         },
                         _ => push(rvars, vd),
                     }
                 }
-                push(out, EnumDecl(name, params, rvars, is_pub, sp))
+                push(out, frontend.Node.EnumDecl(name, params, rvars, is_pub, sp))
             },
-            FnDecl(name, nsp, is_pub, lit, sp) => {
+            frontend.Node.FnDecl(name, nsp, is_pub, lit, sp) => {
                 match lit {
-                    FnLit(params, muts, pspans, param_tys, ret_ty, body, fname, lsp) => {
+                    frontend.Node.FnLit(params, muts, pspans, param_tys, ret_ty, body, fname, lsp) => {
                         let mut rparam_tys = []
                         for te in param_tys {
                             push(rparam_tys, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
                         }
                         let rret_ty = match ret_ty {
-                            NoNode => NoNode,
+                            frontend.Node.NoNode => frontend.Node.NoNode,
                             te => resolve_te(te, aliases, mod_path, disp, diags, dfiles),
                         }
-                        push(out, FnDecl(name, nsp, is_pub, FnLit(params, muts, pspans, rparam_tys, rret_ty, body, fname, lsp), sp))
+                        push(out, frontend.Node.FnDecl(name, nsp, is_pub, frontend.Node.FnLit(params, muts, pspans, rparam_tys, rret_ty, body, fname, lsp), sp))
                     },
                     _ => push(out, s),
                 }
             },
-            LetStmt(name, nsp, is_mut, is_pub, init, sp) => {
+            frontend.Node.LetStmt(name, nsp, is_mut, is_pub, init, sp) => {
                 match init {
-                    TEName(_, _, _, _, _) => push(out, LetStmt(name, nsp, is_mut, is_pub, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
-                    TEList(_, _) => push(out, LetStmt(name, nsp, is_mut, is_pub, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
-                    TEFn(_, _, _) => push(out, LetStmt(name, nsp, is_mut, is_pub, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend.Node.TEName(_, _, _, _, _) => push(out, frontend.Node.LetStmt(name, nsp, is_mut, is_pub, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend.Node.TEList(_, _) => push(out, frontend.Node.LetStmt(name, nsp, is_mut, is_pub, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend.Node.TEFn(_, _, _) => push(out, frontend.Node.LetStmt(name, nsp, is_mut, is_pub, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
                     _ => push(out, s),
                 }
             },
@@ -452,36 +430,36 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
         let disp = file_paths[fi]
         for s in files_stmts[fi] {
             let mut name = ""
-            let mut name_sp = Sp(0, 0)
+            let mut name_sp = frontend.SpanT.Sp(0, 0)
             match s {
-                FnDecl(n, nsp, _, _, _) => {
+                frontend.Node.FnDecl(n, nsp, _, _, _) => {
                     name = n
                     name_sp = nsp
                 },
-                EnumDecl(n, _, _, _, esp) => {
+                frontend.Node.EnumDecl(n, _, _, _, esp) => {
                     name = n
                     name_sp = esp
                 },
-                ConstDecl(n, nsp, _, _, _) => {
+                frontend.Node.ConstDecl(n, nsp, _, _, _) => {
                     name = n
                     name_sp = nsp
                 },
-                LetStmt(n, nsp, _, _, init, _) => {
+                frontend.Node.LetStmt(n, nsp, _, _, init, _) => {
                     name = n
                     name_sp = nsp
                     if !is_const_expr(init) {
-                        match span_of(init) {
-                            Sp(is0, ie0) => {
-                                push(diags, Diag(true, "E0802", "package-level `let` must be initialized with a constant expression", "package-level `let` allows literals, arithmetic on literals, list literals, and `fn` literals; compute anything else inside a function", is0, ie0))
+                        match frontend.span_of(init) {
+                            frontend.SpanT.Sp(is0, ie0) => {
+                                push(diags, lib.DiagT.Diag(true, "E0802", "package-level `let` must be initialized with a constant expression", "package-level `let` allows literals, arithmetic on literals, list literals, and `fn` literals; compute anything else inside a function", is0, ie0))
                                 push(dfiles, disp)
                             },
                         }
                     }
                 },
                 _ => {
-                    match span_of(s) {
-                        Sp(ss0, se0) => {
-                            push(diags, Diag(true, "E0801", "only declarations are allowed at the top level of a package file", "executable code lives inside functions; the program starts at `fn main`", ss0, se0))
+                    match frontend.span_of(s) {
+                        frontend.SpanT.Sp(ss0, se0) => {
+                            push(diags, lib.DiagT.Diag(true, "E0801", "only declarations are allowed at the top level of a package file", "executable code lives inside functions; the program starts at `fn main`", ss0, se0))
                             push(dfiles, disp)
                         },
                     }
@@ -504,13 +482,13 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
                             None => 0,
                         }
                         match name_sp {
-                            Sp(ns0, ne0) => {
+                            frontend.SpanT.Sp(ns0, ne0) => {
                                 // the "first declared here" label is same-file
                                 // only: LabelT carries no file of its own
                                 if prev == disp {
-                                    push(diags, DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [Lab(ps, pe, "first declared here")], []))
+                                    push(diags, lib.DiagT.DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [lib.LabelT.Lab(ps, pe, "first declared here")], []))
                                 } else {
-                                    push(diags, Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
+                                    push(diags, lib.DiagT.Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
                                 }
                                 push(dfiles, disp)
                             },
@@ -519,7 +497,7 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
                     None => {
                         put(declared, name, disp)
                         match name_sp {
-                            Sp(ns0, ne0) => {
+                            frontend.SpanT.Sp(ns0, ne0) => {
                                 put(declared_s, name, ns0)
                                 put(declared_e, name, ne0)
                             },
@@ -557,7 +535,7 @@ fn load_module_opts(dir0, test_rel) {
     let mod_src = match read_file(mod_file) {
         Ok(s) => s,
         Err(msg) => {
-            push(diags, Diag(true, "E0432", "cannot read " + mod_file + ": " + msg, "create one with a module directive, e.g. `module example.com/you/hello`", 0, 0))
+            push(diags, lib.DiagT.Diag(true, "E0432", "cannot read " + mod_file + ": " + msg, "create one with a module directive, e.g. `module example.com/you/hello`", 0, 0))
             push(dfiles, "")
             return ModFailed(diags, dfiles)
             ""
@@ -607,7 +585,7 @@ fn load_module_opts(dir0, test_rel) {
             },
         },
         Err(msg) => {
-            push(diags, Diag(true, "E0432", "cannot resolve module dependencies: " + msg, "fetch the required modules with `bur mod download`", 0, 0))
+            push(diags, lib.DiagT.Diag(true, "E0432", "cannot resolve module dependencies: " + msg, "fetch the required modules with `bur mod download`", 0, 0))
             push(dfiles, mod_file)
             return ModFailed(diags, dfiles)
         },
@@ -648,8 +626,8 @@ fn load_module_opts(dir0, test_rel) {
             }
             push(cyc, path)
             match from_sp {
-                Sp(s0, e0) => {
-                    push(diags, Diag(true, "E0391", "import cycle: " + join(cyc, " -> "), "", s0, e0))
+                frontend.SpanT.Sp(s0, e0) => {
+                    push(diags, lib.DiagT.Diag(true, "E0391", "import cycle: " + join(cyc, " -> "), "", s0, e0))
                     push(dfiles, from_file)
                 },
             }
@@ -660,15 +638,15 @@ fn load_module_opts(dir0, test_rel) {
         // A std module checked or tested as the root package stays local so
         // development sees its working tree and *_test.bur files. Only an
         // import from another module is resolved from the bundled table.
-        let is_std = path != mod_path && (path == "std" || str_has_prefix(path, "std/"))
+        let is_std = path != mod_path && (path == "std" || lib.str_has_prefix(path, "std/"))
 
-        let is_local = path == mod_path || str_has_prefix(path, mod_path + "/")
+        let is_local = path == mod_path || lib.str_has_prefix(path, mod_path + "/")
         let mut dep_ix = -1
         let mut dep_len = -1
         let mut xi = 0
         while xi < len(dep_paths) {
             let prefix = dep_paths[xi]
-            if (path == prefix || str_has_prefix(path, prefix + "/")) && str_len(prefix) > dep_len {
+            if (path == prefix || lib.str_has_prefix(path, prefix + "/")) && str_len(prefix) > dep_len {
                 dep_ix = xi
                 dep_len = str_len(prefix)
             }
@@ -677,8 +655,8 @@ fn load_module_opts(dir0, test_rel) {
         let is_external = !is_std && !is_local && dep_ix >= 0
         if !is_std && !is_local && !is_external {
             match from_sp {
-                Sp(s0, e0) => {
-                    push(diags, Diag(true, "E0432", "cannot resolve import \"" + path + "\"", "add its module with `bur get <module>@<version>` or a `require` directive", s0, e0))
+                frontend.SpanT.Sp(s0, e0) => {
+                    push(diags, lib.DiagT.Diag(true, "E0432", "cannot resolve import \"" + path + "\"", "add its module with `bur get <module>@<version>` or a `require` directive", s0, e0))
                     push(dfiles, from_file)
                 },
             }
@@ -686,12 +664,12 @@ fn load_module_opts(dir0, test_rel) {
             return
         }
         let std_rels = if is_std {
-            match get(std_embed_files(), path) {
+            match get(lib.std_embed_files(), path) {
                 Some(rels) => rels,
                 None => {
                     match from_sp {
-                        Sp(s0, e0) => {
-                            push(diags, Diag(true, "E0433", "cannot find bundled standard package \"" + path + "\"", "check the `std/` import path shipped with this Burryn version", s0, e0))
+                        frontend.SpanT.Sp(s0, e0) => {
+                            push(diags, lib.DiagT.Diag(true, "E0433", "cannot find bundled standard package \"" + path + "\"", "check the `std/` import path shipped with this Burryn version", s0, e0))
                             push(dfiles, from_file)
                         },
                     }
@@ -724,8 +702,8 @@ fn load_module_opts(dir0, test_rel) {
                 Ok(es) => es,
                 Err(msg) => {
                     match from_sp {
-                        Sp(s0, e0) => {
-                            push(diags, Diag(true, "E0433", "cannot find package \"" + path + "\": " + msg, "", s0, e0))
+                        frontend.SpanT.Sp(s0, e0) => {
+                            push(diags, lib.DiagT.Diag(true, "E0433", "cannot find package \"" + path + "\": " + msg, "", s0, e0))
                             push(dfiles, from_file)
                         },
                     }
@@ -748,10 +726,10 @@ fn load_module_opts(dir0, test_rel) {
                 bur_files = bur_files + 1
                 let disp = pdir + "/" + name
                 let src = if is_std {
-                    match std_embed_get(path, name) {
+                    match lib.std_embed_get(path, name) {
                         Some(s) => s,
                         None => {
-                            push(diags, Diag(true, "E0433", "missing embedded source " + path + "/" + name, "rebuild Burryn so its bundled standard library is complete", 0, 0))
+                            push(diags, lib.DiagT.Diag(true, "E0433", "missing embedded source " + path + "/" + name, "rebuild Burryn so its bundled standard library is complete", 0, 0))
                             push(dfiles, "")
                             ""
                         },
@@ -760,23 +738,23 @@ fn load_module_opts(dir0, test_rel) {
                     match lsp_overlay_read(disp) {
                         Ok(s) => s,
                         Err(msg) => {
-                            push(diags, Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
+                            push(diags, lib.DiagT.Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
                             push(dfiles, "")
                             ""
                         },
                     }
                 }
                 if src != "" {
-                    match lex(src) {
-                        Lexed(toks, ldiags, _) => {
+                    match frontend.lex(src) {
+                        lib.LexOut.Lexed(toks, ldiags, _) => {
                             if len(ldiags) > 0 {
                                 for d in ldiags {
                                     push(diags, d)
                                     push(dfiles, disp)
                                 }
                             } else {
-                                match parse(toks) {
-                                    Parsed(stmts, pdiags) => {
+                                match frontend.parse(toks) {
+                                    frontend.ParseOut.Parsed(stmts, pdiags) => {
                                         if len(pdiags) > 0 {
                                             for d in pdiags {
                                                 push(diags, d)
@@ -788,11 +766,11 @@ fn load_module_opts(dir0, test_rel) {
                                             let mut imports_done = false
                                             for s in stmts {
                                                 match s {
-                                                    ImportDecl(_, _, _, _, isp) => {
+                                                    frontend.Node.ImportDecl(_, _, _, _, isp) => {
                                                         if imports_done {
                                                             match isp {
-                                                                Sp(is0, ie0) => {
-                                                                    push(diags, Diag(true, "E0432", "`import` must come before any declarations", "move it to the top of the file, above the declarations", is0, ie0))
+                                                                frontend.SpanT.Sp(is0, ie0) => {
+                                                                    push(diags, lib.DiagT.Diag(true, "E0432", "`import` must come before any declarations", "move it to the top of the file, above the declarations", is0, ie0))
                                                                     push(dfiles, disp)
                                                                 },
                                                             }
@@ -809,7 +787,7 @@ fn load_module_opts(dir0, test_rel) {
                                             push(files_stmts, kept)
                                             push(file_paths, disp)
                                             push(file_imports, imps)
-                                            push(file_lstarts, line_starts(src))
+                                            push(file_lstarts, lib.line_starts(src))
                                         }
                                     },
                                 }
@@ -821,8 +799,8 @@ fn load_module_opts(dir0, test_rel) {
         }
         if bur_files == 0 {
             match from_sp {
-                Sp(s0, e0) => {
-                    push(diags, Diag(true, "E0433", "no .bur files in package \"" + path + "\" (" + pdir + ")", "", s0, e0))
+                frontend.SpanT.Sp(s0, e0) => {
+                    push(diags, lib.DiagT.Diag(true, "E0433", "no .bur files in package \"" + path + "\" (" + pdir + ")", "", s0, e0))
                     push(dfiles, from_file)
                 },
             }
@@ -838,10 +816,10 @@ fn load_module_opts(dir0, test_rel) {
         while di < len(files_stmts) {
             for s in files_stmts[di] {
                 match s {
-                    FnDecl(n, _, _, _, _) => put(decl_names, n, true),
-                    EnumDecl(n, _, _, _, _) => put(decl_names, n, true),
-                    LetStmt(n, _, _, _, _, _) => put(decl_names, n, true),
-                    ConstDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    frontend.Node.FnDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    frontend.Node.EnumDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    frontend.Node.LetStmt(n, _, _, _, _, _) => put(decl_names, n, true),
+                    frontend.Node.ConstDecl(n, _, _, _, _) => put(decl_names, n, true),
                     _ => {},
                 }
             }
@@ -857,8 +835,8 @@ fn load_module_opts(dir0, test_rel) {
             let mut seen = map()
             for imp in file_imports[fi] {
                 match imp {
-                    ImportDecl(alias0, asp, ipath, psp, isp) => {
-                        let alias = import_alias(alias0, ipath)
+                    frontend.Node.ImportDecl(alias0, asp, ipath, psp, isp) => {
+                        let alias = frontend.import_alias(alias0, ipath)
                         let asp2 = if alias0 == "" {
                             psp
                         } else {
@@ -866,15 +844,15 @@ fn load_module_opts(dir0, test_rel) {
                         }
                         if !valid_import_path(ipath) {
                             match psp {
-                                Sp(s0, e0) => {
-                                    push(diags, Diag(true, "E0432", "invalid import path \"" + ipath + "\"", "", s0, e0))
+                                frontend.SpanT.Sp(s0, e0) => {
+                                    push(diags, lib.DiagT.Diag(true, "E0432", "invalid import path \"" + ipath + "\"", "", s0, e0))
                                     push(dfiles, disp)
                                 },
                             }
                         } else if alias == "_" || alias == "Option" || alias == "Result" {
                             match asp2 {
-                                Sp(s0, e0) => {
-                                    push(diags, Diag(true, "E0252", "cannot use `" + alias + "` as an import name", "rename the import: `import other \"" + ipath + "\"`", s0, e0))
+                                frontend.SpanT.Sp(s0, e0) => {
+                                    push(diags, lib.DiagT.Diag(true, "E0252", "cannot use `" + alias + "` as an import name", "rename the import: `import other \"" + ipath + "\"`", s0, e0))
                                     push(dfiles, disp)
                                 },
                             }
@@ -889,15 +867,15 @@ fn load_module_opts(dir0, test_rel) {
                             }
                             if dup {
                                 match asp2 {
-                                    Sp(s0, e0) => {
-                                        push(diags, Diag(true, "E0252", "`" + alias + "` is imported more than once in this file", "rename one of them: `import other \"" + ipath + "\"`", s0, e0))
+                                    frontend.SpanT.Sp(s0, e0) => {
+                                        push(diags, lib.DiagT.Diag(true, "E0252", "`" + alias + "` is imported more than once in this file", "rename one of them: `import other \"" + ipath + "\"`", s0, e0))
                                         push(dfiles, disp)
                                     },
                                 }
                             } else if clash {
                                 match isp {
-                                    Sp(s0, e0) => {
-                                        push(diags, Diag(true, "E0252", "import `" + alias + "` conflicts with a declaration in this package", "rename the import with an alias: `import other \"...\"`", s0, e0))
+                                    frontend.SpanT.Sp(s0, e0) => {
+                                        push(diags, lib.DiagT.Diag(true, "E0252", "import `" + alias + "` conflicts with a declaration in this package", "rename the import with an alias: `import other \"...\"`", s0, e0))
                                         push(dfiles, disp)
                                     },
                                 }
@@ -911,7 +889,7 @@ fn load_module_opts(dir0, test_rel) {
                 }
             }
             file_imports[fi] = kept_imps
-            let aliases = aliases_of(kept_imps)
+            let aliases = frontend.aliases_of(kept_imps)
             let mut used = map()
             for s in files_stmts[fi] {
                 mark_stmt(s, aliases, used)
@@ -919,16 +897,16 @@ fn load_module_opts(dir0, test_rel) {
             files_stmts[fi] = resolve_file_tes(files_stmts[fi], aliases, mod_path, disp, diags, dfiles)
             for imp in kept_imps {
                 match imp {
-                    ImportDecl(alias0, _, ipath, _, isp) => {
-                        let alias = import_alias(alias0, ipath)
+                    frontend.Node.ImportDecl(alias0, _, ipath, _, isp) => {
+                        let alias = frontend.import_alias(alias0, ipath)
                         let is_used = match get(used, alias) {
                             Some(_) => true,
                             None => false,
                         }
                         if !is_used {
                             match isp {
-                                Sp(s0, e0) => {
-                                    push(diags, Diag(false, "unused_import", "unused import: `" + alias + "`", "remove the import", s0, e0))
+                                frontend.SpanT.Sp(s0, e0) => {
+                                    push(diags, lib.DiagT.Diag(false, "unused_import", "unused import: `" + alias + "`", "remove the import", s0, e0))
                                     push(dfiles, disp)
                                 },
                             }
@@ -945,7 +923,7 @@ fn load_module_opts(dir0, test_rel) {
         while fi < len(file_imports) {
             for imp in file_imports[fi] {
                 match imp {
-                    ImportDecl(_, _, ipath, psp, _) => load_pkg(ipath, file_paths[fi], psp, stack2),
+                    frontend.Node.ImportDecl(_, _, ipath, psp, _) => load_pkg(ipath, file_paths[fi], psp, stack2),
                     _ => {},
                 }
             }
@@ -970,22 +948,22 @@ fn load_module_opts(dir0, test_rel) {
     }
 
     if test_pkg == "" {
-        load_pkg(mod_path, "", Sp(0, 0), [])
+        load_pkg(mod_path, "", frontend.SpanT.Sp(0, 0), [])
     } else {
         // the package under test is the entry: it loads last, so the
         // synthetic test main lands in the entry package
-        load_pkg(test_pkg, "", Sp(0, 0), [])
+        load_pkg(test_pkg, "", frontend.SpanT.Sp(0, 0), [])
     }
 
     let mut has_err = false
     for d in diags {
         match d {
-            Diag(ie, _, _, _, _, _) => {
+            lib.DiagT.Diag(ie, _, _, _, _, _) => {
                 if ie {
                     has_err = true
                 }
             },
-            DiagX(ie, _, _, _, _, _, _, _) => {
+            lib.DiagT.DiagX(ie, _, _, _, _, _, _, _) => {
                 if ie {
                     has_err = true
                 }
@@ -1024,7 +1002,7 @@ pub fn load_module_test(dir0, rel, test_fn) {
                         let mut kept = []
                         for s in pkgs_stmts[pi][fi] {
                             match s {
-                                FnDecl(n, _, _, _, _) => {
+                                frontend.Node.FnDecl(n, _, _, _, _) => {
                                     if n != "main" {
                                         push(kept, s)
                                     }
@@ -1038,10 +1016,10 @@ pub fn load_module_test(dir0, rel, test_fn) {
                         push(flstarts, pkgs_lstarts[pi][fi])
                         fi = fi + 1
                     }
-                    let z = Sp(0, 0)
-                    let call = ExprStmt(Call(Ident(test_fn, z), [], z), z)
-                    let lit = FnLit([], [], [], [], NoNode, Block([call], z), "main", z)
-                    push(fstmts, [FnDecl("main", z, false, lit, z)])
+                    let z = frontend.SpanT.Sp(0, 0)
+                    let call = frontend.Node.ExprStmt(frontend.Node.Call(frontend.Node.Ident(test_fn, z), [], z), z)
+                    let lit = frontend.Node.FnLit([], [], [], [], frontend.Node.NoNode, frontend.Node.Block([call], z), "main", z)
+                    push(fstmts, [frontend.Node.FnDecl("main", z, false, lit, z)])
                     push(fpaths, "<test:" + test_fn + ">")
                     push(fimps, [])
                     push(flstarts, [0])
@@ -1076,7 +1054,7 @@ pub fn test_walk(root) {
         match read_dir(dir) {
             Ok(names) => {
                 for n in sorted_strs(names) {
-                    if !str_has_prefix(n, ".") {
+                    if !lib.str_has_prefix(n, ".") {
                         let sub = if rel == "" {
                             n
                         } else {
@@ -1127,22 +1105,22 @@ pub fn test_discover(dir) {
                 ""
             },
         }
-        match lex(src) {
-            Lexed(toks, ldiags, _) => {
+        match frontend.lex(src) {
+            lib.LexOut.Lexed(toks, ldiags, _) => {
                 if len(ldiags) > 0 {
                     return Err(disp + " has lex errors; run `bur check " + dir + "`")
                 }
-                match parse(toks) {
-                    Parsed(stmts, pdiags) => {
+                match frontend.parse(toks) {
+                    frontend.ParseOut.Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             return Err(disp + " has parse errors; run `bur check " + dir + "`")
                         }
                         for s in stmts {
                             match s {
-                                FnDecl(n, _, _, flit, _) => {
-                                    if str_has_prefix(n, "test_") {
+                                frontend.Node.FnDecl(n, _, _, flit, _) => {
+                                    if lib.str_has_prefix(n, "test_") {
                                         match flit {
-                                            FnLit(ps, _, _, _, _, _, _, _) => {
+                                            frontend.Node.FnLit(ps, _, _, _, _, _, _, _) => {
                                                 if len(ps) == 0 {
                                                     push(names, n)
                                                 }
