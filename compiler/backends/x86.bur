@@ -416,6 +416,18 @@ fn x86gen_epilogue() {
     mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + pop_r(rbp) + ret()
 }
 
+// x86gen_str_native: inline code for str(n) -> str.
+// Divides n by 10 repeatedly, pushes digit bytes, then allocates and fills.
+// Clobbers rax, rcx, rdx, r10, r11, rdi. Non-negative only.
+fn x86gen_str_native() {
+    let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + idiv_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
+    let loop_jne = jne_rel32(0 - (str_len(loop_body) + 6))
+    let alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + lea(rcx, r10, 8) + add_rr(r12, rcx) + lea(rdi, r11, 8)
+    let pop_body = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
+    let pop_jne = jne_rel32(0 - (str_len(pop_body) + 6))
+    mov_rm(rax, r15, 0 - 8) + xor_rr(r10, r10) + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+}
+
 // x86gen_start: program entry. nfn = number of functions.
 // Layout: [funcs][jumptable 8*nfn][_start]. The lea reaches back past
 // itself (7 bytes) and past the jump table (8*nfn) to the table base.
@@ -806,6 +818,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     ret_type = "str"
                 } else if callee == "byte_chr" {
                     w(mov_rm(rax, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(rcx, rcx) + add_ri32(rcx, 1) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rax) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
+                    ret_type = "str"
+                } else if callee == "str" {
+                    w(x86gen_str_native())
                     ret_type = "str"
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
