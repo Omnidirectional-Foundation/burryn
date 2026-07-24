@@ -10,6 +10,9 @@
 // graph into import loading (module.bur E0432 relaxation) lands together
 // with the interface cache (S6.1).
 
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
 // MI carries one parsed bur.mod: module path, require paths, require
 // versions (parallel lists)
 pub enum ModInfo {
@@ -46,7 +49,7 @@ pub fn modgraph_parse(text) {
                 }
                 mpath = fields[1]
             } else if fields[0] == "require" {
-                if len(fields) != 3 || !valid_import_path(fields[1]) || !str_has_prefix(fields[2], "v") {
+                if len(fields) != 3 || !valid_import_path(fields[1]) || !lib.str_has_prefix(fields[2], "v") {
                     return Err("malformed require directive")
                 }
                 push(rpaths, fields[1])
@@ -81,7 +84,7 @@ pub fn ver_cmp(a, b) {
 }
 
 fn ver_parts(v) {
-    let s = if str_has_prefix(v, "v") {
+    let s = if lib.str_has_prefix(v, "v") {
         substr(v, 1, str_len(v) - 1)
     } else {
         v
@@ -250,7 +253,7 @@ fn mvs_walk(dir, fetch) {
         let p = qp[qi]
         let v = qv[qi]
         qi = qi + 1
-        if p == "std" || str_has_prefix(p, "std/") {
+        if p == "std" || lib.str_has_prefix(p, "std/") {
             return Err("std ships with the toolchain; drop `require " + p + "`")
         }
         let key = p + "@" + v
@@ -384,7 +387,7 @@ fn collect_files(root, rel, mut acc) {
     match read_dir(dir) {
         Ok(names) => {
             for n in names {
-                if !str_has_prefix(n, ".") {
+                if !lib.str_has_prefix(n, ".") {
                     let r = if rel == "" {
                         n
                     } else {
@@ -505,19 +508,19 @@ fn tidy_scan_imports(dir) {
                         ""
                     },
                 }
-                match lex(src) {
-                    Lexed(toks, ldiags, _) => {
+                match frontend.lex(src) {
+                    lib.LexOut.Lexed(toks, ldiags, _) => {
                         if len(ldiags) > 0 {
                             return Err(disp + " has lex errors; run `bur check " + dir + "`")
                         }
-                        match parse(toks) {
-                            Parsed(stmts, pdiags) => {
+                        match frontend.parse(toks) {
+                            frontend.ParseOut.Parsed(stmts, pdiags) => {
                                 if len(pdiags) > 0 {
                                     return Err(disp + " has parse errors; run `bur check " + dir + "`")
                                 }
                                 for s in stmts {
                                     match s {
-                                        ImportDecl(_, _, ipath, _, _) => {
+                                        frontend.Node.ImportDecl(_, _, ipath, _, _) => {
                                             match get(seen, ipath) {
                                                 Some(_) => {},
                                                 None => {
@@ -569,13 +572,13 @@ pub fn mod_tidy(dir) {
     // (longest module-path prefix wins)
     let mut needed = map()
     for ip in imports {
-        let local = ip == "std" || str_has_prefix(ip, "std/") || ip == mod_path || str_has_prefix(ip, mod_path + "/")
+        let local = ip == "std" || lib.str_has_prefix(ip, "std/") || ip == mod_path || lib.str_has_prefix(ip, mod_path + "/")
         if !local {
             let mut best = -1
             let mut blen = -1
             let mut gi = 0
             while gi < len(gpaths) {
-                if (ip == gpaths[gi] || str_has_prefix(ip, gpaths[gi] + "/")) && str_len(gpaths[gi]) > blen {
+                if (ip == gpaths[gi] || lib.str_has_prefix(ip, gpaths[gi] + "/")) && str_len(gpaths[gi]) > blen {
                     best = gi
                     blen = str_len(gpaths[gi])
                 }
@@ -705,10 +708,10 @@ pub fn mod_get(dir, spec) {
     if !valid_import_path(path) {
         return Err("invalid module path \"" + path + "\"")
     }
-    if !str_has_prefix(version, "v") {
+    if !lib.str_has_prefix(version, "v") {
         return Err("version must look like v1.2.3, got \"" + version + "\"")
     }
-    if path == "std" || str_has_prefix(path, "std/") {
+    if path == "std" || lib.str_has_prefix(path, "std/") {
         return Err("std ships with the toolchain; it is never fetched")
     }
     let text = match read_file(dir + "/bur.mod") {

@@ -1,7 +1,8 @@
 import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
 // Pretty-printer for Burryn source.
 // Stage 3: full AST coverage plus comment reinsertion. Comments ride along
-// as lexer trivia (lib.Token.Tok(lib.t_comment, text, s, e)) and are threaded through the
+// as lexer trivia (lib.Token.Tok(frontend.t_comment, text, s, e)) and are threaded through the
 // printers with a cursor: own-line comments flush ahead of the next item at
 // the current indent, same-line comments stay pinned to their line, and the
 // verifier rejects output that drops or invents a comment.
@@ -19,7 +20,7 @@ import "burryn.dev/compiler/lib"
 // formatter bug.
 pub fn format_verified(stmts, src, comments) {
     let out = format_file(stmts, src, comments)
-    match lib.lex(out) {
+    match frontend.lex(out) {
         lib.LexOut.Lexed(toks2, ldiags2, comments2) => {
             if len(ldiags2) > 0 {
                 return Err("fmt verifier: output fails to lex")
@@ -29,17 +30,17 @@ pub fn format_verified(stmts, src, comments) {
             }
             let mut ci = 0
             while ci < len(comments) {
-                if lib.tok_lex(comments[ci]) != lib.tok_lex(comments2[ci]) {
+                if frontend.tok_lex(comments[ci]) != frontend.tok_lex(comments2[ci]) {
                     return Err("fmt verifier: comment text changed")
                 }
                 ci = ci + 1
             }
-            match lib.parse(toks2) {
-                lib.ParseOut.Parsed(stmts2, pdiags2) => {
+            match frontend.parse(toks2) {
+                frontend.ParseOut.Parsed(stmts2, pdiags2) => {
                     if len(pdiags2) > 0 {
                         return Err("fmt verifier: output fails to parse")
                     }
-                    if !lib.ast_eq_list(stmts, stmts2) {
+                    if !frontend.ast_eq_list(stmts, stmts2) {
                         return Err("fmt verifier: AST changed by formatting")
                     }
                     Ok(out)
@@ -113,7 +114,7 @@ fn flush_comments(comments, mut cc, limit, src, indent, pe0, mut buf) {
             push(buf, "\n")
         }
         push_indent(buf, indent)
-        push(buf, lib.tok_lex(c))
+        push(buf, frontend.tok_lex(c))
         push(buf, "\n")
         pe = tok_end(c)
         cc[0] = cc[0] + 1
@@ -129,7 +130,7 @@ fn try_trailing(comments, mut cc, code_end, src, mut buf) {
         let s = tok_start(c)
         if s >= code_end && !src_has_newline(src, code_end, s) {
             push(buf, " ")
-            push(buf, lib.tok_lex(c))
+            push(buf, frontend.tok_lex(c))
             cc[0] = cc[0] + 1
             return tok_end(c)
         }
@@ -139,7 +140,7 @@ fn try_trailing(comments, mut cc, code_end, src, mut buf) {
 
 fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
     match n {
-        lib.Node.ConstDecl(name, _, is_pub, init, _) => {
+        frontend.Node.ConstDecl(name, _, is_pub, init, _) => {
             if is_pub {
                 push(buf, "pub ")
             }
@@ -148,7 +149,7 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " = ")
             fmt_expr(init, src, comments, cc, indent, buf)
         },
-        lib.Node.LetStmt(name, _, is_mut, is_pub, init, _) => {
+        frontend.Node.LetStmt(name, _, is_mut, is_pub, init, _) => {
             if is_pub {
                 push(buf, "pub ")
             }
@@ -160,35 +161,35 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " = ")
             fmt_expr(init, src, comments, cc, indent, buf)
         },
-        lib.Node.FnDecl(name, _, is_pub, fnlit, _) => {
+        frontend.Node.FnDecl(name, _, is_pub, fnlit, _) => {
             if is_pub {
                 push(buf, "pub ")
             }
             fmt_fn_lit(name, fnlit, src, comments, cc, indent, buf)
         },
-        lib.Node.ReturnStmt(val, _) => {
+        frontend.Node.ReturnStmt(val, _) => {
             push(buf, "return")
             match val {
-                lib.Node.NoNode => {},
+                frontend.Node.NoNode => {},
                 _ => {
                     push(buf, " ")
                     fmt_expr(val, src, comments, cc, indent, buf)
                 },
             }
         },
-        lib.Node.AssignStmt(target, val, _) => {
+        frontend.Node.AssignStmt(target, val, _) => {
             fmt_expr(target, src, comments, cc, indent, buf)
             push(buf, " = ")
             fmt_expr(val, src, comments, cc, indent, buf)
         },
-        lib.Node.ExprStmt(e, _) => fmt_expr(e, src, comments, cc, indent, buf),
-        lib.Node.WhileStmt(cond, body, _) => {
+        frontend.Node.ExprStmt(e, _) => fmt_expr(e, src, comments, cc, indent, buf),
+        frontend.Node.WhileStmt(cond, body, _) => {
             push(buf, "while ")
             fmt_expr(cond, src, comments, cc, indent, buf)
             push(buf, " ")
             fmt_expr(body, src, comments, cc, indent, buf)
         },
-        lib.Node.ForStmt(v, _, iter, _, body, _) => {
+        frontend.Node.ForStmt(v, _, iter, _, body, _) => {
             push(buf, "for ")
             push(buf, v)
             push(buf, " in ")
@@ -196,15 +197,15 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " ")
             fmt_expr(body, src, comments, cc, indent, buf)
         },
-        lib.Node.SpawnStmt(call, _) => {
+        frontend.Node.SpawnStmt(call, _) => {
             push(buf, "spawn ")
             fmt_expr(call, src, comments, cc, indent, buf)
         },
-        lib.Node.DeferStmt(body, _) => {
+        frontend.Node.DeferStmt(body, _) => {
             push(buf, "defer ")
             fmt_expr(body, src, comments, cc, indent, buf)
         },
-        lib.Node.TypeAliasDecl(name, te, is_pub, _) => {
+        frontend.Node.TypeAliasDecl(name, te, is_pub, _) => {
             if is_pub {
                 push(buf, "pub ")
             }
@@ -213,14 +214,14 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " = ")
             fmt_expr(te, src, comments, cc, indent, buf)
         },
-        lib.Node.SendStmt(ch, val, _) => {
+        frontend.Node.SendStmt(ch, val, _) => {
             fmt_expr(ch, src, comments, cc, indent, buf)
             push(buf, " <- ")
             fmt_expr(val, src, comments, cc, indent, buf)
         },
-        lib.Node.BreakStmt(_) => push(buf, "break"),
-        lib.Node.ContinueStmt(_) => push(buf, "continue"),
-        lib.Node.ImportDecl(alias, _, _, psp, _) => {
+        frontend.Node.BreakStmt(_) => push(buf, "break"),
+        frontend.Node.ContinueStmt(_) => push(buf, "continue"),
+        frontend.Node.ImportDecl(alias, _, _, psp, _) => {
             push(buf, "import ")
             if alias != "" {
                 push(buf, alias)
@@ -228,7 +229,7 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             }
             push(buf, span_text(src, psp))
         },
-        lib.Node.EnumDecl(name, tparams, variants, is_pub, sp) => {
+        frontend.Node.EnumDecl(name, tparams, variants, is_pub, sp) => {
             if is_pub {
                 push(buf, "pub ")
             }
@@ -266,7 +267,7 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
             push_indent(buf, indent)
             push(buf, "}")
         },
-        lib.Node.SelectStmt(arms, has_default, dflt, dsp, sp) => {
+        frontend.Node.SelectStmt(arms, has_default, dflt, dsp, sp) => {
             push(buf, "select " + chr(123) + "\n")
             let deeper = indent + 4
             let mut i = 0
@@ -305,7 +306,7 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
 
 fn fmt_variant(n, mut buf) {
     match n {
-        lib.Node.EnumVariantDecl(name, arity, vtypes, _) => {
+        frontend.Node.EnumVariantDecl(name, arity, vtypes, _) => {
             push(buf, name)
             if arity > 0 {
                 push(buf, "(")
@@ -326,7 +327,7 @@ fn fmt_variant(n, mut buf) {
 
 fn fmt_type(n, mut buf) {
     match n {
-        lib.Node.TEName(pkg, name, constraint, targs, _) => {
+        frontend.Node.TEName(pkg, name, constraint, targs, _) => {
             if pkg != "" {
                 push(buf, pkg)
                 push(buf, ".")
@@ -349,12 +350,12 @@ fn fmt_type(n, mut buf) {
                 push(buf, ")")
             }
         },
-        lib.Node.TEList(el, _) => {
+        frontend.Node.TEList(el, _) => {
             push(buf, "[")
             fmt_type(el, buf)
             push(buf, "]")
         },
-        lib.Node.TEFn(params, ret, _) => {
+        frontend.Node.TEFn(params, ret, _) => {
             push(buf, "fn(")
             let mut i = 0
             while i < len(params) {
@@ -367,7 +368,7 @@ fn fmt_type(n, mut buf) {
             push(buf, ") -> ")
             fmt_type(ret, buf)
         },
-        lib.Node.TERecord(fnames, ftypes, row, _) => {
+        frontend.Node.TERecord(fnames, ftypes, row, _) => {
             push(buf, "record ")
             push(buf, chr(123))
             let mut i = 0
@@ -382,7 +383,7 @@ fn fmt_type(n, mut buf) {
                 i = i + 1
             }
             match row {
-                lib.Node.NoNode => {},
+                frontend.Node.NoNode => {},
                 _ => {
                     if len(fnames) > 0 {
                         push(buf, ",")
@@ -402,7 +403,7 @@ fn fmt_type(n, mut buf) {
 
 fn fmt_select_arm(n, src, comments, mut cc, indent, mut buf) {
     match n {
-        lib.Node.SelectArm(is_send, bind, _, ch, val, body, _) => {
+        frontend.Node.SelectArm(is_send, bind, _, ch, val, body, _) => {
             if is_send {
                 fmt_expr(ch, src, comments, cc, indent, buf)
                 push(buf, " <- ")
@@ -424,7 +425,7 @@ fn fmt_select_arm(n, src, comments, mut cc, indent, mut buf) {
 
 fn fmt_fn_lit(name, n, src, comments, mut cc, indent, mut buf) {
     match n {
-        lib.Node.FnLit(params, muts, _pspans, param_tys, ret_ty, body, _, _) => {
+        frontend.Node.FnLit(params, muts, _pspans, param_tys, ret_ty, body, _, _) => {
             push(buf, "fn")
             if name != "" {
                 push(buf, " ")
@@ -441,7 +442,7 @@ fn fmt_fn_lit(name, n, src, comments, mut cc, indent, mut buf) {
                 }
                 push(buf, params[i])
                 match param_tys[i] {
-                    lib.Node.NoNode => {},
+                    frontend.Node.NoNode => {},
                     te => {
                         push(buf, ": ")
                         fmt_type(te, buf)
@@ -451,7 +452,7 @@ fn fmt_fn_lit(name, n, src, comments, mut cc, indent, mut buf) {
             }
             push(buf, ")")
             match ret_ty {
-                lib.Node.NoNode => {},
+                frontend.Node.NoNode => {},
                 te => {
                     push(buf, " -> ")
                     fmt_type(te, buf)
@@ -466,17 +467,17 @@ fn fmt_fn_lit(name, n, src, comments, mut cc, indent, mut buf) {
 
 fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
     match n {
-        lib.Node.IntLit(_, sp) => push(buf, span_text(src, sp)),
-        lib.Node.FloatLit(_, sp) => push(buf, span_text(src, sp)),
-        lib.Node.StrLit(_, sp) => push(buf, span_text(src, sp)),
-        lib.Node.BoolLit(v, _) => push(buf, if v {
+        frontend.Node.IntLit(_, sp) => push(buf, span_text(src, sp)),
+        frontend.Node.FloatLit(_, sp) => push(buf, span_text(src, sp)),
+        frontend.Node.StrLit(_, sp) => push(buf, span_text(src, sp)),
+        frontend.Node.BoolLit(v, _) => push(buf, if v {
             "true"
         } else {
             "false"
         }),
-        lib.Node.Ident(_, sp) => push(buf, span_text(src, sp)),
-        lib.Node.Binary(op, lhs, rhs, sp) => {
-            if op == lib.t_plus && span_is_interpolation(src, sp) {
+        frontend.Node.Ident(_, sp) => push(buf, span_text(src, sp)),
+        frontend.Node.Binary(op, lhs, rhs, sp) => {
+            if op == frontend.t_plus && span_is_interpolation(src, sp) {
                 // parser 把插值脱糖为 `+`；这里重建表层语法并格式化各内嵌表达式。/ The parser lowers interpolation to `+`; reconstruct its surface syntax while formatting each embedded expression.
                 // 含注释的插值逐字节保留，因为行注释的位置属于语法。/ Keep a comment-bearing interpolation byte-identical because line-comment placement is syntactic.
                 if cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
@@ -498,8 +499,8 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
                 fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
             }
         },
-        lib.Node.Logical(op, lhs, rhs, _) => {
-            let level = if op == lib.t_and_and {
+        frontend.Node.Logical(op, lhs, rhs, _) => {
+            let level = if op == frontend.t_and_and {
                 3
             } else {
                 2
@@ -510,7 +511,7 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " ")
             fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
         },
-        lib.Node.Pipe(lhs, target, args, sp) => {
+        frontend.Node.Pipe(lhs, target, args, sp) => {
             fmt_child(lhs, 1, src, comments, cc, indent, buf)
             push(buf, " |> ")
             fmt_expr(target, src, comments, cc, indent, buf)
@@ -527,19 +528,19 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
                 push(buf, ")")
             }
         },
-        lib.Node.Unary(op, rhs, _) => {
+        frontend.Node.Unary(op, rhs, _) => {
             push(buf, unary_op_text(op))
             fmt_child(rhs, 8, src, comments, cc, indent, buf)
         },
-        lib.Node.RecvExpr(e, _) => {
+        frontend.Node.RecvExpr(e, _) => {
             push(buf, "<-")
             fmt_child(e, 8, src, comments, cc, indent, buf)
         },
-        lib.Node.TryExpr(e, _) => {
+        frontend.Node.TryExpr(e, _) => {
             fmt_child(e, 9, src, comments, cc, indent, buf)
             push(buf, "?")
         },
-        lib.Node.RecordLit(names, vals, _) => {
+        frontend.Node.RecordLit(names, vals, _) => {
             push(buf, "record ")
             push(buf, chr(123))
             let mut i = 0
@@ -558,7 +559,7 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             }
             push(buf, chr(125))
         },
-        lib.Node.RecordUpdate(base, names, vals, _) => {
+        frontend.Node.RecordUpdate(base, names, vals, _) => {
             push(buf, "record ")
             push(buf, chr(123))
             push(buf, " ")
@@ -578,18 +579,18 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             push(buf, " ")
             push(buf, chr(125))
         },
-        lib.Node.FieldAccess(base, field, _) => {
+        frontend.Node.FieldAccess(base, field, _) => {
             fmt_child(base, 9, src, comments, cc, indent, buf)
             push(buf, ".")
             push(buf, field)
         },
-        lib.Node.Index(target, idx, _) => {
+        frontend.Node.Index(target, idx, _) => {
             fmt_child(target, 9, src, comments, cc, indent, buf)
             push(buf, "[")
             fmt_expr(idx, src, comments, cc, indent, buf)
             push(buf, "]")
         },
-        lib.Node.ListLit(elems, _) => {
+        frontend.Node.ListLit(elems, _) => {
             push(buf, "[")
             let mut i = 0
             while i < len(elems) {
@@ -601,8 +602,8 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             }
             push(buf, "]")
         },
-        lib.Node.FnLit(_, _, _, _, _, _, _, _) => fmt_fn_lit("", n, src, comments, cc, indent, buf),
-        lib.Node.Block(stmts, sp) => {
+        frontend.Node.FnLit(_, _, _, _, _, _, _, _) => fmt_fn_lit("", n, src, comments, cc, indent, buf),
+        frontend.Node.Block(stmts, sp) => {
             if len(stmts) == 0 && !comment_inside(comments, cc, span_end2(sp)) {
                 push(buf, "" + chr(123) + "}")
             } else {
@@ -626,20 +627,20 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
                 push(buf, "}")
             }
         },
-        lib.Node.IfExpr(cond, then, els, _) => {
+        frontend.Node.IfExpr(cond, then, els, _) => {
             push(buf, "if ")
             fmt_expr(cond, src, comments, cc, indent, buf)
             push(buf, " ")
             fmt_expr(then, src, comments, cc, indent, buf)
             match els {
-                lib.Node.NoNode => {},
+                frontend.Node.NoNode => {},
                 _ => {
                     push(buf, " else ")
                     fmt_expr(els, src, comments, cc, indent, buf) // a nested IfExpr renders as `else if`
                 },
             }
         },
-        lib.Node.MatchExpr(scrut, arms, sp) => {
+        frontend.Node.MatchExpr(scrut, arms, sp) => {
             push(buf, "match ")
             fmt_expr(scrut, src, comments, cc, indent, buf)
             push(buf, " " + chr(123) + "\n")
@@ -662,7 +663,7 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             push_indent(buf, indent)
             push(buf, "}")
         },
-        lib.Node.Call(callee, cargs, _) => {
+        frontend.Node.Call(callee, cargs, _) => {
             fmt_child(callee, 9, src, comments, cc, indent, buf)
             push(buf, "(")
             let mut i = 0
@@ -675,17 +676,17 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
             }
             push(buf, ")")
         },
-        lib.Node.VariantAccess(en, v, _) => {
+        frontend.Node.VariantAccess(en, v, _) => {
             push(buf, en)
             push(buf, ".")
             push(buf, v)
         },
-        lib.Node.PkgAccess(pkg, name, _) => {
+        frontend.Node.PkgAccess(pkg, name, _) => {
             push(buf, pkg)
             push(buf, ".")
             push(buf, name)
         },
-        lib.Node.QualVariantAccess(pkg, en, v, _) => {
+        frontend.Node.QualVariantAccess(pkg, en, v, _) => {
             push(buf, pkg)
             push(buf, ".")
             push(buf, en)
@@ -698,10 +699,10 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
 
 fn fmt_arm(n, src, comments, mut cc, indent, mut buf) {
     match n {
-        lib.Node.MatchArm(pat, guard, body, _) => {
+        frontend.Node.MatchArm(pat, guard, body, _) => {
             fmt_pat(pat, src, buf)
             match guard {
-                lib.Node.NoNode => {},
+                frontend.Node.NoNode => {},
                 _ => {
                     push(buf, " if ")
                     fmt_expr(guard, src, comments, cc, indent, buf)
@@ -716,11 +717,11 @@ fn fmt_arm(n, src, comments, mut cc, indent, mut buf) {
 
 fn fmt_pat(n, src, mut buf) {
     match n {
-        lib.Node.PatWildcard(_) => push(buf, "_"),
+        frontend.Node.PatWildcard(_) => push(buf, "_"),
         // the pattern's own span covers a leading '-', the literal's does not
-        lib.Node.PatLiteral(_, sp) => push(buf, span_text(src, sp)),
-        lib.Node.PatBinding(name, _) => push(buf, name),
-        lib.Node.PatVariant(pkg, en, v, binds, _) => {
+        frontend.Node.PatLiteral(_, sp) => push(buf, span_text(src, sp)),
+        frontend.Node.PatBinding(name, _) => push(buf, name),
+        frontend.Node.PatVariant(pkg, en, v, binds, _) => {
             if pkg != "" {
                 push(buf, pkg)
                 push(buf, ".")
@@ -770,35 +771,35 @@ fn fmt_child(n, need, src, comments, mut cc, indent, mut buf) {
 //   8 unary ! - and <-recv   9 postfix call/index/?   10 atoms
 fn node_prec(n) {
     match n {
-        lib.Node.Logical(op, _, _, _) => if op == lib.t_and_and {
+        frontend.Node.Logical(op, _, _, _) => if op == frontend.t_and_and {
             3
         } else {
             2
         },
-        lib.Node.Pipe(_, _, _, _) => 1,
-        lib.Node.Binary(op, _, _, _) => bin_prec(op),
-        lib.Node.Unary(_, _, _) => 8,
-        lib.Node.RecvExpr(_, _) => 8,
-        lib.Node.Call(_, _, _) => 9,
-        lib.Node.Index(_, _, _) => 9,
-        lib.Node.TryExpr(_, _) => 9,
-        lib.Node.FieldAccess(_, _, _) => 9,
-        lib.Node.FnLit(_, _, _, _, _, _, _, _) => 0,
-        lib.Node.Block(_, _) => 0,
-        lib.Node.IfExpr(_, _, _, _) => 0,
-        lib.Node.MatchExpr(_, _, _) => 0,
+        frontend.Node.Pipe(_, _, _, _) => 1,
+        frontend.Node.Binary(op, _, _, _) => bin_prec(op),
+        frontend.Node.Unary(_, _, _) => 8,
+        frontend.Node.RecvExpr(_, _) => 8,
+        frontend.Node.Call(_, _, _) => 9,
+        frontend.Node.Index(_, _, _) => 9,
+        frontend.Node.TryExpr(_, _) => 9,
+        frontend.Node.FieldAccess(_, _, _) => 9,
+        frontend.Node.FnLit(_, _, _, _, _, _, _, _) => 0,
+        frontend.Node.Block(_, _) => 0,
+        frontend.Node.IfExpr(_, _, _, _) => 0,
+        frontend.Node.MatchExpr(_, _, _) => 0,
         _ => 10,
     }
 }
 
 fn bin_prec(op) {
-    if op == lib.t_eq_eq || op == lib.t_bang_eq {
+    if op == frontend.t_eq_eq || op == frontend.t_bang_eq {
         4
-    } else if op == lib.t_lt || op == lib.t_lt_eq || op == lib.t_gt || op == lib.t_gt_eq {
+    } else if op == frontend.t_lt || op == frontend.t_lt_eq || op == frontend.t_gt || op == frontend.t_gt_eq {
         5
-    } else if op == lib.t_plus || op == lib.t_minus {
+    } else if op == frontend.t_plus || op == frontend.t_minus {
         6
-    } else if op == lib.t_star || op == lib.t_slash || op == lib.t_percent {
+    } else if op == frontend.t_star || op == frontend.t_slash || op == frontend.t_percent {
         7
     } else {
         fmt_internal("unknown binary operator token")
@@ -825,41 +826,41 @@ fn tok_end(t) {
 }
 
 fn span_start(n) {
-    match lib.span_of(n) {
-        lib.SpanT.Sp(s, _) => s,
+    match frontend.span_of(n) {
+        frontend.SpanT.Sp(s, _) => s,
     }
 }
 
 fn span_end(n) {
-    match lib.span_of(n) {
-        lib.SpanT.Sp(_, e) => e,
+    match frontend.span_of(n) {
+        frontend.SpanT.Sp(_, e) => e,
     }
 }
 
 fn span_start2(sp) {
     match sp {
-        lib.SpanT.Sp(s, _) => s,
+        frontend.SpanT.Sp(s, _) => s,
     }
 }
 
 fn span_end2(sp) {
     match sp {
-        lib.SpanT.Sp(_, e) => e,
+        frontend.SpanT.Sp(_, e) => e,
     }
 }
 
 fn span_text(src, sp) {
     match sp {
-        lib.SpanT.Sp(s, e) => substr(src, s, e - s),
+        frontend.SpanT.Sp(s, e) => substr(src, s, e - s),
     }
 }
 
 // span_is_interpolation 验证 sp 恰好覆盖一个插值字符串，而非 union span 同样以引号起止的更大 `"...{...}" + ...` 表达式；嵌套插值会增加 depth 直至自身结束。/ span_is_interpolation verifies that sp covers exactly one interpolated string, not a larger quoted union span; nested interpolations increase depth until their own end.
 fn span_is_interpolation(src, sp) {
     let raw = span_text(src, sp)
-    match lib.lex(raw) {
+    match frontend.lex(raw) {
         lib.LexOut.Lexed(toks, diags, _) => {
-            if len(diags) > 0 || len(toks) == 0 || lib.tok_type(toks[0]) != lib.t_interp_start {
+            if len(diags) > 0 || len(toks) == 0 || frontend.tok_type(toks[0]) != frontend.t_interp_start {
                 false
             } else {
                 let mut depth = 0
@@ -867,10 +868,10 @@ fn span_is_interpolation(src, sp) {
                 let mut done = false
                 let mut exact = false
                 while i < len(toks) && !done {
-                    let t = lib.tok_type(toks[i])
-                    if t == lib.t_interp_start {
+                    let t = frontend.tok_type(toks[i])
+                    if t == frontend.t_interp_start {
                         depth = depth + 1
-                    } else if t == lib.t_interp_end {
+                    } else if t == frontend.t_interp_end {
                         depth = depth - 1
                         if depth == 0 {
                             exact = tok_end(toks[i]) == str_len(raw)
@@ -888,11 +889,11 @@ fn span_is_interpolation(src, sp) {
 // fmt_interp_parts 遍历 parser 产生的「片段、表达式、片段……」交替拼接链；字面左花括号加倍，确保重解析为字节而非新插值。/ fmt_interp_parts walks the parser's alternating segment/expression concat chain; literal opening braces are doubled so reparsing keeps them as bytes.
 fn fmt_interp_parts(n, src, comments, mut cc, indent, mut buf) {
     match n {
-        lib.Node.StrLit(seg, _) => fmt_interp_segment(seg, buf),
-        lib.Node.Binary(op, with_expr, rhs, _) => match rhs {
-            lib.Node.StrLit(seg, _) => match with_expr {
-                lib.Node.Binary(op2, prefix, inner, _) => {
-                    if op != lib.t_plus || op2 != lib.t_plus {
+        frontend.Node.StrLit(seg, _) => fmt_interp_segment(seg, buf),
+        frontend.Node.Binary(op, with_expr, rhs, _) => match rhs {
+            frontend.Node.StrLit(seg, _) => match with_expr {
+                frontend.Node.Binary(op2, prefix, inner, _) => {
+                    if op != frontend.t_plus || op2 != frontend.t_plus {
                         fmt_internal("malformed interpolation concat chain")
                     }
                     fmt_interp_parts(prefix, src, comments, cc, indent, buf)
@@ -970,31 +971,31 @@ fn push_indent(mut buf, mut n) {
 }
 
 fn bin_op_text(op) {
-    if op == lib.t_plus {
+    if op == frontend.t_plus {
         "+"
-    } else if op == lib.t_minus {
+    } else if op == frontend.t_minus {
         "-"
-    } else if op == lib.t_star {
+    } else if op == frontend.t_star {
         "*"
-    } else if op == lib.t_slash {
+    } else if op == frontend.t_slash {
         "/"
-    } else if op == lib.t_percent {
+    } else if op == frontend.t_percent {
         "%"
-    } else if op == lib.t_eq_eq {
+    } else if op == frontend.t_eq_eq {
         "=="
-    } else if op == lib.t_bang_eq {
+    } else if op == frontend.t_bang_eq {
         "!="
-    } else if op == lib.t_lt {
+    } else if op == frontend.t_lt {
         "<"
-    } else if op == lib.t_lt_eq {
+    } else if op == frontend.t_lt_eq {
         "<="
-    } else if op == lib.t_gt {
+    } else if op == frontend.t_gt {
         ">"
-    } else if op == lib.t_gt_eq {
+    } else if op == frontend.t_gt_eq {
         ">="
-    } else if op == lib.t_and_and {
+    } else if op == frontend.t_and_and {
         "&&"
-    } else if op == lib.t_or_or {
+    } else if op == frontend.t_or_or {
         "||"
     } else {
         fmt_internal("unknown operator token")
@@ -1003,9 +1004,9 @@ fn bin_op_text(op) {
 }
 
 fn unary_op_text(op) {
-    if op == lib.t_minus {
+    if op == frontend.t_minus {
         "-"
-    } else if op == lib.t_bang {
+    } else if op == frontend.t_bang {
         "!"
     } else {
         fmt_internal("unknown unary operator token")
