@@ -210,6 +210,158 @@
 
 **S8 分工**：S8 全部子项(S8.1–S8.5)由 LLM 实现，owner 审查设计与验收。
 
+### x86-64 后端架构（S8.1，开发中）
+
+单文件 `compiler/backends/x86.bur`（~930 行）+ ELF64 发射 `compiler/backends/elf.bur`。无 cc 依赖，手写 ELF。
+
+#### 寄存器约定
+
+| 寄存器 | 角色 |
+|--------|------|
+| r15 | 值栈顶（向上增长） |
+| r14 | 帧基（当前函数） |
+| r13 | 跳转表基址 |
+| r12 | 堆 bump 指针 |
+| rbx | 全局变量表基址 |
+| rbp | 保存调用者 r14 |
+
+**不得修改寄存器约定**——这是 ABI 级别的约束，改了全盘崩。
+
+#### 值表示
+
+Raw int64，8 字节/槽，**无 tag**。字符串是指针 → `[8B len][content bytes]`（data section 或堆）。
+
+#### 内存布局
+
+```
+ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
+                                 ^base_addr+120
+```
+
+- 堆：16MB via mmap(MAP_ANONYMOUS)，零填充，bump-allocated via r12
+- 值栈：1MB below rsp，向上增长
+- 全局变量：堆首 N*8 字节（rbx = base）
+
+#### Shadow stack（编译期类型跟踪）
+
+每个值 push 记录一个 shadow 条目（编译期 `[]` 字符串数组，不进入输出二进制）：
+- `""` = int/unknown
+- `"str"` = string pointer
+- `"list"` = list pointer
+- 函数名 = 用于 call dispatch
+
+#### 堆对象布局
+
+**String**：`[8B len][content bytes]`（data section 或堆）
+
+**List**（header 不移动）：`[8B len][8B cap][8B elements_ptr]`（24 字节）。elements 在 elements_ptr 处，连续 8 字节槽。初始 inline（elements_ptr = header+24）。push 增长：分配新 elements 数组（cap*2, min 4），复制旧数据，更新 header 的 elements_ptr 和 cap。
+
+**Closure**：`[8B fn_index][8B upval0][8B upval1]...`（8*(1+N) 字节）。fn_index 通过跳转表解析：`shl rax, 3; add rax, r13; mov rax, [rax]; call rax`。Slot 0 of callee frame holds closure ptr; op_get_upval reads `[closure + 8 + 8*idx]`。Copy-at-capture-time 语义（非共享 cell）。
+
+**Enum instance**（堆，由 constructor 调用创建）：
+```
+[8B: eh][8B: vi][8B: field0][8B: field1]...[8B: fieldN-1]
+```
+- eh = enum type index；vi = variant index；fields 紧随
+
+**Enum type object**（data section，CEnumType 常量）：`[8B: eh]`
+
+**Singleton**（data section，CSingleton 常量，即 0 字段 enum instance）：`[8B: eh][8B: vi]`
+
+**Constructor**（data section，CCtor 常量，callable，非 instance）：
+```
+[8B: 0xFFFFFFFFFFFFFFFF][8B: eh][8B: vi]
+```
+- Sentinel `-1` at offset 0（永远不可能是有效 fn_index）。op_call 检测 `[callee] == -1` 时分流到 ctor path。
+
+**不加 type tag 的理由**：类型检查器保证 op_test_variant 和 op_get_field 只收到 enum instance。运行时类型区分只在 op_call（closure vs constructor）需要，sentinel 处理。
+
+#### 调用约定
+
+Caller pushes: `[callee/closure-ptr][arg0]...[argN]`, then calls。
+Callee prologue: `push rbp; mov rbp, r14; lea r14, [r15 - 8*(arity+1)]`。
+Callee epilogue: peek return value, collapse to r14, restore rbp, ret。
+op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
+
+#### 已实现 native
+
+| Native | Args | 说明 |
+|--------|------|------|
+| exit(n) | 1 | sys_exit |
+| print(s) | 1 | write(1, s+8, [s]) |
+| println(s) | 1 | write + newline |
+| str_len(s) | 1 | reads [s+0] |
+| substr(s, start, len) | 3 | allocates + rep movsb |
+| byte_chr(n) | 1 | allocates [1][byte] |
+| str(n) | 1 | div-by-10 loop, non-negative only |
+| len(x) | 1 | reads [x+0] (list and str) |
+| push(list, val) | 2 | grows elements if len==cap |
+| pop(list) | 1 | decrements len, returns last element |
+
+#### Opcode 覆盖
+
+**已实现**：const(CInt/CStr), unit, true, false, pop, pop_n, end_block, get_local, set_local, get_global, def_global, set_global, eq, neq, gt, gt_eq, lt, lt_eq, add(str concat dispatch), sub, mul, div, mod, list, index_get(list+str), index_set, len, neg, not, jump, jump_if_false, jump_if_true, jump_if_false_pop, loop, call(natives + user fn + closure dispatch), return, closure, get_upval, set_upval
+
+**未实现**（int3）：test_variant, get_field, get_field_name, no_match, try, spawn, send, recv, chan_next, select, defer, record, record_update, close_upvalue
+
+### Opcode 实现 spec（未实现 opcode）
+
+每个 spec：opcode 号、字节长度、栈 I/O、VM 语义、C 参考、x86 编码方案。
+
+#### Phase 2A: match/enum（阻塞使用 match 的程序自举）
+
+**op_test_variant (40)**, 2 bytes: `[op][vidx:1B]`
+- 栈入: `[cand][etv]` ← top
+- 栈出: `[bool]`
+- VM: pop etv, pop cand; cand 是 enuminst 且 enum type 匹配且 variant == vidx → push true/false
+- x86: 比较 `[cand] == [etv]`（both eh at offset 0）and `[cand+8] == vidx`
+- shadow: pop 2, push ""
+- data section: CEnumType 常量需预分配 `[8B: eh]` 条目
+
+**op_get_field (41)**, 2 bytes: `[op][fidx:1B]`
+- 栈入: `[instance]` ← top
+- 栈出: `[field_value]`
+- x86: `mov_rm(rax, r15, 0-8)` + `mov_rm(rax, rax, 16 + 8*fidx)` + vs_pop_n(1) + vs_push(rax)
+- shadow: pop 1, push ""
+
+**op_const 扩展**（CEnumType / CSingleton / CCtor）
+- CEnumType(eh): `mov_ri64(rax, const_addr)` + vs_push(rax) — 指向 data section `[8B: eh]`
+- CSingleton(eh, vi): 同上 — 指向 `[8B: eh][8B: vi]`
+- CCtor(eh, vi): 同上 — 指向 `[8B: -1][8B: eh][8B: vi]`
+- shadow: CEnumType → "enumtype", CSingleton → "enum", CCtor → "ctor"
+- 预扫描: 扩展 string pre-scan 以收集 CEnumType/CSingleton/CCtor 常量并分配 data section 偏移
+
+**op_call constructor dispatch**（修改现有 else 分支）
+- 加载 `[callee]` 后检查 sentinel `-1`：`cmp_ri32(rcx, -1)` → `je ctor_path`
+- closure path（现有）: `mov_rr(rax, rcx)` + shl + add r13 + load + call
+- ctor_path: 从 constructor 读 eh/vi → bump alloc instance `[eh][vi][fields...]` → rep movsb 复制 n 个 args → 覆盖 callee slot → vs_pop_n(n) → push shadow "enum"
+
+**op_no_match (42)**, 1 byte: emit `int3()`（SIGTRAP）。类型检查器防止 well-typed 程序到达此处。
+
+#### Phase 2B: records（阻塞使用 record 类型的程序）
+
+**op_record (50)**, 4 bytes: `[op][n:1B][cidx:2B]` — 堆布局 `[8B: n_fields][8B: cidx][8B: field0]...[8B: fieldN-1]`，rep movsb 复制 fields。shadow: pop n, push "record"
+
+**op_get_field_name (51)**, 3 bytes: `[op][cidx:2B]` — 编译期将 field name 映射为 numeric index，直接偏移访问（需跨指令分析）。或运行时存储 name→index 映射。**待实现时决策**。
+
+**op_record_update (52)**, 4 bytes: `[op][n:1B][cidx:2B]` — 分配新 record，复制旧 fields，覆写 n 个更新字段。
+
+#### Phase 2C: error handling
+
+**op_try (43)**, 1 byte: 检查栈顶是否 Err variant（读 `[value]` for eh, `[value+8]` for vi，比较 Err 的 eh+vi）。Err → jump to handler or trap；Ok → fall through。依赖 enum 布局（Phase 2A 先行）。
+
+#### Phase 3: CSP（独立设计——不阻塞非并发代码自举）
+
+全部 CSP opcode 需要 fiber scheduler + ucontext（POSIX）或等价物。x86 后端无 scheduler。**deferred**：
+
+- **op_spawn (44)**: 2 bytes `[op][argc:1B]`。需 fiber struct + 独立栈 + 上下文切换。
+- **op_send (45)**: 2 bytes。需 channel struct + sendq/recvq + park/wake。
+- **op_recv (46)**: 2 bytes。同 send。
+- **op_chan_next (47)**: 3 bytes `[op][cidx:2B]`。channel 迭代。
+- **op_select (48)**: variable。多路 select，最复杂 CSP opcode。
+- **op_defer (49)**: 1 byte。需 per-frame defer stack（可与 CSP 并发独立实现，但仍需 defer 栈管理）。
+- **close_upvalue**: 跳过——当前 copy-at-capture 语义不产生 open upvalues。
+
 ## 6.8 LSP 与编辑器生态(工程视角，对应 S9)
 
 **架构定案**：LSP 服务器用 Burryn 写(延续自举原则)，作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0(LSP 3.17 规范)。所有语言智能在服务器端；编辑器插件是**薄客户端**——只转发 LSP 消息 + 渲染 UI，不含语言逻辑。新增编辑器支持 = 实现 LSP client 协议，零服务器改动。
