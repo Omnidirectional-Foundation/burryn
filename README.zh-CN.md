@@ -3,7 +3,7 @@
 # Burryn
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
-[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/GOALS.md)
+[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
 
 > **Meyrin 之下的环。** 一座洞穴，一枚戒指——在地下安静生长。
 
@@ -207,7 +207,7 @@ S1–S7 已全部完成。
 | 文档 | 用途 |
 | ----------------- | ---------------- |
 | [`tutorial.zh-CN.md`](tutorial.zh-CN.md) | 用户 —— 语言实践导览（[English](tutorial.md)） |
-| [`docs/GOALS.md`](docs/GOALS.md) | 设计权威 —— 语言设计、路线图与分阶段里程碑 |
+| [`docs/SPEC.md`](docs/SPEC.md) | 设计权威 —— 语言设计、路线图与分阶段里程碑 |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | 贡献者 —— 旧 `v`/`L` 标签到新 `S` 编号的历史对照 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献者 —— 分支策略、提交规范与自举定点要求 |
 | [`SECURITY.md`](SECURITY.md) | 私下报告安全漏洞 |

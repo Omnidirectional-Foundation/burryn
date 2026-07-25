@@ -2,7 +2,7 @@
 
 # Burryn 教程
 
-> 相关文档：[`README.zh-CN.md`](README.zh-CN.md) 项目概览 · [`docs/GOALS.md`](docs/GOALS.md) 设计定案与里程碑
+> 相关文档：[`README.zh-CN.md`](README.zh-CN.md) 项目概览 · [`docs/SPEC.md`](docs/SPEC.md) 设计定案与里程碑
 
 Burryn 是一门静态推导、零标注、CSP 并发的实用工具语言：Rust 式的类型与
 `match`，Go 式的并发与简洁，一个二进制交付。本教程只用**当前能跑**的特性，

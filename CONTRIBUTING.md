@@ -45,7 +45,7 @@ Example / 示例:
 ```markdown
 feat(lexer): collect comments as out-of-band trivia
 fix(cgen): access enum fields by integer index
-docs(GOALS): add S4 ecosystem toolchain roadmap
+docs(SPEC): add S4 ecosystem toolchain roadmap
 ```
 
 ## Bootstrap fixpoint / 自举定点
