@@ -428,6 +428,23 @@ fn x86gen_str_native() {
     mov_rm(rax, r15, 0 - 8) + xor_rr(r10, r10) + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
 }
 
+// x86gen_push_native: inline code for push(list, val).
+// List header: [len][cap][elements_ptr]. Header never moves.
+// Grows elements array if len==cap (doubles cap, min 4).
+// Stack in: [callee, list_ptr, val] at r15-24, r15-16, r15-8. Stack out: [unit].
+fn x86gen_push_native() {
+    let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(4) + add_ri32(r10, 4) + mov_rr(r11, r12) + mov_rm(rsi, rax, 16) + mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_rr(rdi, r11) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
+    let store = mov_rm(rcx, rax, 0) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_mr(r11, 0, r9) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + xor_rr(r11, r11) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
+    mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rm(r10, rax, 8) + cmp_rr(rcx, r10) + jne_rel32(str_len(growth)) + growth + store
+}
+
+// x86gen_pop_native: inline code for pop(list) -> element.
+// Decrements len and returns the last element via elements_ptr.
+// Stack in: [callee, list_ptr] at r15-16, r15-8. Stack out: [element].
+fn x86gen_pop_native() {
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + sub_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_rm(r9, r11, 0) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1)
+}
+
 // x86gen_start: program entry. nfn = number of functions.
 // Layout: [funcs][jumptable 8*nfn][_start]. The lea reaches back past
 // itself (7 bytes) and past the jump table (8*nfn) to the table base.
@@ -717,8 +734,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     Some(s) => s,
                     None => 0,
                 }
-                w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax) + vs_pop_n(1))
-                shadow_pop(shadow, 1)
+                w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax))
             } else if op == lib.op_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
@@ -772,6 +788,29 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 push(shadow, "")
+            } else if op == lib.op_list {
+                let n = read_u16(code, ip + 1)
+                w(mov_rr(r11, r12) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(rax, r11, 24) + mov_mr(r11, 16, rax) + lea(rsi, r15, 0 - 8 * n) + mov_rr(rdi, rax) + mov_ri64(rcx, 8 * n) + rep_movsb() + lea(rax, r11, 24 + 8 * n) + mov_rr(r12, rax) + lea(r15, r15, 0 - 8 * n) + vs_push(r11))
+                shadow_pop(shadow, n)
+                push(shadow, "list")
+            } else if op == lib.op_index_get {
+                let st = shadow[len(shadow) - 2]
+                if st == "str" {
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(r9, r9) + add_ri32(r9, 1) + mov_mr(r11, 0, r9) + mov_rm(r9, rax, 8) + add_rr(r9, rcx) + mov_mr(r11, 8, r9) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
+                    shadow_pop(shadow, 2)
+                    push(shadow, "str")
+                } else {
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_rm(rdx, rax, 0) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                    shadow_pop(shadow, 2)
+                    push(shadow, "")
+                }
+            } else if op == lib.op_index_set {
+                w(mov_rm(rax, r15, 0 - 24) + mov_rm(r9, r15, 0 - 16) + mov_rm(rdx, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_mr(rax, 0, rdx) + vs_pop_n(3))
+                shadow_pop(shadow, 3)
+            } else if op == lib.op_len {
+                w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 8, rax))
+                shadow_pop(shadow, 1)
+                push(shadow, "")
             } else if op == lib.op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
             } else if op == lib.op_not {
@@ -822,6 +861,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "str" {
                     w(x86gen_str_native())
                     ret_type = "str"
+                } else if callee == "len" {
+                    w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                } else if callee == "push" {
+                    w(x86gen_push_native())
+                } else if callee == "pop" {
+                    w(x86gen_pop_native())
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                 } else {
