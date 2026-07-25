@@ -3,7 +3,7 @@ English | [中文](README.zh-CN.md)
 # Burryn
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
-[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/GOALS.md)
+[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
 
 > **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
 
@@ -206,7 +206,7 @@ Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindin
 | Document | Purpose |
 | ----------------- | ---------------- |
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language ([中文](tutorial.zh-CN.md)) |
-| [`docs/GOALS.md`](docs/GOALS.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
+| [`docs/SPEC.md`](docs/SPEC.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
 | [`SECURITY.md`](SECURITY.md) | reporting vulnerabilities privately |

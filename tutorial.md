@@ -2,7 +2,7 @@ English | [中文](tutorial.zh-CN.md)
 
 # The Burryn Tutorial
 
-> See also: [`README.md`](README.md) project overview · [`docs/GOALS.md`](docs/GOALS.md) design authority and milestones
+> See also: [`README.md`](README.md) project overview · [`docs/SPEC.md`](docs/SPEC.md) design authority and milestones
 
 Burryn is a small, statically-inferred, zero-annotation language with CSP
 concurrency: Rust-style types and `match`, Go-style concurrency and
