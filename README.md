@@ -8,10 +8,10 @@ English | [中文](README.zh-CN.md)
 > **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
 
 Burryn is a small programming language forged from Go and Rust.
-It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference with zero annotations, a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, and a C backend that turns programs into standalone native binaries.
+It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference with zero annotations, a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and an in-progress hand-written x86-64 backend.
 
 **The compiler is self-hosted.**
-`burc/` reimplements the whole pipeline — lexer, parser, type checker, bytecode compiler, C code generator — in Burryn itself (~7000 lines).
+`compiler/` reimplements the whole pipeline — lexer, parser, type checker, bytecode compiler, C code generator, VM, module loader, tooling, and the `bur` CLI — in Burryn itself.
 `bur` compiles itself to C, `cc` turns that into a native binary, and the resulting native `bur` compiles the same source to the same bytes again.
 A closed bootstrap fixpoint.
 The original Go implementation that seeded the bootstrap is archived on the `archive/go-host` branch.
@@ -126,7 +126,7 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/programs/wordcount.bur` | maps and string functions |
 | `examples/programs/gc_stress.bur` | watch the collector work |
 | `examples/programs/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
-| `burc/` | the self-hosted compiler and `bur` CLI — the biggest Burryn program there is |
+| `compiler/` | the self-hosted compiler and `bur` CLI — the biggest Burryn program there is |
 
 ## Architecture
 
@@ -134,17 +134,17 @@ for _i in range(0, 5) { sum = sum + <-ch }
 source --lexer--> tokens --parser--> AST --checker--> typed --compiler--> bytecode
  (lexer.bur)        (auto-semicolons)  (parser.bur) (types.bur, HM)   (compiler.bur)
 ||
-                                         +--------------------------------+
-|  |
-                                         v                                v
-                                   BurrynVM (vm.bur)           C backend (cgen.bur)
-                                   fibers + channels            --> .c --cc--> native
-                                   scheduler, GC                runtime/burrt*.h
+                                         +-------------------+-------------------+
+                                         |                   |
+                                         v                   v
+                                   BurrynVM            Native backends
+                                   (vm.bur)            - C backend (cgen.bur)
+                                   fibers + GC         - x86-64 ELF (x86.bur + elf.bur)
 
-Burryn is self-hosted: the whole pipeline lives in `burc/lib/` (token/lexer/
-parser/types/compiler/cgen/module/vm .bur), and the `bur` CLI (`burc/main.bur`)
-drives it. `bur` compiles itself to C, `cc` turns that into a native binary,
-and the result rebuilds itself byte for byte.
+Burryn is self-hosted: the whole pipeline lives under `compiler/`
+(`frontend/`, `bytecode/`, `backends/`, `module/`, `tooling/`), and the `bur`
+CLI is `compiler/main.bur`. `bur` compiles itself to C, `cc` turns that into a
+native binary, and the result rebuilds itself byte for byte.
 ```
 
 - **Compiler**: single pass, clox-style locals/upvalues, with a temp-tracking scheme that lets `match`/block expressions (which declare locals) appear at any expression depth.
@@ -160,19 +160,24 @@ bur run <file|dir>    typecheck and run on the VM
 bur <file|dir>        same
 bur check <file|dir>  typecheck only (rustc-style diagnostics)
 bur build <file|dir>  compile to a native binary via C (needs cc/gcc/clang)
+bur build --backend x86 <file.bur> -o <out>  compile to a native x86-64 ELF binary
+bur fmt <file|dir|->  rewrite source in the official format
 bur dis <file|dir>    disassemble the compiled bytecode
+bur test [dir]        run test_* functions from *_test.bur files
+bur mod <subcommand>  module management (init, tidy, download, verify)
+bur get <path>@<ver>  add or upgrade a module dependency
 bur version           print the version
 ```
 
-Build (self-hosting): a native `bur` builds itself with `bur build burc -o bur`.
-To bootstrap from scratch, check out the archived Go host and let it compile the first `bur`:
+Build (self-hosting): a native `bur` builds itself with `bur build compiler -o bur`.
+To bootstrap from scratch, use the archived Go host plus the frozen `seed-base-1` bridge:
 
 ```sh
-git checkout archive/go-host
-go build -o bur.exe .          # temporary Go seed
-./bur.exe build burc -o bur    # seed compiles the self-hosted CLI
-git checkout main
-./bur build burc -o bur        # from here on, bur rebuilds itself
+git worktree add ../go-host archive/go-host
+(cd ../go-host && go build -o ../bur-seed .)
+git worktree add ../seed-base seed-base-1
+(cd ../seed-base && ../bur-seed build burc -o ../bur-base)
+./bur-base build compiler -o bur
 ```
 
 > **Note:** Bootstrapping from the archived Go host requires **Go 1.26+**.
@@ -194,11 +199,12 @@ See [`SECURITY.md`](SECURITY.md) for the full policy and private reporting instr
 
 ## Honest Limitations
 
-Stages S1–S7 are done.
-They cover the semantic core, C backend, modules, maps, `select`/`close`, `mut` parameters, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, compile-time constants (`const`), `defer`, TCP networking, and a fully self-hosted compiler with the Go host removed.
-Both backends produce byte-identical output for the whole language, concurrency included.
+Stages S1-S7 are done.
+They cover the semantic core, the portable C backend, modules, maps, `select`/`close`, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, compile-time constants (`const`), `defer`, TCP networking, and a fully self-hosted compiler with the Go host removed.
 
-Still missing: records/structs (model product types with single-variant enums).
+Current work is in S8 and S9.
+The hand-written x86-64 ELF backend is in progress on Linux and currently trails the C backend in feature coverage.
+Row polymorphism, closed records, type aliases, and the remaining editor features are still in progress.
 Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.
 
 ## Documentation
@@ -206,7 +212,7 @@ Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindin
 | Document | Purpose |
 | ----------------- | ---------------- |
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language ([中文](tutorial.zh-CN.md)) |
-| [`docs/SPEC.md`](docs/SPEC.md) | design authority — the language design, roadmap, and staged milestones (S1–S8) |
+| [`docs/SPEC.md`](docs/SPEC.md) | design authority — the language design, roadmap, and staged milestones (S1-S10) |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
 | [`SECURITY.md`](SECURITY.md) | reporting vulnerabilities privately |
