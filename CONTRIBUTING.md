@@ -109,10 +109,10 @@ Before submitting a PR that touches the compiler:
 
 提交触及编译器的 PR 前：
 
-1. `bur check burc` — no type errors in the compiler itself
+1. `bur check compiler` — no type errors in the compiler itself
 2. `bur test ./...` — all tests pass
 3. Golden examples: `bur run` each and diff against `.golden`
-4. `bur fmt --check burc` — compiler source is formatted
+4. `bur fmt --check compiler` — compiler source is formatted
 5. Bootstrap fixpoint (see above) if the change affects codegen or types
 
 ## Code style / 代码风格
