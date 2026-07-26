@@ -450,12 +450,10 @@ fn x86gen_pop_native() {
 // itself (7 bytes) and past the jump table (8*nfn) to the table base.
 fn x86gen_start(nfn, n_globals) {
     // lea must be first: its RIP-relative offset assumes position 0 in _start
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) +
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
     // mmap(0, 16MB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0) -> r12
-    mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) +
+
     // globals array: rbx = heap base, bump r12 past it (zero-filled by mmap)
-    mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) +
-    mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
 }
 
 // x86gen_program_to_buf: compile a program to a self-contained ELF64
@@ -581,11 +579,32 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
 
     let nfn = len(f_name)
-    // Collect string constants into a data section emitted before the code,
-    // so addresses are known during codegen (no patching). Each string:
-    // [8-byte length][content bytes], padded to 8-byte alignment.
-    let mut str_data = ""
-    let mut str_map = map()
+    // Collect address-taken constants into a data section emitted before the
+    // code, so addresses are known during codegen (no patching). Strings are
+    // stored as [8-byte length][content bytes], padded to 8-byte alignment;
+    // enum metadata/constructors use the raw layouts from SPEC §6.7.
+    let mut const_data = ""
+    let mut const_slot_map = map()
+    let mut enum_const_map = map()
+    fn const_slot_key(f, i) {
+        f * 100000 + i
+    }
+    fn enum_const_key(cv) {
+        match cv {
+            lib.CVal.CEnumType(eh) => "e:" + str(eh),
+            lib.CVal.CSingleton(eh, vi) => "s:" + str(eh) + ":" + str(vi),
+            lib.CVal.CCtor(eh, vi) => "c:" + str(eh) + ":" + str(vi),
+            _ => "",
+        }
+    }
+    fn enum_const_bytes(cv) {
+        match cv {
+            lib.CVal.CEnumType(eh) => e8(eh),
+            lib.CVal.CSingleton(eh, vi) => e8(eh) + e8(vi),
+            lib.CVal.CCtor(eh, vi) => e8s(0 - 1) + e8(eh) + e8(vi),
+            _ => "",
+        }
+    }
     let mut sf = 0
     while sf < nfn {
         let consts = f_consts[sf]
@@ -593,17 +612,53 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         while ci < len(consts) {
             match consts[ci] {
                 lib.CVal.CStr(s) => {
-                    let key = sf * 100000 + ci
-                    let dup = match get(str_map, key) {
+                    let key = const_slot_key(sf, ci)
+                    let dup = match get(const_slot_map, key) {
                         Some(_) => true,
                         None => false,
                     }
                     if !dup {
-                        put(str_map, key, str_len(str_data))
-                        str_data = str_data + e8(str_len(s)) + s
-                        while str_len(str_data) % 8 != 0 {
-                            str_data = str_data + byte_chr(0)
+                        put(const_slot_map, key, str_len(const_data))
+                        const_data = const_data + e8(str_len(s)) + s
+                        while str_len(const_data) % 8 != 0 {
+                            const_data = const_data + byte_chr(0)
                         }
+                    }
+                },
+                lib.CVal.CEnumType(_) => {
+                    let ek = enum_const_key(consts[ci])
+                    match get(enum_const_map, ek) {
+                        Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
+                        None => {
+                            let off = str_len(const_data)
+                            put(enum_const_map, ek, off)
+                            put(const_slot_map, const_slot_key(sf, ci), off)
+                            const_data = const_data + enum_const_bytes(consts[ci])
+                        },
+                    }
+                },
+                lib.CVal.CSingleton(_, _) => {
+                    let ek = enum_const_key(consts[ci])
+                    match get(enum_const_map, ek) {
+                        Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
+                        None => {
+                            let off = str_len(const_data)
+                            put(enum_const_map, ek, off)
+                            put(const_slot_map, const_slot_key(sf, ci), off)
+                            const_data = const_data + enum_const_bytes(consts[ci])
+                        },
+                    }
+                },
+                lib.CVal.CCtor(_, _) => {
+                    let ek = enum_const_key(consts[ci])
+                    match get(enum_const_map, ek) {
+                        Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
+                        None => {
+                            let off = str_len(const_data)
+                            put(enum_const_map, ek, off)
+                            put(const_slot_map, const_slot_key(sf, ci), off)
+                            const_data = const_data + enum_const_bytes(consts[ci])
+                        },
                     }
                 },
                 _ => {},
@@ -612,9 +667,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         sf = sf + 1
     }
-    let str_data_len = str_len(str_data)
-    fn str_addr(f, i) {
-        match get(str_map, f * 100000 + i) {
+    let const_data_len = str_len(const_data)
+    fn const_addr(f, i) {
+        match get(const_slot_map, const_slot_key(f, i)) {
             Some(off) => base_addr + 120 + off,
             None => 0,
         }
@@ -671,11 +726,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let idx = read_u16(code, ip + 1)
                 match f_consts[fh][idx] {
                     lib.CVal.CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
-                    lib.CVal.CStr(_) => w(mov_ri64(rax, str_addr(fh, idx)) + vs_push(rax)),
+                    lib.CVal.CStr(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib.CVal.CEnumType(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib.CVal.CSingleton(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib.CVal.CCtor(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
                     _ => w(int3()),
                 }
                 match f_consts[fh][idx] {
                     lib.CVal.CStr(_) => push(shadow, "str"),
+                    lib.CVal.CEnumType(_) => push(shadow, "enumtype"),
+                    lib.CVal.CSingleton(_, _) => push(shadow, "enum"),
+                    lib.CVal.CCtor(_, _) => push(shadow, "ctor"),
                     _ => push(shadow, ""),
                 }
             } else if op == lib.op_unit {
@@ -811,6 +872,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 8, rax))
                 shadow_pop(shadow, 1)
                 push(shadow, "")
+            } else if op == lib.op_test_variant {
+                let vidx = code[ip + 1]
+                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(r8, rcx, 0) + mov_rm(rdx, rax, 0) + xor_rr(r9, r9) + cmp_rr(rdx, r8) + sete(r9) + mov_rm(r8, rax, 8) + mov_ri64(rdx, vidx) + xor_rr(r10, r10) + cmp_rr(r8, rdx) + sete(r10) + and_rr(r9, r10) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1))
+                shadow_pop(shadow, 2)
+                push(shadow, "")
+            } else if op == lib.op_get_field {
+                let fidx = code[ip + 1]
+                w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 16 + 8 * fidx) + mov_mr(r15, 0 - 8, rax))
+                shadow_pop(shadow, 1)
+                push(shadow, "")
+            } else if op == lib.op_no_match {
+                w(int3())
             } else if op == lib.op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
             } else if op == lib.op_not {
@@ -870,10 +943,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                 } else {
-                    w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rax, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax))
+                    let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + mov_rr(r9, r12) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + mov_mr(r15, 0 - 8 * (n + 1), r9) + vs_pop_n(n)
+                    let closure_path = mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
+                    w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
                 }
                 shadow_pop(shadow, n + 1)
-                push(shadow, ret_type)
+                if callee == "ctor" {
+                    push(shadow, "enum")
+                } else {
+                    push(shadow, ret_type)
+                }
             } else if op == lib.op_return {
                 w(x86gen_epilogue())
             } else if op == lib.op_closure {
@@ -938,11 +1017,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
-        jt_bytes = jt_bytes + e8(base_addr + 120 + str_data_len + func_offsets[jh])
+        jt_bytes = jt_bytes + e8(base_addr + 120 + const_data_len + func_offsets[jh])
         jh = jh + 1
     }
     // _start is the entry, placed last.
-    let start_off = str_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
+    let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn, n_globals)
-    emit_elf(str_data + funcs_bytes + jt_bytes + start_bytes, start_off)
+    emit_elf(const_data + funcs_bytes + jt_bytes + start_bytes, start_off)
 }
