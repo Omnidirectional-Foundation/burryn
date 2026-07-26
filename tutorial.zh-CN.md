@@ -707,9 +707,9 @@ bur test -v           # 详细输出
 
 ---
 
-*v3 里程碑「编译器完全自举」已达成，并已收尾：整条编译管线与 VM 都用 Burryn 写成
-（`burc/lib/` 下的 lexer/parser/types/compiler/cgen/vm .bur），`bur` CLI
-（`burc/main.bur`）驱动它。`bur` 把自己编译成 C、经 cc 落地成原生二进制，再由该
+*自举里程碑 S3-S5 已达成并收尾：整条编译管线、VM 与 CLI 都用 Burryn 写成，位于
+`compiler/` 下（`frontend/`、`bytecode/`、`backends/`、`module/`、`tooling/`，
+以及 `compiler/main.bur`）。`bur` 把自己编译成 C、经 cc 落地成原生二进制，再由该
 二进制逐字节重建自身。曾作为参照的 Go 宿主已归档到 `archive/go-host` 分支。想看一个
-"真实规模"的 Burryn 程序，`burc/` 就是最好的读物。语法尚未冻结；冻结与正式 grammar
-是 v4 的事。*
+"真实规模"的 Burryn 程序，`compiler/` 是最好的读物。语法尚未冻结；冻结与正式 grammar
+属于 S8.2。*

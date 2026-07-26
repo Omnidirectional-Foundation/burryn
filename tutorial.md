@@ -745,11 +745,11 @@ Not in the language yet:
 
 ---
 
-*The v3 milestone — a fully self-hosted compiler — is done and wrapped up: the
-whole pipeline and VM are written in Burryn (`burc/lib/`:
-lexer/parser/types/compiler/cgen/vm .bur), driven by the `bur` CLI
-(`burc/main.bur`). `bur` compiles itself to C, `cc` turns that into a native
-binary, and the binary rebuilds itself byte for byte. The Go host that once
-served as the reference is archived on the `archive/go-host` branch. For a
-real-sized Burryn program to read, `burc/` is the best material. The grammar is
-not frozen yet; freezing it is a v4 matter.*
+*The self-hosting milestones S3-S5 are done and wrapped up: the whole pipeline,
+VM, and CLI are written in Burryn under `compiler/` (`frontend/`, `bytecode/`,
+`backends/`, `module/`, `tooling/`, plus `compiler/main.bur`). `bur` compiles
+itself to C, `cc` turns that into a native binary, and the binary rebuilds
+itself byte for byte. The Go host that once served as the reference is archived
+on the `archive/go-host` branch. For a real-sized Burryn program to read,
+`compiler/` is the best material. The grammar is not frozen yet; that belongs
+to S8.2.*
