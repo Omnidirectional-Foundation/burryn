@@ -8,10 +8,10 @@
 > **Meyrin 之下的环。** 一座洞穴，一枚戒指——在地下安静生长。
 
 Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
-它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机，以及能把程序编译成独立原生二进制文件的 C 后端。
+它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机、可移植的 C 后端，以及一个开发中的手写 x86-64 后端。
 
 **编译器是自举的。**
-`burc/` 用 Burryn 自身重实现了整条编译管线——词法、语法、类型检查、字节码编译、C 代码生成——约 7000 行。
+`compiler/` 用 Burryn 自身重实现了整条编译管线——词法、语法、类型检查、字节码编译、C 代码生成、虚拟机、模块加载、工具链与 `bur` CLI。
 `bur` 先把自身编译为 C，`cc` 再将其编译为原生二进制，而这个原生 `bur` 又能把同一份源码编译出逐字节相同的输出。
 一个封闭的自举定点。
 用于启动自举的原始 Go 实现已归档在 `archive/go-host` 分支。
@@ -127,7 +127,7 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/programs/wordcount.bur` | map 与字符串函数 |
 | `examples/programs/gc_stress.bur` | 观察垃圾回收器工作 |
 | `examples/programs/geometry/` | 多包模块示例（`bur.mod`、`import`、`pub`） |
-| `burc/` | 自举编译器与 `bur` CLI——现存最大的 Burryn 程序 |
+| `compiler/` | 自举编译器与 `bur` CLI——现存最大的 Burryn 程序 |
 
 ## 架构
 
@@ -135,17 +135,16 @@ for _i in range(0, 5) { sum = sum + <-ch }
 source --lexer--> tokens --parser--> AST --checker--> typed --compiler--> bytecode
  (lexer.bur)        (auto-semicolons)  (parser.bur) (types.bur, HM)   (compiler.bur)
 ||
-                                         +--------------------------------+
-|  |
-                                         v                                v
-                                   BurrynVM (vm.bur)           C backend (cgen.bur)
-                                   fibers + channels            --> .c --cc--> native
-                                   scheduler, GC                runtime/burrt*.h
+                                         +-------------------+-------------------+
+                                         |                   |
+                                         v                   v
+                                   BurrynVM               原生后端
+                                   (vm.bur)               - C backend (cgen.bur)
+                                   fibers + GC            - x86-64 ELF (x86.bur + elf.bur)
 
-Burryn is self-hosted: the whole pipeline lives in `burc/lib/` (token/lexer/
-parser/types/compiler/cgen/module/vm .bur), and the `bur` CLI (`burc/main.bur`)
-drives it. `bur` compiles itself to C, `cc` turns that into a native binary,
-and the result rebuilds itself byte for byte.
+Burryn 已完成自举：整条管线位于 `compiler/` 下（`frontend/`、`bytecode/`、
+`backends/`、`module/`、`tooling/`），`bur` CLI 位于 `compiler/main.bur`。
+`bur` 先把自身编译为 C，`cc` 再将其编译为原生二进制，而该结果又能逐字节重建自己。
 ```
 
 - **编译器：** 单遍编译，clox 风格的局部变量/upvalue，配合临时值追踪，使 `match`/块表达式（会声明局部变量）可出现在任意表达式深度。
@@ -161,19 +160,24 @@ bur run <file|dir>    类型检查并在 VM 上运行
 bur <file|dir>        同上
 bur check <file|dir>  仅类型检查（rustc 风格诊断）
 bur build <file|dir>  经 C 编译为原生二进制（需要 cc/gcc/clang）
+bur build --backend x86 <file.bur> -o <out>  编译为 x86-64 ELF 原生二进制
+bur fmt <file|dir|->  按官方格式重写源码
 bur dis <file|dir>    反编译字节码
+bur test [dir]        运行 *_test.bur 中的 test_* 函数
+bur mod <subcommand>  模块管理（init、tidy、download、verify）
+bur get <path>@<ver>  添加或升级模块依赖
 bur version           打印版本号
 ```
 
-构建（自举）：原生 `bur` 用 `bur build burc -o bur` 构建自身。
-要从零自举，请切出归档的 Go 宿主，由它编译出第一个 `bur`：
+构建（自举）：原生 `bur` 用 `bur build compiler -o bur` 构建自身。
+要从零自举，请使用归档的 Go 宿主和冻结的 `seed-base-1` 过桥分支：
 
 ```sh
-git checkout archive/go-host
-go build -o bur.exe .          # 临时 Go 种子
-./bur.exe build burc -o bur    # 种子编译自举 CLI
-git checkout main
-./bur build burc -o bur        # 此后 bur 自行重建
+git worktree add ../go-host archive/go-host
+(cd ../go-host && go build -o ../bur-seed .)
+git worktree add ../seed-base seed-base-1
+(cd ../seed-base && ../bur-seed build burc -o ../bur-base)
+./bur-base build compiler -o bur
 ```
 
 > **注意：** 从归档的 Go 宿主自举需要 **Go 1.26+**。
@@ -195,11 +199,12 @@ Burryn 是自举编译器与运行时。
 
 ## 诚实局限
 
-S1–S7 已全部完成。
-覆盖范围包括语义内核、C 后端、模块、map、`select`/`close`、`mut` 参数、依赖工具、诊断、字符串插值、管道操作符 `|>`、match guard、编译期常量（`const`）、`defer`、TCP 网络，以及移除 Go 宿主后的完全自举编译器。
-两个后端对整门语言（含并发）都能产生逐字节一致的输出。
+S1-S7 已全部完成。
+覆盖范围包括语义内核、可移植的 C 后端、模块、map、`select`/`close`、依赖工具、诊断、字符串插值、管道操作符 `|>`、match guard、编译期常量（`const`）、`defer`、TCP 网络，以及移除 Go 宿主后的完全自举编译器。
 
-仍缺失：records/structs（可用单变体枚举建模乘积类型）。
+当前主线是 S8 与 S9。
+手写 x86-64 ELF 后端正在 Linux 上推进，功能覆盖仍落后于 C 后端。
+row polymorphism、封闭 records、类型别名，以及剩余编辑器能力仍在开发中。
 深 `mut` 是绑定级别的规则，不是借用检查器：两个 `mut` 绑定仍可能别名同一个列表。
 
 ## 文档
