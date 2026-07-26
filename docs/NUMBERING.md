@@ -1,6 +1,6 @@
 # NUMBERING.md — 编号历史映射
 
-> 状态：历史对照(只读) · 当前有效编号定义见 [`SPEC.md`](SPEC.md) §5
+> version: n/a · status: 历史对照(只读) · updated: 2026-07-26
 > 相关文档：[`SPEC.md`](SPEC.md) 目标与里程碑 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
 
 > **注意：** 本文档只做历史对照。
@@ -40,6 +40,6 @@
 
 ## 当前状态速览
 
-- **S1–S5 已完成**：自举闭环成，main 清零 Go，`bur` 经 cc 逐字节重建自身。
-- **S6 进行中**：生态工具链(依赖 → fmt → test → debugger)。
-- **S7 / S8 未开工**：语言特性扩展 / 手写后端 + 重型类型。
+- **S1-S7 已完成**：自举闭环、生态工具链、字符串插值、管道操作符、match guard、编译期常量、`defer` 与 TCP networking 均已落地。
+- **S8 进行中**：手写 x86-64 后端与重型类型推进中；x86-64 ELF 后端已开工。
+- **S9 部分实现**：LSP 核心、hover 与 VSCode 扩展已落地，剩余语言特性继续推进。
