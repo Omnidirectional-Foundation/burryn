@@ -25,8 +25,11 @@ run_parity() {
 
     # VM output
     local vm_out vm_rc
-    vm_out=$("$BUR" run "$file" 2>/dev/null) || true
-    vm_rc=$?
+    if vm_out=$("$BUR" run "$file" 2>/dev/null); then
+        vm_rc=0
+    else
+        vm_rc=$?
+    fi
 
     # x86 build + run
     local bin="$TMPDIR/$name"
@@ -37,8 +40,11 @@ run_parity() {
     fi
 
     local x86_out x86_rc
-    x86_out=$("$bin" 2>/dev/null) || true
-    x86_rc=$?
+    if x86_out=$("$bin" 2>/dev/null); then
+        x86_rc=0
+    else
+        x86_rc=$?
+    fi
 
     # SIGTRAP = unimplemented opcode
     if [ "$x86_rc" -eq 133 ]; then
