@@ -337,6 +337,10 @@ pub fn rep_movsb() {
     e1(243) + e1(164) // F3 A4
 }
 
+pub fn repe_cmpsb() {
+    e1(243) + e1(166) // F3 A6
+}
+
 // ---- setcc (set byte on condition) ----
 pub fn sete(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(148) + modrm_reg(0, dst) // 0x0F 0x94
@@ -451,6 +455,86 @@ fn x86gen_push_native() {
 // Stack in: [callee, list_ptr] at r15-16, r15-8. Stack out: [element].
 fn x86gen_pop_native() {
     mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + sub_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_rm(r9, r11, 0) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1)
+}
+
+// x86gen_str_convert_at: inline int-to-str conversion.
+// Reads int from stack at [r15+off], writes string ptr back to same slot.
+// Clobbers rax,rcx,rdx,r10,r11,rdi.
+fn x86gen_str_convert_at(off) {
+    let div_loop = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + idiv_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
+    let div_jne = jne_rel32(0 - (str_len(div_loop) + 6))
+    let alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + lea(rcx, r10, 8) + add_rr(r12, rcx) + lea(rdi, r11, 8)
+    let pop_loop = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
+    let pop_jne = jne_rel32(0 - (str_len(pop_loop) + 6))
+    mov_rm(rax, r15, off) + xor_rr(r10, r10) + div_loop + div_jne + alloc + pop_loop + pop_jne + mov_mr(r15, off, r11)
+}
+
+// x86gen_bool_convert_at: inline 0/1 -> "true"/"false" string.
+// Reads int at [r15+off], writes str ptr back to same slot.
+// Clobbers rax, rdx, r10, r11.
+fn x86gen_bool_convert_at(off) {
+    let fpath = mov_rr(r11, r12) + mov_ri64(r10, 5) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 435728179558) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11)
+    let tpath = mov_rr(r11, r12) + mov_ri64(r10, 4) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 1702195828) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11) + jmp_rel32(str_len(fpath))
+    mov_rm(rax, r15, off) + test_rr(rax, rax) + je_rel32(str_len(tpath)) + tpath + fpath
+}
+
+// x86gen_unit_convert_at: inline unit -> "()" string.
+// Reads int at [r15+off], writes str ptr back to same slot.
+// Clobbers rax, rdx, r10, r11.
+fn x86gen_unit_convert_at(off) {
+    mov_rm(rax, r15, off) + mov_rr(r11, r12) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 10536) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11)
+}
+
+// x86gen_ord_native: inline code for ord(str) -> leading UTF-8 code point.
+// Decodes 1-4 continuation bytes per RFC 3629. String at [r15-8].
+// Clobbers rax, rcx, rdx, rsi, r8, r9.
+// is_unimpl_native: true for VM natives the x86 backend does not inline
+// (mirrors decl_native in compiler/frontend/types.bur minus the inlined
+// subset handled in op_call). Calls to these emit int3 -> SIGTRAP so the
+// parity suite skips the program instead of miscompiling it.
+fn is_unimpl_native(name) {
+    name == "args" || name == "clock" || name == "close" || name == "concat" || name == "contains" || name == "delete" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "get" || name == "heap_objects" || name == "join" || name == "keys" || name == "map" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "put" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "slice" || name == "split" || name == "stdin_nb" || name == "str_contains" || name == "str_index_of" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trim" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan" || name == "eprintln"
+}
+
+fn x86gen_ord_native() {
+    let pre = mov_rm(rcx, r15, 0 - 8) + lea(rsi, rcx, 8) + xor_rr(rax, rax) + e1(172)
+    let t_ascii = mov_rr(rdx, rax) + mov_ri64(r9, 128) + and_rr(rdx, r9)
+    let t_2 = mov_rr(rdx, rax) + mov_ri64(r9, 224) + and_rr(rdx, r9) + mov_ri64(r9, 192) + cmp_rr(rdx, r9)
+    let t_3 = mov_rr(rdx, rax) + mov_ri64(r9, 240) + and_rr(rdx, r9) + mov_ri64(r9, 224) + cmp_rr(rdx, r9)
+    let dec_2 = mov_ri64(r9, 31) + and_rr(rax, r9) + mov_ri64(r8, 1)
+    let dec_3 = mov_ri64(r9, 15) + and_rr(rax, r9) + mov_ri64(r8, 2)
+    let dec_4 = mov_ri64(r9, 7) + and_rr(rax, r9) + mov_ri64(r8, 3)
+    let cont_test = test_rr(r8, r8)
+    let cont_body = mov_ri64(rcx, 6) + shl_rcl(rax) + mov_rr(r9, rax) + e1(172) + mov_ri64(rcx, 63) + and_rr(rax, rcx) + or_rr(r9, rax) + mov_rr(rax, r9) + sub_ri32(r8, 1)
+    let done = mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let cont_back = jmp_rel32(0 - (str_len(cont_test) + 6 + str_len(cont_body) + 5))
+    let cont = cont_test + je_rel32(str_len(cont_body) + 5) + cont_body + cont_back
+    let try3_jne = jne_rel32(str_len(dec_2) + 5)
+    let cont2_jmp = jmp_rel32(str_len(t_3) + 6 + str_len(dec_3) + 5 + str_len(dec_4))
+    let try4_jne = jne_rel32(str_len(dec_3) + 5)
+    let cont3_jmp = jmp_rel32(str_len(dec_4))
+    let ascii_je = je_rel32(str_len(t_2) + 6 + str_len(dec_2) + 5 + str_len(t_3) + 6 + str_len(dec_3) + 5 + str_len(dec_4) + str_len(cont))
+    pre + t_ascii + ascii_je + t_2 + try3_jne + dec_2 + cont2_jmp + t_3 + try4_jne + dec_3 + cont3_jmp + dec_4 + cont + done
+}
+
+// x86gen_eq_str: inline code for string value equality.
+// Stack in: [a, b]. Stack out: [0/1]. Lengths differ -> false; else
+// byte-by-byte compare (repe cmpsb). Clobbers rax, rcx, rdx, r9, r10,
+// rsi, rdi.
+fn x86gen_eq_str() {
+    let cmp_body = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(r10)
+    let done = mov_mr(r15, 0 - 16, r10) + vs_pop_n(1)
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
+}
+
+// x86gen_range_native: inline code for range(start, end) -> [int].
+// Allocates a list [start, start+1, ..., end-1] on the heap.
+// Stack in: [callee, start, end] at r15-24, r15-16, r15-8. Stack out: [list_ptr].
+fn x86gen_range_native() {
+    let fill_loop = mov_mr(rdi, 0, rax) + add_ri32(rdi, 8) + add_ri32(rax, 1) + sub_ri32(r9, 1)
+    let fill_jne = jne_rel32(0 - (str_len(fill_loop) + 6))
+    let fill_all = fill_loop + fill_jne
+    mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rr(rax, r9) + sub_rr(rax, r8) + mov_rr(rcx, rax) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + test_rr(rcx, rcx) + je_rel32(str_len(fill_all)) + mov_rr(rdi, r10) + mov_rr(rax, r8) + mov_rr(r9, rcx) + fill_all + mov_rr(r10, rcx) + mov_ri32(rcx, 3) + shl_rcl(r10) + add_ri32(r10, 24) + add_rr(r10, r11) + mov_rr(r12, r10) + vs_pop_n(3) + vs_push(r11)
 }
 
 // x86gen_start: program entry. nfn = number of functions.
@@ -580,7 +664,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // shadow_pop: remove the last n entries from the shadow list.
     fn shadow_pop(mut lst, n) {
         let mut k = 0
-        while k < n {
+        while k < n && len(lst) > 0 {
             pop(lst)
             k = k + 1
         }
@@ -769,6 +853,256 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         gf = gf + 1
     }
+    // Pre-scan all functions to determine return types (reversed: callees first).
+    let mut fn_ret_type = []
+    let mut rhAlloc = 0
+    while rhAlloc < nfn {
+        push(fn_ret_type, "")
+        rhAlloc = rhAlloc + 1
+    }
+    let mut pti = nfn
+    let mut p_depth_maps = []
+    while pti > 0 {
+        let ptfh = pti - 1
+        let pcode = f_code[ptfh]
+        let mut pshadow_ps = []
+        let mut ptshadow_ps = []
+        let mut ppos_types = []
+        let pa_ps = f_arity[ptfh]
+        let mut pseed = 0
+        while pseed < pa_ps + 1 {
+            push(pshadow_ps, "")
+            push(ptshadow_ps, "")
+            push(ppos_types, "")
+            pseed = pseed + 1
+        }
+        let mut p_depth_at = map()
+        let mut pit = 0
+        while pit < len(pcode) {
+            let pal = match get(p_depth_at, pit) {
+                Some(pd) => pd,
+                None => 0 - 1,
+            }
+            if pal >= 0 {
+                while len(pshadow_ps) > pal {
+                    shadow_pop(pshadow_ps, 1)
+                }
+                while len(ptshadow_ps) > pal {
+                    shadow_pop(ptshadow_ps, 1)
+                }
+            }
+            let pop = pcode[pit]
+            if pop == lib.op_return {
+                if len(ptshadow_ps) > 0 {
+                    fn_ret_type[ptfh] = ptshadow_ps[len(ptshadow_ps) - 1]
+                }
+            } else if pop == lib.op_const {
+                let pval = f_consts[ptfh][read_u16(pcode, pit + 1)]
+                push(pshadow_ps, "")
+                match pval {
+                    lib.CVal.CStr(_) => {
+                        push(ptshadow_ps, "str")
+                    },
+                    _ => {
+                        push(ptshadow_ps, "int")
+                    },
+                }
+            } else if pop == lib.op_get_local {
+                let pslot = read_u16(pcode, pit + 1)
+                if pslot == 0 {
+                    push(pshadow_ps, f_name[ptfh])
+                    push(ptshadow_ps, "")
+                } else {
+                    push(pshadow_ps, "")
+                    let pstype = if pslot < len(ppos_types) {
+                        ppos_types[pslot]
+                    } else {
+                        "int"
+                    }
+                    push(ptshadow_ps, pstype)
+                }
+            } else if pop == lib.op_set_local {
+                let pslot = read_u16(pcode, pit + 1)
+                if pslot > 0 && len(ptshadow_ps) > 0 {
+                    if len(ppos_types) <= pslot {
+                        push(ppos_types, "")
+                    }
+                    ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
+                }
+            } else if pop == lib.op_get_global {
+                let pidx = read_u16(pcode, pit + 1)
+                let pname = const_str(ptfh, pidx)
+                push(pshadow_ps, pname)
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_set_global {} else if pop == lib.op_def_global {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+            } else if pop == lib.op_pop {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+            } else if pop == lib.op_pop_n {
+                shadow_pop(pshadow_ps, pcode[pit + 1])
+                shadow_pop(ptshadow_ps, pcode[pit + 1])
+            } else if pop == lib.op_end_block {
+                let pn_eb = pcode[pit + 1]
+                let presult = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    "int"
+                }
+                let presname = if len(pshadow_ps) > 0 {
+                    pshadow_ps[len(pshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, pn_eb + 1)
+                shadow_pop(ptshadow_ps, pn_eb + 1)
+                push(pshadow_ps, presname)
+                push(ptshadow_ps, presult)
+            } else if pop == lib.op_call {
+                let pn = pcode[pit + 1]
+                let pcallee = if len(pshadow_ps) > pn {
+                    pshadow_ps[len(pshadow_ps) - pn - 1]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, pn + 1)
+                shadow_pop(ptshadow_ps, pn + 1)
+                if pcallee == "ctor" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "enum")
+                } else if pcallee == "substr" || pcallee == "chr" || pcallee == "char_at" || pcallee == "byte_chr" || pcallee == "str" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "str")
+                } else if pcallee == "range" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "list")
+                } else {
+                    let phandle = find_fn_by_name(pcallee)
+                    if phandle >= 0 && fn_ret_type[phandle] != "" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, fn_ret_type[phandle])
+                    } else {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "int")
+                    }
+                }
+            } else if pop == lib.op_closure {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "")
+            } else if pop == lib.op_get_upval {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "")
+            } else if pop == lib.op_jump {
+                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+            } else if pop == lib.op_loop {
+                put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
+            } else if pop == lib.op_jump_if_false || pop == lib.op_jump_if_true {
+                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+            } else if pop == lib.op_jump_if_false_pop {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+            } else if pop == lib.op_chan_next {
+                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_neg {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_not {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib.op_true {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib.op_false {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib.op_unit {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "unit")
+            } else if pop == lib.op_eq || pop == lib.op_neq || pop == lib.op_gt || pop == lib.op_gt_eq || pop == lib.op_lt || pop == lib.op_lt_eq {
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib.op_add {
+                let add_last = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let add_prev = if len(ptshadow_ps) > 1 {
+                    ptshadow_ps[len(ptshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                if add_last == "str" || add_prev == "str" {
+                    push(ptshadow_ps, "str")
+                } else {
+                    push(ptshadow_ps, "int")
+                }
+            } else if pop == lib.op_sub || pop == lib.op_mul || pop == lib.op_div || pop == lib.op_mod {
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_list {
+                let plen = read_u16(pcode, pit + 1)
+                shadow_pop(pshadow_ps, plen)
+                shadow_pop(ptshadow_ps, plen)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "list")
+            } else if pop == lib.op_index_get {
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_index_set {
+                shadow_pop(pshadow_ps, 3)
+                shadow_pop(ptshadow_ps, 3)
+            } else if pop == lib.op_len {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_record {
+                shadow_pop(pshadow_ps, pcode[pit + 1])
+                shadow_pop(ptshadow_ps, pcode[pit + 1])
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "record")
+            } else if pop == lib.op_get_field_name || pop == lib.op_get_field {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_record_update {
+                shadow_pop(pshadow_ps, pcode[pit + 1] + 1)
+                shadow_pop(ptshadow_ps, pcode[pit + 1] + 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "record")
+            } else if pop == lib.op_spawn || pop == lib.op_select {
+                // conservative: assume these don't affect return type
+            }
+            if len(ptshadow_ps) > 0 {
+                let pdepth = len(ptshadow_ps) - 1
+                while len(ppos_types) <= pdepth {
+                    push(ppos_types, "")
+                }
+                ppos_types[pdepth] = ptshadow_ps[len(ptshadow_ps) - 1]
+            }
+            pit = pit + inst_len(ptfh, pcode, pit)
+        }
+        push(p_depth_maps, p_depth_at)
+        pti = pti - 1
+    }
+
     let mut funcs_bytes = ""
     let mut func_offsets = []
     let mut fh = 0
@@ -782,6 +1116,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut out = []
         let mut patches = []
         let mut shadow = []
+        let mut type_shadow = []
+        let mut global_type = map()
+        let mut pos_types = []
+        let mut seed = 0
+        while seed < arity + 1 {
+            push(shadow, "")
+            push(type_shadow, "")
+            push(pos_types, "")
+            seed = seed + 1
+        }
         let mut ip_to_byte = map()
         fn w(s) {
             push(out, s)
@@ -803,43 +1147,89 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     _ => w(int3()),
                 }
                 match f_consts[fh][idx] {
-                    lib.CVal.CStr(_) => push(shadow, "str"),
-                    lib.CVal.CEnumType(_) => push(shadow, "enumtype"),
-                    lib.CVal.CSingleton(_, _) => push(shadow, "enum"),
-                    lib.CVal.CCtor(_, _) => push(shadow, "ctor"),
-                    _ => push(shadow, ""),
+                    lib.CVal.CStr(_) => {
+                        push(shadow, "str")
+                        push(type_shadow, "str")
+                    },
+                    lib.CVal.CEnumType(_) => {
+                        push(shadow, "enumtype")
+                        push(type_shadow, "enumtype")
+                    },
+                    lib.CVal.CSingleton(_, _) => {
+                        push(shadow, "enum")
+                        push(type_shadow, "enum")
+                    },
+                    lib.CVal.CCtor(_, _) => {
+                        push(shadow, "ctor")
+                        push(type_shadow, "ctor")
+                    },
+                    _ => {
+                        push(shadow, "")
+                        push(type_shadow, "int")
+                    },
                 }
             } else if op == lib.op_unit {
                 w(vs_push_zero())
                 push(shadow, "")
+                push(type_shadow, "unit")
             } else if op == lib.op_true {
                 w(e1(73) + e1(199) + modrm(0, 0, r15) + e4(1) + add_ri32(r15, 8))
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_false {
                 w(vs_push_zero())
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_pop {
                 w(vs_pop_n(1))
                 shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
             } else if op == lib.op_pop_n {
                 let n = code[ip + 1]
                 w(vs_pop_n(n))
                 shadow_pop(shadow, n)
+                shadow_pop(type_shadow, n)
             } else if op == lib.op_end_block {
                 let n = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 8) + sub_ri32(r15, 8 * (n + 1)) + mov_mr(r15, 0, rax) + add_ri32(r15, 8))
-                shadow_pop(shadow, n)
+                let res_name = if len(shadow) > 0 {
+                    shadow[len(shadow) - 1]
+                } else {
+                    ""
+                }
+                let res_type = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    "int"
+                }
+                shadow_pop(shadow, n + 1)
+                shadow_pop(type_shadow, n + 1)
+                push(shadow, res_name)
+                push(type_shadow, res_type)
             } else if op == lib.op_get_local {
                 let slot = read_u16(code, ip + 1)
                 if slot == 0 {
                     w(vs_push_zero())
                     push(shadow, f_name[fh])
+                    push(type_shadow, "")
                 } else {
+                    let stype = if slot < len(pos_types) {
+                        pos_types[slot]
+                    } else {
+                        "int"
+                    }
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
                     push(shadow, "")
+                    push(type_shadow, stype)
                 }
             } else if op == lib.op_set_local {
                 let slot = read_u16(code, ip + 1)
+                if slot > 0 && len(type_shadow) > 0 {
+                    if len(pos_types) <= slot {
+                        push(pos_types, "")
+                    }
+                    pos_types[slot] = type_shadow[len(type_shadow) - 1]
+                }
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
             } else if op == lib.op_get_global {
                 let idx = read_u16(code, ip + 1)
@@ -849,6 +1239,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     None => w(vs_push_zero()),
                 }
                 push(shadow, name)
+                let gtype = match get(global_type, name) {
+                    Some(t) => t,
+                    None => "",
+                }
+                push(type_shadow, gtype)
             } else if op == lib.op_def_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
@@ -856,8 +1251,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     Some(s) => s,
                     None => 0,
                 }
+                let gtype = match len(type_shadow) {
+                    0 => "",
+                    _ => type_shadow[len(type_shadow) - 1],
+                }
+                put(global_type, name, gtype)
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
             } else if op == lib.op_set_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
@@ -867,97 +1268,165 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax))
             } else if op == lib.op_eq {
-                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                let sa_eq = if len(type_shadow) > 1 {
+                    type_shadow[len(type_shadow) - 2]
+                } else {
+                    ""
+                }
+                let sb_eq = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if sa_eq == "str" && sb_eq == "str" {
+                    w(x86gen_eq_str())
+                } else {
+                    w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                }
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_neq {
-                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                let sa_neq = if len(type_shadow) > 1 {
+                    type_shadow[len(type_shadow) - 2]
+                } else {
+                    ""
+                }
+                let sb_neq = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if sa_neq == "str" && sb_neq == "str" {
+                    let cmp_body_neq = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + setne(r10)
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body_neq)) + cmp_body_neq + mov_mr(r15, 0 - 16, r10) + vs_pop_n(1))
+                } else {
+                    w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                }
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_gt {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_gt_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_lt {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_lt_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "bool")
             } else if op == lib.op_add {
-                let sa = shadow[len(shadow) - 2]
-                let sb = shadow[len(shadow) - 1]
-                if sa == "str" && sb == "str" {
+                let sa = type_shadow[len(type_shadow) - 2]
+                let sb = type_shadow[len(type_shadow) - 1]
+                if sa == "str" || sb == "str" {
                     // string concat: allocate [len_a+len_b][content_a][content_b]
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r10, r9, 0) + mov_rr(r11, r12) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(r11, 0, rcx) + add_ri32(rcx, 8) + add_rr(r12, rcx) + lea(rsi, rax, 8) + lea(rdi, r11, 8) + mov_rr(rcx, rdx) + rep_movsb() + lea(rsi, r9, 8) + lea(rdi, r11, 8) + add_rr(rdi, rdx) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
                     push(shadow, "str")
+                    push(type_shadow, "str")
                 } else {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + add_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
                     push(shadow, "")
+                    push(type_shadow, "int")
                 }
             } else if op == lib.op_sub {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + sub_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_mul {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + imul_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_div {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_mod {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_list {
                 let n = read_u16(code, ip + 1)
                 w(mov_rr(r11, r12) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(rax, r11, 24) + mov_mr(r11, 16, rax) + lea(rsi, r15, 0 - 8 * n) + mov_rr(rdi, rax) + mov_ri64(rcx, 8 * n) + rep_movsb() + lea(rax, r11, 24 + 8 * n) + mov_rr(r12, rax) + lea(r15, r15, 0 - 8 * n) + vs_push(r11))
                 shadow_pop(shadow, n)
+                shadow_pop(type_shadow, n)
                 push(shadow, "list")
+                push(type_shadow, "list")
             } else if op == lib.op_index_get {
-                let st = shadow[len(shadow) - 2]
+                let st = type_shadow[len(type_shadow) - 2]
                 if st == "str" {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(r9, r9) + add_ri32(r9, 1) + mov_mr(r11, 0, r9) + mov_rm(r9, rax, 8) + add_rr(r9, rcx) + mov_mr(r11, 8, r9) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
                     push(shadow, "str")
+                    push(type_shadow, "str")
                 } else {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_rm(rdx, rax, 0) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
                     push(shadow, "")
+                    push(type_shadow, "int")
                 }
             } else if op == lib.op_index_set {
                 w(mov_rm(rax, r15, 0 - 24) + mov_rm(r9, r15, 0 - 16) + mov_rm(rdx, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_mr(rax, 0, rdx) + vs_pop_n(3))
                 shadow_pop(shadow, 3)
+                shadow_pop(type_shadow, 3)
             } else if op == lib.op_len {
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 8, rax))
                 shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_test_variant {
                 let vidx = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(r8, rcx, 0) + mov_rm(rdx, rax, 0) + xor_rr(r9, r9) + cmp_rr(rdx, r8) + sete(r9) + mov_rm(r8, rax, 8) + mov_ri64(rdx, vidx) + xor_rr(r10, r10) + cmp_rr(r8, rdx) + sete(r10) + and_rr(r9, r10) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
+                shadow_pop(type_shadow, 2)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_get_field {
                 let fidx = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 16 + 8 * fidx) + mov_mr(r15, 0 - 8, rax))
                 shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
                 push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_no_match {
                 w(int3())
             } else if op == lib.op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
+                push(type_shadow, "int")
             } else if op == lib.op_not {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 8) + cmp_rr(rax, rdx) + sete(rdx) + mov_mr(r15, 0 - 8, rdx))
+                push(type_shadow, "bool")
             } else if op == lib.op_jump {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 push(patches, [cur_byte() + 1, target])
@@ -976,6 +1445,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + lea(r15, r15, 0 - 8))
                 shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
                 push(patches, [cur_byte() + 2, target])
                 w(je_rel32(0))
             } else if op == lib.op_loop {
@@ -990,9 +1460,91 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 if callee == "exit" {
                     w(mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(60) + syscall())
                 } else if callee == "print" {
-                    w(mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                    let mut all_str = true
+                    let mut ai = 0
+                    while ai < n {
+                        if type_shadow[len(type_shadow) - n + ai] != "str" {
+                            all_str = false
+                        }
+                        ai = ai + 1
+                    }
+                    if n == 0 {
+                        w(xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                    } else {
+                        if !all_str {
+                            let mut ci = 0
+                            while ci < n {
+                                let atype = type_shadow[len(type_shadow) - n + ci]
+                                if atype == "bool" {
+                                    w(x86gen_bool_convert_at(0 - 8 * (n - ci)))
+                                } else if atype == "unit" {
+                                    w(x86gen_unit_convert_at(0 - 8 * (n - ci)))
+                                } else if atype != "str" {
+                                    w(x86gen_str_convert_at(0 - 8 * (n - ci)))
+                                }
+                                ci = ci + 1
+                            }
+                        }
+                        if n == 1 {
+                            let off = 0 - 8 * (n - 0)
+                            w(mov_rm(rcx, r15, off) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                        } else {
+                            let mut pi = 0
+                            let mut pcode = ""
+                            while pi < n {
+                                let off = 0 - 8 * (n - pi)
+                                pcode = pcode + mov_rm(rcx, r15, off) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall()
+                                if pi < n - 1 {
+                                    pcode = pcode + e1(106) + e1(32) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax)
+                                }
+                                pi = pi + 1
+                            }
+                            w(pcode + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                        }
+                    }
                 } else if callee == "println" {
-                    w(mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                    let mut all_str = true
+                    let mut ai = 0
+                    while ai < n {
+                        if type_shadow[len(type_shadow) - n + ai] != "str" {
+                            all_str = false
+                        }
+                        ai = ai + 1
+                    }
+                    if n == 0 {
+                        w(e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                    } else {
+                        if !all_str {
+                            let mut cj = 0
+                            while cj < n {
+                                let btype = type_shadow[len(type_shadow) - n + cj]
+                                if btype == "bool" {
+                                    w(x86gen_bool_convert_at(0 - 8 * (n - cj)))
+                                } else if btype == "unit" {
+                                    w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
+                                } else if btype != "str" {
+                                    w(x86gen_str_convert_at(0 - 8 * (n - cj)))
+                                }
+                                cj = cj + 1
+                            }
+                        }
+                        if n == 1 {
+                            let off = 0 - 8 * (n - 0)
+                            w(mov_rm(rcx, r15, off) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                        } else {
+                            let mut pi = 0
+                            let mut pcode = ""
+                            while pi < n {
+                                let off = 0 - 8 * (n - pi)
+                                pcode = pcode + mov_rm(rcx, r15, off) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall()
+                                if pi < n - 1 {
+                                    pcode = pcode + e1(106) + e1(32) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax)
+                                }
+                                pi = pi + 1
+                            }
+                            w(pcode + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                        }
+                    }
                 } else if callee == "str_len" {
                     w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 } else if callee == "substr" {
@@ -1010,18 +1562,45 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(x86gen_push_native())
                 } else if callee == "pop" {
                     w(x86gen_pop_native())
+                } else if callee == "range" {
+                    w(x86gen_range_native())
+                    ret_type = "list"
+                } else if callee == "chr" || callee == "byte_chr" {
+                    w(mov_rm(rax, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(rcx, rcx) + add_ri32(rcx, 1) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rax) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
+                    ret_type = "str"
+                } else if callee == "char_at" {
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(r10, r10) + add_ri32(r10, 1) + mov_mr(r11, 0, r10) + add_ri32(r12, 16) + lea(rsi, rax, 8) + add_rr(rsi, rcx) + xor_rr(rax, rax) + e1(172) + mov_mr(r11, 8, rax) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2))
+                    ret_type = "str"
+                } else if callee == "byte_at" {
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + lea(rsi, rax, 8) + add_rr(rsi, rcx) + xor_rr(rax, rax) + e1(172) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2))
+                    ret_type = "int"
+                } else if callee == "ord" {
+                    w(x86gen_ord_native())
+                    ret_type = "int"
+                } else if callee == "assert" {
+                    let err_path = mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + sys_mov_rdi(1) + sys_mov_rax(60) + syscall()
+                    let done_path = xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero()
+                    w(mov_rm(rax, r15, 0 - 16) + test_rr(rax, rax) + jne_rel32(str_len(err_path)) + err_path + done_path)
+                } else if is_unimpl_native(callee) {
+                    w(int3())
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
+                    if handle < len(fn_ret_type) {
+                        ret_type = fn_ret_type[handle]
+                    }
                 } else {
                     let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + mov_rr(r9, r12) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + mov_mr(r15, 0 - 8 * (n + 1), r9) + vs_pop_n(n)
                     let closure_path = mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
                     w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
                 }
                 shadow_pop(shadow, n + 1)
+                shadow_pop(type_shadow, n + 1)
                 if callee == "ctor" {
                     push(shadow, "enum")
+                    push(type_shadow, "enum")
                 } else {
                     push(shadow, ret_type)
+                    push(type_shadow, ret_type)
                 }
             } else if op == lib.op_return {
                 w(x86gen_epilogue())
@@ -1045,10 +1624,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 w(add_ri32(r12, 8 * (nup + 1)) + vs_push(r11))
                 push(shadow, "")
+                push(type_shadow, "")
             } else if op == lib.op_get_upval {
                 let idx = read_u16(code, ip + 1)
                 w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax))
                 push(shadow, "")
+                push(type_shadow, "")
             } else if op == lib.op_set_upval {
                 let idx = read_u16(code, ip + 1)
                 w(mov_rm(rcx, r14, 0) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 8 + 8 * idx, rax))
@@ -1070,7 +1651,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 // Allocation = 16 + n*8 bytes. Copy field values from stack in field order.
                 w(mov_rr(r11, r12) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_ri64(rax, rec_off) + mov_mr(r11, 8, rax) + lea(rsi, r15, 0 - 8 * n) + lea(rdi, r11, 16) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + lea(r15, r15, 0 - 8 * n) + vs_push(r11))
                 shadow_pop(shadow, n)
+                shadow_pop(type_shadow, n)
                 push(shadow, "record")
+                push(type_shadow, "record")
             } else if op == lib.op_get_field_name {
                 let cidx = read_u16(code, ip + 1)
                 let fname = const_str(fh, cidx)
@@ -1089,7 +1672,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(int3())
                 }
                 shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
                 push(shadow, "")
+                push(type_shadow, "")
             } else if op == lib.op_record_update {
                 let n = code[ip + 1]
                 let cidx = read_u16(code, ip + 2)
@@ -1156,16 +1741,38 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 // Pop value stack (n+1 items), restore native stack, push new record
                 w(upd_code + lea(r15, r15, 0 - 8 * (n + 1)) + alloc_code + ovw_code + add_ri32(rsp, 8 * (n + 1)) + vs_push(r11))
                 shadow_pop(shadow, n + 1)
+                shadow_pop(type_shadow, n + 1)
                 push(shadow, "record")
+                push(type_shadow, "record")
             } else {
                 w(int3())
+            }
+            if len(type_shadow) > 0 {
+                let vdepth = len(type_shadow) - 1
+                while len(pos_types) <= vdepth {
+                    push(pos_types, "")
+                }
+                pos_types[vdepth] = type_shadow[len(type_shadow) - 1]
             }
         }
 
         w(x86gen_prologue(arity, locals))
+        let dm = p_depth_maps[nfn - 1 - fh]
         let mut ip = 0
         while ip < len(code) {
             put(ip_to_byte, ip, cur_byte())
+            let dmv = match get(dm, ip) {
+                Some(dvv) => dvv,
+                None => 0 - 1,
+            }
+            if dmv >= 0 {
+                while len(shadow) > dmv {
+                    shadow_pop(shadow, 1)
+                }
+                while len(type_shadow) > dmv {
+                    shadow_pop(type_shadow, 1)
+                }
+            }
             emit_inst(ip)
             ip = ip + inst_len(fh, code, ip)
         }
