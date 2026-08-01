@@ -493,7 +493,7 @@ fn x86gen_unit_convert_at(off) {
 // subset handled in op_call). Calls to these emit int3 -> SIGTRAP so the
 // parity suite skips the program instead of miscompiling it.
 fn is_unimpl_native(name) {
-    name == "args" || name == "clock" || name == "close" || name == "concat" || name == "contains" || name == "delete" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "get" || name == "heap_objects" || name == "join" || name == "keys" || name == "map" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "put" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "slice" || name == "split" || name == "stdin_nb" || name == "str_contains" || name == "str_index_of" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trim" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan" || name == "eprintln"
+    name == "args" || name == "clock" || name == "close" || name == "delete" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "get" || name == "heap_objects" || name == "keys" || name == "map" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "put" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan" || name == "eprintln"
 }
 
 fn x86gen_ord_native() {
@@ -517,7 +517,87 @@ fn x86gen_ord_native() {
     pre + t_ascii + ascii_je + t_2 + try3_jne + dec_2 + cont2_jmp + t_3 + try4_jne + dec_3 + cont3_jmp + dec_4 + cont + done
 }
 
-// x86gen_eq_str: inline code for string value equality.
+// x86gen_contains_native: inline code for contains(list, x) -> bool.
+// Linear scan of list elements comparing 8B values (int/ptr) to x.
+// Stack in: [callee, list, x] at r15-24, r15-16, r15-8. Out: [bool].
+// Clobbers rax, rcx, rdx, r8-r11.
+fn x86gen_contains_native() {
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rsi, r9, 0) + mov_rm(r10, r9, 16) + xor_rr(r11, r11)
+    let found = mov_ri64(rax, 1) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let notfound = mov_ri64(rax, 0) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + jmp_rel32(str_len(found))
+    let inc = add_ri32(r11, 1)
+    let access = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rdx, rdx, 0) + cmp_rr(rdx, r8) + je_rel32(str_len(inc) + 5 + str_len(notfound))
+    let test = cmp_rr(r11, rsi) + jae_rel32(str_len(access) + str_len(inc) + 5)
+    let back = jmp_rel32(0 - (str_len(test) + str_len(access) + str_len(inc) + 5))
+    head + test + access + inc + back + notfound + found
+}
+
+// x86gen_slice_native: inline code for slice(list, start, end) -> list.
+// New list of len = end-start with elements copied from [start, end).
+// Stack in: [callee, list, start, end] at r15-32, -24, -16, -8. Out: [list].
+// Clobbers rax, rcx, rdx, r8-r11, rsi, rdi.
+fn x86gen_slice_native() {
+    mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + sub_rr(r9, r8) + mov_rm(r10, rax, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rr(r11, r12) + mov_mr(r11, 0, r9) + mov_mr(r11, 8, r9) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rsi, rdx) + mov_rr(rdi, r10) + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(rdx, r11) + mov_rr(r12, rdx) + mov_mr(r15, 0 - 32, r11) + vs_pop_n(3)
+}
+
+// x86gen_list_format_at: convert the list at [r15+off] to its
+// "[elem, ...]" string in place (matches VM format_val). is_str selects
+// str (quoted) or int element formatting at compile time; element lists
+// are homogeneous. Clobbers rax, rcx, rdx, rsi, rdi, r8-r11. Uses the
+// native stack for digit reversal.
+fn x86gen_list_format_at(off, is_str) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let h1 = mov_rm(r9, r15, off) + mov_rm(r8, r9, 0) + mov_rm(r10, r9, 16) + mov_ri64(rcx, 2) + xor_rr(r11, r11)
+    let int1_loop = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+    let int1_loop_jne = jne_rel32(0 - (str_len(int1_loop) + 6))
+    let int1 = mov_rr(rax, rdx) + xor_rr(rsi, rsi)
+    let int1_add = add_rr(rcx, rsi) + jmp_rel32(0)
+    let str1 = mov_rm(rsi, rdx, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+    let e1_load = mov_rr(rax, rcx) + mov_rr(rsi, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r10) + mov_rm(rdx, rsi, 0) + mov_rr(rcx, rax)
+    let sep1_bytes = add_ri32(rcx, 2)
+    let sep1 = test_rr(r11, r11) + je_rel32(str_len(sep1_bytes)) + sep1_bytes
+    let next1_wo = add_ri32(r11, 1)
+    let tail1 = if is_str {
+        str1
+    } else {
+        int1 + int1_loop + int1_loop_jne + int1_add
+    }
+    let test1 = cmp_rr(r11, r8) + jae_rel32(str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5)
+    let next1 = next1_wo + jmp_rel32(0 - (str_len(test1) + str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5))
+    let alloc_zone = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + mb(91) + add_ri32(rdi, 1) + xor_rr(r11, r11)
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int2 = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    let str2 = mb(34) + add_ri32(rdi, 1) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rcx, rdx, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+    let e2_load = mov_rr(rsi, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r10) + mov_rm(rdx, rsi, 0)
+    let sep2_bytes = mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+    let sep2 = test_rr(r11, r11) + je_rel32(str_len(sep2_bytes)) + sep2_bytes
+    let next2_wo = add_ri32(r11, 1)
+    let tail2 = if is_str {
+        str2
+    } else {
+        int2
+    }
+    let test2 = cmp_rr(r11, r8) + jae_rel32(str_len(sep2) + str_len(e2_load) + str_len(tail2) + str_len(next2_wo) + 5)
+    let next2 = next2_wo + jmp_rel32(0 - (str_len(test2) + str_len(sep2) + str_len(e2_load) + str_len(tail2) + str_len(next2_wo) + 5))
+    let endfill = mb(93) + add_ri32(rdi, 1) + mov_mr(r15, off, r9)
+    h1 + test1 + sep1 + e1_load + tail1 + next1 + alloc_zone + test2 + sep2 + e2_load + tail2 + next2 + endfill
+}
+
+// x86gen_concat_native: inline code for concat(x, y) -> list.
+// New list = x's elements followed by y's elements.
+// Stack in: [callee, x, y] at r15-24, r15-16, r15-8. Out: [list].
+// Clobbers rax, rcx, rdx, r8-r11, rsi, rdi.
+fn x86gen_concat_native() {
+    mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rcx, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rcx, rdx) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, r9, 16) + mov_rr(rdi, r10) + mov_rm(rdx, r9, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rsi, r8, 16) + mov_rm(rdx, r8, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rax, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rax, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + add_rr(rax, r11) + mov_rr(r12, rax) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
+}
+
 // Stack in: [a, b]. Stack out: [0/1]. Lengths differ -> false; else
 // byte-by-byte compare (repe cmpsb). Clobbers rax, rcx, rdx, r9, r10,
 // rsi, rdi.
@@ -525,6 +605,104 @@ fn x86gen_eq_str() {
     let cmp_body = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(r10)
     let done = mov_mr(r15, 0 - 16, r10) + vs_pop_n(1)
     mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
+}
+
+// x86gen_join_native: inline code for join([str], sep) -> str.
+// Stack in: [callee, list, sep] at r15-24, r15-16, r15-8. Out: [str].
+// Pass 1 sums element lengths plus sep between elements into rdx; then a
+// single str [len][bytes] is allocated and pass 2 copies elements and sep
+// through rdi. r9=list, r10=sep, r8=n, r11=sn, rax=i, rdx=total/len.
+fn x86gen_join_native() {
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + xor_rr(rdx, rdx) + xor_rr(rax, rax)
+    let done_copy = vs_pop_n(2)
+    let pass2_elem = mov_rr(rsi, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rm(rcx, r9, 16) + add_rr(rcx, rsi) + mov_rm(rcx, rcx, 0) + mov_rr(rsi, rcx) + add_ri32(rsi, 8) + mov_rm(rdx, rcx, 0) + mov_rr(rcx, rdx) + rep_movsb()
+    let pass2_no = mov_rr(rsi, r10) + add_ri32(rsi, 8) + mov_rr(rcx, r11) + rep_movsb()
+    let pass2_je = test_rr(rax, rax) + je_rel32(str_len(pass2_no))
+    let pass2_head = cmp_rr(rax, r8) + jge_rel32(str_len(pass2_je) + str_len(pass2_no) + str_len(pass2_elem) + 9)
+    let loop_copy_body = pass2_je + pass2_no + pass2_elem + add_ri32(rax, 1)
+    let back_copy = jmp_rel32(0 - (str_len(pass2_head) + str_len(loop_copy_body) + 5))
+    let loop_copy = pass2_head + loop_copy_body + back_copy
+    let done_len_tail = mov_mr(r15, 0 - 24, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rdx) + add_rr(r12, rdx) + add_ri32(r12, 8) + mov_rm(rdi, r15, 0 - 24) + add_ri32(rdi, 8) + xor_rr(rax, rax)
+    let pass1_elem = mov_rr(rsi, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rm(rcx, r9, 16) + add_rr(rcx, rsi) + mov_rm(rcx, rcx, 0) + mov_rm(rsi, rcx, 0) + add_rr(rdx, rsi)
+    let pass1_no = add_rr(rdx, r11)
+    let pass1_je = test_rr(rax, rax) + je_rel32(str_len(pass1_no))
+    let pass1_head = cmp_rr(rax, r8) + jge_rel32(str_len(pass1_je) + str_len(pass1_no) + str_len(pass1_elem) + 9)
+    let loop_len_body = pass1_je + pass1_no + pass1_elem + add_ri32(rax, 1)
+    let back_len = jmp_rel32(0 - (str_len(pass1_head) + str_len(loop_len_body) + 5))
+    let loop_len = pass1_head + loop_len_body + back_len
+    head + loop_len + done_len_tail + loop_copy + done_copy
+}
+
+// x86gen_trim_native: inline code for trim(s) -> str.
+// Stack in: [callee, s] at r15-16, r15-8. Out: [str].
+// Strips ASCII whitespace (0x20 and 0x09..0x0d) from both ends; the
+// result is a freshly allocated str [len][bytes]. r9=s, r8=n, rdx=i, rcx=j.
+fn x86gen_trim_native() {
+    let read = mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rax, rsi, 0) + mov_ri64(r10, 255) + and_rr(rax, r10)
+    let done = sub_rr(rcx, rdx) + mov_mr(r15, 0 - 16, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rsi, r15, 0 - 16) + mov_mr(r15, 0 - 16, rsi) + vs_pop_n(1)
+    let yes2 = sub_ri32(rcx, 1)
+    let no2 = jmp_rel32(str_len(yes2) + 5)
+    let jb2 = sub_ri32(rax, 9) + sub_ri32(rax, 5) + jb_rel32(str_len(no2))
+    let je2 = mov_rr(r10, rax) + sub_ri32(r10, 32) + test_rr(r10, r10) + je_rel32(str_len(jb2) + str_len(no2))
+    let tail2 = mov_rr(rsi, r9) + add_rr(rsi, rcx) + add_ri32(rsi, 7) + mov_rm(rax, rsi, 0) + mov_ri64(r10, 255) + and_rr(rax, r10) + je2 + jb2 + no2 + yes2
+    let cond2 = cmp_rr(rcx, rdx) + jle_rel32(str_len(tail2) + 5)
+    let back2 = jmp_rel32(0 - (str_len(cond2) + str_len(tail2) + 5))
+    let loop2 = cond2 + tail2 + back2
+    let yes1 = add_ri32(rdx, 1)
+    let no1 = jmp_rel32(str_len(yes1) + 5)
+    let jb1 = sub_ri32(rax, 9) + sub_ri32(rax, 5) + jb_rel32(str_len(no1))
+    let je1 = mov_rr(r10, rax) + sub_ri32(r10, 32) + test_rr(r10, r10) + je_rel32(str_len(jb1) + str_len(no1))
+    let tail1 = read + je1 + jb1 + no1 + yes1
+    let cond1 = cmp_rr(rdx, rcx) + jge_rel32(str_len(tail1) + 5)
+    let back1 = jmp_rel32(0 - (str_len(cond1) + str_len(tail1) + 5))
+    let loop1 = cond1 + tail1 + back1
+    let head = mov_rm(r9, r15, 0 - 8) + mov_rm(r8, r9, 0) + xor_rr(rdx, rdx) + mov_rr(rcx, r8)
+    head + loop1 + loop2 + done
+}
+
+// x86gen_split_native: inline code for split(s, sep) -> [str].
+// Stack in: [callee, s, sep] at r15-24, r15-16, r15-8. Out: [list].
+// List object [len][cap][elems_ptr] with cap = n+1 preallocated; each
+// element is a freshly allocated str [len][bytes]. r9=s, r10=sep, r8=n,
+// r11=sn, rax=i, rdx=start; obj and w live in the arg slots r15-16 and
+// r15-8, newstr is staged in the callee slot r15-24.
+fn x86gen_split_native() {
+    let push = mov_mr(r15, 0 - 24, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rdi, r15, 0 - 8) + mov_rm(rsi, r15, 0 - 24) + mov_mr(rdi, 0, rsi) + add_ri32(rdi, 8) + mov_mr(r15, 0 - 8, rdi)
+    let done = mov_rr(rcx, r8) + sub_rr(rcx, rdx) + push + mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + sub_rr(rsi, rdi) + sub_ri32(rsi, 24) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shr_rcl(rsi) + mov_mr(rdi, 0, rsi) + mov_mr(r15, 0 - 24, rdi) + vs_pop_n(2)
+    let matched = mov_rr(rcx, rax) + sub_rr(rcx, rdx) + push + mov_rm(r11, r10, 0) + add_rr(rax, r11) + mov_rr(rdx, rax)
+    let no_match = add_ri32(rax, 1)
+    let loop_tail = mov_rr(rsi, r9) + add_rr(rsi, rax) + add_ri32(rsi, 8) + mov_rr(rdi, r10) + add_ri32(rdi, 8) + mov_rr(rcx, r11) + repe_cmpsb() + je_rel32(str_len(no_match) + 5)
+    let cond_ja = mov_rm(r11, r10, 0) + mov_rr(rcx, rax) + add_rr(rcx, r11) + cmp_rr(rcx, r8) + ja_rel32(str_len(loop_tail) + str_len(no_match) + 5 + str_len(matched) + 5)
+    let cond_je = test_rr(r11, r11) + je_rel32(str_len(cond_ja) + str_len(loop_tail) + str_len(no_match) + 5 + str_len(matched) + 5)
+    let loop_head = cond_je + cond_ja + loop_tail
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(no_match) + 5))
+    let matched_back = jmp_rel32(0 - (str_len(loop_head) + str_len(no_match) + 5 + str_len(matched) + 5))
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + mov_rr(rdi, r12) + xor_rr(rax, rax) + mov_mr(rdi, 0, rax) + mov_mr(rdi, 8, rax) + mov_mr(rdi, 16, rax) + mov_rr(rdx, r8) + add_ri32(rdx, 1) + mov_mr(rdi, 8, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + mov_rr(rax, rdi) + add_ri32(rax, 24) + mov_mr(rdi, 16, rax) + add_rr(r12, rdx) + mov_mr(r15, 0 - 16, rdi) + mov_rr(rsi, rdi) + add_ri32(rsi, 24) + mov_mr(r15, 0 - 8, rsi) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
+    head + loop_head + no_match + back + matched + matched_back + done
+}
+
+// x86gen_str_find_native: inline code for str_contains(s, sub) -> bool
+// and str_index_of(s, sub) -> Option<int>, sharing one linear scan with
+// repe cmpsb. as_option selects the enum result.
+// Stack in: [callee, s, sub] at r15-24, r15-16, r15-8. Out: [bool|enum].
+// Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
+fn x86gen_str_find_native(as_option) {
+    let some = if as_option {
+        mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    } else {
+        mov_ri64(rax, 1) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    }
+    let none = if as_option {
+        mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2) + jmp_rel32(str_len(some))
+    } else {
+        mov_ri64(rax, 0) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + jmp_rel32(str_len(some))
+    }
+    let next = add_ri32(rax, 1)
+    let loop_tail = mov_rr(rsi, r9) + add_rr(rsi, rax) + add_ri32(rsi, 8) + mov_rr(rdi, r10) + add_ri32(rdi, 8) + mov_rr(rcx, r11) + test_rr(rcx, rcx) + repe_cmpsb() + je_rel32(str_len(next) + 5 + str_len(none))
+    let loop_head = mov_rr(rcx, rax) + add_rr(rcx, r11) + cmp_rr(rcx, r8) + ja_rel32(str_len(loop_tail) + str_len(next) + 5) + loop_tail
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(next) + 5))
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + xor_rr(rax, rax)
+    head + loop_head + next + back + none + some
 }
 
 // x86gen_range_native: inline code for range(start, end) -> [int].
@@ -1077,6 +1255,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(ptshadow_ps, pcode[pit + 1])
                 push(pshadow_ps, "")
                 push(ptshadow_ps, "record")
+            } else if pop == lib.op_test_variant {
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib.op_no_match {
+                // Never executes at runtime (exhaustive matches). But the linear
+                // walk passes through it on the way to the match-end merge, and the
+                // real arms each carry one block value there, so pad by one.
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
             } else if pop == lib.op_get_field_name || pop == lib.op_get_field {
                 shadow_pop(pshadow_ps, 1)
                 shadow_pop(ptshadow_ps, 1)
@@ -1219,7 +1408,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         "int"
                     }
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
-                    push(shadow, "")
+                    push(shadow, "slot:" + str(slot))
                     push(type_shadow, stype)
                 }
             } else if op == lib.op_set_local {
@@ -1375,11 +1564,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(type_shadow, "int")
             } else if op == lib.op_list {
                 let n = read_u16(code, ip + 1)
+                let ltag = if n > 0 && type_shadow[len(type_shadow) - 1] == "str" {
+                    "list-str"
+                } else {
+                    "list-int"
+                }
                 w(mov_rr(r11, r12) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(rax, r11, 24) + mov_mr(r11, 16, rax) + lea(rsi, r15, 0 - 8 * n) + mov_rr(rdi, rax) + mov_ri64(rcx, 8 * n) + rep_movsb() + lea(rax, r11, 24 + 8 * n) + mov_rr(r12, rax) + lea(r15, r15, 0 - 8 * n) + vs_push(r11))
                 shadow_pop(shadow, n)
                 shadow_pop(type_shadow, n)
-                push(shadow, "list")
-                push(type_shadow, "list")
+                push(shadow, ltag)
+                push(type_shadow, ltag)
             } else if op == lib.op_index_get {
                 let st = type_shadow[len(type_shadow) - 2]
                 if st == "str" {
@@ -1421,6 +1615,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(type_shadow, "int")
             } else if op == lib.op_no_match {
                 w(int3())
+                push(shadow, "")
+                push(type_shadow, "int")
             } else if op == lib.op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
                 push(type_shadow, "int")
@@ -1479,6 +1675,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_bool_convert_at(0 - 8 * (n - ci)))
                                 } else if atype == "unit" {
                                     w(x86gen_unit_convert_at(0 - 8 * (n - ci)))
+                                } else if atype == "list-str" {
+                                    w(x86gen_list_format_at(0 - 8 * (n - ci), true))
+                                } else if atype == "list-int" {
+                                    w(x86gen_list_format_at(0 - 8 * (n - ci), false))
                                 } else if atype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - ci)))
                                 }
@@ -1522,6 +1722,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_bool_convert_at(0 - 8 * (n - cj)))
                                 } else if btype == "unit" {
                                     w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
+                                } else if btype == "list-str" {
+                                    w(x86gen_list_format_at(0 - 8 * (n - cj), true))
+                                } else if btype == "list-int" {
+                                    w(x86gen_list_format_at(0 - 8 * (n - cj), false))
                                 } else if btype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - cj)))
                                 }
@@ -1560,6 +1764,24 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 } else if callee == "push" {
                     w(x86gen_push_native())
+                    let list_shadow = shadow[len(shadow) - 2]
+                    if str_len(list_shadow) > 5 && substr(list_shadow, 0, 5) == "slot:" {
+                        match parse_int(substr(list_shadow, 5, str_len(list_shadow) - 5)) {
+                            Some(slot) => {
+                                if slot < len(pos_types) {
+                                    let elem_type = type_shadow[len(type_shadow) - 1]
+                                    if elem_type == "str" {
+                                        pos_types[slot] = "list-str"
+                                        type_shadow[slot] = "list-str"
+                                    } else if elem_type == "int" {
+                                        pos_types[slot] = "list-int"
+                                        type_shadow[slot] = "list-int"
+                                    }
+                                }
+                            },
+                            None => {},
+                        }
+                    }
                 } else if callee == "pop" {
                     w(x86gen_pop_native())
                 } else if callee == "range" {
@@ -1583,6 +1805,30 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(mov_rm(rax, r15, 0 - 16) + test_rr(rax, rax) + jne_rel32(str_len(err_path)) + err_path + done_path)
                 } else if is_unimpl_native(callee) {
                     w(int3())
+                } else if callee == "contains" {
+                    w(x86gen_contains_native())
+                    ret_type = "bool"
+                } else if callee == "join" {
+                    w(x86gen_join_native())
+                    ret_type = "str"
+                } else if callee == "trim" {
+                    w(x86gen_trim_native())
+                    ret_type = "str"
+                } else if callee == "split" {
+                    w(x86gen_split_native())
+                    ret_type = "list-str"
+                } else if callee == "str_contains" {
+                    w(x86gen_str_find_native(false))
+                    ret_type = "bool"
+                } else if callee == "str_index_of" {
+                    w(x86gen_str_find_native(true))
+                    ret_type = "enum"
+                } else if callee == "slice" {
+                    w(x86gen_slice_native())
+                    ret_type = type_shadow[len(type_shadow) - n]
+                } else if callee == "concat" {
+                    w(x86gen_concat_native())
+                    ret_type = type_shadow[len(type_shadow) - n]
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                     if handle < len(fn_ret_type) {
