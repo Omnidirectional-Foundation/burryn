@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
 [![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
 
-> **Meyrin 之下的环。** 一座洞穴，一枚戒指——在地下安静生长。
+> 一座洞穴，一枚戒指——在地下安静生长。
 
 Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机、可移植的 C 后端，以及一个开发中的手写 x86-64 后端。
