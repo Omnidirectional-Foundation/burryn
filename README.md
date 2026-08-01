@@ -5,7 +5,7 @@ English | [中文](README.zh-CN.md)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
 [![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
 
-> **The ring beneath Meyrin.** A burrow, a ring — quiet work underground.
+> A burrow, a ring — quiet work underground.
 
 Burryn is a small programming language forged from Go and Rust.
 It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference with zero annotations, a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and an in-progress hand-written x86-64 backend.
