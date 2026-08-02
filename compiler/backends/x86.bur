@@ -493,7 +493,7 @@ fn x86gen_unit_convert_at(off) {
 // subset handled in op_call). Calls to these emit int3 -> SIGTRAP so the
 // parity suite skips the program instead of miscompiling it.
 fn is_unimpl_native(name) {
-    name == "args" || name == "clock" || name == "close" || name == "delete" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "get" || name == "heap_objects" || name == "keys" || name == "map" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "put" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan" || name == "eprintln"
+    name == "args" || name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan" || name == "eprintln"
 }
 
 fn x86gen_ord_native() {
@@ -705,6 +705,177 @@ fn x86gen_str_find_native(as_option) {
     head + loop_head + next + back + none + some
 }
 
+// x86gen_map_native: inline code for map() -> map.
+// Map header: [n][cap][keys_ptr][vals_ptr] (32 bytes). keys/vals are
+// separate 8-byte-slot arrays (raw int or str pointer per slot); all-zero
+// header = empty map. Not covered by SPEC, matches VM semantics.
+// Stack in: [callee] at r15-8. Stack out: [map_ptr].
+// Clobbers rdx, r11, r12.
+fn x86gen_map_native() {
+    mov_rr(r11, r12) + xor_rr(rdx, rdx) + mov_mr(r11, 0, rdx) + mov_mr(r11, 8, rdx) + mov_mr(r11, 16, rdx) + mov_mr(r11, 24, rdx) + add_ri32(r12, 32) + mov_mr(r15, 0 - 8, r11)
+}
+
+// x86gen_get_map_native: inline code for get(map, key) -> Option<T>.
+// Linear scan over keys; key_is_str selects content compare (repe cmpsb,
+// length first) over raw 8B compare. Missing key -> None ([eh][vi=1]),
+// found -> Some ([eh][vi=0][val]) with val read from the parallel vals
+// array. Stack in: [callee, map, key] at r15-24, r15-16, r15-8. Out: [enum].
+// Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
+fn x86gen_get_map_native(key_is_str) {
+    let some_body = mov_rm(rax, r9, 0) + mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let none = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2) + jmp_rel32(str_len(some_body))
+    let advance = add_ri32(r10, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
+    let access = mov_rm(rdx, r10, 0)
+    let body = if key_is_str {
+        let klen = mov_rm(rcx, rax, 0)
+        let clen = mov_rm(rdi, rdx, 0)
+        let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(none))
+        access + mov_rm(rax, r15, 0 - 8) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
+    } else {
+        access + mov_rm(rax, r15, 0 - 8) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(none))
+    }
+    let loop_head = cmp_rr(r11, r8) + jae_rel32(str_len(body) + str_len(advance) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
+    let head = mov_rm(rax, r15, 0 - 16) + mov_rm(r8, rax, 0) + mov_rm(r10, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
+    head + loop_head + body + advance + back + none + some_body
+}
+
+// x86gen_put_map_native: inline code for put(map, key, val) -> unit.
+// Grows keys/vals arrays (cap*2, min 4, rep movsb copy) when len==cap,
+// then linear-scans for the key: existing -> overwrite val, absent ->
+// append at index len. Stack in: [callee, map, key, val] at r15-32, -24,
+// -16, -8. Out: [unit]. Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
+fn x86gen_put_map_native(key_is_str) {
+    let done = xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + vs_pop_n(3)
+    let found = mov_rm(rax, r15, 0 - 8) + mov_mr(r9, 0, rax)
+    let not_found = mov_rm(rax, r15, 0 - 24) + mov_rm(rsi, rax, 16) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rsi, rdx) + mov_rm(r8, r15, 0 - 16) + mov_mr(rsi, 0, r8) + mov_rm(r9, rax, 24) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r9, rdx) + mov_rm(r8, r15, 0 - 8) + mov_mr(r9, 0, r8) + mov_rm(rdx, rax, 0) + add_ri32(rdx, 1) + mov_mr(rax, 0, rdx) + jmp_rel32(str_len(found))
+    let advance = add_ri32(r8, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
+    let access = mov_rm(rdx, r8, 0)
+    let body = if key_is_str {
+        let klen = mov_rm(rcx, rax, 0)
+        let clen = mov_rm(rdi, rdx, 0)
+        let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(not_found))
+        access + mov_rm(rax, r15, 0 - 16) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
+    } else {
+        access + mov_rm(rax, r15, 0 - 16) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(not_found))
+    }
+    let loop_head = cmp_rr(r11, r10) + jae_rel32(str_len(body) + str_len(advance) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
+    let post_head = mov_rm(r10, rax, 0) + mov_rm(r8, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
+    let g_min = add_ri32(r10, 4)
+    let g_keys = mov_rr(r11, r12) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r11) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
+    let g_vals = mov_rm(rsi, rax, 24) + mov_rr(rdi, r12) + mov_rr(r9, r12) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
+    let g_hdr = mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_mr(rax, 24, r9)
+    let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(str_len(g_min)) + g_min + g_keys + g_vals + g_hdr
+    let head1 = mov_rm(rax, r15, 0 - 24) + mov_rm(rcx, rax, 0) + mov_rm(rdx, rax, 8) + cmp_rr(rcx, rdx) + jne_rel32(str_len(growth))
+    head1 + growth + post_head + loop_head + body + advance + back + not_found + found + done
+}
+
+// x86gen_delete_map_native: inline code for delete(map, key) -> unit.
+// Linear-scans for the key; on hit shifts every later entry down by one
+// (memmove-style forward copy) in both arrays and decrements len. Absent
+// key is a no-op. Stack in: [callee, map, key] at r15-24, r15-16, r15-8.
+// Out: [unit]. Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
+fn x86gen_delete_map_native(key_is_str) {
+    let finish = xor_rr(rax, rax) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let kshift = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdi, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
+    let keys_block = mov_rr(rdx, r10) + sub_rr(rdx, r11) + sub_ri32(rdx, 1) + test_rr(rdx, rdx) + jle_rel32(str_len(kshift)) + kshift
+    let vshift = mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdi, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
+    let vals_block = mov_rr(rdx, r10) + sub_rr(rdx, r11) + sub_ri32(rdx, 1) + test_rr(rdx, rdx) + jle_rel32(str_len(vshift)) + vshift
+    let len_dec = mov_rm(rax, r15, 0 - 16) + sub_ri32(r10, 1) + mov_mr(rax, 0, r10)
+    let found_body = keys_block + vals_block + len_dec
+    let not_found = jmp_rel32(str_len(found_body))
+    let advance = add_ri32(r8, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
+    let access = mov_rm(rdx, r8, 0)
+    let body = if key_is_str {
+        let klen = mov_rm(rcx, rax, 0)
+        let clen = mov_rm(rdi, rdx, 0)
+        let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(not_found))
+        access + mov_rm(rax, r15, 0 - 8) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
+    } else {
+        access + mov_rm(rax, r15, 0 - 8) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(not_found))
+    }
+    let loop_head = cmp_rr(r11, r10) + jae_rel32(str_len(body) + str_len(advance) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
+    let head = mov_rm(rax, r15, 0 - 16) + mov_rm(r10, rax, 0) + mov_rm(r8, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
+    head + loop_head + body + advance + back + not_found + found_body + finish
+}
+
+// x86gen_keys_map_native: inline code for keys(map) -> [T].
+// New list [len][len][elems_ptr] (cap = len) filled by copying the raw
+// 8B key slots. Stack in: [callee, map] at r15-16, r15-8. Out: [list].
+// Clobbers rax, rcx, rdx, rsi, rdi, r9-r12.
+fn x86gen_keys_map_native() {
+    let tail = mov_rm(rdx, r11, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(r12, rdx) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r10) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + tail
+}
+
+// x86gen_map_format_at: convert the map at [r15+off] to its "{k: v, ...}"
+// string in place (matches VM format_val; str keys/vals quoted via the
+// list formatter's no-escape-expansion convention, ints decimal).
+// key_is_str / val_is_str are compile-time flags. Pass 1 sums the length
+// into rcx, pass 2 writes through rdi. Clobbers rax, rcx, rdx, rsi, rdi,
+// r8-r11. Uses the native stack for digit reversal and the result ptr.
+fn x86gen_map_format_at(off, key_is_str, val_is_str) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let sep1_bytes = add_ri32(rcx, 2)
+    let sep1 = test_rr(r11, r11) + je_rel32(str_len(sep1_bytes)) + sep1_bytes
+    let key_len = if key_is_str {
+        mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+    } else {
+        let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+        let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+        mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+    }
+    let colon1 = add_ri32(rcx, 2)
+    let val_len = if val_is_str {
+        mov_rm(rax, r9, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+    } else {
+        let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+        let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+        mov_rm(rax, r9, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+    }
+    let advance1 = add_ri32(r11, 1) + add_ri32(r10, 8) + add_ri32(r9, 8)
+    let loop1_test = cmp_rr(r11, r8) + jae_rel32(str_len(sep1) + str_len(key_len) + str_len(colon1) + str_len(val_len) + str_len(advance1) + 5)
+    let back1 = jmp_rel32(0 - (str_len(loop1_test) + str_len(sep1) + str_len(key_len) + str_len(colon1) + str_len(val_len) + str_len(advance1) + 5))
+    let loop1 = loop1_test + sep1 + key_len + colon1 + val_len + advance1 + back1
+    let h1 = mov_rm(r9, r15, off) + mov_rm(r8, r9, 0) + mov_rm(r10, r9, 16) + mov_rm(r9, r9, 24) + mov_ri64(rcx, 2) + xor_rr(r11, r11)
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    let key_write = if key_is_str {
+        let kaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rax, rdx, 0)
+        kaddr + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+    } else {
+        let kaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rdx, rdx, 0)
+        kaddr + int_write
+    }
+    let colon2 = mb(58) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+    let val_write = if val_is_str {
+        let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rax, rdx, 0)
+        vaddr + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+    } else {
+        let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rdx, rdx, 0)
+        vaddr + int_write
+    }
+    let sep2_bytes = mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+    let sep2 = test_rr(r11, r11) + je_rel32(str_len(sep2_bytes)) + sep2_bytes
+    let advance2 = add_ri32(r11, 1)
+    let loop2_test = cmp_rr(r11, r8) + jae_rel32(str_len(sep2) + str_len(key_write) + str_len(colon2) + str_len(val_write) + str_len(advance2) + 5)
+    let back2 = jmp_rel32(0 - (str_len(loop2_test) + str_len(sep2) + str_len(key_write) + str_len(colon2) + str_len(val_write) + str_len(advance2) + 5))
+    let loop2 = loop2_test + sep2 + key_write + colon2 + val_write + advance2 + back2
+    let alloc_zone = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9) + mb(123) + add_ri32(rdi, 1) + xor_rr(r11, r11)
+    let reload2 = mov_rm(r10, r15, off) + mov_rm(r8, r10, 0) + mov_rm(r10, r10, 16)
+    let endfill = mb(125) + add_ri32(rdi, 1) + pop_r(r9) + mov_mr(r15, off, r9)
+    h1 + loop1 + alloc_zone + reload2 + loop2 + endfill
+}
+
 // x86gen_range_native: inline code for range(start, end) -> [int].
 // Allocates a list [start, start+1, ..., end-1] on the heap.
 // Stack in: [callee, start, end] at r15-24, r15-16, r15-8. Stack out: [list_ptr].
@@ -845,6 +1016,102 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         while k < n && len(lst) > 0 {
             pop(lst)
             k = k + 1
+        }
+    }
+    // ---- map/list type helpers (shared by the prescan fixpoint and emit).
+    // Type strings: "int" "str" "bool" "unit" "list" "list-str" "list-int"
+    // "map" "map-str" "map-int" "map-str-int" "map-str-str" "map-int-int"
+    // "map-int-str" "enum" "record" "" (unknown). Higher specificity wins
+    // when merging (e.g. "map-str-int" beats "map" at a call site).
+    fn type_specificity(t) {
+        if t == "" {
+            0
+        } else if t == "map" {
+            1
+        } else if t == "map-str" || t == "map-int" {
+            2
+        } else if str_len(t) > 4 && substr(t, 0, 4) == "map-" {
+            3
+        } else {
+            4
+        }
+    }
+    fn is_more_specific(a, b) {
+        type_specificity(a) > type_specificity(b)
+    }
+    fn is_map_type(t) {
+        str_len(t) >= 3 && substr(t, 0, 3) == "map"
+    }
+    fn map_key_type(t) {
+        if t == "map-str" || t == "map-str-int" || t == "map-str-str" {
+            "str"
+        } else if t == "map-int" || t == "map-int-str" || t == "map-int-int" {
+            "int"
+        } else {
+            ""
+        }
+    }
+    fn map_val_type(t) {
+        if t == "map-str-int" || t == "map-int-int" {
+            "int"
+        } else if t == "map-str-str" || t == "map-int-str" {
+            "str"
+        } else {
+            ""
+        }
+    }
+    fn refine_map_type(k, v) {
+        if k == "" {
+            "map"
+        } else if v == "" {
+            "map-" + k
+        } else {
+            "map-" + k + "-" + v
+        }
+    }
+    fn refine_map_arg(arg_t, k, v) {
+        if arg_t == "" || is_map_type(arg_t) {
+            let cur_k = map_key_type(arg_t)
+            let cur_v = map_val_type(arg_t)
+            let new_k = if k != "" {
+                k
+            } else {
+                cur_k
+            }
+            let new_v = if v != "" {
+                v
+            } else {
+                cur_v
+            }
+            refine_map_type(new_k, new_v)
+        } else {
+            arg_t
+        }
+    }
+    // merge_type: combine a known type into an existing slot type, keeping
+    // the most specific information (maps refine; others just replace).
+    fn merge_type(cur, new) {
+        if cur == "" {
+            new
+        } else if new == "" {
+            cur
+        } else if is_map_type(cur) || is_map_type(new) {
+            refine_map_arg(cur, map_key_type(new), map_val_type(new))
+        } else {
+            new
+        }
+    }
+    // merge_pos: slot type tracking for a stack position. The position's
+    // current value may have changed type (e.g. a popped call result left
+    // "unit" behind), so only keep the old type when the new one is the same
+    // generic map and the old one is a refined version of it.
+    fn merge_pos(pcur, pnew) {
+        if pcur == "" || pnew == pcur {
+            pnew
+        } else if is_map_type(pcur) && is_map_type(pnew) {
+            refine_map_arg(pcur, map_key_type(pnew), map_val_type(pnew))
+        } else {
+            pnew
         }
     }
 
@@ -1031,265 +1298,431 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         gf = gf + 1
     }
-    // Pre-scan all functions to determine return types (reversed: callees first).
+    // Pre-scan all functions to determine return types (reversed: callees
+    // first) and cross-function parameter types. Parameter types are merged
+    // forward at call sites and seeded back into caller locals over 4
+    // fixpoint rounds, so map types (map -> map-str -> map-str-int) converge
+    // even when a callee refines its own params after the caller runs.
     let mut fn_ret_type = []
     let mut rhAlloc = 0
     while rhAlloc < nfn {
         push(fn_ret_type, "")
         rhAlloc = rhAlloc + 1
     }
-    let mut pti = nfn
-    let mut p_depth_maps = []
-    while pti > 0 {
-        let ptfh = pti - 1
-        let pcode = f_code[ptfh]
-        let mut pshadow_ps = []
-        let mut ptshadow_ps = []
-        let mut ppos_types = []
-        let pa_ps = f_arity[ptfh]
-        let mut pseed = 0
-        while pseed < pa_ps + 1 {
-            push(pshadow_ps, "")
-            push(ptshadow_ps, "")
-            push(ppos_types, "")
-            pseed = pseed + 1
+    let mut fn_param_types = []
+    let mut phAlloc = 0
+    while phAlloc < nfn {
+        let mut plist = []
+        let mut piAlloc = 0
+        while piAlloc < f_arity[phAlloc] {
+            push(plist, "")
+            piAlloc = piAlloc + 1
         }
-        let mut p_depth_at = map()
-        let mut pit = 0
-        while pit < len(pcode) {
-            let pal = match get(p_depth_at, pit) {
-                Some(pd) => pd,
-                None => 0 - 1,
-            }
-            if pal >= 0 {
-                while len(pshadow_ps) > pal {
-                    shadow_pop(pshadow_ps, 1)
-                }
-                while len(ptshadow_ps) > pal {
-                    shadow_pop(ptshadow_ps, 1)
-                }
-            }
-            let pop = pcode[pit]
-            if pop == lib.op_return {
-                if len(ptshadow_ps) > 0 {
-                    fn_ret_type[ptfh] = ptshadow_ps[len(ptshadow_ps) - 1]
-                }
-            } else if pop == lib.op_const {
-                let pval = f_consts[ptfh][read_u16(pcode, pit + 1)]
+        push(fn_param_types, plist)
+        phAlloc = phAlloc + 1
+    }
+    let mut p_depth_maps = []
+    let mut round = 0
+    while round < 4 {
+        let mut pti = nfn
+        p_depth_maps = []
+        while pti > 0 {
+            let ptfh = pti - 1
+            let pcode = f_code[ptfh]
+            let mut pshadow_ps = []
+            let mut ptshadow_ps = []
+            let mut ppos_types = []
+            let pa_ps = f_arity[ptfh]
+            let mut pseed = 0
+            while pseed < pa_ps + 1 {
                 push(pshadow_ps, "")
-                match pval {
-                    lib.CVal.CStr(_) => {
-                        push(ptshadow_ps, "str")
-                    },
-                    _ => {
-                        push(ptshadow_ps, "int")
-                    },
+                push(ptshadow_ps, "")
+                push(ppos_types, "")
+                pseed = pseed + 1
+            }
+            // seed param slots from the converged cross-function table
+            let mut pp = 1
+            while pp < pa_ps + 1 {
+                if pp - 1 < len(fn_param_types[ptfh]) {
+                    ppos_types[pp] = fn_param_types[ptfh][pp - 1]
                 }
-            } else if pop == lib.op_get_local {
-                let pslot = read_u16(pcode, pit + 1)
-                if pslot == 0 {
-                    push(pshadow_ps, f_name[ptfh])
-                    push(ptshadow_ps, "")
-                } else {
+                pp = pp + 1
+            }
+            let mut p_depth_at = map()
+            let mut pit = 0
+            while pit < len(pcode) {
+                let pal = match get(p_depth_at, pit) {
+                    Some(pd) => pd,
+                    None => 0 - 1,
+                }
+                if pal >= 0 {
+                    while len(pshadow_ps) > pal {
+                        shadow_pop(pshadow_ps, 1)
+                    }
+                    while len(ptshadow_ps) > pal {
+                        shadow_pop(ptshadow_ps, 1)
+                    }
+                }
+                let pop = pcode[pit]
+                if pop == lib.op_return {
+                    if len(ptshadow_ps) > 0 {
+                        fn_ret_type[ptfh] = ptshadow_ps[len(ptshadow_ps) - 1]
+                    }
+                } else if pop == lib.op_const {
+                    let pval = f_consts[ptfh][read_u16(pcode, pit + 1)]
                     push(pshadow_ps, "")
-                    let pstype = if pslot < len(ppos_types) {
-                        ppos_types[pslot]
+                    match pval {
+                        lib.CVal.CStr(_) => {
+                            push(ptshadow_ps, "str")
+                        },
+                        _ => {
+                            push(ptshadow_ps, "int")
+                        },
+                    }
+                } else if pop == lib.op_get_local {
+                    let pslot = read_u16(pcode, pit + 1)
+                    if pslot == 0 {
+                        push(pshadow_ps, f_name[ptfh])
+                        push(ptshadow_ps, "")
+                    } else {
+                        push(pshadow_ps, "slot:" + str(pslot))
+                        let pstype = if pslot < len(ppos_types) {
+                            ppos_types[pslot]
+                        } else {
+                            "int"
+                        }
+                        push(ptshadow_ps, pstype)
+                    }
+                } else if pop == lib.op_set_local {
+                    let pslot = read_u16(pcode, pit + 1)
+                    if pslot > 0 && len(ptshadow_ps) > 0 {
+                        if len(ppos_types) <= pslot {
+                            push(ppos_types, "")
+                        }
+                        ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
+                    }
+                } else if pop == lib.op_get_global {
+                    let pidx = read_u16(pcode, pit + 1)
+                    let pname = const_str(ptfh, pidx)
+                    push(pshadow_ps, pname)
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_set_global {} else if pop == lib.op_def_global {
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                } else if pop == lib.op_pop {
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                } else if pop == lib.op_pop_n {
+                    shadow_pop(pshadow_ps, pcode[pit + 1])
+                    shadow_pop(ptshadow_ps, pcode[pit + 1])
+                } else if pop == lib.op_end_block {
+                    let pn_eb = pcode[pit + 1]
+                    let presult = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
                     } else {
                         "int"
                     }
-                    push(ptshadow_ps, pstype)
-                }
-            } else if pop == lib.op_set_local {
-                let pslot = read_u16(pcode, pit + 1)
-                if pslot > 0 && len(ptshadow_ps) > 0 {
-                    if len(ppos_types) <= pslot {
-                        push(ppos_types, "")
-                    }
-                    ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
-                }
-            } else if pop == lib.op_get_global {
-                let pidx = read_u16(pcode, pit + 1)
-                let pname = const_str(ptfh, pidx)
-                push(pshadow_ps, pname)
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_set_global {} else if pop == lib.op_def_global {
-                shadow_pop(pshadow_ps, 1)
-                shadow_pop(ptshadow_ps, 1)
-            } else if pop == lib.op_pop {
-                shadow_pop(pshadow_ps, 1)
-                shadow_pop(ptshadow_ps, 1)
-            } else if pop == lib.op_pop_n {
-                shadow_pop(pshadow_ps, pcode[pit + 1])
-                shadow_pop(ptshadow_ps, pcode[pit + 1])
-            } else if pop == lib.op_end_block {
-                let pn_eb = pcode[pit + 1]
-                let presult = if len(ptshadow_ps) > 0 {
-                    ptshadow_ps[len(ptshadow_ps) - 1]
-                } else {
-                    "int"
-                }
-                let presname = if len(pshadow_ps) > 0 {
-                    pshadow_ps[len(pshadow_ps) - 1]
-                } else {
-                    ""
-                }
-                shadow_pop(pshadow_ps, pn_eb + 1)
-                shadow_pop(ptshadow_ps, pn_eb + 1)
-                push(pshadow_ps, presname)
-                push(ptshadow_ps, presult)
-            } else if pop == lib.op_call {
-                let pn = pcode[pit + 1]
-                let pcallee = if len(pshadow_ps) > pn {
-                    pshadow_ps[len(pshadow_ps) - pn - 1]
-                } else {
-                    ""
-                }
-                shadow_pop(pshadow_ps, pn + 1)
-                shadow_pop(ptshadow_ps, pn + 1)
-                if pcallee == "ctor" {
-                    push(pshadow_ps, "")
-                    push(ptshadow_ps, "enum")
-                } else if pcallee == "substr" || pcallee == "chr" || pcallee == "char_at" || pcallee == "byte_chr" || pcallee == "str" {
-                    push(pshadow_ps, "")
-                    push(ptshadow_ps, "str")
-                } else if pcallee == "range" {
-                    push(pshadow_ps, "")
-                    push(ptshadow_ps, "list")
-                } else {
-                    let phandle = find_fn_by_name(pcallee)
-                    if phandle >= 0 && fn_ret_type[phandle] != "" {
-                        push(pshadow_ps, "")
-                        push(ptshadow_ps, fn_ret_type[phandle])
+                    let presname = if len(pshadow_ps) > 0 {
+                        pshadow_ps[len(pshadow_ps) - 1]
                     } else {
+                        ""
+                    }
+                    shadow_pop(pshadow_ps, pn_eb + 1)
+                    shadow_pop(ptshadow_ps, pn_eb + 1)
+                    push(pshadow_ps, presname)
+                    push(ptshadow_ps, presult)
+                } else if pop == lib.op_call {
+                    let pn = pcode[pit + 1]
+                    let pcallee = if len(pshadow_ps) > pn {
+                        pshadow_ps[len(pshadow_ps) - pn - 1]
+                    } else {
+                        ""
+                    }
+                    // capture arg types and arg shadows before popping
+                    let mut p_arg_t = []
+                    let mut p_arg_s = []
+                    let mut pca = 0
+                    while pca < pn {
+                        push(p_arg_t, ptshadow_ps[len(ptshadow_ps) - pn + pca])
+                        push(p_arg_s, pshadow_ps[len(pshadow_ps) - pn + pca])
+                        pca = pca + 1
+                    }
+                    shadow_pop(pshadow_ps, pn + 1)
+                    shadow_pop(ptshadow_ps, pn + 1)
+                    if pcallee == "ctor" {
                         push(pshadow_ps, "")
+                        push(ptshadow_ps, "enum")
+                    } else if pcallee == "substr" || pcallee == "chr" || pcallee == "char_at" || pcallee == "byte_chr" || pcallee == "str" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "str")
+                    } else if pcallee == "range" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "list-int")
+                    } else if pcallee == "map" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "map")
+                    } else if pcallee == "keys" {
+                        let mk = if pn >= 1 {
+                            map_key_type(p_arg_t[0])
+                        } else {
+                            ""
+                        }
+                        push(pshadow_ps, "")
+                        if mk == "str" {
+                            push(ptshadow_ps, "list-str")
+                        } else {
+                            push(ptshadow_ps, "list-int")
+                        }
+                    } else if pcallee == "put" || pcallee == "get" || pcallee == "delete" {
+                        // refine the map argument from its key (and val for put)
+                        let mt = if pn >= 1 {
+                            p_arg_t[0]
+                        } else {
+                            ""
+                        }
+                        let kt = if pn >= 2 {
+                            p_arg_t[1]
+                        } else {
+                            ""
+                        }
+                        let vt = if pcallee == "put" && pn >= 3 {
+                            p_arg_t[2]
+                        } else {
+                            ""
+                        }
+                        let refined = if pcallee == "put" {
+                            refine_map_arg(mt, kt, vt)
+                        } else {
+                            refine_map_arg(mt, kt, "")
+                        }
+                        let mslot = if pn >= 1 {
+                            p_arg_s[0]
+                        } else {
+                            ""
+                        }
+                        if str_len(mslot) > 5 && substr(mslot, 0, 5) == "slot:" {
+                            match parse_int(substr(mslot, 5, str_len(mslot) - 5)) {
+                                Some(sn) => {
+                                    if sn > 0 {
+                                        if len(ppos_types) <= sn {
+                                            while len(ppos_types) <= sn {
+                                                push(ppos_types, "")
+                                            }
+                                        }
+                                        ppos_types[sn] = merge_type(ppos_types[sn], refined)
+                                        if sn <= pa_ps {
+                                            fn_param_types[ptfh][sn - 1] = merge_type(fn_param_types[ptfh][sn - 1], refined)
+                                        }
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                        push(pshadow_ps, "")
+                        if pcallee == "get" {
+                            push(ptshadow_ps, "enum")
+                        } else {
+                            push(ptshadow_ps, "unit")
+                        }
+                    } else if pcallee == "split" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "list-str")
+                    } else if pcallee == "concat" || pcallee == "slice" {
+                        let clt = if pn >= 1 {
+                            p_arg_t[0]
+                        } else {
+                            "list"
+                        }
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, clt)
+                    } else {
+                        let phandle = find_fn_by_name(pcallee)
+                        if phandle >= 0 {
+                            // forward: merge call-site arg types into callee params
+                            let mut pff = 0
+                            while pff < pn && pff < len(fn_param_types[phandle]) {
+                                fn_param_types[phandle][pff] = merge_type(fn_param_types[phandle][pff], p_arg_t[pff])
+                                pff = pff + 1
+                            }
+                            // backward: refine caller slots from callee params
+                            let mut pbb = 0
+                            while pbb < pn && pbb < len(fn_param_types[phandle]) {
+                                let bslot = p_arg_s[pbb]
+                                let ctype = fn_param_types[phandle][pbb]
+                                if str_len(bslot) > 5 && substr(bslot, 0, 5) == "slot:" {
+                                    match parse_int(substr(bslot, 5, str_len(bslot) - 5)) {
+                                        Some(sn) => {
+                                            if sn > 0 {
+                                                if len(ppos_types) <= sn {
+                                                    while len(ppos_types) <= sn {
+                                                        push(ppos_types, "")
+                                                    }
+                                                }
+                                                ppos_types[sn] = merge_type(ppos_types[sn], ctype)
+                                            }
+                                        },
+                                        None => {},
+                                    }
+                                }
+                                pbb = pbb + 1
+                            }
+                            if fn_ret_type[phandle] != "" {
+                                push(pshadow_ps, "")
+                                push(ptshadow_ps, fn_ret_type[phandle])
+                            } else {
+                                push(pshadow_ps, "")
+                                push(ptshadow_ps, "int")
+                            }
+                        } else {
+                            push(pshadow_ps, "")
+                            push(ptshadow_ps, "int")
+                        }
+                    }
+                } else if pop == lib.op_closure {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "")
+                } else if pop == lib.op_get_upval {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "")
+                } else if pop == lib.op_jump {
+                    put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+                } else if pop == lib.op_loop {
+                    put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
+                } else if pop == lib.op_jump_if_false || pop == lib.op_jump_if_true {
+                    put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+                } else if pop == lib.op_jump_if_false_pop {
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                    put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+                } else if pop == lib.op_chan_next {
+                    put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_neg {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_not {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "bool")
+                } else if pop == lib.op_true {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "bool")
+                } else if pop == lib.op_false {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "bool")
+                } else if pop == lib.op_unit {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "unit")
+                } else if pop == lib.op_eq || pop == lib.op_neq || pop == lib.op_gt || pop == lib.op_gt_eq || pop == lib.op_lt || pop == lib.op_lt_eq {
+                    shadow_pop(pshadow_ps, 2)
+                    shadow_pop(ptshadow_ps, 2)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "bool")
+                } else if pop == lib.op_add {
+                    let add_last = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
+                    let add_prev = if len(ptshadow_ps) > 1 {
+                        ptshadow_ps[len(ptshadow_ps) - 2]
+                    } else {
+                        ""
+                    }
+                    shadow_pop(pshadow_ps, 2)
+                    shadow_pop(ptshadow_ps, 2)
+                    push(pshadow_ps, "")
+                    if add_last == "str" || add_prev == "str" {
+                        push(ptshadow_ps, "str")
+                    } else {
                         push(ptshadow_ps, "int")
                     }
-                }
-            } else if pop == lib.op_closure {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "")
-            } else if pop == lib.op_get_upval {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "")
-            } else if pop == lib.op_jump {
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-            } else if pop == lib.op_loop {
-                put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
-            } else if pop == lib.op_jump_if_false || pop == lib.op_jump_if_true {
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-            } else if pop == lib.op_jump_if_false_pop {
-                shadow_pop(pshadow_ps, 1)
-                shadow_pop(ptshadow_ps, 1)
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-            } else if pop == lib.op_chan_next {
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
-                shadow_pop(pshadow_ps, 1)
-                shadow_pop(ptshadow_ps, 1)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_neg {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_not {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "bool")
-            } else if pop == lib.op_true {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "bool")
-            } else if pop == lib.op_false {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "bool")
-            } else if pop == lib.op_unit {
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "unit")
-            } else if pop == lib.op_eq || pop == lib.op_neq || pop == lib.op_gt || pop == lib.op_gt_eq || pop == lib.op_lt || pop == lib.op_lt_eq {
-                shadow_pop(pshadow_ps, 2)
-                shadow_pop(ptshadow_ps, 2)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "bool")
-            } else if pop == lib.op_add {
-                let add_last = if len(ptshadow_ps) > 0 {
-                    ptshadow_ps[len(ptshadow_ps) - 1]
-                } else {
-                    ""
-                }
-                let add_prev = if len(ptshadow_ps) > 1 {
-                    ptshadow_ps[len(ptshadow_ps) - 2]
-                } else {
-                    ""
-                }
-                shadow_pop(pshadow_ps, 2)
-                shadow_pop(ptshadow_ps, 2)
-                push(pshadow_ps, "")
-                if add_last == "str" || add_prev == "str" {
-                    push(ptshadow_ps, "str")
-                } else {
+                } else if pop == lib.op_sub || pop == lib.op_mul || pop == lib.op_div || pop == lib.op_mod {
+                    shadow_pop(pshadow_ps, 2)
+                    shadow_pop(ptshadow_ps, 2)
+                    push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
+                } else if pop == lib.op_list {
+                    let plen = read_u16(pcode, pit + 1)
+                    let pelt = if plen > 0 && len(ptshadow_ps) >= 1 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
+                    shadow_pop(pshadow_ps, plen)
+                    shadow_pop(ptshadow_ps, plen)
+                    push(pshadow_ps, "")
+                    if pelt == "str" {
+                        push(ptshadow_ps, "list-str")
+                    } else {
+                        push(ptshadow_ps, "list-int")
+                    }
+                } else if pop == lib.op_index_get {
+                    let plt = if len(ptshadow_ps) >= 2 {
+                        ptshadow_ps[len(ptshadow_ps) - 2]
+                    } else {
+                        ""
+                    }
+                    shadow_pop(pshadow_ps, 2)
+                    shadow_pop(ptshadow_ps, 2)
+                    push(pshadow_ps, "")
+                    if plt == "list-str" || plt == "str" {
+                        push(ptshadow_ps, "str")
+                    } else {
+                        push(ptshadow_ps, "int")
+                    }
+                } else if pop == lib.op_index_set {
+                    shadow_pop(pshadow_ps, 3)
+                    shadow_pop(ptshadow_ps, 3)
+                } else if pop == lib.op_len {
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_record {
+                    shadow_pop(pshadow_ps, pcode[pit + 1])
+                    shadow_pop(ptshadow_ps, pcode[pit + 1])
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "record")
+                } else if pop == lib.op_test_variant {
+                    shadow_pop(pshadow_ps, 2)
+                    shadow_pop(ptshadow_ps, 2)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_no_match {
+                    // Never executes at runtime (exhaustive matches). But the linear
+                    // walk passes through it on the way to the match-end merge, and the
+                    // real arms each carry one block value there, so pad by one.
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_get_field_name || pop == lib.op_get_field {
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pop == lib.op_record_update {
+                    shadow_pop(pshadow_ps, pcode[pit + 1] + 1)
+                    shadow_pop(ptshadow_ps, pcode[pit + 1] + 1)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "record")
+                } else if pop == lib.op_spawn || pop == lib.op_select {
+                    // conservative: assume these don't affect return type
                 }
-            } else if pop == lib.op_sub || pop == lib.op_mul || pop == lib.op_div || pop == lib.op_mod {
-                shadow_pop(pshadow_ps, 2)
-                shadow_pop(ptshadow_ps, 2)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_list {
-                let plen = read_u16(pcode, pit + 1)
-                shadow_pop(pshadow_ps, plen)
-                shadow_pop(ptshadow_ps, plen)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "list")
-            } else if pop == lib.op_index_get {
-                shadow_pop(pshadow_ps, 2)
-                shadow_pop(ptshadow_ps, 2)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_index_set {
-                shadow_pop(pshadow_ps, 3)
-                shadow_pop(ptshadow_ps, 3)
-            } else if pop == lib.op_len {
-                shadow_pop(pshadow_ps, 1)
-                shadow_pop(ptshadow_ps, 1)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_record {
-                shadow_pop(pshadow_ps, pcode[pit + 1])
-                shadow_pop(ptshadow_ps, pcode[pit + 1])
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "record")
-            } else if pop == lib.op_test_variant {
-                shadow_pop(pshadow_ps, 2)
-                shadow_pop(ptshadow_ps, 2)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_no_match {
-                // Never executes at runtime (exhaustive matches). But the linear
-                // walk passes through it on the way to the match-end merge, and the
-                // real arms each carry one block value there, so pad by one.
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_get_field_name || pop == lib.op_get_field {
-                shadow_pop(pshadow_ps, 1)
-                shadow_pop(ptshadow_ps, 1)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "int")
-            } else if pop == lib.op_record_update {
-                shadow_pop(pshadow_ps, pcode[pit + 1] + 1)
-                shadow_pop(ptshadow_ps, pcode[pit + 1] + 1)
-                push(pshadow_ps, "")
-                push(ptshadow_ps, "record")
-            } else if pop == lib.op_spawn || pop == lib.op_select {
-                // conservative: assume these don't affect return type
-            }
-            if len(ptshadow_ps) > 0 {
-                let pdepth = len(ptshadow_ps) - 1
-                while len(ppos_types) <= pdepth {
-                    push(ppos_types, "")
+                if len(ptshadow_ps) > 0 {
+                    let pdepth = len(ptshadow_ps) - 1
+                    while len(ppos_types) <= pdepth {
+                        push(ppos_types, "")
+                    }
+                    ppos_types[pdepth] = merge_pos(ppos_types[pdepth], ptshadow_ps[len(ptshadow_ps) - 1])
                 }
-                ppos_types[pdepth] = ptshadow_ps[len(ptshadow_ps) - 1]
+                pit = pit + inst_len(ptfh, pcode, pit)
             }
-            pit = pit + inst_len(ptfh, pcode, pit)
+            push(p_depth_maps, p_depth_at)
+            pti = pti - 1
         }
-        push(p_depth_maps, p_depth_at)
-        pti = pti - 1
+        round = round + 1
     }
 
     let mut funcs_bytes = ""
@@ -1314,6 +1747,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             push(type_shadow, "")
             push(pos_types, "")
             seed = seed + 1
+        }
+        // seed param slots from the converged cross-function table so map
+        // natives see refined map types inside the callee body
+        let mut pseed_e = 1
+        while pseed_e < arity + 1 {
+            if pseed_e - 1 < len(fn_param_types[fh]) {
+                pos_types[pseed_e] = fn_param_types[fh][pseed_e - 1]
+            }
+            pseed_e = pseed_e + 1
         }
         let mut ip_to_byte = map()
         fn w(s) {
@@ -1587,7 +2029,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(shadow, 2)
                     shadow_pop(type_shadow, 2)
                     push(shadow, "")
-                    push(type_shadow, "int")
+                    if st == "list-str" {
+                        push(type_shadow, "str")
+                    } else {
+                        push(type_shadow, "int")
+                    }
                 }
             } else if op == lib.op_index_set {
                 w(mov_rm(rax, r15, 0 - 24) + mov_rm(r9, r15, 0 - 16) + mov_rm(rdx, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_mr(rax, 0, rdx) + vs_pop_n(3))
@@ -1679,6 +2125,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - ci), true))
                                 } else if atype == "list-int" {
                                     w(x86gen_list_format_at(0 - 8 * (n - ci), false))
+                                } else if is_map_type(atype) {
+                                    w(x86gen_map_format_at(0 - 8 * (n - ci), map_key_type(atype) == "str", map_val_type(atype) == "str"))
                                 } else if atype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - ci)))
                                 }
@@ -1726,6 +2174,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), true))
                                 } else if btype == "list-int" {
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), false))
+                                } else if is_map_type(btype) {
+                                    w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str"))
                                 } else if btype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - cj)))
                                 }
@@ -1803,6 +2253,64 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let err_path = mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + sys_mov_rdi(1) + sys_mov_rax(60) + syscall()
                     let done_path = xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero()
                     w(mov_rm(rax, r15, 0 - 16) + test_rr(rax, rax) + jne_rel32(str_len(err_path)) + err_path + done_path)
+                } else if callee == "map" {
+                    w(x86gen_map_native())
+                    ret_type = "map"
+                } else if callee == "get" || callee == "put" || callee == "delete" {
+                    let m_t = type_shadow[len(type_shadow) - n]
+                    let k_t = if n >= 2 {
+                        type_shadow[len(type_shadow) - n + 1]
+                    } else {
+                        ""
+                    }
+                    let v_t = if n >= 3 {
+                        type_shadow[len(type_shadow) - 1]
+                    } else {
+                        ""
+                    }
+                    let kk = map_key_type(m_t)
+                    if callee == "get" {
+                        w(x86gen_get_map_native(kk == "str"))
+                        ret_type = "enum"
+                    } else if callee == "put" {
+                        w(x86gen_put_map_native(kk == "str"))
+                        ret_type = "unit"
+                    } else {
+                        w(x86gen_delete_map_native(kk == "str"))
+                        ret_type = "unit"
+                    }
+                    // refine the map arg's local slot type so later get/keys
+                    // on the same map see the refined key/val types
+                    let msh = shadow[len(shadow) - n]
+                    if str_len(msh) > 5 && substr(msh, 0, 5) == "slot:" {
+                        match parse_int(substr(msh, 5, str_len(msh) - 5)) {
+                            Some(sn) => {
+                                if sn > 0 {
+                                    let refined = if callee == "put" {
+                                        refine_map_arg(m_t, k_t, v_t)
+                                    } else {
+                                        refine_map_arg(m_t, k_t, "")
+                                    }
+                                    if len(pos_types) <= sn {
+                                        while len(pos_types) <= sn {
+                                            push(pos_types, "")
+                                        }
+                                    }
+                                    pos_types[sn] = merge_type(pos_types[sn], refined)
+                                }
+                            },
+                            None => {},
+                        }
+                    }
+                } else if callee == "keys" {
+                    let k_t = type_shadow[len(type_shadow) - n]
+                    let kk = map_key_type(k_t)
+                    w(x86gen_keys_map_native())
+                    if kk == "str" {
+                        ret_type = "list-str"
+                    } else {
+                        ret_type = "list-int"
+                    }
                 } else if is_unimpl_native(callee) {
                     w(int3())
                 } else if callee == "contains" {
@@ -1833,6 +2341,28 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                     if handle < len(fn_ret_type) {
                         ret_type = fn_ret_type[handle]
+                    }
+                    // backward: refine caller arg slots from the callee's
+                    // converged param types (mirrors the prescan pass)
+                    let mut bmi = 0
+                    while bmi < n && bmi < len(fn_param_types[handle]) {
+                        let bshadow = shadow[len(shadow) - n + bmi]
+                        if str_len(bshadow) > 5 && substr(bshadow, 0, 5) == "slot:" {
+                            match parse_int(substr(bshadow, 5, str_len(bshadow) - 5)) {
+                                Some(bsn) => {
+                                    if bsn > 0 {
+                                        if len(pos_types) <= bsn {
+                                            while len(pos_types) <= bsn {
+                                                push(pos_types, "")
+                                            }
+                                        }
+                                        pos_types[bsn] = merge_type(pos_types[bsn], fn_param_types[handle][bmi])
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                        bmi = bmi + 1
                     }
                 } else {
                     let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + mov_rr(r9, r12) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + mov_mr(r15, 0 - 8 * (n + 1), r9) + vs_pop_n(n)
@@ -1998,7 +2528,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 while len(pos_types) <= vdepth {
                     push(pos_types, "")
                 }
-                pos_types[vdepth] = type_shadow[len(type_shadow) - 1]
+                pos_types[vdepth] = merge_pos(pos_types[vdepth], type_shadow[len(type_shadow) - 1])
             }
         }
 
