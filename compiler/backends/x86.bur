@@ -493,7 +493,7 @@ fn x86gen_unit_convert_at(off) {
 // subset handled in op_call). Calls to these emit int3 -> SIGTRAP so the
 // parity suite skips the program instead of miscompiling it.
 fn is_unimpl_native(name) {
-    name == "args" || name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan" || name == "eprintln"
+    name == "args" || name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "parse_int" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
 }
 
 fn x86gen_ord_native() {
@@ -2442,6 +2442,67 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 pi = pi + 1
                             }
                             w(pcode + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                        }
+                    }
+                } else if callee == "eprintln" {
+                    let mut all_str = true
+                    let mut ai = 0
+                    while ai < n {
+                        if type_shadow[len(type_shadow) - n + ai] != "str" {
+                            all_str = false
+                        }
+                        ai = ai + 1
+                    }
+                    if n == 0 {
+                        w(e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(2) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                    } else {
+                        if !all_str {
+                            let mut cj = 0
+                            while cj < n {
+                                let btype = type_shadow[len(type_shadow) - n + cj]
+                                if btype == "bool" {
+                                    w(x86gen_bool_convert_at(0 - 8 * (n - cj)))
+                                } else if btype == "unit" {
+                                    w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
+                                } else if btype == "list-str" {
+                                    w(x86gen_list_format_at(0 - 8 * (n - cj), true))
+                                } else if btype == "list-int" {
+                                    w(x86gen_list_format_at(0 - 8 * (n - cj), false))
+                                } else if is_map_type(btype) {
+                                    w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str"))
+                                } else if is_record_type(btype) {
+                                    let brc_schema = record_schema(btype)
+                                    if str_len(brc_schema) > 0 {
+                                        match get(record_field_types, brc_schema) {
+                                            Some(brc_ft) => {
+                                                if len(brc_ft) > 0 {
+                                                    w(x86gen_record_format_at(0 - 8 * (n - cj), enc_names(brc_schema), brc_ft))
+                                                }
+                                            },
+                                            None => {},
+                                        }
+                                    }
+                                } else if btype != "str" {
+                                    w(x86gen_str_convert_at(0 - 8 * (n - cj)))
+                                }
+                                cj = cj + 1
+                            }
+                        }
+                        if n == 1 {
+                            let off = 0 - 8 * (n - 0)
+                            w(mov_rm(rcx, r15, off) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(2) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(2) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
+                        } else {
+                            let mut pi = 0
+                            let mut pcode = ""
+                            while pi < n {
+                                let off = 0 - 8 * (n - pi)
+                                pcode = pcode + mov_rm(rcx, r15, off) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(2) + sys_mov_rax(1) + syscall()
+                                if pi < n - 1 {
+                                    pcode = pcode + e1(106) + e1(32) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(2) + sys_mov_rax(1) + syscall() + pop_r(rax)
+                                }
+                                pi = pi + 1
+                            }
+                            w(pcode + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(2) + sys_mov_rax(1) + syscall() + pop_r(rax) + xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero())
                         }
                     }
                 } else if callee == "str_len" {
