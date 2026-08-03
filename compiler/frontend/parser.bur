@@ -155,6 +155,8 @@ fn p_statement(toks, mut pos) {
         p_const_stmt(toks, pos)
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
         p_fn_decl(toks, pos)
+    } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_lparen {
+        p_method_decl(toks, pos)
     } else if p_check(toks, pos, t_enum) {
         p_enum_decl(toks, pos)
     } else if p_check(toks, pos, t_type) {
@@ -580,6 +582,129 @@ fn p_fn_decl(toks, mut pos) {
         },
     }
     Ok(FnDecl(tok_lex(name), sp_of_tok(name), false, lit, span_of(lit)))
+}
+
+// fn (recv: Type) name(params) -> ret { body } —— receiver 方法声明。
+// receiver 作为 fnlit 的首参（带类型标注），方法表由 checker/compiler 注册。
+fn p_method_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos) // fn
+    match p_expect(toks, pos, t_lparen, "'(' after fn in method") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let recv = match p_expect(toks, pos, t_ident, "receiver name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    match p_expect(toks, pos, t_colon, "':' after receiver name") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let rty = match p_type_expr(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_expect(toks, pos, t_rparen, "')' after receiver") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let name = match p_expect(toks, pos, t_ident, "method name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    // 剩余参数：方法名后的 (params) -> ret { body }
+    match p_expect(toks, pos, t_lparen, "'(' after method name") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let mut params = [tok_lex(recv)]
+    let mut muts = [false]
+    let mut pspans = [sp_of_tok(recv)]
+    let mut param_tys = [rty]
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rparen) {
+        let is_mut = p_match(toks, pos, t_mut)
+        let ptok = match p_expect(toks, pos, t_ident, "parameter name") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        push(params, tok_lex(ptok))
+        push(muts, is_mut)
+        push(pspans, sp_of_tok(ptok))
+        let pty = if p_match(toks, pos, t_colon) {
+            match p_type_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else {
+            NoNode
+        }
+        push(param_tys, pty)
+        if !p_match(toks, pos, t_comma) {
+            break
+        }
+        p_skip_semis(toks, pos)
+    }
+    p_skip_semis(toks, pos)
+    let rp = match p_expect(toks, pos, t_rparen, "')' after parameters") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let ret_ty = if p_match(toks, pos, t_thin_arrow) {
+        match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    } else {
+        NoNode
+    }
+    let body = match p_block(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    let lit = FnLit(params, muts, pspans, param_tys, ret_ty, body, tok_lex(name), sp_union(sp_of_tok(tok), span_of(body)))
+    Ok(MethodDecl(rty_name(rty), tok_lex(name), sp_of_tok(name), lit, span_of(lit)))
+}
+
+// 方法 receiver 的类型名：record 类型取别名；enum/其他取名字。/ Receiver type name for the method table.
+fn rty_name(ty) {
+    match ty {
+        TEName(_, n, _, _, _) => n,
+        TERecord(_, _, _, _) => "",
+        _ => "",
+    }
 }
 
 // params and body, after 'fn [name]'; fn_sp is the span of the `fn` keyword

@@ -44,6 +44,13 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     let mut enum_by = map()
     let mut global_mut = map()
     let mut pkg_decls = map()
+    let mut method_calls = map() // "file:start" -> "recvType.method"（来自 checker 的 side channel）
+    for mc in chan_fors {
+        match str_index_of(mc, "|") {
+            Some(bar) => put(method_calls, substr(mc, 0, bar), substr(mc, bar + 1, str_len(mc) - bar - 1)),
+            None => {},
+        }
+    }
     let mut cur_pkg = "" // import path of the package being compiled
     let mut cur_aliases = map() // current file's import aliases (alias -> path)
     // ---- compiler arena ----
@@ -1505,29 +1512,77 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 patch_jump(ch, end)
             },
             frontend::Node::Call(callee, cargs, sp) => {
-                match cp_expr(ch, callee) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
+                // 方法调用：obj.method(args) —— side channel 命中时 receiver 作首参
+                let mut m_obj = frontend::Node::NoNode
+                let mpath = match callee {
+                    frontend::Node::FieldAccess(obj, _, fsp) => {
+                        m_obj = obj
+                        let fstart = match fsp {
+                            frontend::SpanT::Sp(fs, _) => fs,
+                        }
+                        match get(method_calls, cur_file + ":" + str(fstart)) {
+                            Some(p) => Some(p),
+                            None => None,
+                        }
+                    },
+                    _ => None,
+                }
+                match mpath {
+                    Some(p) => {
+                        // callee 先压（栈底），然后 receiver + args（fpeek(f, argc) 取 callee）
+                        let gidx = add_const(ch, lib::CVal::CStr(p))
+                        emit(ch, lib::op_get_global, sp)
+                        emit_u16(ch, gidx, sp)
+                        match cp_expr(ch, m_obj) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                        c_temps[ch] = c_temps[ch] + 1
+                        for a in cargs {
+                            match cp_expr(ch, a) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return Err(d)
+                                },
+                            }
+                            c_temps[ch] = c_temps[ch] + 1
+                        }
+                        c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
+                        if len(cargs) + 1 > 255 {
+                            return frontend::perr("E2005", "", "too many arguments", sp)
+                        }
+                        emit(ch, lib::op_call, sp)
+                        emit(ch, len(cargs) + 1, sp)
+                        Ok(true)
+                    },
+                    None => {
+                        match cp_expr(ch, callee) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                        c_temps[ch] = c_temps[ch] + 1
+                        for a in cargs {
+                            match cp_expr(ch, a) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return Err(d)
+                                },
+                            }
+                            c_temps[ch] = c_temps[ch] + 1
+                        }
+                        c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
+                        if len(cargs) > 255 {
+                            return frontend::perr("E2005", "", "too many arguments", sp)
+                        }
+                        emit(ch, lib::op_call, sp)
+                        emit(ch, len(cargs), sp)
+                        Ok(true)
                     },
                 }
-                c_temps[ch] = c_temps[ch] + 1
-                for a in cargs {
-                    match cp_expr(ch, a) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    c_temps[ch] = c_temps[ch] + 1
-                }
-                c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
-                if len(cargs) > 255 {
-                    return frontend::perr("E2005", "", "too many arguments", sp)
-                }
-                emit(ch, lib::op_call, sp)
-                emit(ch, len(cargs), sp)
-                Ok(true)
             },
             frontend::Node::Index(target, idx, sp) => {
                 match cp_expr(ch, target) {
@@ -1704,6 +1759,20 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     define_global(ch, name, is_mut, sp)
                 } else {
                     declare_local(ch, name, is_mut, sp)
+                }
+            },
+            frontend::Node::MethodDecl(rt, name, _, lit, sp) => {
+                if c_scope_depth[ch] == 0 {
+                    match cp_function(ch, lit) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    define_global(ch, rt + "." + name, false, sp)
+                } else {
+                    return frontend::perr("E2019", "", "methods must be declared at the top level", sp)
+                    Ok(true)
                 }
             },
             frontend::Node::FnDecl(name, _, _, lit, sp) => {

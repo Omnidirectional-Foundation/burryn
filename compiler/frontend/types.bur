@@ -644,6 +644,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut dm_msg = []
     let mut dm_file = []
     let mut chan_fors = []
+    let mut method_tbl = map() // recv type name -> map(method name -> fn type handle)
     let mut cur_file = ""
     let mut diag_files = []
     let mut e_prefix = []
@@ -1894,6 +1895,54 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     }
 
     fn infer_call(callee, cargs, csp) {
+        // 方法调用：obj.method(args) —— callee 是 FieldAccess(obj, m) 且 obj 类型命中方法表
+        match callee {
+            FieldAccess(obj, mname, _) => {
+                let ot = infer_expr_ref(obj)
+                let os = ty_resolve(tk, tr, ot)
+                let recv_name = if tk[os] == 0 {
+                    tn[os]
+                } else {
+                    ""
+                }
+                let mft = match get(method_tbl, recv_name + "." + mname) {
+                    Some(f) => f,
+                    None => -1,
+                }
+                if mft >= 0 {
+                    b_used[lookup(recv_name + "." + mname)] = true
+                    // side channel：方法调用位置 → `rt.method`（compiler 据此把
+                    // Call(FieldAccess) 编译成 receiver 作首参的全局函数调用）
+                    match csp {
+                        Sp(cs, _) => push(chan_fors, cur_file + ":" + str(cs) + "|" + recv_name + "." + mname),
+                    }
+                    let ft = instantiate(b_scheme[lookup(recv_name + "." + mname)])
+                    let ft_res = ty_resolve(tk, tr, ft)
+                    // receiver 参数与 obj 类型 unify；其余参数逐个 unify
+                    if tk[ft_res] == 1 && len(ta[ft_res]) > 0 {
+                        let first = ta[ft_res][0]
+                        let e = ty_unify(tk, tn, ta, tr, tl, first, ot)
+                        if e != "" {
+                            cerr(span_of(obj), "E0308", "", "method `" + mname + "` expects receiver of `" + recv_name + "`, found `" + ty_pretty1(tk, tn, ta, tr, ot) + "`")
+                        }
+                        let mut i = 1
+                        while i < len(ta[ft_res]) && i - 1 < len(cargs) {
+                            let at = infer_expr_ref(cargs[i - 1])
+                            let e2 = ty_unify(tk, tn, ta, tr, tl, ta[ft_res][i], at)
+                            if e2 != "" {
+                                cerr(span_of(cargs[i - 1]), "E0308", "", e2 + " (argument " + str(i - 1) + " of method `" + mname + "`)")
+                            }
+                            i = i + 1
+                        }
+                        if len(cargs) != len(ta[ft_res]) - 1 {
+                            cerr(csp, "E0061", "", "method `" + mname + "` takes " + str(len(ta[ft_res]) - 1) + " argument(s), got " + str(len(cargs)))
+                        }
+                        return tr[ft_res]
+                    }
+                }
+            },
+            _ => {},
+        }
         let callee_name = match callee {
             Ident(n, _) => n,
             VariantAccess(pkg, n, _) => {
@@ -2657,7 +2706,6 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 match ty {
                     NoNode => {},
                     _ => {
-                        eprintln("ANN unify for", name)
                         let ah = convert_type_expr(ty, map(), "")
                         let e = ty_unify(tk, tn, ta, tr, tl, ah, t)
                         if e != "" {
@@ -2705,6 +2753,28 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 level = level - 1
                 b_scheme[b] = generalize(ft) // before unify: see top-level FnDecl note
                 unify_at(tv, ft, nsp, "in this function")
+            },
+            MethodDecl(rt, name, nsp, lit, ssp) => {
+                if rt == "" {
+                    cerr(ssp, "E0609", "receiver must be a named enum or type alias, e.g. `fn (s: Point) ...`", "cannot resolve receiver type of method `" + name + "`")
+                }
+                let tv = fresh("")
+                let b = declare(rt + "." + name, mono(tv), false, "local", nsp)
+                b_isfn[b] = true
+                b_used[b] = true
+                match lit {
+                    FnLit(_, muts, _, _, _, _, _, _) => {
+                        put(b_muts, b, muts)
+                    },
+                    _ => {},
+                }
+                level = level + 1
+                let ft = infer_expr(lit)
+                level = level - 1
+                b_scheme[b] = generalize(ft)
+                unify_at(tv, ft, nsp, "in this method")
+                // 方法表注册：扁平 key `recv_type.method` → 函数签名 handle
+                put(method_tbl, rt + "." + name, ft)
             },
             EnumDecl(_, _, _, _, ssp) => {
                 cerr(ssp, "E0637", "", "enum declarations are only allowed at top level")
