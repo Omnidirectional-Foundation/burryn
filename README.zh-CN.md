@@ -203,6 +203,7 @@ S1-S7 已全部完成。
 覆盖范围包括语义内核、可移植的 C 后端、模块、map、`select`/`close`、依赖工具、诊断、字符串插值、管道操作符 `|>`、match guard、编译期常量（`const`）、`defer`、TCP 网络，以及移除 Go 宿主后的完全自举编译器。
 
 当前主线是 S8 与 S9。
+**语法已冻结（S8.2）**，正式 grammar 见 [`docs/grammar.md`](docs/grammar.md)。冻结定案包括：`::` 与 `.` 的分工（路径 vs 成员）、复合赋值、带索引的 `for` 循环、or-pattern、标签循环、record 模式、receiver 方法、tuple 与解构、hex/二进制/指数字面量、多行字符串、`..` range——此后语法变更须走 grammar 修订流程。
 手写 x86-64 ELF 后端正在 Linux 上推进，功能覆盖仍落后于 C 后端。
 row polymorphism、封闭 records、类型别名，以及剩余编辑器能力仍在开发中。
 深 `mut` 是绑定级别的规则，不是借用检查器：两个 `mut` 绑定仍可能别名同一个列表。
@@ -212,6 +213,7 @@ row polymorphism、封闭 records、类型别名，以及剩余编辑器能力�
 | 文档 | 用途 |
 | ----------------- | ---------------- |
 | [`tutorial.zh-CN.md`](tutorial.zh-CN.md) | 用户 —— 语言实践导览（[English](tutorial.md)） |
+| [`docs/grammar.md`](docs/grammar.md) | 已冻结的正式 grammar（S8.2）—— 词法与语法参考 |
 | [`docs/SPEC.md`](docs/SPEC.md) | 设计权威 —— 语言设计、路线图与分阶段里程碑 |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | 贡献者 —— 旧 `v`/`L` 标签到新 `S` 编号的历史对照 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献者 —— 分支策略、提交规范与自举定点要求 |

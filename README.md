@@ -203,7 +203,7 @@ Stages S1-S7 are done.
 They cover the semantic core, the portable C backend, modules, maps, `select`/`close`, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, compile-time constants (`const`), `defer`, TCP networking, and a fully self-hosted compiler with the Go host removed.
 
 Current work is in S8 and S9.
-The syntax is frozen (S8.2): the formal grammar lives in `docs/grammar.md`, and the path separator `::` (packages, enum variants) is distinct from `.` (record fields).
+The syntax is frozen (S8.2): the formal grammar lives in `docs/grammar.md`. The freeze covers `::` vs `.` (paths vs members), compound assignment, indexed `for` loops, or-patterns, labeled loops, record patterns, receiver methods, tuples with destructuring, hex/binary/exponent literals, multiline strings, and `..` ranges — syntax changes now go through the grammar revision process.
 The hand-written x86-64 ELF backend is in progress on Linux and currently trails the C backend in feature coverage.
 Row polymorphism, closed records, type aliases, and the remaining editor features are still in progress.
 Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.

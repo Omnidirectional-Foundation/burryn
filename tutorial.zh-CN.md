@@ -249,7 +249,7 @@ let last = pop(xs)       // 40，xs 变回长度 3
 ```rust
 let mut sum = 0
 for i in range(1, 101) {         // 1..100
-    sum = sum + i
+    sum += i
 }
 println("1..100 =", sum)         // 5050
 
@@ -261,7 +261,7 @@ println()
 
 let mut i = 0
 while i < len(words) {
-    i = i + 1
+    i += 1
 }
 ```
 
@@ -379,7 +379,7 @@ fn find(xs, want) {
     let mut i = 0
     while i < len(xs) {
         if xs[i] == want { return Some(i) }
-        i = i + 1
+        i += 1
     }
     None
 }
@@ -534,7 +534,7 @@ import "example.com/hello/shapes"          // 导入子包
 // import s "example.com/hello/shapes"     // 起别名
 
 fn main() {
-    let c = shapes.Shape.Circle(2.0)       // 用 pkg.name 访问
+    let c = shapes::Shape::Circle(2.0)      // 用 pkg::name 访问
     println(shapes.describe(c))
 }
 ```
@@ -628,8 +628,8 @@ import "std/json"
 
 fn main() {
     // {{ 是字面左花括号（{ 触发插值）
-    match json.parse("{{\"name\":\"bur\"}") {
-        Ok(v) => println(json.render(v)),   // {"name":"bur"}
+    match json::parse("{{\"name\":\"bur\"}") {
+        Ok(v) => println(json::render(v)),   // {"name":"bur"}
         Err(e) => eprintln(e),
     }
 }
@@ -677,11 +677,11 @@ bur version
 import "std/testing"
 
 fn test_add() {
-    testing.assert_eq(1 + 1, 2)
+    testing::assert_eq(1 + 1, 2)
 }
 
 fn test_div_by_zero() {
-    testing.assert_err(safe_div(1, 0))
+    testing::assert_err(safe_div(1, 0))
 }
 ```
 
@@ -701,9 +701,9 @@ bur test -v           # 详细输出
 
 语言层还没有的东西：
 
-- **记录/结构体（records）**：目前只能用单变体枚举（如 `Output(int, str, str)`）
-  凑，字段按位置访问。
 - 还没有 `sort`、`getenv`、`math`（sqrt/floor…）、regex 等标准库；按需生长中。
+- 深 `mut` 是绑定级别的规则，不是借用检查器：两个 `mut` 绑定仍可能别名同一个列表。
+- x86-64 原生后端的功能覆盖落后于 C 后端。
 
 ---
 
@@ -711,5 +711,101 @@ bur test -v           # 详细输出
 `compiler/` 下（`frontend/`、`bytecode/`、`backends/`、`module/`、`tooling/`，
 以及 `compiler/main.bur`）。`bur` 把自己编译成 C、经 cc 落地成原生二进制，再由该
 二进制逐字节重建自身。曾作为参照的 Go 宿主已归档到 `archive/go-host` 分支。想看一个
-"真实规模"的 Burryn 程序，`compiler/` 是最好的读物。语法尚未冻结；冻结与正式 grammar
-属于 S8.2。*
+"真实规模"的 Burryn 程序，`compiler/` 是最好的读物。*
+
+---
+
+## 18. 语法冻结新增（S8.2）
+
+语法已冻结；正式 grammar 见 `docs/grammar.md`，此后变更须走修订流程。冻结新增：
+
+**字面量形式**
+
+```rust
+let a = 0xFF          // 十六进制（255）
+let b = 0b1010        // 二进制（10）
+let c = 1_000_000     // 数字分隔符
+let d = 1.5e-3        // 浮点指数
+let s = """
+    \line one
+    \line two
+    """               // 多行字符串：行首 \ 标记内容，缩进忽略
+let r = 1..5          // range，脱糖为 range(1, 5)
+```
+
+**复合赋值**
+
+```rust
+let mut n = 0
+n += 5                // n = n + 5；另有 -= *= /= %=
+```
+
+**绑定的类型标注**
+
+```rust
+let x: int = 5
+const LIMIT: int = 100
+```
+
+**带索引的 for 循环**
+
+```rust
+let words = ["a", "b", "c"]
+for i, w in words {
+    println(i, w)     // 索引与元素；channel 拒绝索引形式
+}
+```
+
+**or-pattern**
+
+```rust
+match code {
+    1 | 2 => println("low"),
+    3 | 4 | 5 => println("mid"),
+    _ => println("high"),
+}
+```
+
+**标签循环**
+
+```rust
+outer: for x in xs {
+    for y in ys {
+        if done { break outer }
+    }
+}
+```
+
+**record 模式**
+
+```rust
+let r = record { x: 10, y: 20 }
+match r {
+    record { x, y } => println(x + y),   // 解构到同名局部变量
+    _ => println("no"),
+}
+```
+
+**receiver 方法**
+
+```rust
+enum Point { Point(float, float) }
+
+fn (p: Point) dist() {                   // receiver 带类型，按类型建方法表
+    match p {
+        Point(x, y) => x * x + y * y,
+    }
+}
+
+let p = Point::Point(3.0, 4.0)
+println(p.dist())                        // 25.0；编译为 dist(p)
+```
+
+**tuple 与解构**
+
+```rust
+let t = (10, "hello")                    // tuple 字面量，≥2 元素
+println(t[0], t[1])
+let (a, b) = t                           // 解构 let
+let pair: (int, str) = (1, "x")          // tuple 类型标注
+```
