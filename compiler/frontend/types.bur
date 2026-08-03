@@ -1697,7 +1697,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 let _ = pop(sc)
             },
-            LetStmt(name, _, _, _, init, _) => {
+            LetStmt(name, _, _, _, _, init, _) => {
                 scan_free(init, sc, seen, out)
                 scan_bind(sc, name)
             },
@@ -2624,11 +2624,23 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     fn infer_stmt(s) {
         match s {
-            LetStmt(name, nsp, is_mut, is_pub, init, ssp) => {
+            LetStmt(name, nsp, is_mut, is_pub, ty, init, ssp) => {
                 if is_pub {
                     err_pub_script(ssp)
                 }
                 let t = infer_let_init(init)
+                // 可选类型标注（S8.2 冻结）：与推导结果 unify，冲突报错
+                match ty {
+                    NoNode => {},
+                    _ => {
+                        eprintln("ANN unify for", name)
+                        let ah = convert_type_expr(ty, map(), "")
+                        let e = ty_unify(tk, tn, ta, tr, tl, ah, t)
+                        if e != "" {
+                            cerr(nsp, "E0308", "", "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, t) + "` (annotation on `" + name + "`)")
+                        }
+                    },
+                }
                 let is_fnlit = match init {
                     FnLit(_, _, _, _, _, _, _, _) => true,
                     _ => false,
@@ -3036,7 +3048,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         push(fd_stmt, s)
                         push(fd_file, fi)
                     },
-                    LetStmt(name, nsp, is_mut, is_pub, _, _) => {
+                    LetStmt(name, nsp, is_mut, is_pub, _, _, _) => {
                         let tv = fresh("")
                         put(pre, name, tv)
                         let b = declare(name, mono(tv), is_mut, "global", nsp)
@@ -3176,7 +3188,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     FnDecl(_, _, _, _, _) => {
                         // inferred in pass 2a
                     },
-                    LetStmt(name, nsp, _, is_pub, init, _) => {
+                    LetStmt(name, nsp, _, is_pub, ty, init, _) => {
                         if is_pub && !is_pkg {
                             err_pub_script(span_of(s))
                         }
@@ -3186,6 +3198,17 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                             convert_type_expr(init, annotation_vars, cur_pkg)
                         } else {
                             infer_let_init(init)
+                        }
+                        // 可选类型标注（S8.2 冻结）：与推导结果 unify，冲突报错
+                        match ty {
+                            NoNode => {},
+                            _ => {
+                                let ah = convert_type_expr(ty, map(), "")
+                                let e = ty_unify(tk, tn, ta, tr, tl, ah, t)
+                                if e != "" {
+                                    cerr(nsp, "E0308", "", "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, t) + "` (annotation on `" + name + "`)")
+                                }
+                            },
                         }
                         let pt = match get(pre, name) {
                             Some(x) => x,
