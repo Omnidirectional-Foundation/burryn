@@ -1,6 +1,6 @@
 #!/bin/bash
 # 全量语法验证：S8.2 冻结语法的每个特性一个可运行样例。
-# 跑全部样例（期望 exit 0）+ 输出断言 + 自举 fixpoint。
+# 每个样例配 .golden（冻结期望 stdout）；跑全部 diff + 自举 fixpoint。
 set -u
 cd "$(dirname "$0")/.."
 
@@ -8,7 +8,7 @@ BUR=${BUR:-./bur}
 fails=0
 
 run() {
-    local file="$1" expect="$2"
+    local file="$1"
     local out
     out=$("$BUR" run "examples/syntax/$file" 2>&1)
     local rc=$?
@@ -18,35 +18,35 @@ run() {
         fails=$((fails + 1))
         return
     fi
-    if ! echo "$out" | grep -q "$expect"; then
-        echo "FAIL $file: expected '$expect' in output"
-        echo "$out" | head -5
+    if ! echo "$out" | diff -q - "examples/syntax/${file%.bur}.golden" >/dev/null 2>&1; then
+        echo "FAIL $file: output differs from golden"
+        echo "$out" | diff - "examples/syntax/${file%.bur}.golden" | head -8
         fails=$((fails + 1))
         return
     fi
     echo "PASS $file"
 }
 
-run literals.bur    "255 10 1000000 0.0015 4294967295"
-run multiline.bur   "line two 42"
-run compound.bur    "sum 13"
-run annotations.bur "5 100 (1, \"hi\")"
-run orpattern.bur   "mid"
-run recordpat.bur   "sum 30"
-run methods.bur     "25.0"
-run tuple.bur       "16"
-run range.bur       "1  2  3  4"
-run shebang.bur     "3"
-run keywords.bur     "11 1 5 5 true false 7"
-run functions.bur    "10 5 -1 6 big value is 5"
-run map.bur          "1 2 1"
+for f in examples/syntax/*.bur; do
+    name=$(basename "$f")
+    [ "$name" = "rowvar.bur" ] && continue
+    run "$name"
+done
 
-# 模块样例（import/pub/::）单独跑目录
+# 模块样例（目录入口）输出对比 golden
 out=$("$BUR" run examples/syntax/modules 2>&1)
-if echo "$out" | grep -q "hi, bur"; then
-    echo "PASS modules.bur"
+if echo "$out" | diff -q - examples/syntax/modules.golden >/dev/null 2>&1; then
+    echo "PASS modules"
 else
-    echo "FAIL modules: $out"
+    echo "FAIL modules"
+    fails=$((fails + 1))
+fi
+
+# 行变量：语法层验证（S8.3 语义未实现，dev parse 应成功）
+if "$BUR" dev parse examples/syntax/rowvar.bur >/dev/null 2>&1; then
+    echo "PASS rowvar.bur (syntax)"
+else
+    echo "FAIL rowvar.bur"
     fails=$((fails + 1))
 fi
 
