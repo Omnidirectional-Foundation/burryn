@@ -2050,7 +2050,40 @@ fn p_match_expr(toks, mut pos) {
 fn p_pattern(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
-    if t == t_int || t == t_float || t == t_string || t == t_true || t == t_false {
+    if t == t_record {
+        // record 模式：record { x, y } 解构字段到同名绑定
+        let rk = p_advance(toks, pos)
+        match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after record pattern") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        let mut names = []
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rbrace) {
+            let fname = match p_expect(toks, pos, t_ident, "field name in record pattern") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            push(names, tok_lex(fname))
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        let rb = match p_expect(toks, pos, t_rbrace, "'}' after record pattern fields") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        Ok(PatRecord(names, sp_union(sp_of_tok(rk), sp_of_tok(rb))))
+    } else if t == t_int || t == t_float || t == t_string || t == t_true || t == t_false {
         let lit = match p_primary(toks, pos) {
             Ok(v) => v,
             Err(d) => {
