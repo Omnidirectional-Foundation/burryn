@@ -47,6 +47,7 @@ let ot_native = 7
 let ot_enumtype = 8
 let ot_ctor = 9
 let ot_record = 10
+let ot_tuple = 11
 
 // fiber status (vm.go FiberStatus)
 let fs_ready = 0
@@ -296,6 +297,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     "enum"
                 } else if t == ot_record {
                     "record"
+                } else if t == ot_tuple {
+                    "tuple"
                 } else {
                     "variant constructor"
                 }
@@ -332,6 +335,12 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         i = i + 1
                     }
                     "" + chr(123) + "" + join(parts, ", ") + "}"
+                } else if t == ot_tuple {
+                    let mut parts = []
+                    for e in o_vals[h] {
+                        push(parts, format_val(e, true))
+                    }
+                    "(" + join(parts, ", ") + ")"
                 } else if t == ot_closure {
                     let name = f_name[o_i1[h]]
                     if name == "" {
@@ -2269,7 +2278,19 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                     fpush(f, VStr(char_at(s, i)))
                 } else {
-                    trap("cannot index " + type_name(target))
+                    let th = tagged_h(target, ot_tuple)
+                    if th >= 0 {
+                        if !is_int(idx) {
+                            trap("tuple index must be an int, got " + type_name(idx))
+                        }
+                        let i = int_of(idx)
+                        if i < 0 || i >= len(o_vals[th]) {
+                            trap("tuple index " + str(i) + " out of bounds (len " + str(len(o_vals[th])) + ")")
+                        }
+                        fpush(f, o_vals[th][i])
+                    } else {
+                        trap("cannot index " + type_name(target))
+                    }
                 }
             } else if op == lib::op_index_set {
                 let v = fpop(f)
@@ -2622,6 +2643,19 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     fb_fr_ip[f][fi] = start_ip
                     return false
                 }
+            } else if op == lib::op_tuple {
+                let n = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                let h = alloc_obj(ot_tuple)
+                let mut vals = []
+                let mut i = 0
+                while i < n {
+                    push(vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
+                fsettop(f, ftop(f) - n)
+                o_vals[h] = vals
+                fpush(f, VObj(h))
             } else if op == lib::op_record {
                 let n = code[start_ip + 1]
                 let cidx = rd_u16(code, start_ip + 2)

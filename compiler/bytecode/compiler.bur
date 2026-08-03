@@ -1602,6 +1602,24 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 emit(ch, lib::op_index_get, sp)
                 Ok(true)
             },
+            frontend::Node::TupleLit(elems, sp) => {
+                for el in elems {
+                    match cp_expr(ch, el) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    c_temps[ch] = c_temps[ch] + 1
+                }
+                c_temps[ch] = c_temps[ch] - len(elems)
+                if len(elems) > 255 {
+                    return frontend::perr("E2006", "", "tuple literal too large", sp)
+                }
+                emit(ch, lib::op_tuple, sp)
+                emit(ch, len(elems), sp)
+                Ok(true)
+            },
             frontend::Node::ListLit(elems, sp) => {
                 for el in elems {
                     match cp_expr(ch, el) {
@@ -1748,6 +1766,63 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
 
     fn cp_stmt(ch, s) {
         match s {
+            frontend::Node::DestructLet(names, nspans, is_mut, init, sp) => {
+                // let (a, b) = t：求值 t 入临时槽，逐名取 [i] 绑定
+                match cp_expr(ch, init) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                let tslot = if c_scope_depth[ch] == 0 {
+                    match declare_local(ch, "(dtmp)", false, sp) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    c_l_slot[ch][n_locals(ch) - 1]
+                } else {
+                    match declare_local(ch, "(dtmp)", false, sp) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    c_l_slot[ch][n_locals(ch) - 1]
+                }
+                let mut i = 0
+                while i < len(names) {
+                    emit(ch, lib::op_get_local, sp)
+                    emit_u16(ch, tslot, sp)
+                    emit_const(ch, lib::CVal::CInt(i), sp)
+                    emit(ch, lib::op_index_get, sp)
+                    if c_scope_depth[ch] == 0 {
+                        match define_global(ch, names[i], is_mut, sp) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                    } else {
+                        match declare_local(ch, names[i], is_mut, sp) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                    }
+                    i = i + 1
+                }
+                // 弹出临时槽值
+                emit(ch, lib::op_pop, sp)
+                if c_scope_depth[ch] == 0 {
+                    let _ = pop_local(ch)
+                } else {
+                    let _ = pop_local(ch)
+                }
+                Ok(true)
+            },
             frontend::Node::LetStmt(name, _, is_mut, _, _, init, sp) => {
                 match cp_expr(ch, init) {
                     Ok(_) => {},

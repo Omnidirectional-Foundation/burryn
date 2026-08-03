@@ -344,6 +344,12 @@ fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
                 i = i + 1
             }
             "record " + chr(123) + " " + join(fields, ", ") + " " + chr(125)
+        } else if tn[x] == "@tup" {
+            let mut parts = []
+            for a in ta[x] {
+                push(parts, ty_pretty(tk, tn, ta, tr, a, names, cnt))
+            }
+            "(" + join(parts, ", ") + ")"
         } else if len(ta[x]) == 0 {
             tn[x]
         } else {
@@ -1123,6 +1129,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     push(fhs, convert_type_expr(ft, subst, prefix))
                 }
                 ty_new_con(tk, tn, ta, tr, tl, rec_type_name(fnames), fhs)
+            },
+            TETuple(ets, _) => {
+                let mut ehs = []
+                for et in ets {
+                    push(ehs, convert_type_expr(et, subst, prefix))
+                }
+                ty_new_con(tk, tn, ta, tr, tl, "@tup", ehs)
             },
             _ => h_unit,
         }
@@ -2533,10 +2546,35 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             Index(target, idx, _) => {
                 let el = fresh("")
                 let tt = infer_expr(target)
-                unify_at(tt, con1("list", el), span_of(target), "when indexing (only lists; for strings use char_at(), for maps use get())")
-                let it = infer_expr(idx)
-                unify_at(it, h_int, span_of(idx), "in this index")
-                el
+                let ts = ty_resolve(tk, tr, tt)
+                if tk[ts] == 0 && tn[ts] == "@tup" {
+                    // tuple 索引：元素类型按位置
+                    let it = infer_expr(idx)
+                    unify_at(it, h_int, span_of(idx), "in this index")
+                    match it {
+                        _ => {},
+                    }
+                    let resolved_i = ty_resolve(tk, tr, it)
+                    if tk[resolved_i] == 0 && tn[resolved_i] == "int" {
+                        // 编译期常量索引才能确定元素类型；运行时用 fresh 兜底
+                        let cv = match idx {
+                            IntLit(n, _) => n,
+                            _ => -1,
+                        }
+                        if cv >= 0 && cv < len(ta[ts]) {
+                            ta[ts][cv]
+                        } else {
+                            fresh("")
+                        }
+                    } else {
+                        fresh("")
+                    }
+                } else {
+                    unify_at(tt, con1("list", el), span_of(target), "when indexing (only lists; for strings use char_at(), for maps use get())")
+                    let it = infer_expr(idx)
+                    unify_at(it, h_int, span_of(idx), "in this index")
+                    el
+                }
             },
             ListLit(elems, _) => {
                 let el = fresh("")
@@ -2545,6 +2583,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     unify_at(el, t, span_of(x), "in this list (all elements must share one type)")
                 }
                 con1("list", el)
+            },
+            TupleLit(elems, _) => {
+                let mut ets = []
+                for x in elems {
+                    push(ets, infer_expr(x))
+                }
+                ty_new_con(tk, tn, ta, tr, tl, "@tup", ets)
             },
             FnLit(params, muts, pspans, param_tys, ret_ty, body, _, _) => {
                 push_scope()
@@ -2753,6 +2798,22 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 level = level - 1
                 b_scheme[b] = generalize(ft) // before unify: see top-level FnDecl note
                 unify_at(tv, ft, nsp, "in this function")
+            },
+            DestructLet(names, nspans, is_mut, init, _) => {
+                let t = infer_let_init(init)
+                let ts = ty_resolve(tk, tr, t)
+                if tk[ts] == 0 && tn[ts] == "@tup" {
+                    if len(ta[ts]) != len(names) {
+                        cerr(span_of(init), "E0061", "", "tuple has " + str(len(ta[ts])) + " element(s), destructuring binds " + str(len(names)))
+                    }
+                    let mut i = 0
+                    while i < len(names) && i < len(ta[ts]) {
+                        let _ = declare(names[i], mono(ta[ts][i]), is_mut, "local", nspans[i])
+                        i = i + 1
+                    }
+                } else {
+                    cerr(span_of(init), "E0609", "only tuples destructure with `let (a, b) = ...`", "cannot destructure a non-tuple value")
+                }
             },
             MethodDecl(rt, name, nsp, lit, ssp) => {
                 if rt == "" {
