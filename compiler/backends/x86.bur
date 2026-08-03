@@ -876,6 +876,102 @@ fn x86gen_map_format_at(off, key_is_str, val_is_str) {
     h1 + loop1 + alloc_zone + reload2 + loop2 + endfill
 }
 
+// x86gen_record_format_at: convert the record at [r15+off] to its
+// "record { f: v, ... }" string in place (matches VM format_val quote=true:
+// str fields wrapped in double quotes, int fields decimal; field names are
+// compile-time). Pass 1 sums the length into rcx, pass 2 writes through rdi.
+// Record layout: [8B n][8B names_enc_off][field0]..[fieldN-1]. Field values
+// are str pointers (len at [s], bytes at [s+8]) or raw int64. Clobbers
+// rax, rcx, rdx, rsi, rdi, r8-r11.
+fn x86gen_record_format_at(off, names, ftypes) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    // pass 1: total length into rcx (prefix "record { " is 9 bytes)
+    let mut p1 = mov_rm(r10, r15, off) + lea(r10, r10, 16) + mov_ri64(rcx, 9)
+    let mut p1f = ""
+    let mut pi = 0
+    while pi < len(names) {
+        if pi > 0 {
+            p1f = p1f + add_ri32(rcx, 2)
+        }
+        p1f = p1f + add_ri32(rcx, str_len(names[pi]) + 2)
+        if ftypes[pi] == "str" {
+            p1f = p1f + mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+        } else {
+            let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+            let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+            p1f = p1f + mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+        }
+        p1f = p1f + add_ri32(r10, 8)
+        pi = pi + 1
+    }
+    // suffix " }" is 2 bytes
+    p1f = p1f + add_ri32(rcx, 2)
+    // allocate the result string on the heap
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9)
+    // pass 2: write through rdi, r10 walks the field slots
+    let p2h = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+    let mut p2f = ""
+    let pre = "record " + chr(123) + " "
+    let mut pb = 0
+    while pb < str_len(pre) {
+        p2f = p2f + mb(byte_at(pre, pb)) + add_ri32(rdi, 1)
+        pb = pb + 1
+    }
+    let mut qi = 0
+    while qi < len(names) {
+        if qi > 0 {
+            p2f = p2f + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+        }
+        let mut nb = 0
+        while nb < str_len(names[qi]) {
+            p2f = p2f + mb(byte_at(names[qi], nb)) + add_ri32(rdi, 1)
+            nb = nb + 1
+        }
+        p2f = p2f + mb(58) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+        if ftypes[qi] == "str" {
+            p2f = p2f + mov_rm(rax, r10, 0) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+        } else {
+            p2f = p2f + mov_rm(rdx, r10, 0) + int_write
+        }
+        p2f = p2f + add_ri32(r10, 8)
+        qi = qi + 1
+    }
+    p2f = p2f + mb(32) + add_ri32(rdi, 1) + mb(125) + add_ri32(rdi, 1)
+    let p2t = pop_r(r9) + mov_mr(r15, off, r9)
+    p1 + p1f + alloc + p2h + p2f + p2t
+}
+
+// x86gen_record_eq: deep-compare the two records at [r15-16] and [r15-8]
+// (matches VM eq_val for ot_record: equal field count and per-field deep
+// equality). Str fields compare length + bytes; other fields raw int64.
+// Result bool written to [r15-16], one slot popped. Clobbers rax, rcx,
+// rdx, rsi, rdi, r8-r11. r11 accumulates the per-field AND.
+fn x86gen_record_eq(ftypes) {
+    let mut body = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_ri64(r11, 1)
+    body = body + mov_rm(rax, r9, 0) + mov_rm(rcx, r10, 0) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+    let mut fi = 0
+    while fi < len(ftypes) {
+        if ftypes[fi] == "str" {
+            let sbody = lea(rsi, rsi, 8) + lea(rdi, rdi, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(rax)
+            body = body + mov_rm(rsi, r9, 16 + 8 * fi) + mov_rm(rdi, r10, 16 + 8 * fi) + mov_rm(rdx, rsi, 0) + mov_rm(r8, rdi, 0) + xor_rr(rax, rax) + cmp_rr(rdx, r8) + jne_rel32(str_len(sbody)) + sbody + and_rr(r11, rax)
+        } else {
+            body = body + mov_rm(rax, r9, 16 + 8 * fi) + mov_rm(rcx, r10, 16 + 8 * fi) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+        }
+        fi = fi + 1
+    }
+    let done = mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+    body + done
+}
+
 // x86gen_range_native: inline code for range(start, end) -> [int].
 // Allocates a list [start, start+1, ..., end-1] on the heap.
 // Stack in: [callee, start, end] at r15-24, r15-16, r15-8. Stack out: [list_ptr].
@@ -1088,6 +1184,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             arg_t
         }
     }
+    // Records track their field schema ("record:<enc>") so field access,
+    // formatting and equality can resolve per-field types. "record" alone
+    // means the schema is unknown (e.g. a cross-function opaque record).
+    fn is_record_type(t) {
+        t == "record" || str_len(t) >= 7 && substr(t, 0, 7) == "record:"
+    }
+    fn record_schema(t) {
+        if str_len(t) >= 7 && substr(t, 0, 7) == "record:" {
+            substr(t, 7, str_len(t) - 7)
+        } else {
+            ""
+        }
+    }
     // merge_type: combine a known type into an existing slot type, keeping
     // the most specific information (maps refine; others just replace).
     fn merge_type(cur, new) {
@@ -1241,6 +1350,32 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             rip = rip + inst_len(rf, rcode, rip)
         }
         rf = rf + 1
+    }
+    // enc -> [field type strings] in field order, populated at RECORD
+    // construction (both the prescan and the emit passes).
+    let mut record_field_types = map()
+    // enc_names: split a names_enc ("f1\nf2\n") into the field name list.
+    fn enc_names(enc) {
+        let mut names = []
+        let mut pos = 0
+        while pos < str_len(enc) {
+            let rest = substr(enc, pos, str_len(enc) - pos)
+            match str_index_of(rest, "\n") {
+                None => {
+                    if str_len(rest) > 0 {
+                        push(names, rest)
+                    }
+                    pos = str_len(enc)
+                },
+                Some(nl) => {
+                    if nl > 0 {
+                        push(names, substr(enc, pos, nl))
+                    }
+                    pos = pos + nl + 1
+                },
+            }
+        }
+        names
     }
     let const_data_len = str_len(const_data)
     fn find_field_in_enc(enc, fname) {
@@ -1682,29 +1817,82 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
                 } else if pop == lib.op_record {
-                    shadow_pop(pshadow_ps, pcode[pit + 1])
-                    shadow_pop(ptshadow_ps, pcode[pit + 1])
+                    let prec_n = pcode[pit + 1]
+                    let prec_cidx = read_u16(pcode, pit + 2)
+                    let prec_enc = const_str(ptfh, prec_cidx)
+                    let mut prec_ft = []
+                    let mut prec_i = 0
+                    while prec_i < prec_n {
+                        push(prec_ft, ptshadow_ps[len(ptshadow_ps) - prec_n + prec_i])
+                        prec_i = prec_i + 1
+                    }
+                    put(record_field_types, prec_enc, prec_ft)
+                    shadow_pop(pshadow_ps, prec_n)
+                    shadow_pop(ptshadow_ps, prec_n)
                     push(pshadow_ps, "")
-                    push(ptshadow_ps, "record")
+                    push(ptshadow_ps, "record:" + prec_enc)
                 } else if pop == lib.op_test_variant {
                     shadow_pop(pshadow_ps, 2)
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
                 } else if pop == lib.op_no_match {
-                    // Never executes at runtime (exhaustive matches). Fully inert:
-                    // no depth-restore, no push, no merge. Keeps the match-end merge
-                    // converging on the real arms' types.
+                    // Never executes at runtime (exhaustive matches); keep it
+                    // fully inert: no depth restore above, no stack effect, no
+                    // type merge below, so the linear walk carries the last
+                    // arm's block value type through to the match-end merge.
                 } else if pop == lib.op_get_field_name || pop == lib.op_get_field {
+                    let pg_rt = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
+                    let mut pg_field_t = "int"
+                    if is_record_type(pg_rt) {
+                        let pg_schema = record_schema(pg_rt)
+                        let mut pg_idx = -1
+                        if pop == lib.op_get_field_name {
+                            let pg_cidx = read_u16(pcode, pit + 1)
+                            let pg_name = const_str(ptfh, pg_cidx)
+                            let mut pg_ei = 0
+                            while pg_ei < len(record_encs) && pg_idx < 0 {
+                                pg_idx = find_field_in_enc(record_encs[pg_ei], pg_name)
+                                pg_ei = pg_ei + 1
+                            }
+                        } else {
+                            pg_idx = pcode[pit + 1]
+                        }
+                        match get(record_field_types, pg_schema) {
+                            Some(pg_ft) => {
+                                if pg_idx >= 0 && pg_idx < len(pg_ft) {
+                                    if pg_ft[pg_idx] == "str" {
+                                        pg_field_t = "str"
+                                    }
+                                }
+                            },
+                            None => {},
+                        }
+                    }
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
                     push(pshadow_ps, "")
-                    push(ptshadow_ps, "int")
+                    push(ptshadow_ps, pg_field_t)
                 } else if pop == lib.op_record_update {
+                    let pu_cidx = read_u16(pcode, pit + 2)
+                    let pu_enc = const_str(ptfh, pu_cidx)
+                    let pu_base = if len(ptshadow_ps) > pcode[pit + 1] {
+                        ptshadow_ps[len(ptshadow_ps) - pcode[pit + 1] - 1]
+                    } else {
+                        "record"
+                    }
                     shadow_pop(pshadow_ps, pcode[pit + 1] + 1)
                     shadow_pop(ptshadow_ps, pcode[pit + 1] + 1)
                     push(pshadow_ps, "")
-                    push(ptshadow_ps, "record")
+                    if is_record_type(pu_base) {
+                        push(ptshadow_ps, pu_base)
+                    } else {
+                        push(ptshadow_ps, "record:" + pu_enc)
+                    }
                 } else if pop == lib.op_spawn || pop == lib.op_select {
                     // conservative: assume these don't affect return type
                 }
@@ -1909,6 +2097,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 if sa_eq == "str" && sb_eq == "str" {
                     w(x86gen_eq_str())
+                } else if is_record_type(sa_eq) && is_record_type(sb_eq) {
+                    let rq_schema = if str_len(record_schema(sa_eq)) > 0 {
+                        record_schema(sa_eq)
+                    } else {
+                        record_schema(sb_eq)
+                    }
+                    match get(record_field_types, rq_schema) {
+                        Some(ft) => w(x86gen_record_eq(ft)),
+                        None => w(x86gen_record_eq([])),
+                    }
                 } else {
                     w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 }
@@ -1930,6 +2128,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 if sa_neq == "str" && sb_neq == "str" {
                     let cmp_body_neq = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + setne(r10)
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body_neq)) + cmp_body_neq + mov_mr(r15, 0 - 16, r10) + vs_pop_n(1))
+                } else if is_record_type(sa_neq) && is_record_type(sb_neq) {
+                    let rn_schema = if str_len(record_schema(sa_neq)) > 0 {
+                        record_schema(sa_neq)
+                    } else {
+                        record_schema(sb_neq)
+                    }
+                    match get(record_field_types, rn_schema) {
+                        Some(ft) => w(x86gen_record_eq(ft) + mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + sete(r8) + mov_mr(r15, 0 - 8, r8)),
+                        None => w(x86gen_record_eq([]) + mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + sete(r8) + mov_mr(r15, 0 - 8, r8)),
+                    }
                 } else {
                     w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 }
@@ -2053,10 +2261,27 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else if op == lib.op_get_field {
                 let fidx = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 16 + 8 * fidx) + mov_mr(r15, 0 - 8, rax))
+                let mut gf_t = "int"
+                let gf_rt = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if is_record_type(gf_rt) {
+                    let gf_schema = record_schema(gf_rt)
+                    match get(record_field_types, gf_schema) {
+                        Some(gf_ft) => {
+                            if fidx < len(gf_ft) {
+                                gf_t = gf_ft[fidx]
+                            }
+                        },
+                        None => {},
+                    }
+                }
                 shadow_pop(shadow, 1)
                 shadow_pop(type_shadow, 1)
                 push(shadow, "")
-                push(type_shadow, "int")
+                push(type_shadow, gf_t)
             } else if op == lib.op_no_match {
                 w(int3())
             } else if op == lib.op_neg {
@@ -2123,6 +2348,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - ci), false))
                                 } else if is_map_type(atype) {
                                     w(x86gen_map_format_at(0 - 8 * (n - ci), map_key_type(atype) == "str", map_val_type(atype) == "str"))
+                                } else if is_record_type(atype) {
+                                    let arc_schema = record_schema(atype)
+                                    if str_len(arc_schema) > 0 {
+                                        match get(record_field_types, arc_schema) {
+                                            Some(arc_ft) => {
+                                                if len(arc_ft) > 0 {
+                                                    w(x86gen_record_format_at(0 - 8 * (n - ci), enc_names(arc_schema), arc_ft))
+                                                }
+                                            },
+                                            None => {},
+                                        }
+                                    }
                                 } else if atype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - ci)))
                                 }
@@ -2172,6 +2409,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), false))
                                 } else if is_map_type(btype) {
                                     w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str"))
+                                } else if is_record_type(btype) {
+                                    let brc_schema = record_schema(btype)
+                                    if str_len(brc_schema) > 0 {
+                                        match get(record_field_types, brc_schema) {
+                                            Some(brc_ft) => {
+                                                if len(brc_ft) > 0 {
+                                                    w(x86gen_record_format_at(0 - 8 * (n - cj), enc_names(brc_schema), brc_ft))
+                                                }
+                                            },
+                                            None => {},
+                                        }
+                                    }
                                 } else if btype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - cj)))
                                 }
@@ -2204,7 +2453,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(mov_rm(rax, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(rcx, rcx) + add_ri32(rcx, 1) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rax) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                     ret_type = "str"
                 } else if callee == "str" {
-                    w(x86gen_str_native())
+                    let str_arg_t = if len(type_shadow) > 0 {
+                        type_shadow[len(type_shadow) - 1]
+                    } else {
+                        ""
+                    }
+                    if str_arg_t == "bool" {
+                        w(x86gen_bool_convert_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    } else if str_arg_t == "str" {
+                        w(mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    } else {
+                        w(x86gen_str_native())
+                    }
                     ret_type = "str"
                 } else if callee == "len" {
                     w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
@@ -2422,10 +2682,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 // Record heap layout: [8B: nfields][8B: names_enc_offset][8B: field0]..[8B: fieldN-1]
                 // Allocation = 16 + n*8 bytes. Copy field values from stack in field order.
                 w(mov_rr(r11, r12) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_ri64(rax, rec_off) + mov_mr(r11, 8, rax) + lea(rsi, r15, 0 - 8 * n) + lea(rdi, r11, 16) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + lea(r15, r15, 0 - 8 * n) + vs_push(r11))
+                let mut rec_ftypes = []
+                let mut rfi = 0
+                while rfi < n {
+                    push(rec_ftypes, type_shadow[len(type_shadow) - n + rfi])
+                    rfi = rfi + 1
+                }
+                put(record_field_types, enc, rec_ftypes)
                 shadow_pop(shadow, n)
                 shadow_pop(type_shadow, n)
                 push(shadow, "record")
-                push(type_shadow, "record")
+                push(type_shadow, "record:" + enc)
             } else if op == lib.op_get_field_name {
                 let cidx = read_u16(code, ip + 1)
                 let fname = const_str(fh, cidx)
@@ -2443,10 +2710,27 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else {
                     w(int3())
                 }
+                let mut gftype = ""
+                let g_rt = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if is_record_type(g_rt) {
+                    let g_schema = record_schema(g_rt)
+                    match get(record_field_types, g_schema) {
+                        Some(g_ft) => {
+                            if fidx >= 0 && fidx < len(g_ft) {
+                                gftype = g_ft[fidx]
+                            }
+                        },
+                        None => {},
+                    }
+                }
                 shadow_pop(shadow, 1)
                 shadow_pop(type_shadow, 1)
                 push(shadow, "")
-                push(type_shadow, "")
+                push(type_shadow, gftype)
             } else if op == lib.op_record_update {
                 let n = code[ip + 1]
                 let cidx = read_u16(code, ip + 2)
@@ -2512,10 +2796,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 // Pop value stack (n+1 items), restore native stack, push new record
                 w(upd_code + lea(r15, r15, 0 - 8 * (n + 1)) + alloc_code + ovw_code + add_ri32(rsp, 8 * (n + 1)) + vs_push(r11))
+                let upd_base_t = if len(type_shadow) > n {
+                    type_shadow[len(type_shadow) - n - 1]
+                } else {
+                    "record"
+                }
                 shadow_pop(shadow, n + 1)
                 shadow_pop(type_shadow, n + 1)
                 push(shadow, "record")
-                push(type_shadow, "record")
+                if is_record_type(upd_base_t) {
+                    push(type_shadow, upd_base_t)
+                } else {
+                    push(type_shadow, "record")
+                }
             } else {
                 w(int3())
             }
