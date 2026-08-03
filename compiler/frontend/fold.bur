@@ -1,10 +1,19 @@
+// fold.bur — 编译期常量折叠：const 初始化表达式在编译期求值，
+// 溢出/除零等在编译期即报错（运行时 trap 提前到编译期）。
+// / Compile-time constant folding: const initializers evaluate at compile time,
+// so runtime traps (overflow, division by zero) surface as compile errors.
+// 求值器分两档：纯表达式求值 fc_* 与语句级重写 fr_*（把 const 声明替换为折叠值）。
+// Evaluation splits into pure expression folding (fc_*) and statement rewriting (fr_*),
+// which replaces const declarations with their folded values.
 import "burryn.dev/compiler/lib"
 
+// 折叠结果：脚本或包集合 / Fold outcome: a script or a package set
 pub enum FoldOut {
     FoldedScript([Node], [lib::DiagT]),
     FoldedPkgs([[[Node]]], [lib::DiagT], [str]),
 }
 
+// 折叠值：字面值、被遮蔽（未定型）、毒值（错误路径）/ Folded value: literal, masked (not yet typed), or poison (error path)
 enum FVal {
     FVInt(int),
     FVFloat(float),
@@ -14,6 +23,7 @@ enum FVal {
     FVPoison,
 }
 
+// 表达式求值结果 / Expression fold result
 enum FRes {
     FRVal(FVal),
     FRBlocked(str),
@@ -21,6 +31,7 @@ enum FRes {
     FRErr,
 }
 
+// 类型折叠结果 / Type fold result
 enum FTRes {
     FTType(int),
     FTBlocked(str),
@@ -28,12 +39,15 @@ enum FTRes {
     FTErr,
 }
 
+// int 边界（i64）/ i64 bounds
 let fold_max_int = 9223372036854775807
 let fold_min_int = -9223372036854775807 - 1
 
+// 折叠限制提示与 trap 提前报错提示（诊断 help 文本）/ Diagnostic help strings for folding limits and early traps
 let fold_help = "const initializers allow literals, references to other constants, arithmetic, comparisons, `&&`/`||`/`!`, and str concatenation"
 let trap_help = "this operation traps at runtime; constant initializers are evaluated at compile time, so the trap is reported as a compile error"
 
+// 脚本级折叠入口 / Script-level fold entry
 pub fn fold_consts(stmts) {
     let mut diags = []
     let mut dfiles = []
@@ -43,6 +57,8 @@ pub fn fold_consts(stmts) {
     FoldOut::FoldedScript(out, diags)
 }
 
+// 包级折叠入口：逐包折叠，pub const 提升为限定名（<包路径>.<名>）供跨包引用 /
+// Package-level entry: folds per package and lifts pub consts to qualified names for cross-package references
 pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
     let mut diags = []
     let mut dfiles = []
@@ -164,6 +180,7 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
     FoldOut::FoldedPkgs(out_pkgs, diags, dfiles)
 }
 
+// 非编译期常量的诊断 / Diagnostic: not a compile-time constant
 fn fc_not_const(label, sp, mut adiags) {
     match sp {
         Sp(s0, e0) => push(adiags, lib::DiagT::Diag(true, "E0015", "`" + label + "` is not a compile-time constant", fold_help, s0, e0)),
@@ -193,6 +210,8 @@ fn fc_of_val(v, label, sp, mut adiags) {
     }
 }
 
+// 表达式求值：支持字面量、const/变量引用、算术比较、逻辑、字符串拼接 /
+// Expression evaluation: literals, const/variable references, arithmetic, comparisons, logic, string concat
 fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
     match e {
         IntLit(v, _) => FRVal(FVInt(v)),
@@ -275,6 +294,8 @@ fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
     }
 }
 
+// 类型折叠：const 的类型在编译期解析（行变量/记录类型同样折叠）/
+// Type folding: a const's type resolves at compile time (row vars and record types fold the same way)
 fn fc_type(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
     match e {
         IntLit(_, _) => FTType(0),
@@ -707,6 +728,8 @@ fn fr_stmts(stmts, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, 
     out
 }
 
+// 语句级折叠：把 const 声明替换为折叠后的字面量声明 /
+// Statement-level folding: replaces const declarations with their folded literal forms
 fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
     match s {
         ConstDecl(name, nsp, is_pub, ty, init, sp) => {
@@ -791,6 +814,7 @@ fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut d
     }
 }
 
+// 表达式级折叠（进入 const 初始化子表达式时用）/ Expression-level folding inside const initializers
 fn fr_expr(e, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
     match e {
         Unary(op, rhs, sp) => Unary(op, fr_expr(rhs, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
