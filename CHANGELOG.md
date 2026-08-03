@@ -25,6 +25,18 @@ process.
   content markers, range literals `1..10`.
 - **Added:** grammar.md covers keywords, tokens, EBNF, record, `<-`
   disambiguation, and interface-file syntax.
+- **Added:** Examples cover the previously undocumented natives — numeric
+  conversions (`trunc`/`float_bits`/`parse_float`), `file_exists`/`read_dir`,
+  `read_stdin`/`stdin_nb`, `byte_chr`, `yield`, `net_nb` — each with a `.golden`.
+- **Changed:** `testdata/` regrouped by topic (`basics/`, `types/`,
+  `regression/`) like `examples/`; the frozen-grammar samples moved out of the
+  monolithic `syntax/` directory and `modules/` joined `pkg/`.
+- **Changed:** Verification scripts merged — `scripts/examples-verify.sh` and
+  `scripts/testdata-verify.sh` (with the bootstrap fixpoint) replace
+  `fixpoint.sh` and `syntax-verify.sh`; `golden-verify.sh` gained multi-directory
+  and trap-exit-4 handling.
+- **Fixed:** x86 backend `chr` now emits UTF-8 for multi-byte code points
+  (was single-byte only, silently wrong for non-ASCII).
 
 
 **Landed S7.6 `defer`** — `defer { ... }` registers a block on the enclosing

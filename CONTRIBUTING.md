@@ -88,9 +88,12 @@ bur run examples/basics/hello.bur | diff - examples/basics/hello.golden
 
 Examples are organized by topic: `basics/`, `types/`, `concurrency/`, `net/`,
 `io/`, `programs/`. Files without a `.golden` (e.g. `*_trap.bur`) are expected
-to abort — run manually and check the exit code.
+to abort — run manually and check the exit code. `io/stdin.bur` needs piped
+input (`printf 'helloWORLD' | bur run io/stdin.bur`) and is skipped by
+`examples-verify.sh`.
 
 样例按主题分目录。无 `.golden` 的文件（如 `*_trap.bur`）预期中止——手动运行并检查退出码。
+`io/stdin.bur` 需要管道输入（`printf 'helloWORLD' | bur run io/stdin.bur`），被 `examples-verify.sh` 豁免。
 
 ### testdata/ layout / testdata/ 目录结构
 
@@ -102,7 +105,18 @@ to abort — run manually and check the exit code.
 | `testdata/fmt/` | Formatter pairs: `.bur` (messy input) → `.golden` (formatted) |
 | `testdata/pkg/` | Multi-package module fixtures (import, pub, MVS) |
 | `testdata/modcache/` | Committed module cache for offline dependency tests |
-| `testdata/syntax/` | Frozen-grammar samples paired with `.golden`, whole-program verification (driven by `scripts/syntax-verify.sh`) |
+| `testdata/basics/` | Whole-program samples for core language (literals, statements, functions), `.golden`-paired |
+| `testdata/types/` | Whole-program samples for the type system (patterns, records, tuples), `.golden`-paired |
+| `testdata/regression/` | Bug-regression samples paired with `.golden`, whole-program verification |
+
+Whole-program suites run via `scripts/golden-verify.sh <dir>...` (`.golden`
+byte-compare; `*_trap.bur` expects exit 4). The two entry points are
+`scripts/examples-verify.sh` (all of `examples/`) and
+`scripts/testdata-verify.sh` (basics/types/regression + bootstrap fixpoint).
+
+全程序套件由 `scripts/golden-verify.sh <dir>...` 驱动（`.golden` 逐字节对比；
+`*_trap.bur` 期待 exit 4）。两个入口：`scripts/examples-verify.sh`（全部
+`examples/`）与 `scripts/testdata-verify.sh`（basics/types/regression + 自举 fixpoint）。
 
 ### Verification protocol (simplified) / 验证协议（简化版）
 
@@ -112,9 +126,9 @@ Before submitting a PR that touches the compiler:
 
 1. `bur check compiler` — no type errors in the compiler itself
 2. `bur test ./...` — all tests pass
-3. Golden examples: `bur run` each and diff against `.golden`
-4. `bur fmt --check compiler` — compiler source is formatted
-5. Bootstrap fixpoint (see above) if the change affects codegen or types
+3. `./scripts/examples-verify.sh` — every example matches its `.golden` (or traps with exit 4)
+4. `./scripts/testdata-verify.sh` — whole-program samples + double bootstrap fixpoint
+5. `bur fmt --check compiler` — compiler source is formatted
 
 ## Code style / 代码风格
 
