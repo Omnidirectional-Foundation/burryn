@@ -1,8 +1,5 @@
-// x86-64 instruction encoder (System V AMD64 ABI).
 import "burryn.dev/compiler/lib"
-// Emits machine code as byte strings via byte_chr; concatenation builds code blocks.
 
-// ---- registers ----
 pub let rax = 0
 pub let rcx = 1
 pub let rdx = 2
@@ -20,12 +17,10 @@ pub let r13 = 13
 pub let r14 = 14
 pub let r15 = 15
 
-// System V AMD64 argument registers in order
 pub fn arg_regs() {
     [rdi, rsi, rdx, rcx, r8, r9]
 }
 
-// ---- byte emission ----
 pub fn e1(b) {
     byte_chr(b)
 }
@@ -42,8 +37,6 @@ pub fn e8(v) {
     e4(v % 4294967296) + e4(v / 4294967296)
 }
 
-// sb: signed int8 -> one byte (two's complement). byte_chr() traps on
-// negatives, so fold into 0..255 before emitting.
 pub fn sb(v) {
     let m = v % 256
     if m < 0 {
@@ -53,7 +46,6 @@ pub fn sb(v) {
     }
 }
 
-// e4s: signed int32 -> 4 bytes (two's complement, little-endian).
 pub fn e4s(v) {
     if v < 0 {
         e4(v + 4294967296)
@@ -62,8 +54,6 @@ pub fn e4s(v) {
     }
 }
 
-// e8s: signed int64 -> 8 bytes (two's complement, little-endian). Avoids
-// 2^64 overflow by negating first then forming (~u + 1) per 32-bit half.
 pub fn e8s(v) {
     if v >= 0 {
         e8(v)
@@ -83,7 +73,6 @@ pub fn e8s(v) {
     }
 }
 
-// ---- REX prefix ----
 fn rex_needed(w, r, x, b) {
     w != 0 || r >= 8 || x >= 8 || b >= 8
 }
@@ -92,7 +81,7 @@ pub fn rex(w, r, x, b) {
     if !rex_needed(w, r, x, b) {
         ""
     } else {
-        let mut v = 64 // 0x40
+        let mut v = 64
         if w != 0 {
             v = v + 8
         }
@@ -109,7 +98,6 @@ pub fn rex(w, r, x, b) {
     }
 }
 
-// ---- ModRM ----
 pub fn modrm(mod, reg, rm) {
     e1(mod % 4 * 64 + reg % 8 * 8 + rm % 8)
 }
@@ -118,13 +106,12 @@ fn modrm_reg(reg, rm) {
     modrm(3, reg, rm)
 }
 
-// ---- mov ----
 pub fn mov_rr(dst, src) {
-    rex(1, src, 0, dst) + e1(137) + modrm_reg(src, dst) // 0x89
+    rex(1, src, 0, dst) + e1(137) + modrm_reg(src, dst)
 }
 
 pub fn mov_ri64(dst, imm) {
-    rex(1, 0, 0, dst) + e1(184 + dst % 8) + e8(imm) // 0xB8+rd
+    rex(1, 0, 0, dst) + e1(184 + dst % 8) + e8(imm)
 }
 
 pub fn mov_ri32(dst, imm) {
@@ -163,82 +150,78 @@ pub fn mov_mr(base, disp, src) {
     }
 }
 
-// ---- push / pop ----
 pub fn push_r(reg) {
-    rex(0, 0, 0, reg) + e1(80 + reg % 8) // 0x50+rd
+    rex(0, 0, 0, reg) + e1(80 + reg % 8)
 }
 
 pub fn pop_r(reg) {
-    rex(0, 0, 0, reg) + e1(88 + reg % 8) // 0x58+rd
+    rex(0, 0, 0, reg) + e1(88 + reg % 8)
 }
 
-// ---- arithmetic ----
 pub fn add_rr(dst, src) {
-    rex(1, src, 0, dst) + e1(1) + modrm_reg(src, dst) // 0x01
+    rex(1, src, 0, dst) + e1(1) + modrm_reg(src, dst)
 }
 
 pub fn sub_rr(dst, src) {
-    rex(1, src, 0, dst) + e1(41) + modrm_reg(src, dst) // 0x29
+    rex(1, src, 0, dst) + e1(41) + modrm_reg(src, dst)
 }
 
 pub fn and_rr(dst, src) {
-    rex(1, src, 0, dst) + e1(33) + modrm_reg(src, dst) // 0x21
+    rex(1, src, 0, dst) + e1(33) + modrm_reg(src, dst)
 }
 
 pub fn or_rr(dst, src) {
-    rex(1, src, 0, dst) + e1(9) + modrm_reg(src, dst) // 0x09
+    rex(1, src, 0, dst) + e1(9) + modrm_reg(src, dst)
 }
 
 pub fn xor_rr(dst, src) {
-    rex(1, src, 0, dst) + e1(49) + modrm_reg(src, dst) // 0x31
+    rex(1, src, 0, dst) + e1(49) + modrm_reg(src, dst)
 }
 
 pub fn cmp_rr(a, b) {
-    rex(1, b, 0, a) + e1(57) + modrm_reg(b, a) // 0x39
+    rex(1, b, 0, a) + e1(57) + modrm_reg(b, a)
 }
 
 pub fn test_rr(a, b) {
-    rex(1, b, 0, a) + e1(133) + modrm_reg(b, a) // 0x85
+    rex(1, b, 0, a) + e1(133) + modrm_reg(b, a)
 }
 
 pub fn neg_r(reg) {
-    rex(1, 0, 0, reg) + e1(247) + modrm_reg(3, reg) // 0xF7 /3
+    rex(1, 0, 0, reg) + e1(247) + modrm_reg(3, reg)
 }
 
 pub fn imul_rr(dst, src) {
-    rex(1, dst, 0, src) + e1(15) + e1(175) + modrm_reg(dst, src) // 0x0F 0xAF
+    rex(1, dst, 0, src) + e1(15) + e1(175) + modrm_reg(dst, src)
 }
 
 pub fn add_ri32(dst, imm) {
     if imm >= -128 && imm <= 127 {
-        rex(1, 0, 0, dst) + e1(131) + modrm_reg(0, dst) + sb(imm) // 0x83 /0
+        rex(1, 0, 0, dst) + e1(131) + modrm_reg(0, dst) + sb(imm)
     } else {
-        rex(1, 0, 0, dst) + e1(129) + modrm_reg(0, dst) + e4s(imm) // 0x81 /0
+        rex(1, 0, 0, dst) + e1(129) + modrm_reg(0, dst) + e4s(imm)
     }
 }
 
 pub fn sub_ri32(dst, imm) {
     if imm >= -128 && imm <= 127 {
-        rex(1, 0, 0, dst) + e1(131) + modrm_reg(5, dst) + sb(imm) // 0x83 /5
+        rex(1, 0, 0, dst) + e1(131) + modrm_reg(5, dst) + sb(imm)
     } else {
-        rex(1, 0, 0, dst) + e1(129) + modrm_reg(5, dst) + e4s(imm) // 0x81 /5
+        rex(1, 0, 0, dst) + e1(129) + modrm_reg(5, dst) + e4s(imm)
     }
 }
 
-// ---- shifts (by CL) ----
 pub fn shl_rcl(dst) {
-    rex(1, 0, 0, dst) + e1(211) + modrm_reg(4, dst) // 0xD3 /4
+    rex(1, 0, 0, dst) + e1(211) + modrm_reg(4, dst)
 }
 
 pub fn shr_rcl(dst) {
-    rex(1, 0, 0, dst) + e1(211) + modrm_reg(5, dst) // 0xD3 /5
+    rex(1, 0, 0, dst) + e1(211) + modrm_reg(5, dst)
 }
 
 pub fn sar_rcl(dst) {
-    rex(1, 0, 0, dst) + e1(211) + modrm_reg(7, dst) // 0xD3 /7
+    rex(1, 0, 0, dst) + e1(211) + modrm_reg(7, dst)
 }
 
-// ---- lea ----
 pub fn lea(dst, base, disp) {
     if disp == 0 && base % 8 != 5 {
         rex(1, dst, 0, base) + e1(141) + modrm(0, dst, base) + sib_for(base)
@@ -249,68 +232,66 @@ pub fn lea(dst, base, disp) {
     }
 }
 
-// ---- control flow ----
 pub fn ret() {
-    e1(195) // 0xC3
+    e1(195)
 }
 
 pub fn call_r(reg) {
-    rex(0, 0, 0, reg) + e1(255) + modrm_reg(2, reg) // 0xFF /2
+    rex(0, 0, 0, reg) + e1(255) + modrm_reg(2, reg)
 }
 
 pub fn jmp_r(reg) {
-    rex(0, 0, 0, reg) + e1(255) + modrm_reg(4, reg) // 0xFF /4
+    rex(0, 0, 0, reg) + e1(255) + modrm_reg(4, reg)
 }
 
 pub fn jmp_rel32(off) {
-    e1(233) + e4s(off) // 0xE9
+    e1(233) + e4s(off)
 }
 
 pub fn je_rel32(off) {
-    e1(15) + e1(132) + e4s(off) // 0x0F 0x84
+    e1(15) + e1(132) + e4s(off)
 }
 
 pub fn jne_rel32(off) {
-    e1(15) + e1(133) + e4s(off) // 0x0F 0x85
+    e1(15) + e1(133) + e4s(off)
 }
 
 pub fn jl_rel32(off) {
-    e1(15) + e1(140) + e4s(off) // 0x0F 0x8C
+    e1(15) + e1(140) + e4s(off)
 }
 
 pub fn jg_rel32(off) {
-    e1(15) + e1(143) + e4s(off) // 0x0F 0x8F
+    e1(15) + e1(143) + e4s(off)
 }
 
 pub fn jle_rel32(off) {
-    e1(15) + e1(142) + e4s(off) // 0x0F 0x8E
+    e1(15) + e1(142) + e4s(off)
 }
 
 pub fn jge_rel32(off) {
-    e1(15) + e1(141) + e4s(off) // 0x0F 0x8D
+    e1(15) + e1(141) + e4s(off)
 }
 
 pub fn ja_rel32(off) {
-    e1(15) + e1(135) + e4s(off) // 0x0F 0x87
+    e1(15) + e1(135) + e4s(off)
 }
 
 pub fn jb_rel32(off) {
-    e1(15) + e1(130) + e4s(off) // 0x0F 0x82
+    e1(15) + e1(130) + e4s(off)
 }
 
 pub fn jae_rel32(off) {
-    e1(15) + e1(131) + e4s(off) // 0x0F 0x83
+    e1(15) + e1(131) + e4s(off)
 }
 
 pub fn jbe_rel32(off) {
-    e1(15) + e1(134) + e4s(off) // 0x0F 0x86
+    e1(15) + e1(134) + e4s(off)
 }
 
 pub fn call_rel32(off) {
-    e1(232) + e4s(off) // 0xE8
+    e1(232) + e4s(off)
 }
 
-// ---- function prologue / epilogue ----
 pub fn prologue(frame_size) {
     let code = push_r(rbp) + mov_rr(rbp, rsp)
     if frame_size > 0 {
@@ -324,120 +305,86 @@ pub fn epilogue() {
     mov_rr(rsp, rbp) + pop_r(rbp) + ret()
 }
 
-// ---- nop / int3 ----
 pub fn nop() {
-    e1(144) // 0x90
+    e1(144)
 }
 
 pub fn int3() {
-    e1(204) // 0xCC
+    e1(204)
 }
 
 pub fn rep_movsb() {
-    e1(243) + e1(164) // F3 A4
+    e1(243) + e1(164)
 }
 
 pub fn repe_cmpsb() {
-    e1(243) + e1(166) // F3 A6
+    e1(243) + e1(166)
 }
 
-// ---- setcc (set byte on condition) ----
 pub fn sete(dst) {
-    rex(0, 0, 0, dst) + e1(15) + e1(148) + modrm_reg(0, dst) // 0x0F 0x94
+    rex(0, 0, 0, dst) + e1(15) + e1(148) + modrm_reg(0, dst)
 }
 
 pub fn setne(dst) {
-    rex(0, 0, 0, dst) + e1(15) + e1(149) + modrm_reg(0, dst) // 0x0F 0x95
+    rex(0, 0, 0, dst) + e1(15) + e1(149) + modrm_reg(0, dst)
 }
 
 pub fn setl(dst) {
-    rex(0, 0, 0, dst) + e1(15) + e1(156) + modrm_reg(0, dst) // 0x0F 0x9C
+    rex(0, 0, 0, dst) + e1(15) + e1(156) + modrm_reg(0, dst)
 }
 
 pub fn setg(dst) {
-    rex(0, 0, 0, dst) + e1(15) + e1(159) + modrm_reg(0, dst) // 0x0F 0x9F
+    rex(0, 0, 0, dst) + e1(15) + e1(159) + modrm_reg(0, dst)
 }
 
-// ---- idiv (signed divide rdx:rax by reg; quotient rax, remainder rdx) ----
 pub fn idiv_r(reg) {
-    rex(1, 0, 0, reg) + e1(247) + modrm_reg(7, reg) // 0xF7 /7
+    rex(1, 0, 0, reg) + e1(247) + modrm_reg(7, reg)
 }
 
-// ---- div (unsigned divide rdx:rax by reg; quotient rax, remainder rdx) ----
 pub fn div_r(reg) {
-    rex(1, 0, 0, reg) + e1(247) + modrm_reg(6, reg) // 0xF7 /6
+    rex(1, 0, 0, reg) + e1(247) + modrm_reg(6, reg)
 }
 
 pub fn cqo() {
-    e1(72) + e1(153) // 0x48 0x99
+    e1(72) + e1(153)
 }
 
-// ---- setcc for >= and <= ----
 pub fn setge(dst) {
-    rex(0, 0, 0, dst) + e1(15) + e1(157) + modrm_reg(0, dst) // 0x0F 0x9D
+    rex(0, 0, 0, dst) + e1(15) + e1(157) + modrm_reg(0, dst)
 }
 
 pub fn setle(dst) {
-    rex(0, 0, 0, dst) + e1(15) + e1(158) + modrm_reg(0, dst) // 0x0F 0x9E
+    rex(0, 0, 0, dst) + e1(15) + e1(158) + modrm_reg(0, dst)
 }
 
-// ---- movzx eax, al (zero-extend the low byte into rax) ----
-// used after setcc to produce a clean 0/1 int64 on the value stack
 pub fn movzx_eax_al() {
-    e1(15) + e1(182) + modrm_reg(0, 0) // 0x0F 0xB6 /0 mod=11 r/m=al
+    e1(15) + e1(182) + modrm_reg(0, 0)
 }
 
-// ---- lea dst, [rip + rel32] (RIP-relative) ----
-// _start uses this to load the jump table base into r13. rel32 is signed,
-// measured from the instruction *after* this 7-byte sequence.
 pub fn lea_rip_rel32(dst, rel32) {
-    rex(1, dst, 0, 0) + e1(141) + modrm(0, dst, 5) + e4s(rel32) // 0x8D /reg mod=00 r/m=101
+    rex(1, dst, 0, 0) + e1(141) + modrm(0, dst, 5) + e4s(rel32)
 }
 
-// ---- value-stack helpers (r15 = top, grows up; r14 = frame base) ----
-// push reg onto the value stack
 pub fn vs_push(reg) {
     mov_mr(r15, 0, reg) + add_ri32(r15, 8)
 }
 
-// push 0 (unit / false / dummy callee self-slot)
 pub fn vs_push_zero() {
-    // mov qword [r15], 0  (49 C7 07 00 00 00 00) + add r15, 8
     e1(73) + e1(199) + modrm(0, 0, r15) + e4(0) + add_ri32(r15, 8)
 }
 
-// discard n slots from the value stack
 pub fn vs_pop_n(n) {
     sub_ri32(r15, 8 * n)
 }
 
-// ================================================================
-// Phase 1 native x86-64 code generator.
-// Mirrors cgen.bur's structure (inst_len / jump_targets / emit_inst)
-// but emits raw machine code instead of C strings. Values are raw
-// int64 (8 bytes/slot, no tagging). r15 = value stack top (grows up),
-// r14 = frame base, r13 = jump table base (set once by _start),
-// rbp = saved caller r14, rsp = native call stack.
-// ================================================================
-
-// x86gen_prologue: save caller base, set callee base to the self slot.
-// Locals live on the value stack (pushed by declarations), not in a reserved
-// frame area — mirroring the C backend's `base = top - arity - 1`.
 fn x86gen_prologue(arity, _locals) {
     push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1))
 }
 
-// x86gen_epilogue: peek the return value, collapse the frame to the
-// base, drop the result at the base slot, restore caller r14, ret.
 fn x86gen_epilogue() {
     mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + pop_r(rbp) + ret()
 }
 
-// x86gen_str_native: inline code for str(n) -> str.
-// Divides |n| by 10 repeatedly, pushes digit bytes, then allocates and fills.
-// A negative n records a '-' flag in r8, negates, and prepends '-' before the
-// digits. Unsigned div (div_r) so INT64_MIN converts without overflow.
-// Clobbers rax, rcx, rdx, r8, r10, r11, rdi.
 fn x86gen_str_native() {
     let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
     let loop_jne = jne_rel32(0 - (str_len(loop_body) + 6))
@@ -451,27 +398,16 @@ fn x86gen_str_native() {
     head + neg_path + loop_start + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
 }
 
-// x86gen_push_native: inline code for push(list, val).
-// List header: [len][cap][elements_ptr]. Header never moves.
-// Grows elements array if len==cap (doubles cap, min 4).
-// Stack in: [callee, list_ptr, val] at r15-24, r15-16, r15-8. Stack out: [unit].
 fn x86gen_push_native() {
     let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(4) + add_ri32(r10, 4) + mov_rr(r11, r12) + mov_rm(rsi, rax, 16) + mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_rr(rdi, r11) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
     let store = mov_rm(rcx, rax, 0) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_mr(r11, 0, r9) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + xor_rr(r11, r11) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
     mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rm(r10, rax, 8) + cmp_rr(rcx, r10) + jne_rel32(str_len(growth)) + growth + store
 }
 
-// x86gen_pop_native: inline code for pop(list) -> element.
-// Decrements len and returns the last element via elements_ptr.
-// Stack in: [callee, list_ptr] at r15-16, r15-8. Stack out: [element].
 fn x86gen_pop_native() {
     mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + sub_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_rm(r9, r11, 0) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1)
 }
 
-// x86gen_str_convert_at: inline int-to-str conversion.
-// Reads int from stack at [r15+off], writes string ptr back to same slot.
-// Negative values get a '-' prefix via the r8 flag; unsigned div for INT64_MIN.
-// Clobbers rax,rcx,rdx,r8,r10,r11,rdi.
 fn x86gen_str_convert_at(off) {
     let div_loop = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
     let div_jne = jne_rel32(0 - (str_len(div_loop) + 6))
@@ -485,29 +421,16 @@ fn x86gen_str_convert_at(off) {
     head + neg_path + loop_start + div_loop + div_jne + alloc + pop_loop + pop_jne + mov_mr(r15, off, r11)
 }
 
-// x86gen_bool_convert_at: inline 0/1 -> "true"/"false" string.
-// Reads int at [r15+off], writes str ptr back to same slot.
-// Clobbers rax, rdx, r10, r11.
 fn x86gen_bool_convert_at(off) {
     let fpath = mov_rr(r11, r12) + mov_ri64(r10, 5) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 435728179558) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11)
     let tpath = mov_rr(r11, r12) + mov_ri64(r10, 4) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 1702195828) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11) + jmp_rel32(str_len(fpath))
     mov_rm(rax, r15, off) + test_rr(rax, rax) + je_rel32(str_len(tpath)) + tpath + fpath
 }
 
-// x86gen_unit_convert_at: inline unit -> "()" string.
-// Reads int at [r15+off], writes str ptr back to same slot.
-// Clobbers rax, rdx, r10, r11.
 fn x86gen_unit_convert_at(off) {
     mov_rm(rax, r15, off) + mov_rr(r11, r12) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 10536) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11)
 }
 
-// x86gen_ord_native: inline code for ord(str) -> leading UTF-8 code point.
-// Decodes 1-4 continuation bytes per RFC 3629. String at [r15-8].
-// Clobbers rax, rcx, rdx, rsi, r8, r9.
-// is_unimpl_native: true for VM natives the x86 backend does not inline
-// (mirrors decl_native in compiler/frontend/types.bur minus the inlined
-// subset handled in op_call). Calls to these emit int3 -> SIGTRAP so the
-// parity suite skips the program instead of miscompiling it.
 fn is_unimpl_native(name) {
     name == "args" || name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
 }
@@ -533,11 +456,6 @@ fn x86gen_ord_native() {
     pre + t_ascii + ascii_je + t_2 + try3_jne + dec_2 + cont2_jmp + t_3 + try4_jne + dec_3 + cont3_jmp + dec_4 + cont + done
 }
 
-// x86gen_chr_native: inline UTF-8 encoding of a code point -> str.
-// Stack in: [callee, cp] at r15-16, r15-8. Out: [str] at r15-16.
-// Byte count dispatch: <0x80 -> 1, <0x800 -> 2, <0x10000 -> 3, else 4.
-// Each path allocates [len][bytes] (8B per byte) and returns independently.
-// Clobbers rax, rcx, rdx, r8-r11.
 fn x86gen_chr_native() {
     let p1 = mov_rr(r11, r12) + mov_mr(r11, 8, rax) + mov_ri64(r10, 1) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 16) + vs_pop_n(1)
     let p2 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 192) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 24) + vs_pop_n(1)
@@ -552,10 +470,6 @@ fn x86gen_chr_native() {
     mov_rm(rax, r15, 0 - 8) + chk1 + p1 + jmp1 + chk2 + p2 + jmp2 + chk3 + p3 + jmp3 + p4
 }
 
-// x86gen_contains_native: inline code for contains(list, x) -> bool.
-// Linear scan of list elements comparing 8B values (int/ptr) to x.
-// Stack in: [callee, list, x] at r15-24, r15-16, r15-8. Out: [bool].
-// Clobbers rax, rcx, rdx, r8-r11.
 fn x86gen_contains_native() {
     let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rsi, r9, 0) + mov_rm(r10, r9, 16) + xor_rr(r11, r11)
     let found = mov_ri64(rax, 1) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
@@ -567,19 +481,10 @@ fn x86gen_contains_native() {
     head + test + access + inc + back + notfound + found
 }
 
-// x86gen_slice_native: inline code for slice(list, start, end) -> list.
-// New list of len = end-start with elements copied from [start, end).
-// Stack in: [callee, list, start, end] at r15-32, -24, -16, -8. Out: [list].
-// Clobbers rax, rcx, rdx, r8-r11, rsi, rdi.
 fn x86gen_slice_native() {
     mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + sub_rr(r9, r8) + mov_rm(r10, rax, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rr(r11, r12) + mov_mr(r11, 0, r9) + mov_mr(r11, 8, r9) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rsi, rdx) + mov_rr(rdi, r10) + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(rdx, r11) + mov_rr(r12, rdx) + mov_mr(r15, 0 - 32, r11) + vs_pop_n(3)
 }
 
-// x86gen_list_format_at: convert the list at [r15+off] to its
-// "[elem, ...]" string in place (matches VM format_val). is_str selects
-// str (quoted) or int element formatting at compile time; element lists
-// are homogeneous. Clobbers rax, rcx, rdx, rsi, rdi, r8-r11. Uses the
-// native stack for digit reversal.
 fn x86gen_list_format_at(off, is_str) {
     let mb_al = e1(136) + e1(7)
     let mb = fn(c) {
@@ -625,28 +530,16 @@ fn x86gen_list_format_at(off, is_str) {
     h1 + test1 + sep1 + e1_load + tail1 + next1 + alloc_zone + test2 + sep2 + e2_load + tail2 + next2 + endfill
 }
 
-// x86gen_concat_native: inline code for concat(x, y) -> list.
-// New list = x's elements followed by y's elements.
-// Stack in: [callee, x, y] at r15-24, r15-16, r15-8. Out: [list].
-// Clobbers rax, rcx, rdx, r8-r11, rsi, rdi.
 fn x86gen_concat_native() {
     mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rcx, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rcx, rdx) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, r9, 16) + mov_rr(rdi, r10) + mov_rm(rdx, r9, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rsi, r8, 16) + mov_rm(rdx, r8, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rax, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rax, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + add_rr(rax, r11) + mov_rr(r12, rax) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
 }
 
-// Stack in: [a, b]. Stack out: [0/1]. Lengths differ -> false; else
-// byte-by-byte compare (repe cmpsb). Clobbers rax, rcx, rdx, r9, r10,
-// rsi, rdi.
 fn x86gen_eq_str() {
     let cmp_body = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(r10)
     let done = mov_mr(r15, 0 - 16, r10) + vs_pop_n(1)
     mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
 }
 
-// x86gen_join_native: inline code for join([str], sep) -> str.
-// Stack in: [callee, list, sep] at r15-24, r15-16, r15-8. Out: [str].
-// Pass 1 sums element lengths plus sep between elements into rdx; then a
-// single str [len][bytes] is allocated and pass 2 copies elements and sep
-// through rdi. r9=list, r10=sep, r8=n, r11=sn, rax=i, rdx=total/len.
 fn x86gen_join_native() {
     let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + xor_rr(rdx, rdx) + xor_rr(rax, rax)
     let done_copy = vs_pop_n(2)
@@ -668,10 +561,6 @@ fn x86gen_join_native() {
     head + loop_len + done_len_tail + loop_copy + done_copy
 }
 
-// x86gen_trim_native: inline code for trim(s) -> str.
-// Stack in: [callee, s] at r15-16, r15-8. Out: [str].
-// Strips ASCII whitespace (0x20 and 0x09..0x0d) from both ends; the
-// result is a freshly allocated str [len][bytes]. r9=s, r8=n, rdx=i, rcx=j.
 fn x86gen_trim_native() {
     let read = mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rax, rsi, 0) + mov_ri64(r10, 255) + and_rr(rax, r10)
     let done = sub_rr(rcx, rdx) + mov_mr(r15, 0 - 16, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rsi, r15, 0 - 16) + mov_mr(r15, 0 - 16, rsi) + vs_pop_n(1)
@@ -695,11 +584,6 @@ fn x86gen_trim_native() {
     head + loop1 + loop2 + done
 }
 
-// x86gen_parse_int_native: inline code for parse_int(s) -> Option<int>.
-// Reuses x86gen_trim_native (same [callee, s] layout) then parses a signed
-// decimal with an overflow check per digit. Stack in: [callee, s] at
-// r15-16, r15-8. Out: [enum] (Some [0][0][v] / None [0][1]) at r15-8.
-// Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
 fn x86gen_parse_int_native() {
     let trim = x86gen_trim_native()
     let head = mov_rm(r9, r15, 0 - 8) + mov_rm(r8, r9, 0) + lea(rsi, r9, 8) + mov_rr(rdi, rsi) + add_rr(rdi, r8) + mov_ri64(r11, 1) + xor_rr(r10, r10)
@@ -724,12 +608,6 @@ fn x86gen_parse_int_native() {
     trim + head + empty_check + sign_read + minus_cmp + sign_jmp + plus + minus + digit_check + limit_set + limit_neg + loop_head + digit_parse + overflow_check + accumulate + back + success + positive + none
 }
 
-// x86gen_split_native: inline code for split(s, sep) -> [str].
-// Stack in: [callee, s, sep] at r15-24, r15-16, r15-8. Out: [list].
-// List object [len][cap][elems_ptr] with cap = n+1 preallocated; each
-// element is a freshly allocated str [len][bytes]. r9=s, r10=sep, r8=n,
-// r11=sn, rax=i, rdx=start; obj and w live in the arg slots r15-16 and
-// r15-8, newstr is staged in the callee slot r15-24.
 fn x86gen_split_native() {
     let push = mov_mr(r15, 0 - 24, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rdi, r15, 0 - 8) + mov_rm(rsi, r15, 0 - 24) + mov_mr(rdi, 0, rsi) + add_ri32(rdi, 8) + mov_mr(r15, 0 - 8, rdi)
     let done = mov_rr(rcx, r8) + sub_rr(rcx, rdx) + push + mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + sub_rr(rsi, rdi) + sub_ri32(rsi, 24) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shr_rcl(rsi) + mov_mr(rdi, 0, rsi) + mov_mr(r15, 0 - 24, rdi) + vs_pop_n(2)
@@ -745,11 +623,6 @@ fn x86gen_split_native() {
     head + loop_head + no_match + back + matched + matched_back + done
 }
 
-// x86gen_str_find_native: inline code for str_contains(s, sub) -> bool
-// and str_index_of(s, sub) -> Option<int>, sharing one linear scan with
-// repe cmpsb. as_option selects the enum result.
-// Stack in: [callee, s, sub] at r15-24, r15-16, r15-8. Out: [bool|enum].
-// Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
 fn x86gen_str_find_native(as_option) {
     let some = if as_option {
         mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
@@ -769,22 +642,10 @@ fn x86gen_str_find_native(as_option) {
     head + loop_head + next + back + none + some
 }
 
-// x86gen_map_native: inline code for map() -> map.
-// Map header: [n][cap][keys_ptr][vals_ptr] (32 bytes). keys/vals are
-// separate 8-byte-slot arrays (raw int or str pointer per slot); all-zero
-// header = empty map. Not covered by SPEC, matches VM semantics.
-// Stack in: [callee] at r15-8. Stack out: [map_ptr].
-// Clobbers rdx, r11, r12.
 fn x86gen_map_native() {
     mov_rr(r11, r12) + xor_rr(rdx, rdx) + mov_mr(r11, 0, rdx) + mov_mr(r11, 8, rdx) + mov_mr(r11, 16, rdx) + mov_mr(r11, 24, rdx) + add_ri32(r12, 32) + mov_mr(r15, 0 - 8, r11)
 }
 
-// x86gen_get_map_native: inline code for get(map, key) -> Option<T>.
-// Linear scan over keys; key_is_str selects content compare (repe cmpsb,
-// length first) over raw 8B compare. Missing key -> None ([eh][vi=1]),
-// found -> Some ([eh][vi=0][val]) with val read from the parallel vals
-// array. Stack in: [callee, map, key] at r15-24, r15-16, r15-8. Out: [enum].
-// Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
 fn x86gen_get_map_native(key_is_str) {
     let some_body = mov_rm(rax, r9, 0) + mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let none = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2) + jmp_rel32(str_len(some_body))
@@ -804,11 +665,6 @@ fn x86gen_get_map_native(key_is_str) {
     head + loop_head + body + advance + back + none + some_body
 }
 
-// x86gen_put_map_native: inline code for put(map, key, val) -> unit.
-// Grows keys/vals arrays (cap*2, min 4, rep movsb copy) when len==cap,
-// then linear-scans for the key: existing -> overwrite val, absent ->
-// append at index len. Stack in: [callee, map, key, val] at r15-32, -24,
-// -16, -8. Out: [unit]. Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
 fn x86gen_put_map_native(key_is_str) {
     let done = xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + vs_pop_n(3)
     let found = mov_rm(rax, r15, 0 - 8) + mov_mr(r9, 0, rax)
@@ -835,11 +691,6 @@ fn x86gen_put_map_native(key_is_str) {
     head1 + growth + post_head + loop_head + body + advance + back + not_found + found + done
 }
 
-// x86gen_delete_map_native: inline code for delete(map, key) -> unit.
-// Linear-scans for the key; on hit shifts every later entry down by one
-// (memmove-style forward copy) in both arrays and decrements len. Absent
-// key is a no-op. Stack in: [callee, map, key] at r15-24, r15-16, r15-8.
-// Out: [unit]. Clobbers rax, rcx, rdx, rsi, rdi, r8-r11.
 fn x86gen_delete_map_native(key_is_str) {
     let finish = xor_rr(rax, rax) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let kshift = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdi, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
@@ -865,21 +716,11 @@ fn x86gen_delete_map_native(key_is_str) {
     head + loop_head + body + advance + back + not_found + found_body + finish
 }
 
-// x86gen_keys_map_native: inline code for keys(map) -> [T].
-// New list [len][len][elems_ptr] (cap = len) filled by copying the raw
-// 8B key slots. Stack in: [callee, map] at r15-16, r15-8. Out: [list].
-// Clobbers rax, rcx, rdx, rsi, rdi, r9-r12.
 fn x86gen_keys_map_native() {
     let tail = mov_rm(rdx, r11, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(r12, rdx) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
     mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r10) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + tail
 }
 
-// x86gen_map_format_at: convert the map at [r15+off] to its "{k: v, ...}"
-// string in place (matches VM format_val; str keys/vals quoted via the
-// list formatter's no-escape-expansion convention, ints decimal).
-// key_is_str / val_is_str are compile-time flags. Pass 1 sums the length
-// into rcx, pass 2 writes through rdi. Clobbers rax, rcx, rdx, rsi, rdi,
-// r8-r11. Uses the native stack for digit reversal and the result ptr.
 fn x86gen_map_format_at(off, key_is_str, val_is_str) {
     let mb_al = e1(136) + e1(7)
     let mb = fn(c) {
@@ -940,13 +781,6 @@ fn x86gen_map_format_at(off, key_is_str, val_is_str) {
     h1 + loop1 + alloc_zone + reload2 + loop2 + endfill
 }
 
-// x86gen_record_format_at: convert the record at [r15+off] to its
-// "record { f: v, ... }" string in place (matches VM format_val quote=true:
-// str fields wrapped in double quotes, int fields decimal; field names are
-// compile-time). Pass 1 sums the length into rcx, pass 2 writes through rdi.
-// Record layout: [8B n][8B names_enc_off][field0]..[fieldN-1]. Field values
-// are str pointers (len at [s], bytes at [s+8]) or raw int64. Clobbers
-// rax, rcx, rdx, rsi, rdi, r8-r11.
 fn x86gen_record_format_at(off, names, ftypes) {
     let mb_al = e1(136) + e1(7)
     let mb = fn(c) {
@@ -958,7 +792,6 @@ fn x86gen_record_format_at(off, names, ftypes) {
     let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
     let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
     let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
-    // pass 1: total length into rcx (prefix "record { " is 9 bytes)
     let mut p1 = mov_rm(r10, r15, off) + lea(r10, r10, 16) + mov_ri64(rcx, 9)
     let mut p1f = ""
     let mut pi = 0
@@ -977,11 +810,8 @@ fn x86gen_record_format_at(off, names, ftypes) {
         p1f = p1f + add_ri32(r10, 8)
         pi = pi + 1
     }
-    // suffix " }" is 2 bytes
     p1f = p1f + add_ri32(rcx, 2)
-    // allocate the result string on the heap
     let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9)
-    // pass 2: write through rdi, r10 walks the field slots
     let p2h = mov_rm(r10, r15, off) + lea(r10, r10, 16)
     let mut p2f = ""
     let pre = "record " + chr(123) + " "
@@ -1014,11 +844,6 @@ fn x86gen_record_format_at(off, names, ftypes) {
     p1 + p1f + alloc + p2h + p2f + p2t
 }
 
-// x86gen_record_eq: deep-compare the two records at [r15-16] and [r15-8]
-// (matches VM eq_val for ot_record: equal field count and per-field deep
-// equality). Str fields compare length + bytes; other fields raw int64.
-// Result bool written to [r15-16], one slot popped. Clobbers rax, rcx,
-// rdx, rsi, rdi, r8-r11. r11 accumulates the per-field AND.
 fn x86gen_record_eq(ftypes) {
     let mut body = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_ri64(r11, 1)
     body = body + mov_rm(rax, r9, 0) + mov_rm(rcx, r10, 0) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
@@ -1036,9 +861,6 @@ fn x86gen_record_eq(ftypes) {
     body + done
 }
 
-// x86gen_range_native: inline code for range(start, end) -> [int].
-// Allocates a list [start, start+1, ..., end-1] on the heap.
-// Stack in: [callee, start, end] at r15-24, r15-16, r15-8. Stack out: [list_ptr].
 fn x86gen_range_native() {
     let fill_loop = mov_mr(rdi, 0, rax) + add_ri32(rdi, 8) + add_ri32(rax, 1) + sub_ri32(r9, 1)
     let fill_jne = jne_rel32(0 - (str_len(fill_loop) + 6))
@@ -1046,20 +868,10 @@ fn x86gen_range_native() {
     mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rr(rax, r9) + sub_rr(rax, r8) + mov_rr(rcx, rax) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + test_rr(rcx, rcx) + je_rel32(str_len(fill_all)) + mov_rr(rdi, r10) + mov_rr(rax, r8) + mov_rr(r9, rcx) + fill_all + mov_rr(r10, rcx) + mov_ri32(rcx, 3) + shl_rcl(r10) + add_ri32(r10, 24) + add_rr(r10, r11) + mov_rr(r12, r10) + vs_pop_n(3) + vs_push(r11)
 }
 
-// x86gen_start: program entry. nfn = number of functions.
-// Layout: [funcs][jumptable 8*nfn][_start]. The lea reaches back past
-// itself (7 bytes) and past the jump table (8*nfn) to the table base.
 fn x86gen_start(nfn, n_globals) {
-    // lea must be first: its RIP-relative offset assumes position 0 in _start
     lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
-    // mmap(0, 16MB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0) -> r12
-
-    // globals array: rbx = heap base, bump r12 past it (zero-filled by mmap)
 }
 
-// x86gen_program_to_buf: compile a program to a self-contained ELF64
-// static executable (byte string). Takes the 10 Compiled-variant
-// fields; no line tables (Phase 1 has no source debug info).
 pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, _en_qual, _en_vnames, _en_varities) {
     fn read_u16(code, at) {
         code[at] * 256 + code[at + 1]
@@ -1076,9 +888,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             _ => 0,
         }
     }
-    // inst_len: bytecode length of the instruction at ip (copied from
-    // cgen.bur; needed to walk the stream correctly even for opcodes
-    // Phase 1 never emits).
     fn inst_len(fh, code, ip) {
         let op = code[ip]
         if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
@@ -1101,9 +910,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             1
         }
     }
-    // jump_targets: collect the set of IPs that are jump destinations
-    // (copied from cgen.bur; used only for labels, which x86 does not
-    // need — kept for parity / future use).
     fn jump_targets(fh) {
         let code = f_code[fh]
         let mut targets = map()
@@ -1142,7 +948,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         targets
     }
-    // count_locals: max local slot referenced (+1) for frame sizing.
     fn count_locals(fh) {
         let code = f_code[fh]
         let mut max_slot = f_arity[fh]
@@ -1159,7 +964,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         max_slot + 1
     }
-    // find_fn_by_name: linear-search the function arena for a name.
     fn find_fn_by_name(name) {
         let mut i = 0
         while i < len(f_name) {
@@ -1170,7 +974,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         0 - 1
     }
-    // shadow_pop: remove the last n entries from the shadow list.
     fn shadow_pop(mut lst, n) {
         let mut k = 0
         while k < n && len(lst) > 0 {
@@ -1178,11 +981,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             k = k + 1
         }
     }
-    // ---- map/list type helpers (shared by the prescan fixpoint and emit).
-    // Type strings: "int" "str" "bool" "unit" "list" "list-str" "list-int"
-    // "map" "map-str" "map-int" "map-str-int" "map-str-str" "map-int-int"
-    // "map-int-str" "enum" "record" "" (unknown). Higher specificity wins
-    // when merging (e.g. "map-str-int" beats "map" at a call site).
     fn type_specificity(t) {
         if t == "" {
             0
@@ -1248,9 +1046,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             arg_t
         }
     }
-    // Records track their field schema ("record:<enc>") so field access,
-    // formatting and equality can resolve per-field types. "record" alone
-    // means the schema is unknown (e.g. a cross-function opaque record).
     fn is_record_type(t) {
         t == "record" || str_len(t) >= 7 && substr(t, 0, 7) == "record:"
     }
@@ -1261,8 +1056,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             ""
         }
     }
-    // merge_type: combine a known type into an existing slot type, keeping
-    // the most specific information (maps refine; others just replace).
     fn merge_type(cur, new) {
         if cur == "" {
             new
@@ -1274,10 +1067,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             new
         }
     }
-    // merge_pos: slot type tracking for a stack position. The position's
-    // current value may have changed type (e.g. a popped call result left
-    // "unit" behind), so only keep the old type when the new one is the same
-    // generic map and the old one is a refined version of it.
     fn merge_pos(pcur, pnew) {
         if pcur == "" || pnew == pcur {
             pnew
@@ -1289,10 +1078,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
 
     let nfn = len(f_name)
-    // Collect address-taken constants into a data section emitted before the
-    // code, so addresses are known during codegen (no patching). Strings are
-    // stored as [8-byte length][content bytes], padded to 8-byte alignment;
-    // enum metadata/constructors use the raw layouts from SPEC §6.7.
     let mut const_data = ""
     let mut const_slot_map = map()
     let mut enum_const_map = map()
@@ -1378,10 +1163,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         sf = sf + 1
     }
     let _ = str_len(const_data)
-    // Pre-scan for record names_enc strings: collect the subset of CStr
-    // constants that are referenced by RECORD / RECORD_UPDATE opcodes.
-    // Each names_enc encodes field names separated by '\n'.
-    let mut record_encs = [] // parallel lists: names_enc string + its const_data offset
+    let mut record_encs = []
     let mut record_offs = []
     fn add_record_enc(enc) {
         let mut i = 0
@@ -1415,10 +1197,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         rf = rf + 1
     }
-    // enc -> [field type strings] in field order, populated at RECORD
-    // construction (both the prescan and the emit passes).
     let mut record_field_types = map()
-    // enc_names: split a names_enc ("f1\nf2\n") into the field name list.
     fn enc_names(enc) {
         let mut names = []
         let mut pos = 0
@@ -1472,7 +1251,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             None => 0,
         }
     }
-    // Pre-scan: collect global variable names and assign slots.
     let mut globals_map = map()
     let mut n_globals = 0
     let mut gf = 0
@@ -1497,11 +1275,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         gf = gf + 1
     }
-    // Pre-scan all functions to determine return types (reversed: callees
-    // first) and cross-function parameter types. Parameter types are merged
-    // forward at call sites and seeded back into caller locals over 4
-    // fixpoint rounds, so map types (map -> map-str -> map-str-int) converge
-    // even when a callee refines its own params after the caller runs.
     let mut fn_ret_type = []
     let mut rhAlloc = 0
     while rhAlloc < nfn {
@@ -1539,7 +1312,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(ppos_types, "")
                 pseed = pseed + 1
             }
-            // seed param slots from the converged cross-function table
             let mut pp = 1
             while pp < pa_ps + 1 {
                 if pp - 1 < len(fn_param_types[ptfh]) {
@@ -1637,7 +1409,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         ""
                     }
-                    // capture arg types and arg shadows before popping
                     let mut p_arg_t = []
                     let mut p_arg_s = []
                     let mut pca = 0
@@ -1673,7 +1444,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             push(ptshadow_ps, "list-int")
                         }
                     } else if pcallee == "put" || pcallee == "get" || pcallee == "delete" {
-                        // refine the map argument from its key (and val for put)
                         let mt = if pn >= 1 {
                             p_arg_t[0]
                         } else {
@@ -1737,13 +1507,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         let phandle = find_fn_by_name(pcallee)
                         if phandle >= 0 {
-                            // forward: merge call-site arg types into callee params
                             let mut pff = 0
                             while pff < pn && pff < len(fn_param_types[phandle]) {
                                 fn_param_types[phandle][pff] = merge_type(fn_param_types[phandle][pff], p_arg_t[pff])
                                 pff = pff + 1
                             }
-                            // backward: refine caller slots from callee params
                             let mut pbb = 0
                             while pbb < pn && pbb < len(fn_param_types[phandle]) {
                                 let bslot = p_arg_s[pbb]
@@ -1900,12 +1668,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib::op_no_match {
-                    // Never executes at runtime (exhaustive matches); keep it
-                    // fully inert: no depth restore above, no stack effect, no
-                    // type merge below, so the linear walk carries the last
-                    // arm's block value type through to the match-end merge.
-                } else if pop == lib::op_get_field_name || pop == lib::op_get_field {
+                } else if pop == lib::op_no_match {} else if pop == lib::op_get_field_name || pop == lib::op_get_field {
                     let pg_rt = if len(ptshadow_ps) > 0 {
                         ptshadow_ps[len(ptshadow_ps) - 1]
                     } else {
@@ -1957,9 +1720,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         push(ptshadow_ps, "record:" + pu_enc)
                     }
-                } else if pop == lib::op_spawn || pop == lib::op_select {
-                    // conservative: assume these don't affect return type
-                }
+                } else if pop == lib::op_spawn || pop == lib::op_select {}
                 if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
                     let pdepth = len(ptshadow_ps) - 1
                     while len(ppos_types) <= pdepth {
@@ -1984,7 +1745,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let arity = f_arity[fh]
         let locals = count_locals(fh)
 
-        // Per-function mutable state captured by emit_inst.
         let mut out = []
         let mut patches = []
         let mut shadow = []
@@ -1998,8 +1758,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             push(pos_types, "")
             seed = seed + 1
         }
-        // seed param slots from the converged cross-function table so map
-        // natives see refined map types inside the callee body
         let mut pseed_e = 1
         while pseed_e < arity + 1 {
             if pseed_e - 1 < len(fn_param_types[fh]) {
@@ -2237,7 +1995,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let sa = type_shadow[len(type_shadow) - 2]
                 let sb = type_shadow[len(type_shadow) - 1]
                 if sa == "str" || sb == "str" {
-                    // string concat: allocate [len_a+len_b][content_a][content_b]
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r10, r9, 0) + mov_rr(r11, r12) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(r11, 0, rcx) + add_ri32(rcx, 8) + add_rr(r12, rcx) + lea(rsi, rax, 8) + lea(rdi, r11, 8) + mov_rr(rcx, rdx) + rep_movsb() + lea(rsi, r9, 8) + lea(rdi, r11, 8) + add_rr(rdi, rdx) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
                     shadow_pop(type_shadow, 2)
@@ -2663,8 +2420,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         w(x86gen_delete_map_native(kk == "str"))
                         ret_type = "unit"
                     }
-                    // refine the map arg's local slot type so later get/keys
-                    // on the same map see the refined key/val types
                     let msh = shadow[len(shadow) - n]
                     if str_len(msh) > 5 && substr(msh, 0, 5) == "slot:" {
                         match parse_int(substr(msh, 5, str_len(msh) - 5)) {
@@ -2729,8 +2484,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     if handle < len(fn_ret_type) {
                         ret_type = fn_ret_type[handle]
                     }
-                    // backward: refine caller arg slots from the callee's
-                    // converged param types (mirrors the prescan pass)
                     let mut bmi = 0
                     while bmi < n && bmi < len(fn_param_types[handle]) {
                         let bshadow = shadow[len(shadow) - n + bmi]
@@ -2810,8 +2563,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         ri = ri + 1
                     }
                 }
-                // Record heap layout: [8B: nfields][8B: names_enc_offset][8B: field0]..[8B: fieldN-1]
-                // Allocation = 16 + n*8 bytes. Copy field values from stack in field order.
                 w(mov_rr(r11, r12) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_ri64(rax, rec_off) + mov_mr(r11, 8, rax) + lea(rsi, r15, 0 - 8 * n) + lea(rdi, r11, 16) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + lea(r15, r15, 0 - 8 * n) + vs_push(r11))
                 let mut rec_ftypes = []
                 let mut rfi = 0
@@ -2866,7 +2617,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let n = code[ip + 1]
                 let cidx = read_u16(code, ip + 2)
                 let enc = const_str(fh, cidx)
-                // Resolve update field names to their indices in the record's field list.
                 let mut upd_indices = []
                 let mut ui = 0
                 let mut upos = 0
@@ -2901,21 +2651,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                     ui = ui + 1
                 }
-                // Stack: [base][upd0]..[updN-1] at r15-8*(n+1) .. r15-8
-                // Save base + n update values onto native stack (oldest first), then pop value stack.
                 let mut upd_code = ""
                 let mut uj = 0
                 while uj < n + 1 {
                     upd_code = upd_code + mov_rm(rax, r15, 0 - 8 * (n + 1 - uj)) + push_r(rax)
                     uj = uj + 1
                 }
-                // alloc_code: read base nfields/names_enc from saved base at [rsp+0] (last pushed = base)
                 let mut alloc_code = mov_rm(r9, rsp, 8 * n) + mov_rm(r8, r9, 0) + mov_rm(rdx, r9, 8)
                 alloc_code = alloc_code + mov_rr(r11, r12) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, rdx)
-                // Compute allocation size = 16 + 8*r8, copy fields from base to new
                 alloc_code = alloc_code + lea(rsi, r9, 16) + lea(rdi, r11, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + mov_rr(r10, rdx) + rep_movsb()
                 alloc_code = alloc_code + lea(rax, r11, 16) + add_rr(rax, r10) + mov_rr(r12, rax)
-                // Overwrite update fields: ok=0 → upd0 at [rsp+8*(n)], ok=1 → upd1 at [rsp+8*(n-1)], etc
                 let mut ovw_code = ""
                 let mut ok = 0
                 while ok < n {
@@ -2925,7 +2670,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                     ok = ok + 1
                 }
-                // Pop value stack (n+1 items), restore native stack, push new record
                 w(upd_code + lea(r15, r15, 0 - 8 * (n + 1)) + alloc_code + ovw_code + add_ri32(rsp, 8 * (n + 1)) + vs_push(r11))
                 let upd_base_t = if len(type_shadow) > n {
                     type_shadow[len(type_shadow) - n - 1]
@@ -2972,7 +2716,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             emit_inst(ip)
             ip = ip + inst_len(fh, code, ip)
         }
-        // Patch every recorded jump with the real rel32.
         let mut fbytes = join(out, "")
         let mut pi = 0
         while pi < len(patches) {
@@ -2991,14 +2734,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         fh = fh + 1
     }
 
-    // Jump table: 8-byte absolute address per function.
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
         jt_bytes = jt_bytes + e8(base_addr + 120 + const_data_len + func_offsets[jh])
         jh = jh + 1
     }
-    // _start is the entry, placed last.
     let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn, n_globals)
     emit_elf(const_data + funcs_bytes + jt_bytes + start_bytes, start_off)

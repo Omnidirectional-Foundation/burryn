@@ -1,34 +1,16 @@
-// Single-pass bytecode compiler ported from compiler.go. Go aborts on the
-// first compile error via panic; here every compile function returns Result
-// and errors bounce out (same idiom as parser.bur). Compiler instances live
-// in an arena so closures can walk the enclosing chain and mark captured
-// locals; see compile_script below.
-
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
-// compile_script() result. Compiled carries the function arena (name, file,
-// arity, upval count, code bytes, spans, consts — the script itself is
-// handle 0) and the enum arena (qualified name, variant names, variant
-// arities). Compilation stops at the first error, like Go's panic-fail.
 pub enum CompileOut {
     Compiled([str], [str], [int], [int], [[int]], [[frontend::SpanT]], [[lib::CVal]], [str], [[str]], [[int]]),
     CompileFailed(lib::DiagT, str),
 }
 
-// compile_script compiles a script's statements, mirroring compileProgram.
-// chan_fors carries the checker's channel-for span starts (Go sets
-// frontend.Node.ForStmt.IterIsChan on the AST instead).
 pub fn compile_script(stmts, chan_fors) {
     compile_program([[stmts]], [[""]], false, [""], [[[]]], chan_fors)
 }
 
-// compile_program compiles a script (is_pkg false: one pseudo package with
-// one file "") or a whole module (mirrors compileModule): packages arrive
-// in dependency order, entry last; per-file init functions define each
-// package's globals, then the entry package's main runs.
 pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports, chan_fors) {
-    // ---- function arena ----
     let mut f_name = []
     let mut f_file = []
     let mut f_arity = []
@@ -36,7 +18,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     let mut f_code = []
     let mut f_spans = []
     let mut f_consts = []
-    // ---- enum arena (compile-time EnumInfo) ----
     let mut en_qual = []
     let mut en_vnames = []
     let mut en_varities = []
@@ -44,16 +25,15 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     let mut enum_by = map()
     let mut global_mut = map()
     let mut pkg_decls = map()
-    let mut method_calls = map() // "file:start" -> "recvType.method"（来自 checker 的 side channel）
+    let mut method_calls = map()
     for mc in chan_fors {
         match str_index_of(mc, "|") {
             Some(bar) => put(method_calls, substr(mc, 0, bar), substr(mc, bar + 1, str_len(mc) - bar - 1)),
             None => {},
         }
     }
-    let mut cur_pkg = "" // import path of the package being compiled
-    let mut cur_aliases = map() // current file's import aliases (alias -> path)
-    // ---- compiler arena ----
+    let mut cur_pkg = ""
+    let mut cur_aliases = map()
     let mut c_enclosing = []
     let mut c_fn = []
     let mut c_scope_depth = []
@@ -127,8 +107,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         len(c_l_name[ch])
     }
 
-    // qualify maps a top-level name of the current package to its globally
-    // unique global-table name; mangle_if_decl qualifies only declared names
     fn qualify(name) {
         if cur_pkg == "" {
             name
@@ -136,7 +114,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             cur_pkg + "." + name
         }
     }
-    // alias_path resolves an import alias of the current file; "" = no alias
     fn alias_path(name) {
         match get(cur_aliases, name) {
             Some(p) => p,
@@ -164,7 +141,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         put(global_mut, qual, false)
         len(en_qual) - 1
     }
-    // find a variant by bare name; returns [eh, idx], eh = -2 when ambiguous
     fn find_variant(name) {
         let mut found = -1
         let mut idx = -1
@@ -195,8 +171,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             [found, idx]
         }
     }
-    // local_enum resolves a bare enum name: the current package's enums
-    // shadow the builtins (mirrors Shared.localEnum)
     fn local_enum(name) {
         match get(enum_by, qualify(name)) {
             Some(eh) => eh,
@@ -213,7 +187,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
-    // ---- emit helpers ----
     fn emit(ch, b, sp) {
         push(f_code[c_fn[ch]], b)
         push(f_spans[c_fn[ch]], sp)
@@ -258,7 +231,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
-    // ---- scopes and locals ----
     fn next_slot(ch) {
         let n = n_locals(ch)
         if n > 0 {
@@ -267,8 +239,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             c_temps[ch]
         }
     }
-    // the value is already on the stack top; next_slot computes exactly the
-    // slot it landed on
     fn declare_local(ch, name, is_mut, sp) {
         let slot = next_slot(ch)
         if slot > 65534 {
@@ -280,7 +250,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     fn begin_scope(ch) {
         c_scope_depth[ch] = c_scope_depth[ch] + 1
     }
-    // endScope for statement contexts: emits pop/close for each local
     fn end_scope(ch, sp) {
         c_scope_depth[ch] = c_scope_depth[ch] - 1
         while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
@@ -292,8 +261,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             pop_local(ch)
         }
     }
-    // endScopeExpr for expression blocks: result on top; OpEndBlock removes
-    // the scope's locals underneath it
     fn end_scope_expr(ch, sp) {
         c_scope_depth[ch] = c_scope_depth[ch] - 1
         let mut n = 0
@@ -361,9 +328,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(-1)
     }
 
-    // ---- variants ----
-    // nullary variants become singleton instance constants; variants with
-    // fields become constructor constants
     fn emit_variant(ch, eh, idx, sp) {
         if en_varities[eh][idx] == 0 {
             emit_const(ch, lib::CVal::CSingleton(eh, idx), sp)
@@ -445,7 +409,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(declare_enum(qual, cur_pkg, vnames, varities))
     }
 
-    // loop bookkeeping
     fn push_loop(ch, base, cont_to) {
         push(c_lp_base[ch], base)
         push(c_lp_contto[ch], cont_to)
@@ -460,8 +423,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         let _ = pop(c_lp_conts[ch])
         let _ = pop(c_lp_labels[ch])
     }
-    // emit pops for locals above the innermost loop's base without altering
-    // compiler bookkeeping; returns the loop index
     fn labeled_loop(ch, lb, sp) {
         let mut li = len(c_lp_labels[ch]) - 1
         while li >= 0 {
@@ -500,7 +461,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(li)
     }
 
-    // ---- the cp_expr <-> cp_stmt knot ----
     let mut cp_expr_ref = fn(_c, _e) {
         Ok(true)
     }
@@ -533,7 +493,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             None => false,
         }
         if !declared {
-            // bare enum variant like Some / None / Ok / Err
             let fv = find_variant(name)
             if fv[0] == -2 {
                 return frontend::perr("E2014", "qualify it as Enum." + name, "variant \"" + name + "\" exists in several enums", sp)
@@ -543,7 +502,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 return Ok(true)
             }
         }
-        // global (possibly defined later in the script)
         let idx = add_const(ch, lib::CVal::CStr(gname))
         emit(ch, lib::op_get_global, sp)
         emit_u16(ch, idx, sp)
@@ -647,7 +605,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
-    // blockExpr compiles a block leaving its value on the stack
     fn cp_block_expr(ch, blk) {
         begin_scope(ch)
         match blk {
@@ -703,7 +660,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 let fh = new_func(name, cur_file, len(params))
                 let sub = new_compiler(ch, fh)
                 begin_scope(sub)
-                // recursion through slot 0 when the fn has a name
                 push_local(sub, name, c_scope_depth[sub], 0, false, 0)
                 if len(params) > 255 {
                     return frontend::perr("E2019", "", "too many parameters", lsp)
@@ -873,7 +829,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
 
         begin_scope(ch)
         if idx != "" {
-            // for i, x in xs：把内部 (idx) 槽的值暴露为索引变量（declare 即入槽）
             emit(ch, lib::op_get_local, sp)
             emit_u16(ch, idx_slot, sp)
             match declare_local(ch, idx, false, sp) {
@@ -909,7 +864,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
         end_scope(ch, sp)
 
-        // continue lands here: increment
         let li = len(c_lp_conts[ch]) - 1
         for j in c_lp_conts[ch][li] {
             match patch_jump(ch, j) {
@@ -948,11 +902,10 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             }
         }
         pop_loop(ch)
-        end_scope(ch, sp) // pops idx, iter
+        end_scope(ch, sp)
         Ok(true)
     }
 
-    // for v in ch: receive until the channel is closed and drained
     fn cp_for_chan(ch, v, iter, body, sp) {
         begin_scope(ch)
         match cp_expr_ref(ch, iter) {
@@ -978,7 +931,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
 
         begin_scope(ch)
         match declare_local(ch, v, false, sp) {
-            // received value already on the stack
             Ok(_) => {},
             Err(d) => {
                 return Err(d)
@@ -1022,7 +974,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             }
         }
         pop_loop(ch)
-        end_scope(ch, sp) // pops the channel local
+        end_scope(ch, sp)
         Ok(true)
     }
 
@@ -1051,7 +1003,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 _ => {},
             }
         }
-        c_temps[ch] = base_temps // OpSelect consumes all the operands
+        c_temps[ch] = base_temps
 
         if len(arms) > 255 {
             return frontend::perr("E2021", "", "too many select arms", sp)
@@ -1106,7 +1058,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         emit(ch, lib::op_pop, asp)
                     } else if bind != "" && bind != "_" {
                         match declare_local(ch, bind, false, asp) {
-                            // received value on the stack
                             Ok(_) => {},
                             Err(d) => {
                                 return Err(d)
@@ -1120,7 +1071,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         }
                         emit(ch, lib::op_pop, asp)
                     } else {
-                        emit(ch, lib::op_pop, asp) // discard the received value
+                        emit(ch, lib::op_pop, asp)
                         match cp_expr_ref(ch, body) {
                             Ok(_) => {},
                             Err(d) => {
@@ -1191,7 +1142,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     let mut arm_locals = 0
 
                     match pat {
-                        frontend::Node::PatWildcard(_) => {}, // always matches
+                        frontend::Node::PatWildcard(_) => {},
                         frontend::Node::PatLiteral(v, _) => {
                             emit(ch, lib::op_get_local, asp)
                             emit_u16(ch, scrut_slot, asp)
@@ -1207,8 +1158,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                             fail_j = emit_jump(ch, lib::op_jump_if_false_pop, asp)
                         },
                         frontend::Node::PatBinding(name, _) => {
-                            // a bare name is a nullary-variant test if such a
-                            // variant exists, otherwise a catch-all binding
                             let fv = find_variant(name)
                             if fv[0] == -2 {
                                 return frontend::perr("E2014", "qualify it as Enum." + name, "variant \"" + name + "\" exists in several enums", asp)
@@ -1244,7 +1193,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                                 } else {
                                     ppkg + "." + penum
                                 }
-                                // direct qualified lookup (Go reads shared.enums)
                                 eh = match get(enum_by, full) {
                                     Some(h) => h,
                                     None => -1,
@@ -1322,7 +1270,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                             }
                         },
                         frontend::Node::PatRecord(names, _) => {
-                            // record { x, y }：按字段名提取（op_get_field_name 运行时按名查）
                             for fname in names {
                                 emit(ch, lib::op_get_local, asp)
                                 emit_u16(ch, scrut_slot, asp)
@@ -1368,7 +1315,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         pop_local(ch)
                     }
                     push(end_jumps, emit_jump(ch, lib::op_jump, asp))
-                    // guard 为假时 pattern 已绑定；用 unit 占位复用 lib.op_end_block，关闭 upvalue 并删除本 arm locals，再继续尝试下一臂。/ On a false guard the pattern is already bound; a unit placeholder lets lib.op_end_block close upvalues and remove this arm's locals before trying the next arm.
                     if guard_fail_j >= 0 {
                         match patch_jump(ch, guard_fail_j) {
                             Ok(_) => {},
@@ -1404,7 +1350,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 },
             }
         }
-        // squash the scrutinee slot, leaving the arm value
         c_scope_depth[ch] = c_scope_depth[ch] - 1
         pop_local(ch)
         emit(ch, lib::op_end_block, msp)
@@ -1512,12 +1457,10 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 patch_jump(ch, end)
             },
             frontend::Node::Call(callee, cargs, sp) => {
-                // 方法调用：obj.method(args) —— side channel 命中时 receiver 作首参
                 let mut m_obj = frontend::Node::NoNode
                 let mpath = match callee {
                     frontend::Node::FieldAccess(obj, _, _) => {
                         m_obj = obj
-                        // 用 Call 的 span end 匹配（嵌套调用 start 相同，end 唯一）
                         let cend = match sp {
                             frontend::SpanT::Sp(_, ce) => ce,
                         }
@@ -1530,7 +1473,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 }
                 match mpath {
                     Some(p) => {
-                        // callee 先压（栈底），然后 receiver + args（fpeek(f, argc) 取 callee）
                         let gidx = add_const(ch, lib::CVal::CStr(p))
                         emit(ch, lib::op_get_global, sp)
                         emit_u16(ch, gidx, sp)
@@ -1644,8 +1586,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             frontend::Node::IfExpr(cond, then, els, sp) => cp_if(ch, cond, then, els, sp),
             frontend::Node::MatchExpr(scrut, arms, sp) => cp_match(ch, scrut, arms, sp),
             frontend::Node::VariantAccess(en, vr, sp) => {
-                // an import alias as the head makes this a package access
-                // (module.go rewrites the AST; burc resolves on the fly)
                 let apath = alias_path(en)
                 if apath != "" {
                     let idx = add_const(ch, lib::CVal::CStr(apath + "." + vr))
@@ -1674,7 +1614,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 } else {
                     pkg + "." + en
                 }
-                // direct qualified lookup (Go reads shared.enums directly)
                 let eh = match get(enum_by, full) {
                     Some(h) => h,
                     None => -1,
@@ -1768,7 +1707,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     fn cp_stmt(ch, s) {
         match s {
             frontend::Node::DestructLet(names, nspans, is_mut, init, sp) => {
-                // let (a, b) = t：求值 t 入临时槽，逐名取 [i] 绑定
                 match cp_expr(ch, init) {
                     Ok(_) => {},
                     Err(d) => {
@@ -1815,7 +1753,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     }
                     i = i + 1
                 }
-                // 弹出临时槽值
                 emit(ch, lib::op_pop, sp)
                 if c_scope_depth[ch] == 0 {
                     let _ = pop_local(ch)
@@ -1861,10 +1798,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     }
                     define_global(ch, name, false, sp)
                 } else {
-                    // declare first so the body can refer to itself
                     emit(ch, lib::op_unit, sp)
                     match declare_local(ch, name, true, sp) {
-                        // internally mutable for the fixup below
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
@@ -1889,8 +1824,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     return frontend::perr("E2008", "", "enum declarations are only allowed at top level", sp)
                 }
                 let qual = qualify(name)
-                // module builds pre-register every enum; in a script an
-                // existing entry is a redeclaration
                 let pre = match get(enum_by, qual) {
                     Some(h) => h,
                     None => -1,
@@ -2038,8 +1971,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 }
             },
             frontend::Node::DeferStmt(body, sp) => {
-                // the block compiles as a zero-param closure; lib.op_defer moves
-                // it onto the current frame's defer stack, run LIFO on exit
                 match cp_function(ch, frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, body, "<defer>", sp)) {
                     Ok(_) => {},
                     Err(d) => {
@@ -2073,7 +2004,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
     cp_stmt_ref = cp_stmt
 
-    // ---- driver (mirrors compileProgram) ----
     declare_enum("Option", "", ["Some", "None"], [1, 0])
     declare_enum("Result", "", ["Ok", "Err"], [1, 1])
     declare_enum("Output", "", ["Output"], [3])
@@ -2082,11 +2012,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     if is_pkg {
-        // ---- module driver (mirrors compileModule): packages in
-        // dependency order, entry last
-        let module_fn = new_func("<module>", "", 0) // handle 0
+        let module_fn = new_func("<module>", "", 0)
         let c0 = new_compiler(-1, module_fn)
-        push_local(c0, "", 0, 0, false, 0) // slot 0: the program itself
+        push_local(c0, "", 0, 0, false, 0)
         let n_pkgs = len(pkgs_stmts)
         let mut pi = 0
         while pi < n_pkgs {
@@ -2108,8 +2036,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 }
                 fi = fi + 1
             }
-            // register every enum of the package before compiling any body,
-            // so variant references resolve across files regardless of order
             fi = 0
             while fi < n_files {
                 cur_file = file_paths[fi]
@@ -2128,7 +2054,6 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 }
                 fi = fi + 1
             }
-            // per-file init functions, called in order
             fi = 0
             while fi < n_files {
                 cur_file = file_paths[fi]
@@ -2168,10 +2093,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         emit(c0, lib::op_unit, frontend::SpanT::Sp(0, 0))
         emit(c0, lib::op_return, frontend::SpanT::Sp(0, 0))
     } else {
-        // ---- script driver (mirrors compileProgram) ----
-        let script_fn = new_func("<script>", "", 0) // handle 0
+        let script_fn = new_func("<script>", "", 0)
         let c0 = new_compiler(-1, script_fn)
-        push_local(c0, "", 0, 0, false, 0) // slot 0: the script itself
+        push_local(c0, "", 0, 0, false, 0)
         for s in pkgs_stmts[0][0] {
             match cp_stmt(c0, s) {
                 Ok(_) => {},

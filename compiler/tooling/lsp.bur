@@ -1,11 +1,8 @@
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 import "burryn.dev/compiler/module"
-// LSP server: JSON-RPC 2.0 transport, document sync, diagnostics push.
 
 import json "std/json"
-
-// ---- transport ----
 
 fn lsp_read_exact(n) {
     let mut buf = ""
@@ -85,8 +82,6 @@ pub fn lsp_write_message(v) {
     print("Content-Length: " + str(str_len(body)) + crlf + crlf + body)
 }
 
-// ---- JSON helpers ----
-
 fn jobj_get(v, key) {
     match v {
         json::Json::JObj(keys, vals) => json::get(keys, vals, key),
@@ -138,8 +133,6 @@ fn jobj(keys, vals) {
     json::Json::JObj(keys, vals)
 }
 
-// ---- position conversion ----
-
 fn lsp_line_starts(src) {
     let mut starts = [0]
     let mut i = 0
@@ -166,8 +159,6 @@ fn lsp_offset_to_pos(starts, offset) {
     }
     [lo, offset - starts[lo]]
 }
-
-// ---- diagnostics ----
 
 fn lsp_diag_severity(is_err) {
     if is_err {
@@ -238,10 +229,6 @@ fn lsp_publish_diagnostics(uri, diags) {
     lsp_write_message(jobj(["jsonrpc", "method", "params"], [json::Json::JStr("2.0"), json::Json::JStr("textDocument/publishDiagnostics"), jobj(["uri", "diagnostics"], [json::Json::JStr(uri), json::Json::JArr(diags)])]))
 }
 
-// ---- module pipeline ----
-
-// lsp_uri_to_path strips the "file://" scheme prefix from a file URI, leaving
-// the absolute path. "file:///abs" -> "/abs". Non-file URIs pass through.
 fn lsp_uri_to_path(uri) {
     let p = "file://"
     let pn = str_len(p)
@@ -256,8 +243,6 @@ fn lsp_path_to_uri(path) {
     "file://" + path
 }
 
-// lsp_normalize_root strips a single trailing slash so the workspace root
-// compares equal to parent-dir walk candidates (which never carry one).
 fn lsp_normalize_root(p) {
     let n = str_len(p)
     if n > 1 && byte_at(p, n - 1) == 47 {
@@ -267,8 +252,6 @@ fn lsp_normalize_root(p) {
     }
 }
 
-// lsp_parent_dir returns the directory holding path (no trailing slash), or
-// "" for a root-level or empty path.
 fn lsp_parent_dir(path) {
     let mut i = str_len(path) - 1
     while i > 0 && byte_at(path, i) != 47 {
@@ -281,9 +264,6 @@ fn lsp_parent_dir(path) {
     }
 }
 
-// lsp_find_module_root walks up from the open file's directory until it finds
-// a bur.mod, returning that module root. Returns "" when no bur.mod is found,
-// in which case the caller falls back to single-file diagnostics.
 fn lsp_find_module_root(file_path) {
     let mut dir = lsp_parent_dir(file_path)
     let mut steps = 0
@@ -300,9 +280,6 @@ fn lsp_find_module_root(file_path) {
     ""
 }
 
-// lsp_line_starts_for resolves the line-start table for a file path: from the
-// open-doc text (live editor content), else the loaded module tables, else a
-// fresh overlay read. Diagnostic offsets were computed against this source.
 fn lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts) {
     match module::lsp_doc_get(lsp_path_to_uri(path)) {
         Some(text) => {
@@ -327,8 +304,6 @@ fn lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts) {
     }
 }
 
-// lsp_publish_one emits the diagnostics attributed to path, converting byte
-// offsets to LSP positions with that file's line-start table.
 fn lsp_publish_one(path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
     let mut file_diags = []
     let mut dj = 0
@@ -342,11 +317,6 @@ fn lsp_publish_one(path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
     lsp_publish_diagnostics(lsp_path_to_uri(path), lsp_convert_diags_starts(file_diags, starts))
 }
 
-// lsp_publish_module_diags groups diagnostics by file and publishes a
-// publishDiagnostics per affected URI. Files in the module with no
-// diagnostics get an empty list to clear stale markers; the open file is
-// always published even if load dropped it (parse errors). Bundled std paths
-// ("<std:...>") are skipped: they have no real file URI.
 fn lsp_publish_module_diags(open_path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
     let mut pub_files = []
     let mut seen = map()
@@ -392,9 +362,6 @@ fn lsp_publish_module_diags(open_path, all_diags, all_files, pkgs_fpaths, pkgs_l
     }
 }
 
-// lsp_check_module runs the full module check pipeline (load -> fold ->
-// typecheck) and publishes diagnostics for every file in the module. Falls
-// back to single-file check when the open file is not inside a module.
 fn lsp_check_module(open_uri) {
     let open_path = lsp_uri_to_path(open_uri)
     let root = lsp_find_module_root(open_path)
@@ -431,8 +398,6 @@ fn lsp_check_module(open_uri) {
         },
     }
 }
-
-// ---- message handlers ----
 
 fn lsp_respond(id, result) {
     lsp_write_message(jobj(["jsonrpc", "id", "result"], [json::Json::JStr("2.0"), id, result]))
@@ -506,8 +471,6 @@ fn lsp_handle_hover(id, params) {
     }
 }
 
-// ---- server main loop ----
-
 pub fn lsp_serve() {
     let mut shutdown_requested = false
     let mut running = true
@@ -526,9 +489,7 @@ pub fn lsp_serve() {
                 let params = jobj_field(msg, "params")
                 if method == "initialize" {
                     lsp_handle_initialize(id, params)
-                } else if method == "initialized" {
-                    // notification, no response
-                } else if method == "shutdown" {
+                } else if method == "initialized" {} else if method == "shutdown" {
                     shutdown_requested = true
                     lsp_respond(id, json::Json::JNull)
                 } else if method == "exit" {

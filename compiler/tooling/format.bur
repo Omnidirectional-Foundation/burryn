@@ -1,23 +1,6 @@
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
-// Pretty-printer for Burryn source.
-// Stage 3: full AST coverage plus comment reinsertion. Comments ride along
-// as lexer trivia (lib.Token.Tok(frontend.t_comment, text, s, e)) and are threaded through the
-// printers with a cursor: own-line comments flush ahead of the next item at
-// the current indent, same-line comments stay pinned to their line, and the
-// verifier rejects output that drops or invents a comment.
-//
-// Layout rules (SPEC §6.5): 4-space indent, no line wrapping, trailing
-// comma per match/select arm and enum variant. Top-level declarations are
-// separated by exactly one blank line when either neighbor is multi-line;
-// consecutive single-line declarations keep the source's grouping (a blank
-// line survives iff the source had one). Inside blocks, arms, and enum
-// bodies a single source blank line is preserved, never more.
 
-// format_verified formats and then enforces the acceptance rules from
-// SPEC §6.5: the output must reparse to a structurally equal AST (ast_eq,
-// spans ignored) and carry exactly the original comments. Err here means a
-// formatter bug.
 pub fn format_verified(stmts, src, comments) {
     let out = format_file(stmts, src, comments)
     match frontend::lex(out) {
@@ -50,10 +33,9 @@ pub fn format_verified(stmts, src, comments) {
     }
 }
 
-// format_file formats a single file's top-level statements.
 pub fn format_file(stmts, src, comments) {
     let mut out = []
-    let mut cc = [0] // comment cursor, threaded like the parser's pos
+    let mut cc = [0]
     let mut prev_multi = false
     let mut prev_end = 0
     let mut i = 0
@@ -61,8 +43,6 @@ pub fn format_file(stmts, src, comments) {
         let s0 = span_start(stmts[i])
         let mut after_comment = false
         if cc[0] < len(comments) && tok_start(comments[cc[0]]) < s0 {
-            // a blank line goes before the comment group when the source had
-            // one or the previous declaration was multi-line
             if prev_end > 0 && (prev_multi || src_blank_between(src, prev_end, tok_start(comments[cc[0]]))) {
                 push(out, "\n")
             }
@@ -75,8 +55,6 @@ pub fn format_file(stmts, src, comments) {
         let multi = str_contains(seg, "\n")
         if i > 0 || after_comment {
             if after_comment {
-                // comments bind to what follows: only a source blank between
-                // the group and the declaration survives
                 if src_blank_between(src, prev_end, s0) {
                     push(out, "\n")
                 }
@@ -94,7 +72,6 @@ pub fn format_file(stmts, src, comments) {
         i = i + 1
     }
     if cc[0] < len(comments) {
-        // file-tail comments
         if prev_end > 0 && (prev_multi || src_blank_between(src, prev_end, tok_start(comments[cc[0]]))) {
             push(out, "\n")
         }
@@ -103,9 +80,6 @@ pub fn format_file(stmts, src, comments) {
     join(out, "")
 }
 
-// flush_comments emits every unconsumed comment starting before limit as
-// own-line comments at the given indent, preserving one source blank line
-// between them; returns the end offset of the last one for gap tracking
 fn flush_comments(comments, mut cc, limit, src, indent, pe0, mut buf) {
     let mut pe = pe0
     while cc[0] < len(comments) && tok_start(comments[cc[0]]) < limit {
@@ -122,8 +96,6 @@ fn flush_comments(comments, mut cc, limit, src, indent, pe0, mut buf) {
     pe
 }
 
-// try_trailing pins a comment that sits on the same source line as the code
-// that just ended; returns the new end offset for gap tracking
 fn try_trailing(comments, mut cc, code_end, src, mut buf) {
     if cc[0] < len(comments) {
         let c = comments[cc[0]]
@@ -580,8 +552,6 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
         frontend::Node::Ident(_, sp) => push(buf, span_text(src, sp)),
         frontend::Node::Binary(op, lhs, rhs, sp) => {
             if op == frontend::t_plus && span_is_interpolation(src, sp) {
-                // parser 把插值脱糖为 `+`；这里重建表层语法并格式化各内嵌表达式。/ The parser lowers interpolation to `+`; reconstruct its surface syntax while formatting each embedded expression.
-                // 含注释的插值逐字节保留，因为行注释的位置属于语法。/ Keep a comment-bearing interpolation byte-identical because line-comment placement is syntactic.
                 if cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
                     push(buf, span_text(src, sp))
                     while cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
@@ -750,7 +720,7 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
                 frontend::Node::NoNode => {},
                 _ => {
                     push(buf, " else ")
-                    fmt_expr(els, src, comments, cc, indent, buf) // a nested IfExpr renders as `else if`
+                    fmt_expr(els, src, comments, cc, indent, buf)
                 },
             }
         },
@@ -832,7 +802,6 @@ fn fmt_arm(n, src, comments, mut cc, indent, mut buf) {
 fn fmt_pat(n, src, mut buf) {
     match n {
         frontend::Node::PatWildcard(_) => push(buf, "_"),
-        // the pattern's own span covers a leading '-', the literal's does not
         frontend::Node::PatLiteral(_, sp) => push(buf, span_text(src, sp)),
         frontend::Node::PatBinding(name, _) => push(buf, name),
         frontend::Node::PatVariant(pkg, en, v, binds, _) => {
@@ -862,10 +831,6 @@ fn fmt_pat(n, src, mut buf) {
     }
 }
 
-// fmt_child prints an operand, parenthesizing when its rank is below the
-// minimum its position requires (left operand of a binary: the operator's
-// own level; right operand: level + 1, since every binary and logical
-// operator is left-associative).
 fn fmt_child(n, need, src, comments, mut cc, indent, mut buf) {
     if node_prec(n) < need {
         push(buf, "(")
@@ -876,13 +841,6 @@ fn fmt_child(n, need, src, comments, mut cc, indent, mut buf) {
     }
 }
 
-// node_prec ranks how tightly an expression binds, mirroring the parser's
-// precedence-climbing ladder (parser.bur p_or_expr..p_postfix). The parser
-// folds parentheses away, so the printer re-derives the minimal set from
-// these ranks:
-//   0 statement-like expressions (fn/block/if/match): wrapped as any operand
-//   1 |>   2 ||   3 &&   4 == !=   5 < <= > >=   6 + -   7 * / %
-//   8 unary ! - and <-recv   9 postfix call/index/?   10 atoms
 fn node_prec(n) {
     match n {
         frontend::Node::Logical(op, _, _, _) => if op == frontend::t_and_and {
@@ -921,8 +879,6 @@ fn bin_prec(op) {
     }
 }
 
-// comment_inside reports whether the next unconsumed comment sits before
-// byte offset limit (used to keep braces open for comment-only blocks)
 fn comment_inside(comments, cc, limit) {
     cc[0] < len(comments) && tok_start(comments[cc[0]]) < limit
 }
@@ -969,7 +925,6 @@ fn span_text(src, sp) {
     }
 }
 
-// span_is_interpolation 验证 sp 恰好覆盖一个插值字符串，而非 union span 同样以引号起止的更大 `"...{...}" + ...` 表达式；嵌套插值会增加 depth 直至自身结束。/ span_is_interpolation verifies that sp covers exactly one interpolated string, not a larger quoted union span; nested interpolations increase depth until their own end.
 fn span_is_interpolation(src, sp) {
     let raw = span_text(src, sp)
     match frontend::lex(raw) {
@@ -1000,7 +955,6 @@ fn span_is_interpolation(src, sp) {
     }
 }
 
-// fmt_interp_parts 遍历 parser 产生的「片段、表达式、片段……」交替拼接链；字面左花括号加倍，确保重解析为字节而非新插值。/ fmt_interp_parts walks the parser's alternating segment/expression concat chain; literal opening braces are doubled so reparsing keeps them as bytes.
 fn fmt_interp_parts(n, src, comments, mut cc, indent, mut buf) {
     match n {
         frontend::Node::StrLit(seg, _) => fmt_interp_segment(seg, buf),
@@ -1052,8 +1006,6 @@ fn fmt_interp_segment(s, mut buf) {
     push(buf, substr(s, seg, str_len(s) - seg))
 }
 
-// src_blank_between reports whether the source holds a blank line between
-// byte offsets a and b (two or more newlines)
 fn src_blank_between(src, a, b) {
     let mut i = a
     let mut nl = 0
@@ -1128,8 +1080,6 @@ fn unary_op_text(op) {
     }
 }
 
-// fmt_internal reports a formatter bug: these branches are unreachable for
-// any AST the parser produces.
 fn fmt_internal(msg) {
     assert(false, "internal error: fmt: " + msg)
 }

@@ -1,31 +1,14 @@
-// S6.1/S6.2 dependency management: bur.mod requires, semver ordering, MVS
-// over the local cache, canonical tree hashes for bur.sum, and network
-// fetching (shell-out `git clone`, zero new natives per SPEC §6.5).
-//
-// Offline resolution (mvs_resolve) reads $BURCACHE only — a cache miss is
-// an error that points at `bur mod download`; mvs_resolve_fetch clones
-// missing modules on the way. Clone URLs are `https://<module path>`;
-// $BURGITBASE overrides the prefix for mirrors and offline tests. `std/`
-// never resolves here: std ships with the toolchain. Wiring the resolved
-// graph into import loading (module.bur E0432 relaxation) lands together
-// with the interface cache (S6.1).
-
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
-// MI carries one parsed bur.mod: module path, require paths, require
-// versions (parallel lists)
 pub enum ModInfo {
     MI(str, [str], [str]),
 }
 
-// MP is a resolution result: selected module paths and versions, parallel,
-// sorted by path
 pub enum ModPick {
     MP([str], [str]),
 }
 
-// modgraph_parse reads a bur.mod text into MI; `//` comments are stripped
 pub fn modgraph_parse(text) {
     let mut mpath = ""
     let mut rpaths = []
@@ -65,8 +48,6 @@ pub fn modgraph_parse(text) {
     Ok(MI(mpath, rpaths, rvers))
 }
 
-// ver_cmp orders two `v<major>.<minor>.<patch>` strings numerically;
-// missing or malformed components count as 0
 pub fn ver_cmp(a, b) {
     let pa = ver_parts(a)
     let pb = ver_parts(b)
@@ -106,8 +87,6 @@ fn ver_parts(v) {
     out
 }
 
-// env_lookup shells out to printenv: there is no env native, and adding one
-// is not this milestone's call
 fn env_lookup(name) {
     match exec("printenv", [name]) {
         Ok(o) => match o {
@@ -123,7 +102,6 @@ fn env_lookup(name) {
     }
 }
 
-// cache_root yields $BURCACHE, defaulting to ~/.burryn/pkg
 pub fn cache_root() {
     match env_lookup("BURCACHE") {
         Some(p) => p,
@@ -134,8 +112,6 @@ pub fn cache_root() {
     }
 }
 
-// mod_git_base yields the clone-URL prefix put before a module path;
-// $BURGITBASE overrides the default https:// (mirrors, offline tests)
 fn mod_git_base() {
     match env_lookup("BURGITBASE") {
         Some(b) => b,
@@ -143,7 +119,6 @@ fn mod_git_base() {
     }
 }
 
-// exec_ok runs a command and folds any failure into Err(what + stderr)
 fn exec_ok(cmd, cargs, what) {
     match exec(cmd, cargs) {
         Ok(o) => match o {
@@ -159,7 +134,6 @@ fn exec_ok(cmd, cargs, what) {
     }
 }
 
-// parent_dir strips the last path component ("a/b/c" -> "a/b")
 fn parent_dir(p) {
     let mut last = -1
     let mut i = 0
@@ -176,10 +150,6 @@ fn parent_dir(p) {
     }
 }
 
-// mod_fetch clones path@version into the cache: git tag `v<semver>`,
-// shallow, `.git` stripped before the tree enters the cache (the tree hash
-// must not see git metadata). A module already in the cache is left
-// untouched. Returns the cache directory.
 pub fn mod_fetch(path, version) {
     let dest = cache_root() + "/" + path + "@" + version
     if file_exists(dest + "/bur.mod") {
@@ -210,11 +180,6 @@ pub fn mod_fetch(path, version) {
     Ok(dest)
 }
 
-// mvs_walk reads dir's bur.mod and walks the require closure through the
-// cache, cloning misses first when fetch is set. Every (path, version)
-// pair ever required contributes its own requires (Go's module graph); the
-// selection per path is the highest version seen — the minimal version
-// satisfying every requirement.
 fn mvs_walk(dir, fetch) {
     let text = match read_file(dir + "/bur.mod") {
         Ok(s) => s,
@@ -246,8 +211,8 @@ fn mvs_walk(dir, fetch) {
         },
     }
     let root = cache_root()
-    let mut sel = map() // path -> highest required version
-    let mut seen = map() // "path@version" -> 1, each pair contributes once
+    let mut sel = map()
+    let mut seen = map()
     let mut qi = 0
     while qi < len(qp) {
         let p = qp[qi]
@@ -316,12 +281,10 @@ fn mvs_walk(dir, fetch) {
     Ok(MP(spaths, svers))
 }
 
-// mvs_resolve resolves offline: a cache miss is an error
 pub fn mvs_resolve(dir) {
     mvs_walk(dir, false)
 }
 
-// mvs_resolve_fetch resolves with the network: misses are cloned (S6.2)
 pub fn mvs_resolve_fetch(dir) {
     mvs_walk(dir, true)
 }
@@ -338,10 +301,6 @@ fn sorted_strs(xs) {
     out
 }
 
-// tree_hash computes the canonical module hash: each file's sha256 plus its
-// sorted relative path, hashed once more (Go dirhash in spirit). Format:
-// `h1:<base64 sha256>` (SPEC §6.5) over manifest lines
-// `<file sha256 hex>  <relative path>\n`.
 pub fn tree_hash(dir) {
     let mut files = []
     collect_files(dir, "", files)
@@ -361,8 +320,6 @@ pub fn tree_hash(dir) {
             },
         }
     }
-    // `$0` carries the manifest as an argument: no quoting, no temp file.
-    // The digest is re-encoded hex -> raw -> base64 (GNU coreutils basenc)
     match exec("sh", ["-c", "printf %s \"$0\" | sha256sum | cut -c1-64 | tr a-f A-F | basenc --base16 -d | base64", join(manifest, "")]) {
         Ok(o) => match o {
             Output(code, so, se) => {
@@ -376,8 +333,6 @@ pub fn tree_hash(dir) {
     }
 }
 
-// collect_files gathers relative file paths under root, skipping
-// dot-entries; a path read_dir rejects is treated as a file
 fn collect_files(root, rel, mut acc) {
     let dir = if rel == "" {
         root
@@ -404,8 +359,6 @@ fn collect_files(root, rel, mut acc) {
     }
 }
 
-// sum_render lays out bur.sum: one `<path> <version> <h1 hash>` line per
-// selected module, already sorted by path
 pub fn sum_render(pick, hashes) {
     match pick {
         MP(paths, vers) => {
@@ -420,9 +373,6 @@ pub fn sum_render(pick, hashes) {
     }
 }
 
-// sum_check verifies a bur.sum text against a resolution: every selected
-// module must have an entry whose version and freshly computed tree hash
-// match
 pub fn sum_check(sum_text, pick, root) {
     let mut want = map()
     for line in split(sum_text, "\n") {
@@ -455,7 +405,6 @@ pub fn sum_check(sum_text, pick, root) {
     }
 }
 
-// mod_hashes computes the tree hash of every selected module
 fn mod_hashes(pick, root) {
     match pick {
         MP(paths, vers) => {
@@ -471,7 +420,6 @@ fn mod_hashes(pick, root) {
     }
 }
 
-// mod_init_text renders a fresh bur.mod for `bur mod init <module-path>`
 pub fn mod_init_text(mpath) {
     if !valid_import_path(mpath) {
         Err("invalid module path \"" + mpath + "\"")
@@ -480,8 +428,6 @@ pub fn mod_init_text(mpath) {
     }
 }
 
-// tidy_scan_imports gathers every import path in the module's .bur files,
-// test files included, across all package directories
 fn tidy_scan_imports(dir) {
     let mut out = []
     let mut seen = map()
@@ -542,12 +488,6 @@ fn tidy_scan_imports(dir) {
     Ok(out)
 }
 
-// mod_tidy syncs bur.mod's requires with the imports the module actually
-// uses, then recomputes MVS offline and rewrites dir/bur.sum. A require no
-// import needs is dropped; an import whose module is missing from the
-// require list is promoted to a direct require at the version the current
-// MVS graph already selected; an import no selected module covers is an
-// error pointing at `bur get`.
 pub fn mod_tidy(dir) {
     let text = match read_file(dir + "/bur.mod") {
         Ok(s) => s,
@@ -568,8 +508,6 @@ pub fn mod_tidy(dir) {
     let gvers = match pick0 {
         MP(_, vs) => vs,
     }
-    // needed: covering module -> selected version, per external import
-    // (longest module-path prefix wins)
     let mut needed = map()
     for ip in imports {
         let local = ip == "std" || lib::str_has_prefix(ip, "std/") || ip == mod_path || lib::str_has_prefix(ip, mod_path + "/")
@@ -620,9 +558,6 @@ pub fn mod_tidy(dir) {
     mod_sum_sync(dir)
 }
 
-// mod_sum_sync recomputes MVS offline over the current bur.mod and
-// rewrites dir/bur.sum; `bur get` uses it directly so a just-added require
-// survives until an import consumes it
 fn mod_sum_sync(dir) {
     let pick = mvs_resolve(dir)?
     let hs = mod_hashes(pick, cache_root())?
@@ -632,8 +567,6 @@ fn mod_sum_sync(dir) {
     }
 }
 
-// mod_download fetches the require closure into the cache, then verifies
-// against bur.sum when present or writes it when absent
 pub fn mod_download(dir) {
     let pick = mvs_resolve_fetch(dir)?
     let root = cache_root()
@@ -652,7 +585,6 @@ pub fn mod_download(dir) {
     }
 }
 
-// mod_verify checks the cached trees against dir/bur.sum
 pub fn mod_verify(dir) {
     let pick = mvs_resolve(dir)?
     let sum = match read_file(dir + "/bur.sum") {
@@ -666,9 +598,6 @@ pub fn mod_verify(dir) {
     Ok(str(n) + " module(s) verified")
 }
 
-// mod_edit_require upserts `require <path> <version>` in bur.mod text,
-// keeping unrelated lines as they are (a comment on a replaced require
-// line is dropped)
 pub fn mod_edit_require(text, path, version) {
     let mut out = []
     let mut hit = false
@@ -693,8 +622,6 @@ pub fn mod_edit_require(text, path, version) {
     join(out, "\n")
 }
 
-// mod_get upserts a require in dir's bur.mod, fetches the new closure, and
-// tidies bur.sum (`bur get <path>@<version>`)
 pub fn mod_get(dir, spec) {
     let at = match str_index_of(spec, "@") {
         Some(ix) => ix,
@@ -725,7 +652,6 @@ pub fn mod_get(dir, spec) {
     match mvs_resolve_fetch(dir) {
         Ok(_) => {},
         Err(m) => {
-            // fetch failed (missing tag, network): restore the old bur.mod
             let _ = write_file(dir + "/bur.mod", text)
             return Err(m)
         },

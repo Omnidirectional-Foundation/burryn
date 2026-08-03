@@ -1,41 +1,20 @@
-// vm.bur — bytecode interpreter, mirroring vm.go + gc.go + builtins.go.
-//
-// Interpreted values are Val. Scalars and strings live inline (strings are
-// immutable and content-equal, so host strings serve directly); every
-// mutable or identity-bearing object (list, map, closure, upvalue, enum
-// instance, channel, native, enum type, variant ctor) lives in a tagged
-// arena of parallel mut lists reached through an int handle, because mut
-// does not penetrate enum fields. The interpreted heap has its own
-// mark-sweep collector ported from gc.go: handles are plain ints the host
-// GC cannot trace, so slot liveness is the VM's own job. Freed slots drop
-// their payloads (letting the host GC reclaim the memory) and go on a free
-// list for reuse.
-//
-// Fibers are plain data in parallel mut lists — the scheduler is the same
-// FIFO ready-queue loop as vm.go, running on one host thread. Runtime traps
-// print to stderr and exit(4) directly: a trap always ends the program, so
-// nothing needs to unwind.
-
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
-// interpreted runtime value
 enum Val {
     VUnit,
     VBool(bool),
     VInt(int),
     VFloat(float),
     VStr(str),
-    VObj(int), // arena handle
+    VObj(int),
 }
 
-// chan_try_recv result (the language has no tuples)
 enum RecvRes {
     RecvGot(Val),
     RecvNone,
 }
 
-// arena object tags
 let ot_free = 0
 let ot_list = 1
 let ot_map = 2
@@ -49,7 +28,6 @@ let ot_ctor = 9
 let ot_record = 10
 let ot_tuple = 11
 
-// fiber status (vm.go FiberStatus)
 let fs_ready = 0
 let fs_blocked_send = 1
 let fs_blocked_recv = 2
@@ -64,77 +42,70 @@ let wait_timer = 1
 let wait_exec = 2
 let wait_net = 3
 
-// instructions per fiber before a forced yield (vm.go timeSlice)
 let vm_time_slice = 10000
 
-// run_program interprets a Compiled(...) payload: the function arena
-// (name/file/arity/upvals/code/spans/consts, entry = handle 0), the enum
-// arena (qualified name, variant names, variant arities) and the
-// interpreted program's argv.
 pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args, ls_files, ls_names, ls_tables) {
     let max_int = 9223372036854775807
     let min_int = -9223372036854775807 - 1
 
-    // ---- interpreted heap arena (parallel lists, one slot per handle) ----
     let mut o_tag = []
     let mut o_mark = []
-    let mut o_vals = [] // list elems / enum inst fields / channel buffer
-    let mut o_keys = [] // map keys, parallel to o_vals entries
-    let mut o_idxi = [] // map: int key -> entry position
-    let mut o_idxs = [] // map: str key -> entry position
-    let mut o_i1 = [] // closure:fn / upval:fiber / inst:enum / chan:cap / native:id / enumtype:enum / ctor:enum
-    let mut o_i2 = [] // upval:slot / inst:variant / ctor:variant
-    let mut o_b1 = [] // upval:open / chan:closed
-    let mut o_v1 = [] // upval: closed-over value
-    let mut o_h1 = [] // closure: upvalue handles / chan: sendq fiber ids
-    let mut o_h2 = [] // chan: recvq fiber ids
-    let mut o_h3 = [] // chan: select waiter fiber ids
+    let mut o_vals = []
+    let mut o_keys = []
+    let mut o_idxi = []
+    let mut o_idxs = []
+    let mut o_i1 = []
+    let mut o_i2 = []
+    let mut o_b1 = []
+    let mut o_v1 = []
+    let mut o_h1 = []
+    let mut o_h2 = []
+    let mut o_h3 = []
     let mut free_slots = []
-    let mut pinned = [] // permanent roots: enum types, ctors, singletons, natives
+    let mut pinned = []
     let mut obj_count = 0
     let mut gc_threshold = 256
     let mut gc_total_alloc = 0
     let mut gc_cycles_n = 0
-    let mut vm_on = false // collections only run once the fibers exist
-    let mut gray = [] // collect()'s worklist
+    let mut vm_on = false
+    let mut gray = []
 
-    // ---- globals and fibers ----
-    let mut globals = map() // name -> Val
-    let mut fb_stack = [] // [[Val]]; list length is the live stack top
+    let mut globals = map()
+    let mut fb_stack = []
     let mut fb_status = []
-    let mut fb_sendval = [] // pending value while blocked on send
-    let mut fb_selectch = [] // channels this fiber waits on in a select
-    let mut fb_openuv = [] // open upvalue handles
-    let mut fb_fr_cl = [] // call frames: closure handle
-    let mut fb_fr_ip = [] // call frames: instruction pointer
-    let mut fb_fr_base = [] // call frames: stack base
-    let mut fb_fr_callip = [] // call frames: caller's call-site ip (traces)
-    let mut fb_fr_defers = [] // call frames: registered defer closures (run LIFO)
-    let mut fb_fr_dstash = [] // call frames: stashed exit value while defers run
-    let mut fb_fr_dact = [] // call frames: a defer exit sequence is in progress
-    let mut fb_wakeat = [] // absolute clock() deadline while fs_blocked_timer
-    let mut fb_ioproc = [] // host exec handle awaited while fs_blocked_io
-    let mut fb_iohas = [] // scheduler delivered an exec result
-    let mut fb_iores = [] // the delivered guest Result value
-    let mut fb_netop = [] // net_nb op while fs_blocked_net (-1 = not net)
-    let mut fb_nethandle = [] // socket handle for the parked net operation
-    let mut fb_netdata = [] // remaining write data while parked
-    let mut fb_netmax = [] // read max while parked
-    let mut fb_stdinmax = [] // read_stdin max while fs_blocked_stdin
-    let mut ready = [] // FIFO of ready fiber ids
+    let mut fb_sendval = []
+    let mut fb_selectch = []
+    let mut fb_openuv = []
+    let mut fb_fr_cl = []
+    let mut fb_fr_ip = []
+    let mut fb_fr_base = []
+    let mut fb_fr_callip = []
+    let mut fb_fr_defers = []
+    let mut fb_fr_dstash = []
+    let mut fb_fr_dact = []
+    let mut fb_wakeat = []
+    let mut fb_ioproc = []
+    let mut fb_iohas = []
+    let mut fb_iores = []
+    let mut fb_netop = []
+    let mut fb_nethandle = []
+    let mut fb_netdata = []
+    let mut fb_netmax = []
+    let mut fb_stdinmax = []
+    let mut ready = []
     let mut main_fiber = 0
-    let mut park_recv = -1 // set by the recv() native to ask OpCall to park
-    let mut park_sleep = -1.0 // wake deadline set by the sleep() native, or -1
-    let mut park_io = -1 // host exec handle set by the exec() native
-    let mut park_netop = -1 // net_nb op set by a net native on EAGAIN
+    let mut park_recv = -1
+    let mut park_sleep = -1.0
+    let mut park_io = -1
+    let mut park_netop = -1
     let mut park_nethandle = -1
     let mut park_netdata = ""
     let mut park_netmax = 0
-    let mut park_stdinmax = -1 // read_stdin max on EAGAIN
-    let mut ntimers = 0 // fibers currently parked on a timer
-    let mut nio = 0 // fibers currently parked on child-process IO
-    let mut nio_net = 0 // fibers currently parked on net IO
-    let mut nio_stdin = 0 // fibers currently parked on stdin
+    let mut park_stdinmax = -1
+    let mut ntimers = 0
+    let mut nio = 0
+    let mut nio_net = 0
+    let mut nio_stdin = 0
     let mut wait_fiber = []
     let mut wait_kind = []
     let mut wait_deadline = []
@@ -143,13 +114,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut opt_enum = -1
     let mut res_enum = -1
     let mut out_enum = -1
-    let mut k_vals = [] // converted constant tables, parallel to f_consts
+    let mut k_vals = []
 
-    let mut cur_f = -1 // fiber whose instruction is executing (traces)
-    let mut cur_ip = 0 // start ip of that instruction (traces)
+    let mut cur_f = -1
+    let mut cur_ip = 0
 
-    // a trap always ends the program: report the message, then the frame
-    // trace of the trapping fiber (same shape as the native runtime's)
     fn trap(msg) {
         eprintln("runtime error: " + msg)
         if cur_f >= 0 {
@@ -182,7 +151,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     f_file[fnh]
                 }
                 if file != "" {
-                    // synthetic glue (module entry) has no source to point at
                     let ln = if li >= 0 && ip < len(f_spans[fnh]) {
                         match f_spans[fnh][ip] {
                             frontend::SpanT::Sp(s0, _) => lib::line_of(ls_tables[li], s0),
@@ -202,7 +170,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         code[ip] * 256 + code[ip + 1]
     }
 
-    // ---- Val inspectors ----
     fn is_str(v) {
         match v {
             VStr(_) => true,
@@ -306,8 +273,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // format mirrors value.go format(): quote=false is display (print),
-    // quote=true is repr (inside containers)
     fn format_val(v, quote) {
         match v {
             VUnit => "()",
@@ -386,8 +351,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // eq_val mirrors valuesEqual: deep for lists, maps and enum instances,
-    // int/float cross-compare, reference (handle) equality otherwise
     fn eq_val(a, b) {
         match a {
             VUnit => match b {
@@ -435,7 +398,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         if len(o_keys[x]) != len(o_keys[y]) {
                             false
                         } else {
-                            // order-insensitive, like objEqual
                             let mut same = true
                             let mut i = 0
                             while i < len(o_keys[x]) {
@@ -501,7 +463,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- mark-sweep collector (gc.go) ----
     fn mark_val(v) {
         match v {
             VObj(h) => {
@@ -524,8 +485,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         gc_cycles_n = gc_cycles_n + 1
         gray = []
 
-        // roots: permanent objects, globals, every fiber's stack, frame
-        // closures, open upvalues and pending send value
         for h in pinned {
             mark_obj(h)
         }
@@ -561,8 +520,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             mark_val(pr)
         }
 
-        // trace: enum types, ctors and natives carry no interpreted
-        // references (variant metadata lives in the compiler's enum arena)
         while len(gray) > 0 {
             let h = pop(gray)
             let t = o_tag[h]
@@ -595,7 +552,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             }
         }
 
-        // sweep: drop payloads so the host GC reclaims them, reuse the slot
         let mut freed = 0
         let mut h = 0
         while h < len(o_tag) {
@@ -625,8 +581,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         freed
     }
 
-    // alloc registers a slot, collecting first when the live count crosses
-    // the threshold (gc.go alloc); freed slots come back payload-clean
     fn alloc_obj(tag) {
         if vm_on && obj_count + 1 > gc_threshold {
             let _ = collect()
@@ -656,7 +610,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- fiber stack ----
     fn fpush(f, v) {
         push(fb_stack[f], v)
     }
@@ -682,8 +635,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         o_vals[h] = fields
         VObj(h)
     }
-    // Option/Result constructors root their payload on the current fiber's
-    // stack across the allocation, mirroring builtins.go
     fn make_some(f, v) {
         fpush(f, v)
         let r = make_inst(opt_enum, 0, [fpeek(f, 0)])
@@ -711,8 +662,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         push(ready, f)
     }
 
-    // convert a host exec Result<Output, str> into a guest value, rooting
-    // fresh objects on fiber f's stack
     fn conv_exec_result(f, r) {
         match r {
             Ok(o) => match o {
@@ -746,7 +695,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         push(wait_handle, h)
     }
 
-    // Register every blocked timer and IO source through one wait list.
     fn wait_register_all() {
         wait_reset()
         let mut i = 0
@@ -765,7 +713,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // Poll registered IO sources and wake their fibers in fiber id order.
     fn wait_poll_io() {
         let mut i = 0
         while i < len(wait_fiber) {
@@ -786,7 +733,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // Retry non-blocking net operations for net-blocked fibers.
     fn wait_poll_net() {
         let mut i = 0
         while i < len(fb_status) {
@@ -836,9 +782,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                 },
                 Err(m) => {
-                    if m == "__eagain" {
-                        // still not ready
-                    } else {
+                    if m == "__eagain" {} else {
                         fb_iores[f] = make_err(f, VStr(m))
                         fb_iohas[f] = true
                         fb_netop[f] = -1
@@ -851,7 +795,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // Retry non-blocking stdin reads for stdin-blocked fibers.
     fn wait_poll_stdin() {
         let mut i = 0
         while i < len(fb_status) {
@@ -868,9 +811,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     schedule(f)
                 },
                 Err(m) => {
-                    if m == "__eagain" {
-                        // still not ready
-                    } else {
+                    if m == "__eagain" {} else {
                         trap("read_stdin: " + m)
                     }
                 },
@@ -893,8 +834,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         nearest
     }
 
-    // wake every timer whose deadline has passed, in (deadline, fiber id)
-    // order; fiber ids ascend during the scan, so strictly-less picks suffice
     fn wake_due_timers() {
         let now = clock()
         let mut going = true
@@ -918,7 +857,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // Block the host only while the guest has no runnable fibers.
     fn wait_idle() {
         while len(ready) == 0 {
             wait_register_all()
@@ -973,9 +911,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         f
     }
 
-    // ---- channels (vm.go) ----
-    // wake every fiber parked in a select on ch; one woken elsewhere first
-    // is skipped
     fn wake_waiters(ch) {
         if len(o_h3[ch]) > 0 {
             for w in o_h3[ch] {
@@ -1001,8 +936,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     fn chan_send_ready(ch) {
         o_b1[ch] || len(o_h2[ch]) > 0 || len(o_vals[ch]) < o_i1[ch]
     }
-    // non-blocking receive, waking one blocked sender to refill the slot it
-    // drains; RecvNone when nothing is available yet
     fn chan_try_recv(ch) {
         if len(o_vals[ch]) > 0 {
             let v = o_vals[ch][0]
@@ -1016,7 +949,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             }
             RecvGot(v)
         } else if len(o_h1[ch]) > 0 {
-            // unbuffered rendezvous
             let s = o_h1[ch][0]
             o_h1[ch] = slice(o_h1[ch], 1, len(o_h1[ch]))
             let v = fb_sendval[s]
@@ -1028,7 +960,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- upvalues ----
     fn uv_get(h) {
         if o_b1[h] {
             fb_stack[o_i1[h]][o_i2[h]]
@@ -1075,7 +1006,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         fb_openuv[f] = kept
     }
 
-    // map entry position for key k: >=0 found, -1 absent, -2 bad key type
     fn map_find(mh, k) {
         match k {
             VInt(n) => match get(o_idxi[mh], n) {
@@ -1097,10 +1027,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- natives (builtins.go); argc already checked by the typechecker,
-    // arg i sits at fpeek(f, argc-1-i) and stays rooted until the caller
-    // pops. Allocating natives root fresh handles before any further
-    // allocation, mirroring the Go implementations.
     fn do_native(f, id, argc) {
         let nm = lib::native_names[id]
         if nm == "print" || nm == "println" || nm == "eprintln" {
@@ -1196,7 +1122,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if mh < 0 {
                 trap("keys() needs a map, got " + type_name(fpeek(f, 0)))
             }
-            // keys are int|str only, never arena handles: plain fill is safe
             let lh = alloc_obj(ot_list)
             o_vals[lh] = slice(o_keys[mh], 0, len(o_keys[mh]))
             VObj(lh)
@@ -1358,7 +1283,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if start < 0 || end < start || end > len(o_vals[src]) {
                 trap("slice(" + str(start) + ", " + str(end) + ") out of bounds (len " + str(len(o_vals[src])) + ")")
             }
-            // the source stays rooted on the stack across the allocation
             let lh = alloc_obj(ot_list)
             o_vals[lh] = slice(o_vals[src], start, end)
             VObj(lh)
@@ -1415,13 +1339,12 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     for n in names {
                         push(o_vals[lh], VStr(n))
                     }
-                    make_ok(f, VObj(lh)) // make_ok roots the fresh list
+                    make_ok(f, VObj(lh))
                 },
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "exec" {
             if fb_iohas[f] {
-                // resuming: the scheduler already delivered
                 fb_iohas[f] = false
                 let r = fb_iores[f]
                 fb_iores[f] = VUnit
@@ -1442,7 +1365,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     Ok(h) => match exec_poll(h) {
                         Some(r) => conv_exec_result(f, r),
                         None => {
-                            park_io = h // OpCall parks this fiber and retries
+                            park_io = h
                             VUnit
                         },
                     },
@@ -1507,8 +1430,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 trap("close of closed channel")
             }
             o_b1[ch] = true
-            // wake every blocked receiver: each re-runs its receive, drains
-            // any buffered values, then observes closure
             for r in o_h2[ch] {
                 schedule(r)
             }
@@ -1522,7 +1443,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             }
             match chan_try_recv(ch) {
                 RecvGot(v) => {
-                    let opt = make_some(f, v) // roots v across the Some allocation
+                    let opt = make_some(f, v)
                     wake_waiters(ch)
                     opt
                 },
@@ -1530,7 +1451,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     if o_b1[ch] {
                         make_none()
                     } else {
-                        park_recv = ch // OpCall parks this fiber and retries once woken
+                        park_recv = ch
                         VUnit
                     }
                 },
@@ -1575,7 +1496,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if int_of(fpeek(f, 0)) > 0 {
                 park_sleep = clock() + to_float(int_of(fpeek(f, 0))) / 1000.0
             } else {
-                yield_flag = true // sleep(0) is a plain yield
+                yield_flag = true
             }
             VUnit
         } else if nm == "tcp_listen" {
@@ -1759,7 +1680,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- calls (vm.go callValue) ----
     fn call_value(f, argc) {
         let callee = fpeek(f, argc)
         let h = obj_h(callee)
@@ -1785,7 +1705,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         } else if t == ot_native {
             let res = do_native(f, o_i1[h], argc)
             if park_recv < 0 && park_io < 0 && park_netop < 0 && park_stdinmax < 0 {
-                // otherwise leave callee+args: OpCall parks and retries
                 let mut i = 0
                 while i <= argc {
                     let _ = fpop(f)
@@ -1799,7 +1718,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if argc != en_varities[eh][vi] {
                 trap(en_qual[eh] + "." + en_vnames[eh][vi] + " expects " + str(en_varities[eh][vi]) + " field(s), got " + str(argc))
             }
-            // fields copied while still on the stack, so they stay rooted
             let mut fields = []
             let mut i = 0
             while i < argc {
@@ -1818,7 +1736,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- arithmetic and comparison (vm.go arith/compare) ----
     fn arith_name(op) {
         if op == lib::op_add {
             "+"
@@ -1848,8 +1765,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             let y = int_of(b)
             let _ = fpop(f)
             let _ = fpop(f)
-            // integer overflow always traps — never wraps silently (SPEC);
-            // checks run before the host operation, which would trap itself
             if op == lib::op_add {
                 if y > 0 && x > max_int - y {
                     trap("integer overflow: " + str(x) + " + " + str(y))
@@ -1963,13 +1878,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
-    // ---- one fiber until it finishes, blocks, or exhausts its slice ----
     fn exec_fiber(f) {
         let mut budget = vm_time_slice
         cur_f = f
         while true {
             if budget <= 0 {
-                // preemption point
                 schedule(f)
                 return false
             }
@@ -2123,30 +2036,27 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 fb_fr_ip[f][fi] = start_ip + 2
                 call_value(f, argc)
                 if park_recv >= 0 {
-                    // the recv() native asked to block on a channel
                     let ch = park_recv
                     park_recv = -1
                     fb_status[f] = fs_blocked_recv
                     push(o_h2[ch], f)
-                    wake_waiters(ch) // a select send arm can now proceed
-                    fb_fr_ip[f][fi] = start_ip // re-run the call (and recv) once woken
+                    wake_waiters(ch)
+                    fb_fr_ip[f][fi] = start_ip
                     return false
                 }
                 if park_sleep >= 0.0 {
-                    // the sleep() native set a deadline
                     fb_status[f] = fs_blocked_timer
                     fb_wakeat[f] = park_sleep
                     park_sleep = -1.0
                     ntimers = ntimers + 1
-                    return false // resumes after the call once the timer fires
+                    return false
                 }
                 if park_io >= 0 {
-                    // the exec() native started a child
                     fb_status[f] = fs_blocked_io
                     fb_ioproc[f] = park_io
                     park_io = -1
                     nio = nio + 1
-                    fb_fr_ip[f][fi] = start_ip // re-run exec once delivered
+                    fb_fr_ip[f][fi] = start_ip
                     return false
                 }
                 if park_netop >= 0 {
@@ -2172,7 +2082,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     return false
                 }
                 if yield_flag {
-                    // a native (yield) asked us to hand off
                     yield_flag = false
                     schedule(f)
                     return false
@@ -2189,7 +2098,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 }
                 let nclh = alloc_obj(ot_closure)
                 o_i1[nclh] = sub
-                fpush(f, VObj(nclh)) // root the closure while upvalues fill in
+                fpush(f, VObj(nclh))
                 let mut i = 0
                 while i < f_nupvals[sub] {
                     let is_local = code[ip] == 1
@@ -2205,9 +2114,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 fb_fr_ip[f][fi] = ip
             } else if op == lib::op_return {
                 if len(fb_fr_defers[f][fi]) > 0 || fb_fr_dact[f][fi] {
-                    // registered defers: stash the exit value once, then run
-                    // each deferred block by re-executing this return after
-                    // its call (the re-entry pops the block's result)
                     let v = fpop(f)
                     if !fb_fr_dact[f][fi] {
                         fb_fr_dstash[f][fi] = v
@@ -2221,7 +2127,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     } else {
                         fpush(f, fb_fr_dstash[f][fi])
                         fb_fr_dact[f][fi] = false
-                        fb_fr_ip[f][fi] = start_ip // plain return path below
+                        fb_fr_ip[f][fi] = start_ip
                     }
                 } else {
                     let result = fpop(f)
@@ -2244,7 +2150,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             } else if op == lib::op_list {
                 let n = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
-                // alloc before popping: elements stay rooted on the stack
                 let lh = alloc_obj(ot_list)
                 let top = ftop(f)
                 let mut i = top - n
@@ -2345,8 +2250,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 trap("no pattern matched value " + format_val(fpeek(f, 0), true))
             } else if op == lib::op_try {
                 if fb_fr_dact[f][fi] {
-                    // mid defer-exit re-entry: drop the deferred block's
-                    // result and continue unwinding with the stashed None/Err
                     let _ = fpop(f)
                     if len(fb_fr_defers[f][fi]) > 0 {
                         let dh = pop(fb_fr_defers[f][fi])
@@ -2383,11 +2286,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         trap("'?' needs an Option or Result, got " + type_name(v))
                     }
                     if o_i2[ih] == 0 {
-                        // Some/Ok
                         let _ = fpop(f)
                         fpush(f, o_vals[ih][0])
                     } else if len(fb_fr_defers[f][fi]) > 0 {
-                        // early exit with registered defers: run them first
                         let _ = fpop(f)
                         fb_fr_dstash[f][fi] = v
                         fb_fr_dact[f][fi] = true
@@ -2396,7 +2297,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         fpush(f, VObj(dh))
                         call_value(f, 0)
                     } else {
-                        // early-return the None/Err itself
                         let _ = fpop(f)
                         let base = fb_fr_base[f][fi]
                         close_upvalues(f, base)
@@ -2453,8 +2353,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("send on closed channel")
                 }
                 if len(o_h2[ch]) > 0 {
-                    // hand the value off through the buffer; the woken
-                    // receiver re-runs its receive and finds it there
                     push(o_vals[ch], v)
                     let r = o_h2[ch][0]
                     o_h2[ch] = slice(o_h2[ch], 1, len(o_h2[ch]))
@@ -2467,11 +2365,11 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     fb_sendval[f] = v
                     fb_status[f] = fs_blocked_send
                     push(o_h1[ch], f)
-                    wake_waiters(ch) // a select receive arm can now proceed
+                    wake_waiters(ch)
                     return false
                 }
             } else if op == lib::op_recv {
-                let chv = fpeek(f, 0) // keep the channel on the stack in case we park
+                let chv = fpeek(f, 0)
                 let ch = tagged_h(chv, ot_channel)
                 if ch < 0 {
                     let _ = fpop(f)
@@ -2490,8 +2388,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         }
                         fb_status[f] = fs_blocked_recv
                         push(o_h2[ch], f)
-                        wake_waiters(ch) // a select send arm can now proceed
-                        fb_fr_ip[f][fi] = start_ip // re-run once woken
+                        wake_waiters(ch)
+                        fb_fr_ip[f][fi] = start_ip
                         return false
                     },
                 }
@@ -2507,25 +2405,22 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                         let _ = fpop(f)
                         fpush(f, v)
                         wake_waiters(ch)
-                        // skip the jump operand: fall through into the body
                         fb_fr_ip[f][fi] = start_ip + 3
                     },
                     RecvNone => {
                         if o_b1[ch] {
                             let _ = fpop(f)
-                            // exit the loop
                             fb_fr_ip[f][fi] = start_ip + 3 + rd_u16(code, start_ip + 1)
                         } else {
                             fb_status[f] = fs_blocked_recv
                             push(o_h2[ch], f)
                             wake_waiters(ch)
-                            fb_fr_ip[f][fi] = start_ip // re-run once woken
+                            fb_fr_ip[f][fi] = start_ip
                             return false
                         }
                     },
                 }
             } else if op == lib::op_select {
-                // on re-entry after a park, drop stale waiter registrations
                 if len(fb_selectch[f]) > 0 {
                     for pch in fb_selectch[f] {
                         remove_waiter(pch, f)
@@ -2560,7 +2455,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     default_target = p + dist
                 }
                 let base = ftop(f) - slots
-                // resolve each arm's operand positions from the bottom up
                 let mut chan_pos = []
                 let mut val_pos = []
                 let mut off = base
@@ -2576,7 +2470,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                     i = i + 1
                 }
-                // pick the first ready arm in declaration order
                 let mut chosen = -1
                 i = 0
                 while i < n_arms {
@@ -2617,10 +2510,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                             RecvGot(v) => {
                                 wake_waiters(ch)
                                 fsettop(f, base)
-                                fpush(f, v) // left on the stack for a binding arm
+                                fpush(f, v)
                             },
                             RecvNone => {
-                                // implies closed here
                                 fsettop(f, base)
                                 trap("receive on closed channel")
                             },
@@ -2631,7 +2523,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     fsettop(f, base)
                     fb_fr_ip[f][fi] = default_target
                 } else {
-                    // nothing ready: park on every arm's channel, retry when woken
                     i = 0
                     while i < n_arms {
                         let ch = tagged_h(fb_stack[f][chan_pos[i]], ot_channel)
@@ -2766,10 +2657,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 trap("bad opcode " + str(op) + " (VM bug)")
             }
         }
-        false // unreachable: the loop only exits through return
+        false
     }
 
-    // ---- load: enum type objects, converted constants, natives ----
     let mut et_obj = []
     let mut e = 0
     while e < len(en_qual) {
@@ -2796,7 +2686,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 lib::CVal::CInt(n) => VInt(n),
                 lib::CVal::CFloat(x) => VFloat(x),
                 lib::CVal::CStr(s) => VStr(s),
-                lib::CVal::CFn(_) => VUnit, // only reached through OpClosure, which reads the CVal
+                lib::CVal::CFn(_) => VUnit,
                 lib::CVal::CEnumType(eh) => VObj(et_obj[eh]),
                 lib::CVal::CSingleton(eh, vi) => {
                     let h = alloc_obj(ot_enuminst)
@@ -2829,9 +2719,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     put(globals, "Result", VObj(et_obj[res_enum]))
     put(globals, "Output", VObj(et_obj[out_enum]))
 
-    // ---- main fiber and scheduler (vm.go run) ----
     let mcl = alloc_obj(ot_closure)
-    o_i1[mcl] = 0 // entry function is handle 0
+    o_i1[mcl] = 0
     main_fiber = new_fiber(mcl, [])
     push(ready, main_fiber)
     vm_on = true
@@ -2854,7 +2743,6 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if nio > 0 || nio_net > 0 || nio_stdin > 0 || ntimers > 0 {
                 wait_idle()
             } else {
-                // main finished => program over (checked below); otherwise deadlock
                 let mut blocked = 0
                 let mut bi = 0
                 while bi < len(fb_status) {
@@ -2876,7 +2764,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         if fb_status[fx] == fs_ready {
             let done = exec_fiber(fx)
             if done && fx == main_fiber {
-                return // Go semantics: program exits when main returns
+                return
             }
         }
     }
