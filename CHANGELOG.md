@@ -6,7 +6,26 @@ All notable changes to this project are documented here.
 Versions use a 2-day date range. Latest first.
 版本号采用 2 天日期区间，最新在前。
 
-## v0.4 (2026-07-21 ~ 07-22)
+## v0.5 (2026-08-03 ~ 08-04)
+
+**Landed S8.2 syntax freeze** — the language syntax is frozen; the formal
+grammar lives in `docs/grammar.md` and future changes go through its revision
+process.
+**落地 S8.2 语法冻结** — 语言表层语法冻结；正式 grammar 见 `docs/grammar.md`，此后变更须走修订流程。
+
+- **Added:** `::` path qualifier (packages, enum variants) distinct from `.`
+  member access (fields, methods).
+- **Added:** Compound assignment `+= -= *= /= %=`; `let`/`const` type
+  annotations; indexed `for i, x in xs`; or-patterns `A | B`; labeled loops
+  `label:` with `break label`/`continue label`; receiver methods
+  `fn (s: Type) name()`; record patterns `record { x, y }`; tuples `(a, b)`
+  with destructuring `let (a, b) = t`.
+- **Added:** Literal forms — hex `0xFF`, binary `0b1010`, digit separators,
+  float exponents, `\r` escape, shebang, multiline strings `"""` with `\`
+  content markers, range literals `1..10`.
+- **Added:** grammar.md covers keywords, tokens, EBNF, record, `<-`
+  disambiguation, and interface-file syntax.
+
 
 **Landed S7.6 `defer`** — `defer { ... }` registers a block on the enclosing
 function; deferred blocks run LIFO when the function exits normally.
