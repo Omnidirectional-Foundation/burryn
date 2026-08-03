@@ -803,7 +803,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
-    fn cp_for(ch, v, iter, body, sp) {
+    fn cp_for(ch, v, idx, iter, body, sp) {
         begin_scope(ch)
         match cp_expr_ref(ch, iter) {
             Ok(_) => {},
@@ -839,6 +839,17 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         let exit_j = emit_jump(ch, lib::op_jump_if_false_pop, sp)
 
         begin_scope(ch)
+        if idx != "" {
+            // for i, x in xs：把内部 (idx) 槽的值暴露为索引变量（declare 即入槽）
+            emit(ch, lib::op_get_local, sp)
+            emit_u16(ch, idx_slot, sp)
+            match declare_local(ch, idx, false, sp) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+        }
         emit(ch, lib::op_get_local, sp)
         emit_u16(ch, iter_slot, sp)
         emit(ch, lib::op_get_local, sp)
@@ -1740,14 +1751,14 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 Ok(true)
             },
             frontend::Node::WhileStmt(cond, body, sp) => cp_while(ch, cond, body, sp),
-            frontend::Node::ForStmt(v, _, iter, _, body, sp) => {
+            frontend::Node::ForStmt(v, _, idx, _, iter, _, body, sp) => {
                 let fstart = match sp {
                     frontend::SpanT::Sp(fs, _) => fs,
                 }
                 if contains(chan_fors, cur_file + ":" + str(fstart)) {
                     cp_for_chan(ch, v, iter, body, sp)
                 } else {
-                    cp_for(ch, v, iter, body, sp)
+                    cp_for(ch, v, idx, iter, body, sp)
                 }
             },
             frontend::Node::BreakStmt(sp) => {
