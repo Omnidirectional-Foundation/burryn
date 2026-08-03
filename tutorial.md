@@ -11,7 +11,7 @@ work **today**, every snippet checked against the compiler.
 
 ---
 
-## 0. Running and building
+## 0. Running and building 🚀
 
 Save code as a `.bur` file and run it on the VM — **no C toolchain needed**:
 
@@ -35,7 +35,7 @@ and the resulting binary runs anywhere.
 
 ---
 
-## 1. Hello, Burryn
+## 1. Hello, Burryn 👋
 
 ```rust
 // A comment. Statements end at newlines — no semicolons (Go-style).
@@ -51,7 +51,7 @@ Because a newline ends a statement, `} else {` must sit on one line (like Go).
 
 ---
 
-## 2. Variables: let, mut, shadowing
+## 2. Variables: let, mut, shadowing 📦
 
 A `let` binding is **immutable by default**; reassigning is a compile error.
 Use `let mut` for mutability.
@@ -124,7 +124,7 @@ n *= 2                // 10
 
 ---
 
-## 3. Primitive types
+## 3. Primitive types 🔢
 
 There are exactly two number types: `int` (i64) and `float` (f64). Plus `bool`,
 `string`, and unit `()` ("no meaningful value"). **No implicit conversions,
@@ -207,7 +207,7 @@ println("literal brace: {{")
 
 ---
 
-## 4. Expression orientation
+## 4. Expression orientation 🧮
 
 `if`, `match` and blocks `{}` are **expressions** — they have values. A function
 returns its last expression.
@@ -226,7 +226,7 @@ An `if` used as a value must have an `else` (otherwise one branch has no value).
 
 ---
 
-## 5. Functions and closures
+## 5. Functions and closures ⚙️
 
 Function parameters and return types are **unannotated** (types are inferred).
 Use `return` to return early; otherwise the last expression is returned.
@@ -331,7 +331,7 @@ println(p.dist())                        // 25.0
 
 ---
 
-## 6. Lists and loops
+## 6. Lists and loops 🔁
 
 Lists use `[...]` literals, `l[i]` to index (out-of-bounds traps), `l[i] = v` to
 assign (needs `mut`).
@@ -392,7 +392,7 @@ Common list functions: `len`, `push`, `pop`, `slice(xs, start, end)`,
 
 ---
 
-## 7. Strings
+## 7. Strings 🔤
 
 `+` concatenates strings; `<` `>` etc. compare bytewise. Strings are immutable
 byte sequences.
@@ -423,7 +423,7 @@ code point -> int), `chr(n)` (code point -> string), `split`, `join`, `substr`,
 
 ---
 
-## 8. Maps
+## 8. Maps 🗺️
 
 Maps use a **function API**, with no `m[k]` sugar (under zero-annotation
 inference, `container[key]` can't tell a list from a map in an unannotated
@@ -450,7 +450,7 @@ println(len(counts))             // number of entries
 
 ---
 
-## 9. Enums and match
+## 9. Enums and match 🧩
 
 Enums are algebraic data types with typed fields — the **only place you write
 types**. Variants may have zero or more fields.
@@ -517,7 +517,7 @@ When a variant name is shared across enums, qualify it as `Enum.Variant`, e.g.
 
 ---
 
-## 10. No null: Option, Result, and ?
+## 10. No null: Option, Result, and ? 🛡️
 
 **There is no null.** A possibly-absent value is the built-in `Option`
 (`Some(v)` / `None`); a possibly-failing one is `Result` (`Ok(v)` / `Err(e)`).
@@ -566,7 +566,7 @@ match read_file("notes.txt") {
 
 ---
 
-## 11. Concurrency: spawn, channel, select
+## 11. Concurrency: spawn, channel, select 🧵
 
 CSP model: `spawn` starts a **fiber** (green thread); fibers talk over
 **channels**. Execution is **always single-threaded** — cooperative scheduling
@@ -613,7 +613,7 @@ select {
 
 ---
 
-## 12. Networking
+## 12. Networking 🌐
 
 Burryn has built-in TCP support: six natives provide non-blocking TCP handle
 management, and the scheduler automatically parks/wakes fibers waiting on
@@ -671,7 +671,7 @@ Unix sockets and TLS are not provided — those are for later versions.
 
 ---
 
-## 13. Modules
+## 13. Modules 📚
 
 **A directory is a package.** A module root holds a `bur.mod` declaring its
 import path. Files in the same directory share a top-level scope; `pub` and
@@ -727,7 +727,7 @@ shallow `git clone` of the `v<semver>` tag.
 
 ---
 
-## 14. Standard library cheat sheet
+## 14. Standard library cheat sheet 🗄️
 
 Every built-in function today, grouped. `-> Option` / `-> Result` means it
 returns that enum.
@@ -799,7 +799,7 @@ fn main() {
 
 ---
 
-## 15. The CLI
+## 15. The CLI 💻
 
 ```sh
 bur run <file|dir>       typecheck and run on the VM
@@ -830,7 +830,7 @@ on both paths, enforced by tests.
 
 ---
 
-## 16. Testing
+## 16. Testing 🧪
 
 `bur test` discovers all zero-argument `fn test_*` functions in `*_test.bur`
 files across the package (and subpackages). Each test runs in its own
@@ -861,7 +861,7 @@ helpers: `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)`.
 
 ---
 
-## 17. Honest limitations
+## 17. Honest limitations ⚠️
 
 Not in the language yet:
 
