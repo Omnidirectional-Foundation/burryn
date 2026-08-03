@@ -37,6 +37,18 @@ run methods.bur     "25.0"
 run tuple.bur       "16"
 run range.bur       "1  2  3  4"
 run shebang.bur     "3"
+run keywords.bur     "11 1 5 5 true false 7"
+run functions.bur    "10 5 -1 6 big value is 5"
+run map.bur          "1 2 1"
+
+# 模块样例（import/pub/::）单独跑目录
+out=$("$BUR" run examples/syntax/modules 2>&1)
+if echo "$out" | grep -q "hi, bur"; then
+    echo "PASS modules.bur"
+else
+    echo "FAIL modules: $out"
+    fails=$((fails + 1))
+fi
 
 echo "--- 自举 fixpoint ---"
 if "$BUR" build compiler -o /tmp/burgen2 2>/dev/null && cmp "$BUR" /tmp/burgen2; then

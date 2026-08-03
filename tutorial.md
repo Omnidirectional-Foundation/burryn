@@ -402,7 +402,7 @@ fn find(xs, want) {
     let mut i = 0
     while i < len(xs) {
         if xs[i] == want { return Some(i) }
-        i = i + 1
+        i += 1
     }
     None
 }
