@@ -64,6 +64,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     let mut c_lp_contto = []
     let mut c_lp_breaks = []
     let mut c_lp_conts = []
+    let mut c_lp_labels = []
+    let mut c_lbl_pending = [""]
     let mut cur_file = ""
 
     fn new_func(name, file, arity) {
@@ -94,6 +96,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push(c_lp_contto, [])
         push(c_lp_breaks, [])
         push(c_lp_conts, [])
+        push(c_lp_labels, [])
+        push(c_lbl_pending, "")
         len(c_fn) - 1
     }
     fn push_local(ch, name, depth, slot, is_mut, tempsbelow) {
@@ -440,15 +444,37 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push(c_lp_contto[ch], cont_to)
         push(c_lp_breaks[ch], [])
         push(c_lp_conts[ch], [])
+        push(c_lp_labels[ch], c_lbl_pending[ch])
     }
     fn pop_loop(ch) {
         let _ = pop(c_lp_base[ch])
         let _ = pop(c_lp_contto[ch])
         let _ = pop(c_lp_breaks[ch])
         let _ = pop(c_lp_conts[ch])
+        let _ = pop(c_lp_labels[ch])
     }
     // emit pops for locals above the innermost loop's base without altering
     // compiler bookkeeping; returns the loop index
+    fn labeled_loop(ch, lb, sp) {
+        let mut li = len(c_lp_labels[ch]) - 1
+        while li >= 0 {
+            if c_lp_labels[ch][li] == lb {
+                let base = c_lp_base[ch][li]
+                let mut i = n_locals(ch) - 1
+                while i >= 0 && c_l_slot[ch][i] >= base {
+                    if c_l_captured[ch][i] {
+                        emit(ch, lib::op_close_upvalue, sp)
+                    } else {
+                        emit(ch, lib::op_pop, sp)
+                    }
+                    i = i - 1
+                }
+                return Ok(li)
+            }
+            li = li - 1
+        }
+        frontend::perr("E2018", "", "no loop labeled `" + lb + "` in scope", sp)
+    }
     fn unwind_to_loop(ch, sp) {
         if len(c_lp_base[ch]) == 0 {
             return frontend::perr("E2013", "", "break/continue outside of a loop", sp)
@@ -1761,24 +1787,44 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     cp_for(ch, v, idx, iter, body, sp)
                 }
             },
-            frontend::Node::BreakStmt(sp) => {
-                let li = match unwind_to_loop(ch, sp) {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        0
-                    },
+            frontend::Node::BreakStmt(lb, sp) => {
+                let li = if lb == "" {
+                    match unwind_to_loop(ch, sp) {
+                        Ok(v) => v,
+                        Err(d) => {
+                            return Err(d)
+                            0
+                        },
+                    }
+                } else {
+                    match labeled_loop(ch, lb, sp) {
+                        Ok(v) => v,
+                        Err(d) => {
+                            return Err(d)
+                            0
+                        },
+                    }
                 }
                 push(c_lp_breaks[ch][li], emit_jump(ch, lib::op_jump, sp))
                 Ok(true)
             },
-            frontend::Node::ContinueStmt(sp) => {
-                let li = match unwind_to_loop(ch, sp) {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        0
-                    },
+            frontend::Node::ContinueStmt(lb, sp) => {
+                let li = if lb == "" {
+                    match unwind_to_loop(ch, sp) {
+                        Ok(v) => v,
+                        Err(d) => {
+                            return Err(d)
+                            0
+                        },
+                    }
+                } else {
+                    match labeled_loop(ch, lb, sp) {
+                        Ok(v) => v,
+                        Err(d) => {
+                            return Err(d)
+                            0
+                        },
+                    }
                 }
                 if c_lp_contto[ch][li] >= 0 {
                     emit_loop(ch, c_lp_contto[ch][li], sp)
@@ -1786,6 +1832,18 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     push(c_lp_conts[ch][li], emit_jump(ch, lib::op_jump, sp))
                     Ok(true)
                 }
+            },
+            frontend::Node::LabelStmt(lb, inner, _) => {
+                let saved = c_lbl_pending[ch]
+                c_lbl_pending[ch] = lb
+                match cp_stmt_ref(ch, inner) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                c_lbl_pending[ch] = saved
+                Ok(true)
             },
             frontend::Node::SpawnStmt(call, sp) => {
                 match call {

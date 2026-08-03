@@ -136,6 +136,19 @@ fn p_end_stmt(toks, mut pos) {
 // ---- statements ----
 
 fn p_statement(toks, mut pos) {
+    // 标签语句：label: while/for（Go 式）
+    if p_check(toks, pos, t_ident) && p_check(toks, [pos[0] + 1], t_colon) && (p_check(toks, [pos[0] + 2], t_while) || p_check(toks, [pos[0] + 2], t_for)) {
+        let ltok = p_advance(toks, pos)
+        let _ = p_advance(toks, pos) // :
+        let inner = match p_statement(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        return Ok(LabelStmt(tok_lex(ltok), inner, sp_union(sp_of_tok(ltok), span_of(inner))))
+    }
     if p_check(toks, pos, t_let) {
         p_let_stmt(toks, pos)
     } else if p_check(toks, pos, t_const) {
@@ -183,22 +196,31 @@ fn p_statement(toks, mut pos) {
         p_defer_stmt(toks, pos)
     } else if p_check(toks, pos, t_break) {
         let tok = p_advance(toks, pos)
+        // break 后跟标识符 = 标签（换行时自动分号已插入，此处只会是同行标签）
+        let mut lb = ""
+        if p_check(toks, pos, t_ident) {
+            lb = tok_lex(p_advance(toks, pos))
+        }
         match p_end_stmt(toks, pos) {
             Ok(_) => {},
             Err(d) => {
                 return Err(d)
             },
         }
-        Ok(BreakStmt(sp_of_tok(tok)))
+        Ok(BreakStmt(lb, sp_of_tok(tok)))
     } else if p_check(toks, pos, t_continue) {
         let tok = p_advance(toks, pos)
+        let mut lb = ""
+        if p_check(toks, pos, t_ident) {
+            lb = tok_lex(p_advance(toks, pos))
+        }
         match p_end_stmt(toks, pos) {
             Ok(_) => {},
             Err(d) => {
                 return Err(d)
             },
         }
-        Ok(ContinueStmt(sp_of_tok(tok)))
+        Ok(ContinueStmt(lb, sp_of_tok(tok)))
     } else {
         // expression statement / assignment / send
         let e = match p_expression(toks, pos) {
