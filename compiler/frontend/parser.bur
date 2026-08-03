@@ -395,6 +395,55 @@ fn p_interface_statement(toks, mut pos) {
 fn p_let_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos) // let
     let is_mut = p_match(toks, pos, t_mut)
+    if p_check(toks, pos, t_lparen) {
+        // 解构 let：let (a, b) = tuple
+        p_advance(toks, pos)
+        let mut names = []
+        let mut nspans = []
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rparen) {
+            let nm = match p_expect(toks, pos, t_ident, "name in destructuring let") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            push(names, tok_lex(nm))
+            push(nspans, sp_of_tok(nm))
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        let rp = match p_expect(toks, pos, t_rparen, "')' in destructuring let") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        match p_expect(toks, pos, t_eq, "'=' in let binding") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        let init = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        return Ok(DestructLet(names, nspans, is_mut, init, sp_union(sp_of_tok(tok), span_of(init))))
+    }
     let name = match p_expect(toks, pos, t_ident, "variable name") {
         Ok(v) => v,
         Err(d) => {
@@ -994,6 +1043,31 @@ fn p_type_expr(toks, mut pos) {
             },
         }
         Ok(TERecord(names, types, row_var, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+    } else if t == t_lparen {
+        // tuple 类型：(T1, T2, ...)
+        let lp = p_advance(toks, pos)
+        let mut ets = []
+        while !p_check(toks, pos, t_rparen) {
+            let et = match p_type_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            push(ets, et)
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+        }
+        let rp = match p_expect(toks, pos, t_rparen, "')' in tuple type") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        Ok(TETuple(ets, sp_union(sp_of_tok(lp), sp_of_tok(rp))))
     } else if t == t_fn {
         p_advance(toks, pos)
         match p_expect(toks, pos, t_lparen, "'(' in fn type") {
@@ -1956,7 +2030,7 @@ fn p_primary(toks, mut pos) {
         p_advance(toks, pos)
         Ok(Ident(tok_lex(tok), sp_of_tok(tok)))
     } else if t == t_lparen {
-        p_advance(toks, pos)
+        let lp = p_advance(toks, pos)
         let e = match p_expression(toks, pos) {
             Ok(v) => v,
             Err(d) => {
@@ -1964,13 +2038,41 @@ fn p_primary(toks, mut pos) {
                 NoNode
             },
         }
-        match p_expect(toks, pos, t_rparen, "')'") {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
+        if p_match(toks, pos, t_comma) {
+            // tuple 字面量：(a, b, ...)
+            let mut elems = [e]
+            p_skip_semis(toks, pos)
+            while !p_check(toks, pos, t_rparen) {
+                let el = match p_expression(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        NoNode
+                    },
+                }
+                push(elems, el)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+                p_skip_semis(toks, pos)
+            }
+            let rp = match p_expect(toks, pos, t_rparen, "')' after tuple") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            Ok(TupleLit(elems, sp_union(sp_of_tok(lp), sp_of_tok(rp))))
+        } else {
+            match p_expect(toks, pos, t_rparen, "')'") {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            Ok(e)
         }
-        Ok(e)
     } else if t == t_lbracket {
         p_advance(toks, pos)
         let mut elems = []
