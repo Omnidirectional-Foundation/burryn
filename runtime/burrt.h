@@ -62,7 +62,7 @@ static inline Value bur_obj(Obj *o)     { Value v; v.t = VOBJ; v.u.o = o; return
 typedef enum {
     OBJ_STRING, OBJ_LIST, OBJ_MAP, OBJ_FUNC, OBJ_CLOSURE,
     OBJ_UPVALUE, OBJ_ENUMTYPE, OBJ_VARIANTCTOR, OBJ_ENUMINST, OBJ_NATIVE,
-    OBJ_CHANNEL, OBJ_RECORD
+    OBJ_CHANNEL, OBJ_RECORD, OBJ_TUPLE
 } ObjType;
 
 struct Obj {
@@ -163,6 +163,12 @@ typedef struct {
     Value *fields;
     int nfields;
 } ORecord;
+
+typedef struct {
+    Obj obj;
+    Value *elems;
+    int64_t n;
+} OTuple;
 
 typedef Value (*NativeFn)(Value *args, int argc);
 
@@ -389,6 +395,16 @@ static ORecord *bur_new_record(OString **names, Value *fields, int nfields) {
     return o;
 }
 
+static OTuple *bur_new_tuple(Value *elems, int64_t n) {
+    OTuple *o = (OTuple *)bur_alloc(sizeof(OTuple), OBJ_TUPLE);
+    o->n = n;
+    if (n > 0) {
+        o->elems = (Value *)malloc(sizeof(Value) * (size_t)n);
+        memcpy(o->elems, elems, sizeof(Value) * (size_t)n);
+    }
+    return o;
+}
+
 static void bur_push(Value v);
 static Value bur_pop(void);
 static void bur_trap(const char *fmt, ...);
@@ -408,6 +424,15 @@ static void bur_record_make(int n, const char *names_enc) {
     ORecord *r = bur_new_record(names, fields, n);
     free(names); free(fields);
     bur_push(bur_obj((Obj *)r));
+}
+
+static void bur_tuple_make(int n) {
+    Value *elems = (Value *)malloc(sizeof(Value) * (size_t)n);
+    for (int i = 0; i < n; i++) elems[i] = bur_cur->stack[bur_cur->top - n + i];
+    bur_cur->top -= n;
+    OTuple *t = bur_new_tuple(elems, n);
+    free(elems);
+    bur_push(bur_obj((Obj *)t));
 }
 
 static void bur_record_get(const char *fname) {
@@ -539,6 +564,11 @@ static void bur_gc_trace(Obj *o) {
         }
         break;
     }
+    case OBJ_TUPLE: {
+        OTuple *t = (OTuple *)o;
+        for (int i = 0; i < t->n; i++) bur_mark_value(t->elems[i]);
+        break;
+    }
     }
 }
 
@@ -605,6 +635,7 @@ static void bur_gc_collect(void) {
                 free(ch->buf); free(ch->sendq); free(ch->recvq); free(ch->waiters);
                 break;
             }
+            case OBJ_TUPLE: free(((OTuple *)o)->elems); break;
             case OBJ_RECORD: {
                 ORecord *r = (ORecord *)o;
                 free(r->names); free(r->fields);
@@ -652,6 +683,7 @@ static const char *bur_typename(Value v) {
         case OBJ_ENUMINST: return ((OEnumInst *)v.u.o)->enm->name;
         case OBJ_NATIVE: return "native function";
         case OBJ_CHANNEL: return "channel";
+        case OBJ_TUPLE: return "tuple";
         case OBJ_RECORD: return "record";
         }
     }
@@ -718,6 +750,13 @@ static bool bur_obj_eq(Obj *a, Obj *b) {
             if (nx->len != ny->len || memcmp(nx->data, ny->data, (size_t)nx->len) != 0) return false;
             if (!bur_eq(x->fields[i], y->fields[i])) return false;
         }
+        return true;
+    }
+    case OBJ_TUPLE: {
+        OTuple *x = (OTuple *)a, *y = (OTuple *)b;
+        if (x->n != y->n) return false;
+        for (int64_t i = 0; i < x->n; i++)
+            if (!bur_eq(x->elems[i], y->elems[i])) return false;
         return true;
     }
     default: return a == b;
@@ -859,6 +898,16 @@ static void bur_format(Buf *b, Value v, bool quote) {
         char t[64];
         snprintf(t, sizeof t, "<chan cap=%d len=%d>", ch->cap, ch->buflen);
         buf_str(b, t);
+        return;
+    }
+    case OBJ_TUPLE: {
+        OTuple *t = (OTuple *)o;
+        buf_char(b, '(');
+        for (int64_t i = 0; i < t->n; i++) {
+            if (i > 0) buf_str(b, ", ");
+            bur_format(b, t->elems[i], true);
+        }
+        buf_char(b, ')');
         return;
     }
     case OBJ_RECORD: {
@@ -1116,6 +1165,13 @@ static Value bur_index_get(Value target, Value idx) {
         if (idx.u.i < 0 || idx.u.i >= s->len)
             bur_trap("string index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, s->len);
         return bur_obj((Obj *)bur_new_string_n(s->data + idx.u.i, 1));
+    }
+    if (target.t == VOBJ && target.u.o->type == OBJ_TUPLE) {
+        OTuple *t = (OTuple *)target.u.o;
+        if (idx.t != VINT) bur_trap("tuple index must be an int, got %s", bur_typename(idx));
+        if (idx.u.i < 0 || idx.u.i >= t->n)
+            bur_trap("tuple index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, t->n);
+        return t->elems[idx.u.i];
     }
     bur_trap("cannot index %s", bur_typename(target));
     return bur_unit();
