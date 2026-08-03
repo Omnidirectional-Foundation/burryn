@@ -231,6 +231,43 @@ fn p_statement(toks, mut pos) {
                 },
             }
             Ok(AssignStmt(e, val, sp_union(span_of(e), span_of(val))))
+        } else if p_check(toks, pos, t_plus_eq) || p_check(toks, pos, t_minus_eq) || p_check(toks, pos, t_star_eq) || p_check(toks, pos, t_slash_eq) || p_check(toks, pos, t_percent_eq) {
+            // 复合赋值：x += v 脱糖为 x = x + v（符号 + 语义都显式）
+            let op = p_advance(toks, pos)
+            let op_t = tok_type(op)
+            let binop = if op_t == t_plus_eq {
+                t_plus
+            } else if op_t == t_minus_eq {
+                t_minus
+            } else if op_t == t_star_eq {
+                t_star
+            } else if op_t == t_slash_eq {
+                t_slash
+            } else {
+                t_percent
+            }
+            let val = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            let ok_target = match e {
+                Ident(_, _) => true,
+                Index(_, _, _) => true,
+                _ => false,
+            }
+            if !ok_target {
+                return perr("E1103", "only a variable or an index expression can be assigned to", "invalid assignment target", span_of(e))
+            }
+            match p_end_stmt(toks, pos) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            Ok(AssignStmt(e, Binary(binop, e, val, sp_union(span_of(e), span_of(val))), sp_union(span_of(e), span_of(val))))
         } else if p_match(toks, pos, t_larrow) {
             let val = match p_expression(toks, pos) {
                 Ok(v) => v,
@@ -310,7 +347,7 @@ fn p_interface_statement(toks, mut pos) {
                     return Err(d)
                 },
             }
-            Ok(LetStmt(tok_lex(name), sp_of_tok(name), false, true, te, sp_union(sp_of_tok(pub_tok), sp_union(sp_of_tok(let_tok), span_of(te)))))
+            Ok(LetStmt(tok_lex(name), sp_of_tok(name), false, true, NoNode, te, sp_union(sp_of_tok(pub_tok), sp_union(sp_of_tok(let_tok), span_of(te)))))
         } else if p_check(toks, pos, t_enum) {
             let decl = match p_enum_decl(toks, pos) {
                 Ok(v) => v,
@@ -341,6 +378,17 @@ fn p_let_stmt(toks, mut pos) {
             lib::Token::Tok(0, "", 0, 0)
         },
     }
+    let ty = if p_match(toks, pos, t_colon) {
+        match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    } else {
+        NoNode
+    }
     match p_expect(toks, pos, t_eq, "'=' in let binding") {
         Ok(_) => {},
         Err(d) => {
@@ -360,7 +408,7 @@ fn p_let_stmt(toks, mut pos) {
             return Err(d)
         },
     }
-    Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, init, sp_union(sp_of_tok(tok), span_of(init))))
+    Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
 // const bindings are immutable by construction: the grammar has no `const mut`,
@@ -374,6 +422,17 @@ fn p_const_stmt(toks, mut pos) {
             return Err(d)
             lib::Token::Tok(0, "", 0, 0)
         },
+    }
+    let ty = if p_match(toks, pos, t_colon) {
+        match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    } else {
+        NoNode
     }
     match p_expect(toks, pos, t_eq, "'=' in const declaration") {
         Ok(_) => {},
@@ -394,7 +453,7 @@ fn p_const_stmt(toks, mut pos) {
             return Err(d)
         },
     }
-    Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, init, sp_union(sp_of_tok(tok), span_of(init))))
+    Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
 // p_pub_decl parses `pub` followed by an exportable declaration; nodes are
@@ -410,7 +469,7 @@ fn p_pub_decl(toks, mut pos) {
             },
         }
         match s {
-            LetStmt(name, nsp, is_mut, _, init, sp) => Ok(LetStmt(name, nsp, is_mut, true, init, sp_union(sp_of_tok(tok), sp))),
+            LetStmt(name, nsp, is_mut, _, ty, init, sp) => Ok(LetStmt(name, nsp, is_mut, true, ty, init, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
     } else if p_check(toks, pos, t_const) {
@@ -422,7 +481,7 @@ fn p_pub_decl(toks, mut pos) {
             },
         }
         match s {
-            ConstDecl(name, nsp, _, init, sp) => Ok(ConstDecl(name, nsp, true, init, sp_union(sp_of_tok(tok), sp))),
+            ConstDecl(name, nsp, _, ty, init, sp) => Ok(ConstDecl(name, nsp, true, ty, init, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {

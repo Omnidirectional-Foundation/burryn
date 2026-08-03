@@ -91,7 +91,7 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
         while fi < len(files) {
             for s in files[fi] {
                 match s {
-                    ConstDecl(n, nsp, _, init, _) => {
+                    ConstDecl(n, nsp, _, _, init, _) => {
                         push(c_file, fi)
                         push(c_name, n)
                         push(c_init, init)
@@ -175,7 +175,7 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
         while fi < len(files) {
             for s in files[fi] {
                 match s {
-                    ConstDecl(n, _, is_pub, _, _) => {
+                    ConstDecl(n, _, is_pub, _, _, _) => {
                         if is_pub {
                             match get(penv, n) {
                                 Some(v) => put(qenv, pkg_paths[pi] + "." + n, v),
@@ -704,7 +704,7 @@ fn fr_top_stmts(stmts, aliases, penv, qenv, cycled, mut env_names, mut env_vals,
     let mut out = []
     for s in stmts {
         match s {
-            ConstDecl(name, nsp, is_pub, init, sp) => {
+            ConstDecl(name, nsp, is_pub, ty, init, sp) => {
                 let folded = match get(penv, name) {
                     Some(v) => match v {
                         FVPoison => NoNode,
@@ -732,9 +732,9 @@ fn fr_top_stmts(stmts, aliases, penv, qenv, cycled, mut env_names, mut env_vals,
                             }
                         }
                         let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
-                        push(out, LetStmt(name, nsp, false, is_pub, init2, sp))
+                        push(out, LetStmt(name, nsp, false, is_pub, ty, init2, sp))
                     },
-                    lit => push(out, LetStmt(name, nsp, false, is_pub, lit, sp)),
+                    lit => push(out, LetStmt(name, nsp, false, is_pub, ty, lit, sp)),
                 }
             },
             other => push(out, fr_stmt(other, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)),
@@ -753,14 +753,14 @@ fn fr_stmts(stmts, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, 
 
 fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
     match s {
-        ConstDecl(name, nsp, is_pub, init, sp) => {
+        ConstDecl(name, nsp, is_pub, ty, init, sp) => {
             let mut adiags = []
             let r = fc_eval(init, aliases, penv, qenv, map(), env_names, env_vals, adiags)
             match r {
                 FRVal(v) => {
                     push(env_names, name)
                     push(env_vals, v)
-                    LetStmt(name, nsp, false, is_pub, fc_lit(v, span_of(init)), sp)
+                    LetStmt(name, nsp, false, is_pub, ty, fc_lit(v, span_of(init)), sp)
                 },
                 FRErr => {
                     for d in adiags {
@@ -770,20 +770,20 @@ fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut d
                     let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
                     push(env_names, name)
                     push(env_vals, FVPoison)
-                    LetStmt(name, nsp, false, is_pub, init2, sp)
+                    LetStmt(name, nsp, false, is_pub, ty, init2, sp)
                 },
                 _ => {
                     let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
                     push(env_names, name)
                     push(env_vals, FVPoison)
-                    LetStmt(name, nsp, false, is_pub, init2, sp)
+                    LetStmt(name, nsp, false, is_pub, ty, init2, sp)
                 },
             }
         },
-        LetStmt(name, nsp, is_mut, is_pub, init, sp) => {
+        LetStmt(name, nsp, is_mut, is_pub, ty, init, sp) => {
             let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
             fr_mask(name, env_names, env_vals)
-            LetStmt(name, nsp, is_mut, is_pub, init2, sp)
+            LetStmt(name, nsp, is_mut, is_pub, ty, init2, sp)
         },
         FnDecl(name, nsp, is_pub, lit, sp) => {
             fr_mask(name, env_names, env_vals)
