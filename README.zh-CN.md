@@ -127,7 +127,6 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/programs/wordcount.bur` | map 与字符串函数 |
 | `examples/programs/gc_stress.bur` | 观察垃圾回收器工作 |
 | `examples/programs/geometry/` | 多包模块示例（`bur.mod`、`import`、`pub`） |
-| `examples/syntax/` | 冻结语法覆盖样例，每个配 `.golden`（由 `scripts/syntax-verify.sh` 验证） |
 | `compiler/` | 自举编译器与 `bur` CLI——现存最大的 Burryn 程序 |
 
 ## 架构

@@ -126,7 +126,6 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/programs/wordcount.bur` | maps and string functions |
 | `examples/programs/gc_stress.bur` | watch the collector work |
 | `examples/programs/geometry/` | a multi-package module (`bur.mod`, `import`, `pub`) |
-| `examples/syntax/` | frozen-grammar coverage samples, each paired with a `.golden` (verified by `scripts/syntax-verify.sh`) |
 | `compiler/` | the self-hosted compiler and `bur` CLI — the biggest Burryn program there is |
 
 ## Architecture
