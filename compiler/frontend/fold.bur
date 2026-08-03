@@ -1,20 +1,3 @@
-// Constant folding for `const` declarations (S7.5).
-//
-// Runs immediately before the type checker and owns pipe lowering as its
-// first step. Package-level consts fold
-// to a fixpoint so declaration order and file order never matter (cycles are
-// E0391); every ConstDecl then lowers to a non-mut LetStmt whose initializer
-// is the folded literal, so the checker and compiler see no const-specific
-// semantics. Initializers are restricted to literals, const references,
-// arithmetic, comparisons, `&&`/`||`/`!`, and str concatenation (SPEC §6.6);
-// anything else is E0015. A fold-time integer trap (overflow, division or
-// modulo by zero) is E0080 — the trap the runtime would raise, just early.
-// Logical operators preserve runtime short-circuiting; the dead side is still
-// checked for an allowed constant shape and a bool type. Operand type
-// mismatches emit nothing here: the initializer is left unfolded and the
-// checker reports its usual E0308. Non-finite float results remain ordinary
-// float constants and are rendered by cgen as INFINITY/NAN.
-
 import "burryn.dev/compiler/lib"
 
 pub enum FoldOut {
@@ -27,19 +10,19 @@ enum FVal {
     FVFloat(float),
     FVStr(str),
     FVBool(bool),
-    FVMasked, // a runtime binding shadows the name: referencing it is E0015
-    FVPoison, // a const that failed to fold: references to it stay silent
+    FVMasked,
+    FVPoison,
 }
 
 enum FRes {
     FRVal(FVal),
-    FRBlocked(str), // waits on a package const not folded yet (fixpoint only)
-    FRSoft, // not foldable, no diagnostic here: the checker reports it
-    FRErr, // not foldable, diagnostic already pushed
+    FRBlocked(str),
+    FRSoft,
+    FRErr,
 }
 
 enum FTRes {
-    FTType(int), // 0 int, 1 float, 2 str, 3 bool
+    FTType(int),
     FTBlocked(str),
     FTSoft,
     FTErr,
@@ -51,8 +34,6 @@ let fold_min_int = -9223372036854775807 - 1
 let fold_help = "const initializers allow literals, references to other constants, arithmetic, comparisons, `&&`/`||`/`!`, and str concatenation"
 let trap_help = "this operation traps at runtime; constant initializers are evaluated at compile time, so the trap is reported as a compile error"
 
-// fold_consts folds a script's statements; top-level consts fold
-// sequentially, in declaration order, like any other block.
 pub fn fold_consts(stmts) {
     let mut diags = []
     let mut dfiles = []
@@ -62,12 +43,10 @@ pub fn fold_consts(stmts) {
     FoldOut::FoldedScript(out, diags)
 }
 
-// fold_const_packages folds a whole loaded module, packages in load order so
-// dependency consts are available to dependents via import aliases.
 pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
     let mut diags = []
     let mut dfiles = []
-    let mut qenv = map() // "<import path>.<name>" -> FVal, pub consts only
+    let mut qenv = map()
     let mut out_pkgs = []
     let lowered_pkgs = lower_pipe_packages(pkgs_stmts)
     let mut pi = 0
@@ -81,12 +60,11 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
             push(amaps, aliases_of(imps[fi]))
             fi = fi + 1
         }
-        // collect package-level consts across all files of the package
         let mut c_file = []
         let mut c_name = []
         let mut c_init = []
         let mut c_nsp = []
-        let mut c_state = [] // 0 pending, 1 folded, 2 failed
+        let mut c_state = []
         fi = 0
         while fi < len(files) {
             for s in files[fi] {
@@ -110,9 +88,6 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
             put(pending, c_name[ci], true)
             ci = ci + 1
         }
-        // fixpoint: attempts blocked on a not-yet-folded const retry until no
-        // attempt makes progress; attempt diagnostics are discarded here and
-        // re-derived exactly once by the rewrite walk below
         let mut e_n0 = []
         let mut e_v0 = []
         let mut progress = true
@@ -142,7 +117,6 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
                 ci = ci + 1
             }
         }
-        // still-pending consts form (or depend on) a reference cycle
         let mut cycled = map()
         ci = 0
         while ci < len(c_name) {
@@ -159,8 +133,6 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
             }
             ci = ci + 1
         }
-        // rewrite every file: consts lower to lets, failures re-derive their
-        // diagnostic once, nested block consts fold with lexical scoping
         let mut new_files = []
         fi = 0
         while fi < len(files) {
@@ -170,7 +142,6 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
             fi = fi + 1
         }
         push(out_pkgs, new_files)
-        // export folded pub consts (and their poisons) to dependents
         fi = 0
         while fi < len(files) {
             for s in files[fi] {
@@ -192,8 +163,6 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
     }
     FoldOut::FoldedPkgs(out_pkgs, diags, dfiles)
 }
-
-// ---- evaluation ----
 
 fn fc_not_const(label, sp, mut adiags) {
     match sp {
@@ -306,9 +275,6 @@ fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
     }
 }
 
-// fc_type checks the primitive type and constant-only shape of an expression
-// without evaluating it. Short-circuited logical operands use this path so a
-// dead integer trap stays dead while calls and type mismatches remain invalid.
 fn fc_type(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
     match e {
         IntLit(_, _) => FTType(0),
@@ -450,8 +416,6 @@ fn fc_type_combine(lt, rt, op) {
     }
 }
 
-// fc_combine merges two operand results: a blocked operand always retries,
-// an emitted diagnostic outranks a silent failure
 fn fc_combine(lr, rr, op, sp, mut adiags) {
     match lr {
         FRVal(lv) => match rr {
@@ -503,8 +467,6 @@ fn fc_bin(op, lv, rv, sp, mut adiags) {
     }
 }
 
-// integer arithmetic mirrors the VM's pre-checks (vm.bur do_arith): overflow
-// and zero divisors trap there, so they are compile errors here
 fn fc_bin_int(op, x, y, sp, mut adiags) {
     if op == t_plus {
         if y > 0 && x > fold_max_int - y {
@@ -670,8 +632,6 @@ fn fc_lit(v, sp) {
     }
 }
 
-// ---- rewrite walk ----
-
 fn fr_trunc(mark, mut env_names, mut env_vals) {
     while len(env_names) > mark {
         let _ = pop(env_names)
@@ -696,10 +656,6 @@ fn fr_mask_pattern(p, mut env_names, mut env_vals) {
     }
 }
 
-// fr_top_stmts rewrites a package file's top level: package consts were
-// already folded by the fixpoint, so folded ones become literal lets
-// silently, cycle members were already reported, and other failures re-run
-// evaluation once to commit their diagnostic
 fn fr_top_stmts(stmts, aliases, penv, qenv, cycled, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
     let mut out = []
     for s in stmts {

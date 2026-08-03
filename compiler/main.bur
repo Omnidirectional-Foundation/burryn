@@ -1,8 +1,3 @@
-// bur — the Burryn CLI driver. Parses argv and dispatches to run/check/dis/
-// build/version, defaulting a bare `bur <file|dir>` to run. The compiler
-// itself lives in the burryn.dev/compiler/lib package; this file only wires the
-// command surface, mirroring the Go host's main.go + build.go.
-
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/backends"
 import "burryn.dev/compiler/tooling"
@@ -15,14 +10,11 @@ let _author_mark = "OFMeteoriteH ☄"
 
 let version = "0.5.0"
 
-// exit codes mirror the Go host: static (compile) errors, CLI misuse,
-// unreadable input, and runtime traps each get a distinct status.
 let exit_static = 1
 let exit_usage = 2
 let exit_no_input = 3
 let _exit_runtime = 4
 
-// pipeline modes shared by run_file/run_module.
 let mode_run = 0
 let mode_check = 1
 let mode_dis = 2
@@ -108,10 +100,6 @@ fn usage() {
     println("  -v                     print each passing test's output too")
 }
 
-// fmt_cmd implements `bur fmt <file|dir|-> [--check]`: rewrite sources in
-// the official format in place, list drifted files with --check, or filter
-// stdin to stdout with `-`. Static errors exit 1; a verifier failure is a
-// formatter bug and exits 4.
 fn fmt_cmd(rest) {
     let mut check_only = false
     let mut targets = []
@@ -126,7 +114,7 @@ fn fmt_cmd(rest) {
         usage()
         exit(exit_usage)
     }
-    let mut state = [0, 0] // [any file differs (--check), any static error]
+    let mut state = [0, 0]
     for t in targets {
         if t == "-" {
             fmt_stdin(state)
@@ -141,8 +129,6 @@ fn fmt_cmd(rest) {
     }
 }
 
-// fmt_source formats one already-read source; static errors print and yield
-// None, a verifier failure aborts as an internal error.
 fn fmt_source(path, src, mut state) {
     match frontend::lex(src) {
         lib::LexOut::Lexed(toks, ldiags, comments) => {
@@ -214,8 +200,6 @@ fn fmt_stdin(mut state) {
     }
 }
 
-// fmt_dir walks a directory tree, formatting every .bur file; dot-entries
-// are skipped.
 fn fmt_dir(dir, check_only, mut state) {
     match read_dir(dir) {
         Ok(names) => {
@@ -240,8 +224,6 @@ fn fmt_dir(dir, check_only, mut state) {
     }
 }
 
-// dispatch routes a path to the file or module pipeline based on whether it
-// names a directory (a bur.mod alongside it marks a module package).
 fn dispatch(path, mode, argv) {
     if is_dir(path) {
         run_module(path, mode, argv)
@@ -250,7 +232,6 @@ fn dispatch(path, mode, argv) {
     }
 }
 
-// is_dir treats an existing path with a bur.mod as a module directory.
 fn is_dir(path) {
     file_exists(strip_trailing_slash(path) + "/bur.mod")
 }
@@ -275,7 +256,6 @@ fn starts_with(s, prefix) {
     n >= m && substr(s, 0, m) == prefix
 }
 
-// diag_is_error reports whether a diagnostic carries the error flag.
 fn diag_is_error(d) {
     match d {
         lib::DiagT::Diag(ie, _, _, _, _, _) => ie,
@@ -283,9 +263,6 @@ fn diag_is_error(d) {
     }
 }
 
-// run_file executes the script pipeline: lex, parse, typecheck, compile, then
-// run/check/dis per mode. Static diagnostics go to stderr; unreadable input
-// exits 3; static errors exit 1.
 fn run_file(path, mode, argv) {
     let src = match read_file(path) {
         Ok(s) => s,
@@ -337,8 +314,6 @@ fn run_file(path, mode, argv) {
     }
 }
 
-// run_module mirrors run_file for a module directory: a missing bur.mod exits
-// 3, load/type/compile errors exit 1.
 fn run_module(dir0, mode, argv) {
     let dir = strip_trailing_slash(dir0)
     if !file_exists(dir + "/bur.mod") {
@@ -387,8 +362,6 @@ fn run_module(dir0, mode, argv) {
     }
 }
 
-// concat_lists flattens one nesting level: per-package per-file lists
-// become one flat list parallel across packages.
 fn concat_lists(xss) {
     let mut acc = []
     for xs in xss {
@@ -399,9 +372,6 @@ fn concat_lists(xss) {
     acc
 }
 
-// emit_errors renders diagnostics to stderr; with errors_only it skips
-// warnings. path names the script the diagnostics point into. Returns
-// whether any error-level diagnostic was seen.
 fn emit_errors(diags, path, errors_only) {
     let mut errs = false
     for d in diags {
@@ -490,8 +460,6 @@ fn fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
     }
 }
 
-// run_check prints top-level binding types then diagnostics, mirroring the
-// Go host's check output for scripts.
 fn run_check(cdiags, path, binds) {
     let mut has_err = false
     for line in binds {
@@ -522,8 +490,6 @@ fn run_check_f(cdiags, cfiles, binds) {
     has_err
 }
 
-// build_cmd parses build flags (-o <path>, --emit c, --backend <name>) then
-// compiles the input via the selected backend. CLI misuse exits 2.
 fn build_cmd(rest) {
     let mut out = ""
     let mut emit_c = false
@@ -572,8 +538,6 @@ fn build_cmd(rest) {
     build_input(input, emit_c, out, backend)
 }
 
-// build_input compiles a file or module via the selected backend.
-// "c" is the production backend; others are stubs until implemented.
 fn build_input(input, emit_c, out, backend) {
     if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
         eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
@@ -636,8 +600,6 @@ fn build_input(input, emit_c, out, backend) {
     }
 }
 
-// compile_to_c runs the front end for a file or module and returns the C
-// source, exiting 1 on static errors and 3 on unreadable input.
 fn compile_to_c(input) {
     if is_dir(input) {
         compile_module_to_c(strip_trailing_slash(input))
@@ -646,8 +608,6 @@ fn compile_to_c(input) {
     }
 }
 
-// compile_to_x86 runs the front end for a file and returns the ELF
-// executable bytes, exiting on errors. Module mode is not yet supported.
 fn compile_to_x86(input) {
     if is_dir(input) {
         eprintln("error: x86 backend does not support modules yet")
@@ -770,8 +730,6 @@ fn compile_module_to_c(dir) {
     }
 }
 
-// default_out_name strips any directory and a trailing .bur to name the
-// binary, mirroring the Go host's defaultOutName.
 fn default_out_name(path) {
     let p = strip_trailing_slash(path)
     let base = base_name(p)
@@ -794,12 +752,6 @@ fn base_name(p) {
     substr(p, start, str_len(p) - start)
 }
 
-// build_native writes the C translation unit to program.c in the current
-// directory and invokes a C compiler, resolving the runtime headers from the
-// fixed relative runtime/ include path (via -Iruntime). With no getenv/mkdir/
-// exe-path natives, $CC is not honored, no temp dir is created, and the
-// runtime headers are located relative to the current working directory —
-// which the bootstrap loop runs from the repo root.
 fn build_native(csrc, out) {
     let cfile = "program.c"
     match write_file(cfile, csrc) {
@@ -815,9 +767,6 @@ fn build_native(csrc, out) {
         eprintln("hint: run without a toolchain using `bur run`")
         exit(exit_static)
     }
-    // -g1 keeps minimal #line-mapped debug info for gdb/lldb. -O1 compiles the
-    // 15MB+ C translation unit in reasonable time; -O2 + -g together exceed
-    // gcc 14's practical limits for the full-compiler TU.
     match exec(cc, ["-O1", "-g1", "-o", out, cfile, "-Iruntime", "-lm"]) {
         Ok(o) => match o {
             Output(code, _, err) => {
@@ -826,8 +775,6 @@ fn build_native(csrc, out) {
                     eprintln("error: C compiler failed")
                     exit(exit_static)
                 }
-                // Best-effort cleanup of the scratch translation unit; there is
-                // no remove native, so shell out and ignore the result.
                 match exec("rm", [cfile]) {
                     Ok(_) => {},
                     Err(_) => {},
@@ -841,16 +788,12 @@ fn build_native(csrc, out) {
     }
 }
 
-// eprint_raw writes captured compiler stderr without an added newline when it
-// is empty, mirroring inherited stderr as closely as exec() allows.
 fn eprint_raw(s) {
     if str_len(s) > 0 {
         eprintln(s)
     }
 }
 
-// find_cc probes for a working C compiler by name, since exec() cannot honor
-// $CC (no getenv native). Order mirrors the Go host: cc, gcc, clang.
 fn find_cc() {
     let candidates = ["cc", "gcc", "clang"]
     let mut found = ""
@@ -871,8 +814,6 @@ fn cc_works(name) {
     }
 }
 
-// dev_cmd exposes the per-stage pipeline dumps used for parity testing. It is
-// intentionally undocumented in usage(); each subcommand mirrors one stage.
 fn dev_cmd(rest) {
     if len(rest) < 2 {
         eprintln("usage: bur dev <lex|parse|check|dis|emit-c> <file.bur>")
@@ -982,10 +923,6 @@ fn dev_interface(dir) {
     }
 }
 
-// dev_hover runs the full module check pipeline with the LSP hover
-// side-channel recording on, then prints the inferred type at (file, offset).
-// It is the testable surface for the span->type query that the LSP itself
-// only exercises interactively (so `bur test` cannot reach it).
 fn dev_hover(dir, file, offset_str) {
     let offset = match parse_int(offset_str) {
         Some(n) => n,
@@ -1043,8 +980,6 @@ fn dev_interface_parse(path) {
     }
 }
 
-// dev_mod_graph resolves a module's require closure offline (S6.1) and
-// prints the would-be bur.sum: `<path> <version> <h1 tree hash>` lines.
 fn dev_mod_graph(dir) {
     match module::mvs_resolve(dir) {
         Ok(pick) => {
@@ -1074,7 +1009,6 @@ fn dev_mod_graph(dir) {
     }
 }
 
-// mod_report prints a mod subcommand's outcome and exits on error
 fn mod_report(r) {
     match r {
         Ok(msg) => println(msg),
@@ -1085,8 +1019,6 @@ fn mod_report(r) {
     }
 }
 
-// mod_cmd implements `bur mod <init|tidy|download|verify>` (SPEC §6.5
-// S6.1/S6.2). tidy/download/verify take an optional module dir, default "."
 fn mod_cmd(rest) {
     if len(rest) == 0 {
         eprintln("usage: bur mod <init|tidy|download|verify> [args]")
@@ -1132,7 +1064,6 @@ fn mod_cmd(rest) {
     }
 }
 
-// get_cmd implements `bur get <path>@<version>` on the module in the CWD
 fn get_cmd(rest) {
     if len(rest) != 1 {
         eprintln("usage: bur get <path>@<version>")
@@ -1141,10 +1072,6 @@ fn get_cmd(rest) {
     mod_report(module::mod_get(".", rest[0]))
 }
 
-// self_exe resolves this binary's own path for re-exec (SPEC S6.4: zero
-// new natives). `readlink /proc/self/exe` in a child would resolve the
-// child's own binary, so the shell reads the parent's — $PPID inside the
-// spawned sh is this bur process.
 fn self_exe() {
     match exec("sh", ["-c", "readlink /proc/$PPID/exe"]) {
         Ok(o) => match o {
@@ -1160,10 +1087,6 @@ fn self_exe() {
     }
 }
 
-// test_cmd implements `bur test [dir] [--run <substr>] [-v]`: each test_*
-// fn of the dir's *_test.bur files runs in its own subprocess (`bur dev
-// run-test`) with BUR_DETERMINISTIC=1; a nonzero exit — including trap and
-// deadlock exits — is a failure.
 fn test_cmd(rest) {
     let mut dir = "."
     let mut run_filter = ""
@@ -1189,8 +1112,6 @@ fn test_cmd(rest) {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
     }
-    // discover across the root package and every subpackage; subpackage
-    // tests display as `<rel dir>/<fn>` while root tests keep bare names
     let mut all = []
     let mut all_dirs = []
     let mut all_fns = []
@@ -1278,7 +1199,6 @@ fn test_cmd(rest) {
     }
 }
 
-// parent_dir strips the final path element; "" means no parent is left
 fn parent_dir(p) {
     let mut cut = -1
     let mut i = 0
@@ -1305,8 +1225,6 @@ fn parent_dir(p) {
     }
 }
 
-// module_root_of walks upward from p0 to the nearest directory holding a
-// bur.mod; "" when none is found
 fn module_root_of(p0) {
     let mut p = strip_trailing_slash(p0)
     let mut root = ""
@@ -1327,9 +1245,6 @@ fn module_root_of(p0) {
     root
 }
 
-// run_test_target compiles the module owning dir with dir's test files and
-// a synthetic main that calls one test fn, then runs it (the `bur dev
-// run-test` child); dir may be any package directory inside a module
 fn run_test_target(dir0, fnname) {
     let dir = strip_trailing_slash(dir0)
     let root = module_root_of(dir)

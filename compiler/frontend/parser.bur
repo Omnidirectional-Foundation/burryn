@@ -1,15 +1,3 @@
-// Recursive-descent parser ported from parser.go. Go raises parse failures
-// as panics and recovers per statement; Burryn has no exceptions, so every
-// parse function returns Result and errors bounce out through explicit
-// matches: `let x = match f(..) { Ok(v) => v, Err(d) => { return Err(d); .. } }`.
-// (The checker now defers the `?` Option/Result decision to the end of the
-// recursion group, so `?` works in mutually-recursive fns; the bounce
-// idiom stays because the archived Go seed, which decides at the use site,
-// must still compile this file.) A tail call passes its Result through
-// unchanged.
-//
-// pos is a one-slot mut list holding the token cursor.
-
 import "burryn.dev/compiler/lib"
 
 pub fn parse(toks) {
@@ -17,7 +5,6 @@ pub fn parse(toks) {
     let mut stmts = []
     let mut diags = []
     p_skip_semis(toks, pos)
-    // maxParseDiags = 20: stop error recovery once hopelessly broken
     while !p_check(toks, pos, t_eof) && len(diags) < 20 {
         match p_statement(toks, pos) {
             Ok(s) => push(stmts, s),
@@ -31,8 +18,6 @@ pub fn parse(toks) {
     Parsed(stmts, diags)
 }
 
-// parse_interface accepts generated package declarations. Bodyless
-// functions and typed lets are deliberately unavailable through parse().
 pub fn parse_interface(toks) {
     let mut pos = [0]
     let mut stmts = []
@@ -51,9 +36,6 @@ pub fn parse_interface(toks) {
     Parsed(stmts, diags)
 }
 
-// synchronize skips tokens until the next statement boundary: a semicolon at
-// the current brace depth (closers of blocks we bailed out of are swallowed
-// as residue) or a token that starts a statement.
 fn p_synchronize(toks, mut pos) {
     let mut depth = 0
     let mut going = true
@@ -120,7 +102,6 @@ fn p_skip_semis(toks, mut pos) {
     }
 }
 
-// terminate a statement: semi, or lookahead at a closer/EOF
 fn p_end_stmt(toks, mut pos) {
     if p_check(toks, pos, t_semi) {
         p_advance(toks, pos)
@@ -133,13 +114,10 @@ fn p_end_stmt(toks, mut pos) {
     }
 }
 
-// ---- statements ----
-
 fn p_statement(toks, mut pos) {
-    // 标签语句：label: while/for（Go 式）
     if p_check(toks, pos, t_ident) && p_check(toks, [pos[0] + 1], t_colon) && (p_check(toks, [pos[0] + 2], t_while) || p_check(toks, [pos[0] + 2], t_for)) {
         let ltok = p_advance(toks, pos)
-        let _ = p_advance(toks, pos) // :
+        let _ = p_advance(toks, pos)
         let inner = match p_statement(toks, pos) {
             Ok(v) => v,
             Err(d) => {
@@ -156,7 +134,6 @@ fn p_statement(toks, mut pos) {
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
         p_fn_decl(toks, pos)
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_lparen && tok_type(toks[pos[0] + 2]) == t_ident && tok_type(toks[pos[0] + 3]) == t_colon {
-        // 方法声明：fn (recv: Type) name(...)；裸 fn(...) 是 lambda（表达式语句）
         p_method_decl(toks, pos)
     } else if p_check(toks, pos, t_enum) {
         p_enum_decl(toks, pos)
@@ -199,7 +176,6 @@ fn p_statement(toks, mut pos) {
         p_defer_stmt(toks, pos)
     } else if p_check(toks, pos, t_break) {
         let tok = p_advance(toks, pos)
-        // break 后跟标识符 = 标签（换行时自动分号已插入，此处只会是同行标签）
         let mut lb = ""
         if p_check(toks, pos, t_ident) {
             lb = tok_lex(p_advance(toks, pos))
@@ -225,7 +201,6 @@ fn p_statement(toks, mut pos) {
         }
         Ok(ContinueStmt(lb, sp_of_tok(tok)))
     } else {
-        // expression statement / assignment / send
         let e = match p_expression(toks, pos) {
             Ok(v) => v,
             Err(d) => {
@@ -257,7 +232,6 @@ fn p_statement(toks, mut pos) {
             }
             Ok(AssignStmt(e, val, sp_union(span_of(e), span_of(val))))
         } else if p_check(toks, pos, t_plus_eq) || p_check(toks, pos, t_minus_eq) || p_check(toks, pos, t_star_eq) || p_check(toks, pos, t_slash_eq) || p_check(toks, pos, t_percent_eq) {
-            // 复合赋值：x += v 脱糖为 x = x + v（符号 + 语义都显式）
             let op = p_advance(toks, pos)
             let op_t = tok_type(op)
             let binop = if op_t == t_plus_eq {
@@ -394,10 +368,9 @@ fn p_interface_statement(toks, mut pos) {
 }
 
 fn p_let_stmt(toks, mut pos) {
-    let tok = p_advance(toks, pos) // let
+    let tok = p_advance(toks, pos)
     let is_mut = p_match(toks, pos, t_mut)
     if p_check(toks, pos, t_lparen) {
-        // 解构 let：let (a, b) = tuple
         p_advance(toks, pos)
         let mut names = []
         let mut nspans = []
@@ -485,11 +458,8 @@ fn p_let_stmt(toks, mut pos) {
     Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
-// const bindings are immutable by construction: the grammar has no `const mut`,
-// and after folding they lower to non-mut lets, so reassignment is rejected by
-// the checker's existing immutability rule.
 fn p_const_stmt(toks, mut pos) {
-    let tok = p_advance(toks, pos) // const
+    let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "constant name") {
         Ok(v) => v,
         Err(d) => {
@@ -530,10 +500,8 @@ fn p_const_stmt(toks, mut pos) {
     Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
-// p_pub_decl parses `pub` followed by an exportable declaration; nodes are
-// immutable, so the parsed declaration is rebuilt with pub set.
 fn p_pub_decl(toks, mut pos) {
-    let tok = p_advance(toks, pos) // pub
+    let tok = p_advance(toks, pos)
     if p_check(toks, pos, t_let) {
         let s = match p_let_stmt(toks, pos) {
             Ok(v) => v,
@@ -589,9 +557,8 @@ fn p_pub_decl(toks, mut pos) {
     }
 }
 
-// p_import_decl parses `import ["alias"] "path"`
 fn p_import_decl(toks, mut pos) {
-    let tok = p_advance(toks, pos) // import
+    let tok = p_advance(toks, pos)
     let mut alias = ""
     let mut asp = Sp(0, 0)
     if p_check(toks, pos, t_ident) {
@@ -616,7 +583,7 @@ fn p_import_decl(toks, mut pos) {
 }
 
 fn p_fn_decl(toks, mut pos) {
-    let tok = p_advance(toks, pos) // fn
+    let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "function name") {
         Ok(v) => v,
         Err(d) => {
@@ -634,10 +601,8 @@ fn p_fn_decl(toks, mut pos) {
     Ok(FnDecl(tok_lex(name), sp_of_tok(name), false, lit, span_of(lit)))
 }
 
-// fn (recv: Type) name(params) -> ret { body } —— receiver 方法声明。
-// receiver 作为 fnlit 的首参（带类型标注），方法表由 checker/compiler 注册。
 fn p_method_decl(toks, mut pos) {
-    let tok = p_advance(toks, pos) // fn
+    let tok = p_advance(toks, pos)
     match p_expect(toks, pos, t_lparen, "'(' after fn in method") {
         Ok(_) => {},
         Err(d) => {
@@ -677,7 +642,6 @@ fn p_method_decl(toks, mut pos) {
             lib::Token::Tok(0, "", 0, 0)
         },
     }
-    // 剩余参数：方法名后的 (params) -> ret { body }
     match p_expect(toks, pos, t_lparen, "'(' after method name") {
         Ok(_) => {},
         Err(d) => {
@@ -748,7 +712,6 @@ fn p_method_decl(toks, mut pos) {
     Ok(MethodDecl(rty_name(rty), tok_lex(name), sp_of_tok(name), lit, span_of(lit)))
 }
 
-// 方法 receiver 的类型名：record 类型取别名；enum/其他取名字。/ Receiver type name for the method table.
 fn rty_name(ty) {
     match ty {
         TEName(_, n, _, _, _) => n,
@@ -757,7 +720,6 @@ fn rty_name(ty) {
     }
 }
 
-// params and body, after 'fn [name]'; fn_sp is the span of the `fn` keyword
 fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     match p_expect(toks, pos, t_lparen, "'(' after fn") {
         Ok(_) => {},
@@ -845,7 +807,7 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
 }
 
 fn p_enum_decl(toks, mut pos) {
-    let tok = p_advance(toks, pos) // enum
+    let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "enum name") {
         Ok(v) => v,
         Err(d) => {
@@ -855,7 +817,6 @@ fn p_enum_decl(toks, mut pos) {
     }
     let mut params = []
     if p_match(toks, pos, t_lparen) {
-        // generic parameters: enum Box(a) { ... }
         while !p_check(toks, pos, t_rparen) {
             let ptok = match p_expect(toks, pos, t_ident, "type parameter") {
                 Ok(v) => v,
@@ -934,7 +895,7 @@ fn p_enum_decl(toks, mut pos) {
 }
 
 fn p_type_alias_decl(toks, mut pos, is_pub) {
-    let tok = p_advance(toks, pos) // type
+    let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "type alias name") {
         Ok(v) => v,
         Err(d) => {
@@ -964,7 +925,6 @@ fn p_type_alias_decl(toks, mut pos, is_pub) {
     Ok(TypeAliasDecl(tok_lex(name), te, is_pub, sp_union(sp_of_tok(tok), span_of(te))))
 }
 
-// typeExpr := "[" typeExpr "]" | "fn" "(" list ")" "->" typeExpr | IDENT ["." IDENT] [":" IDENT] ["(" list ")"]
 fn p_type_expr(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
@@ -1032,7 +992,6 @@ fn p_type_expr(toks, mut pos) {
             push(names, tok_lex(fname))
             push(types, ft)
             if !p_match(toks, pos, t_comma) {
-                // 末字段后也允许行变量：record { a: int | r }
                 if p_match(toks, pos, t_bar) {
                     let rv = match p_expect(toks, pos, t_ident, "row variable after '|'") {
                         Ok(v) => v,
@@ -1056,7 +1015,6 @@ fn p_type_expr(toks, mut pos) {
         }
         Ok(TERecord(names, types, row_var, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     } else if t == t_lparen {
-        // tuple 类型：(T1, T2, ...)
         let lp = p_advance(toks, pos)
         let mut ets = []
         while !p_check(toks, pos, t_rparen) {
@@ -1128,7 +1086,6 @@ fn p_type_expr(toks, mut pos) {
         let mut name = tok_lex(tok)
         let mut sp = sp_of_tok(tok)
         if p_match(toks, pos, t_colon_colon) {
-            // qualified type: pkg::Name
             let n = match p_expect(toks, pos, t_ident, "a type name after '::'") {
                 Ok(v) => v,
                 Err(d) => {
@@ -1210,7 +1167,6 @@ fn p_for_stmt(toks, mut pos) {
             lib::Token::Tok(0, "", 0, 0)
         },
     }
-    // for i, x in xs：第一个 ident 是索引、第二个是元素；无逗号则第一个是元素
     let mut v = tok_lex(first)
     let mut vsp = sp_of_tok(first)
     let mut idx = ""
@@ -1291,11 +1247,8 @@ fn p_defer_stmt(toks, mut pos) {
     Ok(DeferStmt(body, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
-// p_select_stmt parses `select { arm, arm, default => body }`. Each arm is a
-// receive (`v = <-ch => body` / `<-ch => body`), a send (`ch <- v => body`),
-// or `default => body` (at most one).
 fn p_select_stmt(toks, mut pos) {
-    let tok = p_advance(toks, pos) // select
+    let tok = p_advance(toks, pos)
     match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after select") {
         Ok(_) => {},
         Err(d) => {
@@ -1366,7 +1319,6 @@ fn p_select_arm(toks, mut pos) {
     let mut val = NoNode
     let mut asp = Sp(0, 0)
     if p_check(toks, pos, t_larrow) {
-        // <-ch => body  (receive, value discarded)
         let start = p_advance(toks, pos)
         ch = match p_expression(toks, pos) {
             Ok(v) => v,
@@ -1386,7 +1338,6 @@ fn p_select_arm(toks, mut pos) {
         }
         asp = span_of(e)
         if p_match(toks, pos, t_eq) {
-            // v = <-ch => body  (receive, bound)
             match e {
                 Ident(n, isp) => {
                     bind = n
@@ -1410,7 +1361,6 @@ fn p_select_arm(toks, mut pos) {
                 },
             }
         } else if p_match(toks, pos, t_larrow) {
-            // ch <- v => body  (send)
             is_send = true
             ch = e
             val = match p_expression(toks, pos) {
@@ -1472,8 +1422,6 @@ fn p_block(toks, mut pos) {
     Ok(Block(stmts, sp_union(sp_of_tok(lb), sp_of_tok(rb))))
 }
 
-// ---- expressions (precedence climbing) ----
-
 fn p_expression(toks, mut pos) {
     p_pipe_expr(toks, pos)
 }
@@ -1499,9 +1447,6 @@ fn p_pipe_expr(toks, mut pos) {
     Ok(e)
 }
 
-// A pipe target is deliberately narrower than a general postfix expression:
-// a name path, optionally followed by one argument list. In particular, a
-// parenthesized expression cannot introduce a second apply-like call rule.
 fn p_pipe_target(toks, mut pos, lhs) {
     let first = match p_expect(toks, pos, t_ident, "a pipe target") {
         Ok(v) => v,
@@ -1578,8 +1523,6 @@ fn p_or_expr(toks, mut pos) {
         }
         e = Logical(t_or_or, e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
-    // range 字面量：a..b 脱糖为 range(a, b)（半开区间）；优先级低于 ||，
-    // rhs 取完整 and 层（1..2+3 = range(1, 2+3)）
     if p_match(toks, pos, t_dot_dot) {
         let rhs = match p_and_expr(toks, pos) {
             Ok(v) => v,
@@ -1715,7 +1658,6 @@ fn p_unary(toks, mut pos) {
         }
         Ok(Unary(tok_type(op), rhs, sp_union(sp_of_tok(op), span_of(rhs))))
     } else if p_check(toks, pos, t_larrow) {
-        // <-ch  (receive)
         let op = p_advance(toks, pos)
         let rhs = match p_unary(toks, pos) {
             Ok(v) => v,
@@ -1801,7 +1743,6 @@ fn p_postfix(toks, mut pos) {
                     VariantAccess(name, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
                 },
                 VariantAccess(en, vr, hsp) => {
-                    // third segment: pkg::Enum::Variant
                     let v = match p_expect(toks, pos, t_ident, "a name after '::'") {
                         Ok(x) => x,
                         Err(dg) => {
@@ -1833,7 +1774,6 @@ fn p_postfix(toks, mut pos) {
     Ok(e)
 }
 
-// 0x/0b 前缀字面量转换（十进制交给 native parse_int；下划线分隔符在此剥离）。
 fn lit_to_int(lexeme) {
     let l = str_len(lexeme)
     if l > 2 && substr(lexeme, 0, 2) == "0x" {
@@ -2051,7 +1991,6 @@ fn p_primary(toks, mut pos) {
             },
         }
         if p_match(toks, pos, t_comma) {
-            // tuple 字面量：(a, b, ...)
             let mut elems = [e]
             p_skip_semis(toks, pos)
             while !p_check(toks, pos, t_rparen) {
@@ -2126,7 +2065,6 @@ fn p_primary(toks, mut pos) {
     }
 }
 
-// p_interpolated 把 `"head {expr} tail"` 脱糖为现有左结合字符串拼接 AST；保留空首尾片段，使普通 `+` 规则把每个内嵌表达式约束为 str。/ p_interpolated lowers `"head {expr} tail"` into the existing left-associative concat AST; empty edge segments make normal `+` rules constrain every embedded expression to str.
 fn p_interpolated(toks, mut pos) {
     let start = p_advance(toks, pos)
     let mut out = StrLit(tok_lex(start), sp_of_tok(start))
@@ -2156,7 +2094,7 @@ fn p_interpolated(toks, mut pos) {
 }
 
 fn p_if_expr(toks, mut pos) {
-    let tok = p_advance(toks, pos) // if
+    let tok = p_advance(toks, pos)
     let cond = match p_expression(toks, pos) {
         Ok(v) => v,
         Err(d) => {
@@ -2197,7 +2135,7 @@ fn p_if_expr(toks, mut pos) {
 }
 
 fn p_match_expr(toks, mut pos) {
-    let tok = p_advance(toks, pos) // match
+    let tok = p_advance(toks, pos)
     let scrut = match p_expression(toks, pos) {
         Ok(v) => v,
         Err(d) => {
@@ -2221,7 +2159,6 @@ fn p_match_expr(toks, mut pos) {
                 NoNode
             },
         }
-        // or-pattern：A | B => body 展开为两个臂（同一 guard + body）
         let mut pats = [pat]
         while p_match(toks, pos, t_bar) {
             let p2 = match p_pattern(toks, pos) {
@@ -2233,7 +2170,6 @@ fn p_match_expr(toks, mut pos) {
             }
             push(pats, p2)
         }
-        // guard 在 pattern 绑定之后求值，语法为 `pattern if expr => body`。/ A guard is evaluated after pattern binding and uses `pattern if expr => body`.
         let has_guard = p_match(toks, pos, t_if)
         let guard = if has_guard {
             match p_expression(toks, pos) {
@@ -2290,7 +2226,6 @@ fn p_pattern(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
     if t == t_record {
-        // record 模式：record { x, y } 解构字段到同名绑定
         let rk = p_advance(toks, pos)
         match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after record pattern") {
             Ok(_) => {},
@@ -2332,7 +2267,6 @@ fn p_pattern(toks, mut pos) {
         }
         Ok(PatLiteral(lit, span_of(lit)))
     } else if t == t_minus {
-        // negative number literal
         p_advance(toks, pos)
         let lit = match p_primary(toks, pos) {
             Ok(v) => v,
@@ -2367,7 +2301,6 @@ fn p_pattern(toks, mut pos) {
                 variant = tok_lex(vtok)
                 sp = sp_union(sp, sp_of_tok(vtok))
                 if p_match(toks, pos, t_colon_colon) {
-                    // third segment: pkg::Enum::Variant
                     pkg = enum_name
                     enum_name = variant
                     let vtok2 = match p_expect(toks, pos, t_ident, "variant name after '::'") {
@@ -2415,7 +2348,6 @@ fn p_pattern(toks, mut pos) {
             } else if enum_name != "" {
                 Ok(PatVariant(pkg, enum_name, variant, [], sp))
             } else {
-                // bare name: binding, or a nullary variant like None — compiler decides
                 Ok(PatBinding(variant, sp))
             }
         }
