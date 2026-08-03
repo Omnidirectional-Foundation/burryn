@@ -1705,7 +1705,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 scan_bind(sc, name)
                 scan_free(lit, sc, seen, out)
             },
-            ForStmt(v, _, iter, _, body, _) => {
+            ForStmt(v, _, _, _, iter, _, body, _) => {
                 scan_free(iter, sc, seen, out)
                 push(sc, map())
                 scan_bind(sc, v)
@@ -2739,7 +2739,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 infer_block_stmts(body)
                 pop_scope()
             },
-            ForStmt(v, vsp, iter, _, body, fsp) => {
+            ForStmt(v, vsp, idx, isp, iter, _, body, fsp) => {
                 let el = fresh("")
                 let it = infer_expr(iter)
                 // a channel iterable receives until closed; anything else must
@@ -2747,6 +2747,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 let r = ty_resolve(tk, tr, it)
                 if tk[r] == 0 && tn[r] == "chan" {
                     unify_at(el, ta[r][0], span_of(iter), "in this `for` loop (receive from a channel)")
+                    if idx != "" {
+                        cerr(isp, "E0599", "a channel has no index; iterate with `for x in ch`", "cannot use an index variable when iterating a channel")
+                    }
                     match fsp {
                         Sp(fstart, _) => push(chan_fors, cur_file + ":" + str(fstart)),
                     }
@@ -2754,6 +2757,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     unify_at(it, con1("list", el), span_of(iter), "in this `for` loop (iterate over a list or channel)")
                 }
                 push_scope()
+                if idx != "" {
+                    let _ = declare(idx, mono(h_int), false, "pattern", isp)
+                }
                 let _ = declare(v, mono(el), false, "pattern", vsp)
                 infer_block_stmts(body)
                 pop_scope()
