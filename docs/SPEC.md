@@ -80,7 +80,7 @@
 
 - 参考系：Rust(`let`/`mut`、`match`、带字段枚举、`?`、表达式导向、遮蔽)+ Go(`spawn`、channel 语法、自动分号插入)
 - 补充定案：`defer`(资源清理，脚本场景刚需)——归 **S7.6**，倾向块作用域(表达式导向下比 Go 的函数作用域干净)
-- **语法已冻结(S8.2)**，正式 grammar 见 [`grammar.md`](grammar.md)。符号语义分工：`::` = 路径限定(包函数/变体)，`.` = 字段访问；`default`(select 臂特判)与 `chan`(native 函数)非关键字。冻结后语法变更须走修订流程(见 grammar.md §9)
+- **语法已冻结(S8.2)**，正式 grammar 见 [`grammar.md`](grammar.md)。S8.2 定案摘要：`::` = 路径限定、`.` = 成员访问(字段/方法)；复合赋值 `+= -= *= /= %=`；`for i, x in xs` 索引遍历；or-pattern `A | B`；标签循环 `label:` + `break label`；record 模式 `record { x, y }`；方法 `fn (s: Type) name()`；tuple `(a, b)` + 解构 `let (a, b) = t`；hex/二进制/指数/下划线数字字面量；多行字符串 `"""` + `\` 行标记；range `1..10` 脱糖；`\r` 转义；shebang。`default`(select 臂特判)与 `chan`(native 函数)非关键字。冻结后语法变更须走修订流程(见 grammar.md §10)
 
 ### 明确拒绝清单(护住简洁，不接受重新提案)
 
@@ -151,7 +151,7 @@
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
 | **S6 生态工具链** | S6.1 依赖解析 **已完成**(MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；std/testing)；S6.5 诊断/DX 批 **已完成**(cgen `#line` + `-g`、runtime/VM trap 带 span stack trace、公开命令 rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议 + loader 诊断接线)；S6.6 std/json + std/testing **已完成**(核心实现 + CI regen+cmp)；S6.7 runtime IO **已完成**(sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成** | 已完成 |
 | **S7 语言特性扩展** | S7.1 字符串插值 **已完成**；S7.2 管道 `|>` **已完成**；S7.3 match guard **已完成**；S7.4 命名参数 + 默认值(**已否决**，编号保留)；S7.5 编译期常量 **已完成**；S7.6 `defer` **已完成**；S7.7 net stdlib **已完成**；S7.8 可选函数签名标注(**已为 S6.1 提前完成**) | 已完成 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 后端：**ELF**(Linux) + **Mach-O**(macOS) + **PE**(Windows)；S8.2 语法冻结 + grammar 文件 **已完成**([`grammar.md`](grammar.md)，`::` 路径限定符定案、record 语法定稿)；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现**。**x86-64 ELF 后端开发中**（list/closure/global/str native 已完成，match/enum 进行中，详见 §6.7） | 进行中 |
+| **S8 后端与重型类型** | S8.1 手写 x86-64 后端：**ELF**(Linux) + **Mach-O**(macOS) + **PE**(Windows)；S8.2 语法冻结 + grammar 文件 **已完成**([`grammar.md`](grammar.md)，定案：`::`/`.` 分工、复合赋值、for 索引、or-pattern、标签循环、record 模式、方法、tuple+解构、字面量扩展、多行字符串、range)；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现**。**x86-64 ELF 后端开发中**（list/closure/global/str native 已完成，match/enum 进行中，详见 §6.7） | 进行中 |
 | **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段。前置 = S8.2 语法冻结。**S9.1 + S9.2(hover) + S9.3(VSCode 扩展)已落地**；剩余：go-to-def、completion、signature-help、formatting | 部分实现 |
 | **S10 包生态** | 已有 std 包：`json`/`net`/`testing`（S6.6/S7.7 落地）、`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板 + 示例包；S10.3 `bur doc`（导出签名 + 注释 → Markdown）；S10.4 包质量基础设施（CI 模板、测试约定、版本规范）。原则：能纯 Burryn 就不加 native；每包带 bur.mod + *_test.bur，随 std_embed 分发 | 未开工 |
 
