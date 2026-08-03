@@ -37,6 +37,13 @@ process.
   and trap-exit-4 handling.
 - **Fixed:** x86 backend `chr` now emits UTF-8 for multi-byte code points
   (was single-byte only, silently wrong for non-ASCII).
+- **Changed:** Tutorial reorganized — the syntax-freeze features are folded
+  into their topic chapters (literals, tuples, records, methods, indexed and
+  labeled loops, multiline strings, or-patterns) and the standalone section is
+  dropped; EN and ZH stay in sync.
+- **Fixed:** README Tour enum sample used nonexistent field names; the
+  examples table gained the new samples; the SPEC x86 backend status and
+  progress were refreshed.
 
 
 **Landed S7.6 `defer`** — `defer { ... }` registers a block on the enclosing
