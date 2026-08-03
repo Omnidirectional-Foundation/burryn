@@ -40,7 +40,7 @@ A **burr** is what forging leaves on metal.
 - **Shadowing.**
   `let x = x + 1` rebinds, Rust style.
 - **Algebraic data types.**
-  `enum Shape { Circle(r), Rect(w, h), Point }`.
+  `enum Shape { Circle(float), Rect(int, int), Point }`.
 
 ## What It Takes from Go
 
@@ -65,7 +65,7 @@ bur run examples/concurrency/sieve.bur
 ```
 
 ```text
-enum Shape { Circle(r), Rect(w, h) }
+enum Shape { Circle(float), Rect(int, int) }
 
 fn area(s) {
     match s {
@@ -107,6 +107,8 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | ------ | ------------- |
 | `examples/basics/hello.bur` | basics, closures, loops |
 | `examples/basics/fib.bur` | recursion micro-benchmark |
+| `examples/basics/numeric.bur` | numeric conversions: trunc, to_float, parse_float, float_bits |
+| `examples/basics/args.bur` | command-line arguments |
 | `examples/basics/textproc.bur` | string and list natives: split, trim, join, slice, concat |
 | `examples/basics/interpolation.bur` | string interpolation with `{expr}` |
 | `examples/basics/cleanup.bur` | defer: LIFO cleanup, closure capture |
@@ -119,8 +121,10 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/concurrency/pipeline.bur` | buffered-channel producer/consumer |
 | `examples/concurrency/multiplex.bur` | `select` over several channels |
 | `examples/concurrency/streaming.bur` | channel close + for-in drain |
+| `examples/concurrency/yield.bur` | explicit cooperative handoff between fibers |
 | `examples/net/net_loopback.bur` | TCP listener + dialer echo exchange |
-| `examples/io/fs.bur` | read_file/write_file round-trip and error paths |
+| `examples/net/net_nb.bur` | non-blocking accept/read/write over sockets |
+| `examples/io/fs.bur` | read_file/write_file/file_exists/read_dir and error paths |
 | `examples/io/exec.bur` | synchronous exec: Output, exit codes |
 | `examples/programs/brainfuck.bur` | a Brainfuck interpreter written in Burryn |
 | `examples/programs/wordcount.bur` | maps and string functions |

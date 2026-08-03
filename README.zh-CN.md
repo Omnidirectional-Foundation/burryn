@@ -41,7 +41,7 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 - **遮蔽（Shadowing）。**
   `let x = x + 1` 重新绑定，与 Rust 一致。
 - **代数数据类型。**
-  `enum Shape { Circle(r), Rect(w, h), Point }`。
+  `enum Shape { Circle(float), Rect(int, int), Point }`。
 
 ## 取自 Go
 
@@ -66,7 +66,7 @@ bur run examples/concurrency/sieve.bur
 ```
 
 ```text
-enum Shape { Circle(r), Rect(w, h) }
+enum Shape { Circle(float), Rect(int, int) }
 
 fn area(s) {
     match s {
@@ -108,6 +108,8 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | ------ | ------ |
 | `examples/basics/hello.bur` | 基础、闭包、循环 |
 | `examples/basics/fib.bur` | 递归微基准 |
+| `examples/basics/numeric.bur` | 数值转换：trunc、to_float、parse_float、float_bits |
+| `examples/basics/args.bur` | 命令行参数 |
 | `examples/basics/textproc.bur` | 字符串与列表原语：split、trim、join、slice、concat |
 | `examples/basics/interpolation.bur` | 字符串插值 `{expr}` |
 | `examples/basics/cleanup.bur` | defer：LIFO 清理、闭包捕获 |
@@ -120,8 +122,10 @@ for _i in range(0, 5) { sum = sum + <-ch }
 | `examples/concurrency/pipeline.bur` | 带缓冲 channel 的生产者/消费者 |
 | `examples/concurrency/multiplex.bur` | 多 channel 的 `select` |
 | `examples/concurrency/streaming.bur` | channel 关闭与 for-in 排空 |
+| `examples/concurrency/yield.bur` | fiber 间显式协作让出 |
 | `examples/net/net_loopback.bur` | TCP 监听 + 拨号回显交换 |
-| `examples/io/fs.bur` | read_file/write_file 往返与错误路径 |
+| `examples/net/net_nb.bur` | socket 非阻塞 accept/read/write |
+| `examples/io/fs.bur` | read_file/write_file/file_exists/read_dir 与错误路径 |
 | `examples/io/exec.bur` | 同步 exec：Output、退出码 |
 | `examples/programs/brainfuck.bur` | 用 Burryn 写的 Brainfuck 解释器 |
 | `examples/programs/wordcount.bur` | map 与字符串函数 |
