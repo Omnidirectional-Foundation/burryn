@@ -1,6 +1,21 @@
+// vm.bur — 字节码解释器 + 运行时。
+// / Bytecode interpreter and runtime.
+// 值即 Val：标量与字符串内联；可变的或带身份的对象（list/map/closure/upvalue/枚举实例/channel/native/枚举类型/变体构造器）
+// 活在由 int 句柄索引的平行 mut 列表 arena 里——mut 不穿透枚举字段，因此用 arena 绕过。
+// Values are Val: scalars and strings inline; mutable or identity-bearing objects live in a tagged arena
+// of parallel mut lists reached through int handles, because mut does not penetrate enum fields.
+// 解释堆自带从 GC 移植的 mark-sweep 回收器：句柄是宿主 GC 无法追踪的 int，槽位存活由 VM 自己判定；
+// 释放的槽丢弃负载（让宿主 GC 回收内存）并进入空闲链表复用。
+// The interpreted heap has its own mark-sweep collector ported from the GC: handles are ints the host
+// GC cannot trace, so slot liveness is the VM's own job; freed slots drop payloads and go on a free list.
+// fiber 是平行 mut 列表中的普通数据——调度器与宿主同线程的 FIFO 就绪队列；
+// 运行时 trap 直接打印到 stderr 并 exit(4)：trap 总是结束程序，无需展开。
+// Fibers are plain data in parallel mut lists; the scheduler is the same FIFO ready queue on one host
+// thread. Runtime traps print to stderr and exit(4) directly: a trap always ends the program.
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
+// 解释值 / Interpreted value
 enum Val {
     VUnit,
     VBool(bool),
@@ -10,11 +25,13 @@ enum Val {
     VObj(int),
 }
 
+// channel 尝试接收的结果（语言无 tuple）/ chan_try_recv result (the language has no tuples)
 enum RecvRes {
     RecvGot(Val),
     RecvNone,
 }
 
+// 堆对象类型 / Heap object kinds
 let ot_free = 0
 let ot_list = 1
 let ot_map = 2
@@ -28,6 +45,7 @@ let ot_ctor = 9
 let ot_record = 10
 let ot_tuple = 11
 
+// fiber 状态机 / Fiber states
 let fs_ready = 0
 let fs_blocked_send = 1
 let fs_blocked_recv = 2
@@ -38,12 +56,16 @@ let fs_blocked_io = 6
 let fs_blocked_net = 7
 let fs_blocked_stdin = 8
 
+// 调度等待原因 / Scheduler wait reasons
 let wait_timer = 1
 let wait_exec = 2
 let wait_net = 3
 
+// 协作调度时间片：旋转 fiber 每 10000 条指令让出一次 / Cooperative time slice: a spinning fiber yields every 10000 instructions
 let vm_time_slice = 10000
 
+// 运行入口：加载平行表（代码/常量/枚举元数据），创建主 fiber 并进入调度循环 /
+// Run entry: load the parallel tables (code/constants/enum metadata), create the main fiber, enter the scheduler
 pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args, ls_files, ls_names, ls_tables) {
     let max_int = 9223372036854775807
     let min_int = -9223372036854775807 - 1
