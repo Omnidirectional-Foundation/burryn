@@ -92,6 +92,28 @@ println(str(answer), str(increment()))   // 42 43
 `const` 的初始化表达式只能引用字面值、其它 `const`、以及纯内建运算；不能调用普通
 函数或引用 `let` 变量。
 
+### 类型标注
+
+标注是**可选的**——默认推导。想写时，把类型写在名字后面：
+
+```rust
+let x: int = 5
+const LIMIT: int = 100
+fn add(a: int, b: int) -> int { a + b }   // 参数与返回值也可以标
+```
+
+标注会与推导出的类型比对，能提前抓住类型不符，或只是表达意图。
+
+### 复合赋值
+
+`+=`、`-=`、`*=`、`/=`、`%=` 就地更新 `mut` 绑定：
+
+```rust
+let mut n = 0
+n += 5                // n = n + 5
+n *= 2                // 10
+```
+
 ---
 
 ## 3. 基本类型
@@ -112,11 +134,52 @@ let m = trunc(3.9)           // float -> int（截断）= 3
 let text = str(n)            // 任意值 -> string
 ```
 
+数字字面量支持十六进制、二进制、数字分隔符与浮点指数：
+
+```rust
+let a = 0xFF          // 十六进制（255）
+let b = 0b1010        // 二进制（10）
+let c = 1_000_000     // 数字分隔符会被忽略
+let d = 1.5e-3        // 浮点指数（0.0015）
+```
+
 **整数溢出一律 trap**（运行时 panic），不静默回绕；整数除零、取模零也 trap。这是
 刻意的：默认安全，要就明说。
 
 字符串是 **UTF-8 字节序列**，`len`/索引按**字节**算。取码点用 `char_at`、`ord`、
 `chr`（见第 7 节）。
+
+### Tuple
+
+tuple 把可能不同类型的一批值打包在一起，`t[0]`、`t[1]` 索引：
+
+```rust
+let t = (10, "hello")                    // tuple 字面量，≥2 元素
+println(t[0], t[1])                      // 10 hello
+let (a, b) = t                           // 解构 let
+let pair: (int, str) = (1, "x")          // tuple 类型标注
+```
+
+### Record
+
+record 是带**命名字段**的值：
+
+```rust
+let p = record { x: 1, y: 2 }
+println(p.x, p.y)                        // 1 2
+let p2 = record { p | x: 10 }            // 复制 p 并替换字段 x
+let empty = record {}
+```
+
+record 模式把字段解构为同名局部变量——可用于 `match`：
+
+```rust
+let r = record { x: 10, y: 20 }
+match r {
+    record { x, y } => println(x + y),   // 30
+    _ => println("no"),
+}
+```
 
 ### 字符串插值
 
@@ -229,6 +292,24 @@ fn process(path) {
 
 脚本顶层也能写 `defer`——整个脚本就是一个函数，块在脚本结束时执行。
 
+### receiver 方法
+
+第一个参数写成 `(s: Type)` 的函数就变成该**类型的方法**，用 `s.name(...)` 调用；
+它编译为 `name(s, ...)`：
+
+```rust
+enum Point { Point(float, float) }
+
+fn (p: Point) dist() {
+    match p {
+        Point(x, y) => x * x + y * y,
+    }
+}
+
+let p = Point::Point(3.0, 4.0)
+println(p.dist())                        // 25.0
+```
+
 ---
 
 ## 6. 列表与循环
@@ -244,7 +325,8 @@ let last = pop(xs)       // 40，xs 变回长度 3
 ```
 
 三种循环：`for x in list`、`for i in range(a, b)`（半开区间 `[a, b)`）、`while`。
-`break` / `continue` 可用。
+`break` / `continue` 可用。`a..b` 字面量脱糖为 `range(a, b)`；`for i in 0..10`
+即 `for i in range(0, 10)`。
 
 ```rust
 let mut sum = 0
@@ -265,6 +347,26 @@ while i < len(words) {
 }
 ```
 
+带索引的循环同时绑定索引与元素——`for i, w in words` 给 `i` 位置、`w` 值
+（channel 拒绝索引形式）。
+
+```rust
+let xs = ["a", "b", "c"]
+for i, w in xs {
+    println(i, w)                // 0 a / 1 b / 2 c
+}
+```
+
+循环可以**加标签**，`break` / `continue` 指定外层：
+
+```rust
+outer: for x in xs {
+    for y in ys {
+        if done { break outer }
+    }
+}
+```
+
 常用列表函数：`len`、`push`、`pop`、`slice(xs, start, end)`、`concat(a, b)`、
 `contains(xs, v)`、`range(a, b)`。
 
@@ -280,6 +382,16 @@ let parts = split("a,b,c", ",")      // ["a", "b", "c"]
 let joined = join(parts, " | ")      // "a | b | c"
 let sub = substr("burryn", 0, 3)     // "bur"（起点, 长度）
 let hit = str_contains("burryn", "rry")   // true
+```
+
+多行字符串用 `"""`；行首 `\` 标记该行是内容，因此缩进被忽略：
+
+```rust
+let s = """
+    \line one
+    \line two
+    """
+// s == "line one\nline two\n"
 ```
 
 字符串速查：`len`（字节长）、`str_len`、`char_at(s, i)`、`ord(s)`（首码点 -> int）、
@@ -363,6 +475,16 @@ let status = match jobs {
     None => "missing",
 }
 println(status)
+```
+
+**or-pattern** 用 `|` 把多个备选合到同一臂：
+
+```rust
+let letter = match grade / 10 {
+    9 | 10 => "A",
+    7 | 8  => "B",
+    _      => "F",
+}
 ```
 
 同名变体属于多个枚举时，用 `Enum.Variant` 限定，如 `Shape.Circle(r)`。
@@ -715,97 +837,3 @@ bur test -v           # 详细输出
 
 ---
 
-## 18. 语法冻结新增（S8.2）
-
-语法已冻结；正式 grammar 见 `docs/grammar.md`，此后变更须走修订流程。冻结新增：
-
-**字面量形式**
-
-```rust
-let a = 0xFF          // 十六进制（255）
-let b = 0b1010        // 二进制（10）
-let c = 1_000_000     // 数字分隔符
-let d = 1.5e-3        // 浮点指数
-let s = """
-    \line one
-    \line two
-    """               // 多行字符串：行首 \ 标记内容，缩进忽略
-let r = 1..5          // range，脱糖为 range(1, 5)
-```
-
-**复合赋值**
-
-```rust
-let mut n = 0
-n += 5                // n = n + 5；另有 -= *= /= %=
-```
-
-**绑定的类型标注**
-
-```rust
-let x: int = 5
-const LIMIT: int = 100
-```
-
-**带索引的 for 循环**
-
-```rust
-let words = ["a", "b", "c"]
-for i, w in words {
-    println(i, w)     // 索引与元素；channel 拒绝索引形式
-}
-```
-
-**or-pattern**
-
-```rust
-match code {
-    1 | 2 => println("low"),
-    3 | 4 | 5 => println("mid"),
-    _ => println("high"),
-}
-```
-
-**标签循环**
-
-```rust
-outer: for x in xs {
-    for y in ys {
-        if done { break outer }
-    }
-}
-```
-
-**record 模式**
-
-```rust
-let r = record { x: 10, y: 20 }
-match r {
-    record { x, y } => println(x + y),   // 解构到同名局部变量
-    _ => println("no"),
-}
-```
-
-**receiver 方法**
-
-```rust
-enum Point { Point(float, float) }
-
-fn (p: Point) dist() {                   // receiver 带类型，按类型建方法表
-    match p {
-        Point(x, y) => x * x + y * y,
-    }
-}
-
-let p = Point::Point(3.0, 4.0)
-println(p.dist())                        // 25.0；编译为 dist(p)
-```
-
-**tuple 与解构**
-
-```rust
-let t = (10, "hello")                    // tuple 字面量，≥2 元素
-println(t[0], t[1])
-let (a, b) = t                           // 解构 let
-let pair: (int, str) = (1, "x")          // tuple 类型标注
-```

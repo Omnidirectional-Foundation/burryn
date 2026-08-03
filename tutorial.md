@@ -98,6 +98,30 @@ println(str(answer), str(increment()))   // 42 43
 The initializer may only reference literals, other `const` values, and pure
 built-in operations — no ordinary function calls or `let` variables.
 
+### Type annotations
+
+Annotations are **optional** — inference is the default. When you want them,
+write the type after the name:
+
+```rust
+let x: int = 5
+const LIMIT: int = 100
+fn add(a: int, b: int) -> int { a + b }   // parameters and return type too
+```
+
+An annotation is checked against the inferred type, so it can catch a mismatch
+early or just document intent.
+
+### Compound assignment
+
+`+=`, `-=`, `*=`, `/=`, `%=` update a `mut` binding in place:
+
+```rust
+let mut n = 0
+n += 5                // n = n + 5
+n *= 2                // 10
+```
+
 ---
 
 ## 3. Primitive types
@@ -119,11 +143,53 @@ let m = trunc(3.9)           // float -> int (truncate) = 3
 let text = str(n)            // any value -> string
 ```
 
+Number literals accept hex, binary, digit separators, and float exponents:
+
+```rust
+let a = 0xFF          // hex (255)
+let b = 0b1010        // binary (10)
+let c = 1_000_000     // digit separators are ignored
+let d = 1.5e-3        // float exponent (0.0015)
+```
+
 **Integer overflow always traps** (runtime panic) — it never wraps silently;
 integer divide/modulo by zero also traps. Deliberate: safe by default.
 
 Strings are **UTF-8 byte sequences**; `len` and indexing count **bytes**. Use
 `char_at`, `ord`, `chr` for code points (section 7).
+
+### Tuples
+
+A tuple packs values of possibly different types; indexing is `t[0]`, `t[1]`:
+
+```rust
+let t = (10, "hello")                    // tuple literal, >= 2 elements
+println(t[0], t[1])                      // 10 hello
+let (a, b) = t                           // destructuring let
+let pair: (int, str) = (1, "x")          // tuple type annotation
+```
+
+### Records
+
+A record is a value with **named fields**:
+
+```rust
+let p = record { x: 1, y: 2 }
+println(p.x, p.y)                        // 1 2
+let p2 = record { p | x: 10 }            // copy p with field x replaced
+let empty = record {}
+```
+
+A record pattern destructures its fields into same-named locals — usable in a
+`match`:
+
+```rust
+let r = record { x: 10, y: 20 }
+match r {
+    record { x, y } => println(x + y),   // 30
+    _ => println("no"),
+}
+```
 
 ### String interpolation
 
@@ -245,6 +311,24 @@ fn process(path) {
 `defer` works at script top level too — the whole script is one function, so
 the blocks run when the script ends.
 
+### Receiver methods
+
+A function whose first parameter is written `(s: Type)` becomes a **method**
+on that type, called as `s.name(...)`; it compiles to `name(s, ...)`:
+
+```rust
+enum Point { Point(float, float) }
+
+fn (p: Point) dist() {
+    match p {
+        Point(x, y) => x * x + y * y,
+    }
+}
+
+let p = Point::Point(3.0, 4.0)
+println(p.dist())                        // 25.0
+```
+
 ---
 
 ## 6. Lists and loops
@@ -261,7 +345,8 @@ let last = pop(xs)       // 40, xs back to length 3
 ```
 
 Three loops: `for x in list`, `for i in range(a, b)` (half-open `[a, b)`), and
-`while`. `break` / `continue` are available.
+`while`. `break` / `continue` are available. A `a..b` literal desugars to
+`range(a, b)`; `for i in 0..10` is `for i in range(0, 10)`.
 
 ```rust
 let mut sum = 0
@@ -282,6 +367,26 @@ while i < len(words) {
 }
 ```
 
+An indexed loop binds both the index and the element — `for i, w in words`
+gives `i` the position and `w` the value (channels reject the index form).
+
+```rust
+let xs = ["a", "b", "c"]
+for i, w in xs {
+    println(i, w)                // 0 a / 1 b / 2 c
+}
+```
+
+Loops may be **labeled** to `break` / `continue` an outer loop:
+
+```rust
+outer: for x in xs {
+    for y in ys {
+        if done { break outer }
+    }
+}
+```
+
 Common list functions: `len`, `push`, `pop`, `slice(xs, start, end)`,
 `concat(a, b)`, `contains(xs, v)`, `range(a, b)`.
 
@@ -298,6 +403,17 @@ let parts = split("a,b,c", ",")      // ["a", "b", "c"]
 let joined = join(parts, " | ")      // "a | b | c"
 let sub = substr("burryn", 0, 3)     // "bur" (start, length)
 let hit = str_contains("burryn", "rry")   // true
+```
+
+A multiline string uses `"""`; a leading `\` marks the line as content, so
+indentation is ignored:
+
+```rust
+let s = """
+    \line one
+    \line two
+    """
+// s == "line one\nline two\n"
 ```
 
 Cheat sheet: `len` (byte length), `str_len`, `char_at(s, i)`, `ord(s)` (first
@@ -384,6 +500,16 @@ let status = match jobs {
     None => "missing",
 }
 println(status)
+```
+
+**or-patterns** group alternatives in one arm with `|`:
+
+```rust
+let letter = match grade / 10 {
+    9 | 10 => "A",
+    7 | 8  => "B",
+    _      => "F",
+}
 ```
 
 When a variant name is shared across enums, qualify it as `Enum.Variant`, e.g.
@@ -756,98 +882,3 @@ on the `archive/go-host` branch. For a real-sized Burryn program to read,
 
 ---
 
-## 18. New in the syntax freeze (S8.2)
-
-The syntax is frozen; the formal grammar lives in `docs/grammar.md` and future
-changes go through its revision process. The freeze added:
-
-**Literal forms**
-
-```rust
-let a = 0xFF          // hex (255)
-let b = 0b1010        // binary (10)
-let c = 1_000_000     // digit separators
-let d = 1.5e-3        // float exponents
-let s = """
-    \line one
-    \line two
-    """               // multiline: leading \ marks content, indentation ignored
-let r = 1..5          // range, desugars to range(1, 5)
-```
-
-**Compound assignment**
-
-```rust
-let mut n = 0
-n += 5                // n = n + 5; also -= *= /= %=
-```
-
-**Type annotations on bindings**
-
-```rust
-let x: int = 5
-const LIMIT: int = 100
-```
-
-**Indexed for loops**
-
-```rust
-let words = ["a", "b", "c"]
-for i, w in words {
-    println(i, w)     // index and element; channels reject the index form
-}
-```
-
-**or-patterns**
-
-```rust
-match code {
-    1 | 2 => println("low"),
-    3 | 4 | 5 => println("mid"),
-    _ => println("high"),
-}
-```
-
-**Labeled loops**
-
-```rust
-outer: for x in xs {
-    for y in ys {
-        if done { break outer }
-    }
-}
-```
-
-**Record patterns**
-
-```rust
-let r = record { x: 10, y: 20 }
-match r {
-    record { x, y } => println(x + y),   // destructures to same-named locals
-    _ => println("no"),
-}
-```
-
-**Receiver methods**
-
-```rust
-enum Point { Point(float, float) }
-
-fn (p: Point) dist() {                   // receiver typed, method table by type
-    match p {
-        Point(x, y) => x * x + y * y,
-    }
-}
-
-let p = Point::Point(3.0, 4.0)
-println(p.dist())                        // 25.0; compiles to dist(p)
-```
-
-**Tuples and destructuring**
-
-```rust
-let t = (10, "hello")                    // tuple literal, >= 2 elements
-println(t[0], t[1])
-let (a, b) = t                           // destructuring let
-let pair: (int, str) = (1, "x")          // tuple type annotation
-```
