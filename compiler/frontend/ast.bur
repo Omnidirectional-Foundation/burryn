@@ -1,9 +1,15 @@
+// ast.bur — AST 定义与辅助：Span 区间、Node 语法树、模式、类型表达式。
+// / AST definitions and helpers: source spans, the Node tree, patterns, and type expressions.
+// 除 NoNode 哨兵外，每个变体都携带 SpanT 源码区间，供诊断与格式化器使用。
+// Every variant except the NoNode sentinel carries a SpanT for diagnostics and the formatter.
 import "burryn.dev/compiler/lib"
 
+// 源码区间 [start, end)（字节偏移）/ Source span [start, end) in byte offsets
 pub enum SpanT {
     Sp(int, int),
 }
 
+// 语法树节点：表达式、模式、语句、类型表达式 / AST nodes: expressions, patterns, statements, type expressions
 pub enum Node {
     IntLit(int, SpanT),
     FloatLit(float, SpanT),
@@ -70,16 +76,19 @@ pub enum Node {
     NoNode,
 }
 
+// 解析输出：语句列表 + 诊断 / Parse output: statement list plus diagnostics
 pub enum ParseOut {
     Parsed([Node], [lib::DiagT]),
 }
 
+// 构造解析错误诊断 / Build a parse-error diagnostic
 pub fn perr(code, help, msg, sp) {
     match sp {
         Sp(s, e) => Err(lib::DiagT::Diag(true, code, msg, help, s, e)),
     }
 }
 
+// 取两个区间的并集 / Union of two spans
 fn sp_union(a, b) {
     match a {
         Sp(s1, e1) => match b {
@@ -96,6 +105,7 @@ fn sp_union(a, b) {
     }
 }
 
+// 结构相等的 AST 比较（常量折叠与格式化器判重用）/ Structural AST equality (used by const folding and the formatter)
 fn ast_eq(a, b) {
     match a {
         IntLit(x, _) => match b {
@@ -379,6 +389,7 @@ fn ast_eq_bools(xs, ys) {
     true
 }
 
+// 取节点源码区间 / Source span of a node
 pub fn span_of(n) {
     match n {
         IntLit(_, sp) => sp,
@@ -443,10 +454,13 @@ pub fn span_of(n) {
     }
 }
 
+// 管道脱糖：x |> f(a) 展开为 f(x, a)，递归下推整个语法树 /
+// Pipe desugaring: x |> f(a) becomes f(x, a), pushed recursively through the tree
 pub fn lower_pipes(stmts) {
     lower_pipe_nodes(stmts)
 }
 
+// 包级管道脱糖（多文件）/ Pipe desugaring across a package's files
 pub fn lower_pipe_packages(pkgs_stmts) {
     let mut out = []
     for pkg in pkgs_stmts {
@@ -510,6 +524,7 @@ fn lower_pipe_node(n) {
     }
 }
 
+// import 别名：显式别名优先，否则取路径末段 / Import alias: explicit alias wins, else the last path segment
 pub fn import_alias(alias, path) {
     if alias != "" {
         alias
@@ -526,6 +541,7 @@ pub fn import_alias(alias, path) {
     }
 }
 
+// 导入 → 别名映射表 / Map of import path to effective alias
 pub fn aliases_of(imports) {
     let mut am = map()
     for imp in imports {
