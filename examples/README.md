@@ -23,6 +23,7 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 | File | Description |
 |------|-------------|
 | `hello.bur` | println, let, basic expressions |
+| `args.bur` | command-line arguments: args() list and count |
 | `fib.bur` | recursion micro-benchmark |
 | `bytes.bur` | UTF-8 byte vs code-point indexing, chr vs byte_chr |
 | `numeric.bur` | trunc, to_float, parse_float, parse_int, float_bits |
