@@ -1268,6 +1268,18 @@ fn p_or_expr(toks, mut pos) {
         }
         e = Logical(t_or_or, e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
+    // range 字面量：a..b 脱糖为 range(a, b)（半开区间）；优先级低于 ||，
+    // rhs 取完整 and 层（1..2+3 = range(1, 2+3)）
+    if p_match(toks, pos, t_dot_dot) {
+        let rhs = match p_and_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        e = Call(Ident("range", span_of(e)), [e, rhs], sp_union(span_of(e), span_of(rhs)))
+    }
     Ok(e)
 }
 
@@ -1511,12 +1523,75 @@ fn p_postfix(toks, mut pos) {
     Ok(e)
 }
 
+// 0x/0b 前缀字面量转换（十进制交给 native parse_int；下划线分隔符在此剥离）。
+fn lit_to_int(lexeme) {
+    let l = str_len(lexeme)
+    if l > 2 && substr(lexeme, 0, 2) == "0x" {
+        let mut v = 0
+        let mut i = 2
+        while i < l {
+            let c = substr(lexeme, i, 1)
+            if c == "_" {
+                i = i + 1
+                continue
+            }
+            let d = if c >= "0" && c <= "9" {
+                ord(c) - ord("0")
+            } else if c >= "a" && c <= "f" {
+                ord(c) - ord("a") + 10
+            } else if c >= "A" && c <= "F" {
+                ord(c) - ord("A") + 10
+            } else {
+                -1
+            }
+            if d < 0 || v > (9223372036854775807 - d) / 16 {
+                return None
+            }
+            v = v * 16 + d
+            i = i + 1
+        }
+        Some(v)
+    } else if l > 2 && substr(lexeme, 0, 2) == "0b" {
+        let mut v = 0
+        let mut i = 2
+        while i < l {
+            let c = substr(lexeme, i, 1)
+            if c == "_" {
+                i = i + 1
+                continue
+            }
+            let d = if c == "0" || c == "1" {
+                ord(c) - ord("0")
+            } else {
+                -1
+            }
+            if d < 0 || v > (9223372036854775807 - d) / 2 {
+                return None
+            }
+            v = v * 2 + d
+            i = i + 1
+        }
+        Some(v)
+    } else {
+        let mut clean = ""
+        let mut i = 0
+        while i < l {
+            let c = substr(lexeme, i, 1)
+            if c != "_" {
+                clean = clean + c
+            }
+            i = i + 1
+        }
+        parse_int(clean)
+    }
+}
+
 fn p_primary(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
     if t == t_int {
         p_advance(toks, pos)
-        match parse_int(tok_lex(tok)) {
+        match lit_to_int(tok_lex(tok)) {
             Some(n) => Ok(IntLit(n, sp_of_tok(tok))),
             None => perr("E1108", "i64 holds -9223372036854775808..9223372036854775807", "bad integer literal \"" + tok_lex(tok) + "\"", sp_of_tok(tok)),
         }

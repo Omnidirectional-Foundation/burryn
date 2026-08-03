@@ -84,7 +84,12 @@ fn lex_maybe_semi(mut st, mut toks) {
 
 fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     let c = lex_advance(src, st)
-    if c == " " || c == "\t" || c == chr(13) {
+    if c == "#" && st[1] == 1 && lex_peek(src, st) == "!" {
+        // shebang: first line #!... is ignored entirely (script shebang)
+        while st[1] < str_len(src) && lex_peek(src, st) != "\n" {
+            lex_bump(st)
+        }
+    } else if c == " " || c == "\t" || c == chr(13) {
         // chr(13) = \r: Burryn has no \r escape yet
     } else if c == "\n" {
         lex_maybe_semi(st, toks)
@@ -114,7 +119,11 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     } else if c == "," {
         lex_emit(st, toks, t_comma, ",")
     } else if c == "." {
-        lex_emit(st, toks, t_dot, ".")
+        if lex_match(src, st, ".") {
+            lex_emit(st, toks, t_dot_dot, "..")
+        } else {
+            lex_emit(st, toks, t_dot, ".")
+        }
     } else if c == "-" {
         if lex_match(src, st, ">") {
             lex_emit(st, toks, t_thin_arrow, "->")
@@ -180,9 +189,13 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
             lex_emit(st, toks, t_bar, "|")
         }
     } else if c == "\"" {
-        lex_string(src, st, toks, diags, comments)
+        if lex_peek(src, st) == "\"" && lex_peek2(src, st) == "\"" {
+            lex_ml_string(src, st, toks, diags, comments)
+        } else {
+            lex_string(src, st, toks, diags, comments)
+        }
     } else if lex_is_digit(c) {
-        lex_number(src, st, toks)
+        lex_number(src, st, toks, diags)
     } else if lex_is_alpha(c) {
         lex_ident(src, st, toks)
     } else {
@@ -224,7 +237,9 @@ fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
                 } else {
                     t_interp_mid
                 }, join(parts, ""))
-                lex_interpolation(src, st, toks, diags, comments, st[1] - 1)
+                lex_interpolation(src, st, toks, diags, comments, st[1] - 1, fn(mut s, mut st, mut toks, mut d, mut c) {
+                    lex_string_part(s, st, toks, d, c, false)
+                })
                 return
             }
         } else {
@@ -240,8 +255,10 @@ fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
                     push(parts, "\"")
                 } else if e == "\\" {
                     push(parts, "\\")
+                } else if e == "r" {
+                    push(parts, chr(13))
                 } else {
-                    lex_fail(diags, st[1] - 2, st[1], "E1003", "supported escapes: \\n \\t \\\" \\\\", "bad escape \\" + e)
+                    lex_fail(diags, st[1] - 2, st[1], "E1003", "supported escapes: \\n \\t \\\" \\\\ \\r", "bad escape \\" + e)
                     push(parts, e) // keep scanning the rest of the string
                 }
                 seg = st[1]
@@ -251,14 +268,128 @@ fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
     lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
 }
 
-// lex_interpolation 扫描普通表达式 token 直至匹配的 `}`；block、match 与嵌套插值中的花括号先各自配平，再恢复外层字符串模式。/ lex_interpolation scans ordinary expression tokens to the matching `}`; braces inside blocks, match expressions, and nested interpolations balance before the outer string resumes.
-fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open) {
+// 三引号多行字符串（冻结定案，B 方案）：""" 后必须换行；每行行首空白忽略后
+// 必须是 \ 内容标记，\ 后到行尾为该行内容；全空白行 = 空行；内容行行尾换行
+// 进入字面量，结束标记前去掉段尾一个换行；转义与插值照常。
+// / Triple-quoted multiline strings: newline after """ ; leading whitespace
+// ignored, then a \ content marker; content runs to end of line; blank lines
+// are empty rows; row-ending newlines are part of the literal, the final one
+// before """ is stripped; escapes and interpolation behave as usual.
+fn lex_ml_string(src, mut st, mut toks, mut diags, mut comments) {
+    lex_bump(st) // 第二个 "
+    lex_bump(st) // 第三个 "
+    if lex_peek(src, st) != "\n" {
+        lex_fail(diags, st[1], st[1] + 1, "E1006", "put the content on the lines below", "expected a newline after \"\"\"")
+    }
+    lex_bump(st) // 开头换行
+    let mut seg = [""]
+    let mut first = [true]
+    let mut any_interp = [false]
+    while st[1] < str_len(src) {
+        while lex_peek(src, st) == " " || lex_peek(src, st) == "\t" {
+            lex_bump(st)
+        }
+        if lex_peek(src, st) == "\"" && lex_peek2(src, st) == "\"" && substr(src, st[1] + 2, 1) == "\"" {
+            st[1] = st[1] + 3
+            if str_len(seg[0]) > 0 && substr(seg[0], str_len(seg[0]) - 1, 1) == "\n" {
+                seg[0] = substr(seg[0], 0, str_len(seg[0]) - 1)
+            }
+            if any_interp[0] {
+                lex_emit(st, toks, t_interp_end, seg[0])
+            } else {
+                lex_emit(st, toks, t_string, seg[0])
+            }
+            return
+        }
+        if lex_peek(src, st) == "\n" {
+            seg[0] = seg[0] + "\n"
+            lex_bump(st)
+            continue
+        }
+        if lex_peek(src, st) != "\\" {
+            lex_fail(diags, st[1], st[1] + 1, "E1007", "mark content lines with a leading `\\`", "expected `\\` to start a content line in a \"\"\" string")
+            lex_bump(st)
+            continue
+        }
+        lex_bump(st) // 内容标记 \
+        lex_ml_inline(src, st, toks, diags, comments, seg, first, any_interp)
+    }
+    lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
+}
+
+// 多行字符串行内扫描：收集字面量到行尾（\n）或嵌套插值；插值恢复时继续本函数。/ Inline scan of one multiline row: collects literal bytes to end-of-line or a nested interpolation; resumes here after interpolation.
+fn lex_ml_inline(src, mut st, mut toks, mut diags, mut comments, mut seg, mut first, mut any_interp) {
+    while st[1] < str_len(src) {
+        let c = lex_peek(src, st)
+        if c == "\n" {
+            seg[0] = seg[0] + "\n"
+            lex_bump(st)
+            return
+        }
+        if c == "" + chr(123) + "" && substr(src, st[1] + 1, 1) != "" + chr(123) + "" {
+            any_interp[0] = true
+            lex_bump(st) // 插值起始花括号
+            lex_emit(st, toks, if first[0] {
+                t_interp_start
+            } else {
+                t_interp_mid
+            }, seg[0])
+            first[0] = false
+            seg[0] = ""
+            lex_interpolation(src, st, toks, diags, comments, st[1], fn(mut s, mut st, mut toks, mut d, mut c) {
+                lex_ml_inline(s, st, toks, d, c, seg, first, any_interp)
+            })
+            return
+        }
+        if c == "" + chr(123) + "" && substr(src, st[1] + 1, 1) == "" + chr(123) + "" {
+            seg[0] = seg[0] + chr(123)
+            st[1] = st[1] + 2
+            continue
+        }
+        if c == "\\" && st[1] + 1 < str_len(src) {
+            let e = substr(src, st[1] + 1, 1)
+            if e == "n" {
+                seg[0] = seg[0] + "\n"
+                st[1] = st[1] + 2
+                continue
+            }
+            if e == "t" {
+                seg[0] = seg[0] + "\t"
+                st[1] = st[1] + 2
+                continue
+            }
+            if e == "\"" {
+                seg[0] = seg[0] + "\""
+                st[1] = st[1] + 2
+                continue
+            }
+            if e == "\\" {
+                seg[0] = seg[0] + "\\"
+                st[1] = st[1] + 2
+                continue
+            }
+            if e == "r" {
+                seg[0] = seg[0] + chr(13)
+                st[1] = st[1] + 2
+                continue
+            }
+            lex_fail(diags, st[1], st[1] + 2, "E1003", "supported escapes: \\n \\t \\\" \\\\ \\r", "bad escape \\" + e)
+            st[1] = st[1] + 2
+            continue
+        }
+        seg[0] = seg[0] + c
+        lex_bump(st)
+    }
+}
+
+// lex_interpolation 扫描普通表达式 token 直至匹配的 `}`；block、match 与嵌套插值中的花括号先各自配平，再恢复外层字符串模式。/ lex_interpolation scans ordinary expression tokens to the matching `}`; braces inside blocks, match expressions, and nested interpolations balance before the outer string resumes. `resume` 是恢复扫描的回调（普通串或三引号多行串各自的行内扫描）。
+fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open, resume) {
     let mut depth = 0
     while st[1] < str_len(src) {
         if lex_peek(src, st) == "}" && depth == 0 {
             st[0] = st[1]
             lex_bump(st)
-            lex_string_part(src, st, toks, diags, comments, false)
+            resume(src, st, toks, diags, comments)
             return
         }
         st[0] = st[1]
@@ -274,20 +405,81 @@ fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open) {
             }
             i = i + 1
         }
+        if depth < 0 {
+            // 闭合的 `}` 被 lex_scan 消费（如 `{ 1 + 1 }` 带空格时）：
+            // depth 从 0 开始（`{` 由调用方消费），首个 `}` 即闭合。
+            resume(src, st, toks, diags, comments)
+            return
+        }
     }
     lex_fail(diags, open, open + 1, "E1004", "add a closing '}' before the end of the string", "unterminated string interpolation")
 }
 
-fn lex_number(src, mut st, mut toks) {
-    while lex_is_digit(lex_peek(src, st)) {
+fn lex_number(src, mut st, mut toks, mut diags) {
+    // hex/二进制前缀：0x / 0b（lexeme 原样保留，parser 端转换）
+    let c0 = substr(src, st[1] - 1, 1)
+    let c1 = lex_peek(src, st)
+    if c0 == "0" && (c1 == "x" || c1 == "X" || c1 == "b" || c1 == "B") {
+        let is_hex = c1 == "x" || c1 == "X"
+        lex_bump(st) // 前缀第二字符
+        let mut any = false
+        while true {
+            let ch = lex_peek(src, st)
+            if ch == "_" {
+                if !(is_hex && lex_is_hex(lex_peek2(src, st)) || !is_hex && (lex_peek2(src, st) == "0" || lex_peek2(src, st) == "1")) {
+                    lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+                }
+                lex_bump(st)
+            } else if is_hex && lex_is_hex(ch) || !is_hex && (ch == "0" || ch == "1") {
+                any = true
+                lex_bump(st)
+            } else {
+                break
+            }
+        }
+        if !any {
+            lex_fail(diags, st[0], st[1], "E1005", "write digits after the prefix, e.g. `0xFF`", "expected digits after " + substr(src, st[1] - 2, 2))
+        }
+        lex_emit(st, toks, t_int, substr(src, st[0], st[1] - st[0]))
+        return
+    }
+    while lex_is_digit(lex_peek(src, st)) || lex_peek(src, st) == "_" {
+        if lex_peek(src, st) == "_" {
+            if !lex_is_digit(lex_peek2(src, st)) {
+                lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+            }
+        }
         lex_bump(st)
     }
     let mut is_float = false
     if lex_peek(src, st) == "." && lex_is_digit(lex_peek2(src, st)) {
         is_float = true
         lex_bump(st)
-        while lex_is_digit(lex_peek(src, st)) {
+        while lex_is_digit(lex_peek(src, st)) || lex_peek(src, st) == "_" {
+            if lex_peek(src, st) == "_" && !lex_is_digit(lex_peek2(src, st)) {
+                lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+            }
             lex_bump(st)
+        }
+    }
+    // 指数：e/E 后 [±] 数字（前瞻判断，避免吞掉标识符如 1e、1ex）
+    let ec = lex_peek(src, st)
+    if ec == "e" || ec == "E" {
+        let p1 = lex_peek2(src, st)
+        let p2 = substr(src, st[1] + 2, 1)
+        let exp = (p1 == "+" || p1 == "-") && lex_is_digit(p2) || lex_is_digit(p1)
+        if exp {
+            is_float = true
+            lex_bump(st) // e
+            if lex_peek(src, st) == "+" || lex_peek(src, st) == "-" {
+                lex_bump(st)
+            }
+            while lex_is_digit(lex_peek(src, st)) || lex_peek(src, st) == "_" {
+                if lex_peek(src, st) == "_" && !lex_is_digit(lex_peek2(src, st)) {
+                    lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+                }
+                lex_bump(st)
+            }
         }
     }
     let word = substr(src, st[0], st[1] - st[0])
@@ -296,6 +488,10 @@ fn lex_number(src, mut st, mut toks) {
     } else {
         lex_emit(st, toks, t_int, word)
     }
+}
+
+fn lex_is_hex(c) {
+    lex_is_digit(c) || c >= "a" && c <= "f" || c >= "A" && c <= "F"
 }
 
 fn lex_ident(src, mut st, mut toks) {
