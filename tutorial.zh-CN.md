@@ -535,7 +535,7 @@ import "example.com/hello/shapes"          // 导入子包
 
 fn main() {
     let c = shapes::Shape::Circle(2.0)      // 用 pkg::name 访问
-    println(shapes.describe(c))
+    println(shapes::describe(c))
 }
 ```
 
