@@ -63,7 +63,7 @@ fn main() {
     } else if cmd == "test" {
         test_cmd(slice(a, 1, len(a)))
     } else if cmd == "lsp" {
-        tooling.lsp_serve()
+        tooling::lsp_serve()
     } else if cmd == "version" || cmd == "-v" || cmd == "--version" {
         println("Burryn " + version + " — the ring beneath Meyrin")
     } else if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -144,21 +144,21 @@ fn fmt_cmd(rest) {
 // fmt_source formats one already-read source; static errors print and yield
 // None, a verifier failure aborts as an internal error.
 fn fmt_source(path, src, mut state) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, comments) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
             if len(ldiags) > 0 {
                 let _ = emit_errors(ldiags, path, false)
                 state[1] = 1
                 return None
             }
-            match frontend.parse(toks) {
-                frontend.ParseOut.Parsed(stmts, pdiags) => {
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
                     if len(pdiags) > 0 {
                         let _ = emit_errors(pdiags, path, false)
                         state[1] = 1
                         return None
                     }
-                    match tooling.format_verified(stmts, src, comments) {
+                    match tooling::format_verified(stmts, src, comments) {
                         Ok(out) => Some(out),
                         Err(msg) => {
                             eprintln("internal error: " + msg)
@@ -278,8 +278,8 @@ fn starts_with(s, prefix) {
 // diag_is_error reports whether a diagnostic carries the error flag.
 fn diag_is_error(d) {
     match d {
-        lib.DiagT.Diag(ie, _, _, _, _, _) => ie,
-        lib.DiagT.DiagX(ie, _, _, _, _, _, _, _) => ie,
+        lib::DiagT::Diag(ie, _, _, _, _, _) => ie,
+        lib::DiagT::DiagX(ie, _, _, _, _, _, _, _) => ie,
     }
 }
 
@@ -294,19 +294,19 @@ fn run_file(path, mode, argv) {
             exit(exit_no_input)
         },
     }
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
-            match frontend.parse(toks) {
-                frontend.ParseOut.Parsed(stmts, pdiags) => {
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
                     if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
                     let checked_stmts = fold_script_or_exit(stmts, path)
-                    match frontend.typecheck_script(checked_stmts) {
-                        lib.CheckOut.Checked(cdiags, _, binds, chan_fors, _) => {
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, binds, chan_fors, _) => {
                             if mode == mode_check {
                                 if run_check(cdiags, path, binds) {
                                     exit(exit_static)
@@ -316,16 +316,16 @@ fn run_file(path, mode, argv) {
                             if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
-                            match bytecode.compile_script(checked_stmts, chan_fors) {
-                                bytecode.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(tooling.render_diag(d, path))
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
                                     if mode == mode_dis {
-                                        tooling.dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, lib.line_starts(src))
+                                        tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, lib::line_starts(src))
                                     } else {
-                                        bytecode.run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, [""], [path], [lib.line_starts(src)])
+                                        bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, [""], [path], [lib::line_starts(src)])
                                     }
                                 },
                             }
@@ -345,18 +345,18 @@ fn run_module(dir0, mode, argv) {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
     }
-    match module.load_module(dir) {
-        module.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        module.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
             if emit_errors_f(ldiags, lfiles, false) {
                 exit(exit_static)
             }
             let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
-            match module.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
-                lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors, _) => {
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, binds, chan_fors, _) => {
                     if mode == mode_check {
                         if run_check_f(cdiags, cfiles, binds) {
                             exit(exit_static)
@@ -368,16 +368,16 @@ fn run_module(dir0, mode, argv) {
                     }
                     let ls_files = concat_lists(pkgs_fpaths)
                     let ls_tables = concat_lists(pkgs_lstarts)
-                    match bytecode.compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                        bytecode.CompileOut.CompileFailed(d, f) => {
-                            eprintln(tooling.render_diag(d, f))
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
                             exit(exit_static)
                         },
-                        bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
                             if mode == mode_dis {
-                                tooling.dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, [])
+                                tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, [])
                             } else {
-                                bytecode.run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, ls_files, ls_files, ls_tables)
+                                bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, ls_files, ls_files, ls_tables)
                             }
                         },
                     }
@@ -410,7 +410,7 @@ fn emit_errors(diags, path, errors_only) {
             errs = true
         }
         if is_err || !errors_only {
-            eprintln(tooling.render_diag(d, path))
+            eprintln(tooling::render_diag(d, path))
         }
     }
     errs
@@ -425,7 +425,7 @@ fn emit_errors_f(diags, files, errors_only) {
             errs = true
         }
         if is_err || !errors_only {
-            eprintln(tooling.render_diag(diags[i], files[i]))
+            eprintln(tooling::render_diag(diags[i], files[i]))
         }
         i = i + 1
     }
@@ -433,8 +433,8 @@ fn emit_errors_f(diags, files, errors_only) {
 }
 
 fn fold_script_or_exit(stmts, path) {
-    match frontend.fold_consts(stmts) {
-        frontend.FoldOut.FoldedScript(out, diags) => {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
             if emit_errors(diags, path, false) {
                 exit(exit_static)
             }
@@ -445,8 +445,8 @@ fn fold_script_or_exit(stmts, path) {
 }
 
 fn fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
-    match frontend.fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
-        frontend.FoldOut.FoldedPkgs(out, diags, files) => {
+    match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        frontend::FoldOut::FoldedPkgs(out, diags, files) => {
             if emit_errors_f(diags, files, false) {
                 exit(exit_static)
             }
@@ -457,10 +457,10 @@ fn fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
 }
 
 fn fold_script_for_dev(stmts) {
-    match frontend.fold_consts(stmts) {
-        frontend.FoldOut.FoldedScript(out, diags) => {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
             for d in diags {
-                println(tooling.dump_diag(d))
+                println(tooling::dump_diag(d))
             }
             if len(diags) > 0 {
                 None
@@ -473,11 +473,11 @@ fn fold_script_for_dev(stmts) {
 }
 
 fn fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
-    match frontend.fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
-        frontend.FoldOut.FoldedPkgs(out, diags, files) => {
+    match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        frontend::FoldOut::FoldedPkgs(out, diags, files) => {
             let mut i = 0
             while i < len(diags) {
-                println(tooling.dump_diag_f(diags[i], files[i]))
+                println(tooling::dump_diag_f(diags[i], files[i]))
                 i = i + 1
             }
             if len(diags) > 0 {
@@ -501,7 +501,7 @@ fn run_check(cdiags, path, binds) {
         if diag_is_error(d) {
             has_err = true
         }
-        println(tooling.render_diag(d, path))
+        println(tooling::render_diag(d, path))
     }
     has_err
 }
@@ -516,7 +516,7 @@ fn run_check_f(cdiags, cfiles, binds) {
         if diag_is_error(cdiags[i]) {
             has_err = true
         }
-        println(tooling.render_diag(cdiags[i], cfiles[i]))
+        println(tooling::render_diag(cdiags[i], cfiles[i]))
         i = i + 1
     }
     has_err
@@ -665,28 +665,28 @@ fn compile_file_to_x86(path) {
             exit(exit_no_input)
         },
     }
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
-            match frontend.parse(toks) {
-                frontend.ParseOut.Parsed(stmts, pdiags) => {
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
                     if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
                     let checked_stmts = fold_script_or_exit(stmts, path)
-                    match frontend.typecheck_script(checked_stmts) {
-                        lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
                             if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
-                            match bytecode.compile_script(checked_stmts, chan_fors) {
-                                bytecode.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(tooling.render_diag(d, path))
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends.x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends::x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
                             }
                         },
                     }
@@ -704,28 +704,28 @@ fn compile_file_to_c(path) {
             exit(exit_no_input)
         },
     }
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
-            match frontend.parse(toks) {
-                frontend.ParseOut.Parsed(stmts, pdiags) => {
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
                     if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
                     let checked_stmts = fold_script_or_exit(stmts, path)
-                    match frontend.typecheck_script(checked_stmts) {
-                        lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
                             if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
-                            match bytecode.compile_script(checked_stmts, chan_fors) {
-                                bytecode.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(tooling.render_diag(d, path))
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)]),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)]),
                             }
                         },
                     }
@@ -740,29 +740,29 @@ fn compile_module_to_c(dir) {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
     }
-    match module.load_module(dir) {
-        module.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        module.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
             if emit_errors_f(ldiags, lfiles, false) {
                 exit(exit_static)
             }
             let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
-            match module.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
                         exit(exit_static)
                     }
                     let ls_files = concat_lists(pkgs_fpaths)
                     let ls_tables = concat_lists(pkgs_lstarts)
-                    match bytecode.compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                        bytecode.CompileOut.CompileFailed(d, f) => {
-                            eprintln(tooling.render_diag(d, f))
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
                             exit(exit_static)
                         },
-                        bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
                     }
                 },
             }
@@ -909,7 +909,7 @@ fn dev_cmd(rest) {
             eprintln("usage: bur dev embed-std <repo-root>")
             exit(exit_usage)
         }
-        match lib.embed_std(strip_trailing_slash(rest[1])) {
+        match lib::embed_std(strip_trailing_slash(rest[1])) {
             Ok(_) => {},
             Err(msg) => {
                 eprintln("embed-std:", msg)
@@ -960,14 +960,14 @@ fn dev_cmd(rest) {
 }
 
 fn dev_interface(dir) {
-    match module.load_module(dir) {
-        module.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             let _ = emit_errors_f(diags, dfiles, false)
         },
-        module.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, _, _) => {
+        module::ModOut::ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, _, _) => {
             let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
-            match frontend.typecheck_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(diags, dfiles, _, _, interfaces) => {
+            match frontend::typecheck_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib::CheckOut::Checked(diags, dfiles, _, _, interfaces) => {
                     if !emit_errors_f(diags, dfiles, true) {
                         let mut i = 0
                         while i < len(interfaces) {
@@ -994,42 +994,42 @@ fn dev_hover(dir, file, offset_str) {
             exit(exit_usage)
         },
     }
-    match module.load_module(dir) {
-        module.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             let _ = emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        module.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, _pkgs_lstarts) => {
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, _pkgs_lstarts) => {
             if emit_errors_f(ldiags, lfiles, false) {
                 exit(exit_static)
             }
             let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
-            frontend.lsp_set_recording(true)
-            match module.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
-                lib.CheckOut.Checked(_, _, _, _, _) => {},
+            frontend::lsp_set_recording(true)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(_, _, _, _, _) => {},
             }
-            frontend.lsp_set_recording(false)
-            println(frontend.lsp_type_at(file, offset))
+            frontend::lsp_set_recording(false)
+            println(frontend::lsp_type_at(file, offset))
         },
     }
 }
 
 fn dev_interface_parse(path) {
     match read_file(path) {
-        Ok(src) => match frontend.lex(src) {
-            lib.LexOut.Lexed(toks, ldiags, _) => {
+        Ok(src) => match frontend::lex(src) {
+            lib::LexOut::Lexed(toks, ldiags, _) => {
                 if len(ldiags) > 0 {
                     for d in ldiags {
-                        println(tooling.dump_diag(d))
+                        println(tooling::dump_diag(d))
                     }
                 } else {
-                    match frontend.parse_interface(toks) {
-                        frontend.ParseOut.Parsed(stmts, pdiags) => {
+                    match frontend::parse_interface(toks) {
+                        frontend::ParseOut::Parsed(stmts, pdiags) => {
                             for s in stmts {
-                                tooling.dump_node(s, "")
+                                tooling::dump_node(s, "")
                             }
                             for d in pdiags {
-                                println(tooling.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         },
                     }
@@ -1046,15 +1046,15 @@ fn dev_interface_parse(path) {
 // dev_mod_graph resolves a module's require closure offline (S6.1) and
 // prints the would-be bur.sum: `<path> <version> <h1 tree hash>` lines.
 fn dev_mod_graph(dir) {
-    match module.mvs_resolve(dir) {
+    match module::mvs_resolve(dir) {
         Ok(pick) => {
-            let root = module.cache_root()
+            let root = module::cache_root()
             match pick {
-                module.ModPick.MP(paths, vers) => {
+                module::ModPick::MP(paths, vers) => {
                     let mut hashes = []
                     let mut i = 0
                     while i < len(paths) {
-                        match module.tree_hash(root + "/" + paths[i] + "@" + vers[i]) {
+                        match module::tree_hash(root + "/" + paths[i] + "@" + vers[i]) {
                             Ok(h) => push(hashes, h),
                             Err(m) => {
                                 eprintln("error: " + m)
@@ -1063,7 +1063,7 @@ fn dev_mod_graph(dir) {
                         }
                         i = i + 1
                     }
-                    print(module.sum_render(pick, hashes))
+                    print(module::sum_render(pick, hashes))
                 },
             }
         },
@@ -1107,7 +1107,7 @@ fn mod_cmd(rest) {
             eprintln("error: bur.mod already exists")
             exit(exit_static)
         }
-        match module.mod_init_text(rest[1]) {
+        match module::mod_init_text(rest[1]) {
             Ok(text) => match write_file("bur.mod", text) {
                 Ok(_) => {},
                 Err(m) => {
@@ -1121,11 +1121,11 @@ fn mod_cmd(rest) {
             },
         }
     } else if sub == "tidy" {
-        mod_report(module.mod_tidy(dir))
+        mod_report(module::mod_tidy(dir))
     } else if sub == "download" {
-        mod_report(module.mod_download(dir))
+        mod_report(module::mod_download(dir))
     } else if sub == "verify" {
-        mod_report(module.mod_verify(dir))
+        mod_report(module::mod_verify(dir))
     } else {
         eprintln("unknown mod command: " + sub)
         exit(exit_usage)
@@ -1138,7 +1138,7 @@ fn get_cmd(rest) {
         eprintln("usage: bur get <path>@<version>")
         exit(exit_usage)
     }
-    mod_report(module.mod_get(".", rest[0]))
+    mod_report(module::mod_get(".", rest[0]))
 }
 
 // self_exe resolves this binary's own path for re-exec (SPEC S6.4: zero
@@ -1194,13 +1194,13 @@ fn test_cmd(rest) {
     let mut all = []
     let mut all_dirs = []
     let mut all_fns = []
-    for rel in module.test_walk(dir) {
+    for rel in module::test_walk(dir) {
         let pdir = if rel == "." {
             dir
         } else {
             dir + "/" + rel
         }
-        match module.test_discover(pdir) {
+        match module::test_discover(pdir) {
             Ok(ns) => {
                 for n in ns {
                     if rel == "." {
@@ -1342,27 +1342,27 @@ fn run_test_target(dir0, fnname) {
     } else {
         substr(dir, str_len(root) + 1, str_len(dir) - str_len(root) - 1)
     }
-    match module.load_module_test(root, rel, fnname) {
-        module.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module_test(root, rel, fnname) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        module.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        module::ModOut::ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
             let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
-            match module.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
                         exit(exit_static)
                     }
                     let ls_files = concat_lists(pkgs_fpaths)
                     let ls_tables = concat_lists(pkgs_lstarts)
-                    match bytecode.compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                        bytecode.CompileOut.CompileFailed(d, f) => {
-                            eprintln(tooling.render_diag(d, f))
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
                             exit(exit_static)
                         },
-                        bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
-                            bytecode.run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [], ls_files, ls_files, ls_tables)
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                            bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [], ls_files, ls_files, ls_tables)
                         },
                     }
                 },
@@ -1372,27 +1372,27 @@ fn run_test_target(dir0, fnname) {
 }
 
 fn dev_build_dir(dir) {
-    match module.load_module(dir) {
-        module.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             let mut i = 0
             while i < len(diags) {
-                println(tooling.dump_diag_f(diags[i], dfiles[i]))
+                println(tooling::dump_diag_f(diags[i], dfiles[i]))
                 i = i + 1
             }
         },
-        module.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
             let mut i = 0
             while i < len(ldiags) {
-                println(tooling.dump_diag_f(ldiags[i], lfiles[i]))
+                println(tooling::dump_diag_f(ldiags[i], lfiles[i]))
                 i = i + 1
             }
             match fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
-                Some(checked_stmts) => match module.typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
-                    lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors, _) => {
+                Some(checked_stmts) => match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                    lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
                         let mut errs = false
                         i = 0
                         while i < len(cdiags) {
-                            println(tooling.dump_diag_f(cdiags[i], cfiles[i]))
+                            println(tooling::dump_diag_f(cdiags[i], cfiles[i]))
                             if diag_is_error(cdiags[i]) {
                                 errs = true
                             }
@@ -1401,9 +1401,9 @@ fn dev_build_dir(dir) {
                         if !errs {
                             let ls_files = concat_lists(pkgs_fpaths)
                             let ls_tables = concat_lists(pkgs_lstarts)
-                            match bytecode.compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                                bytecode.CompileOut.CompileFailed(d, f) => println(tooling.dump_diag_f(d, f)),
-                                bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(backends.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
+                            match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, f) => println(tooling::dump_diag_f(d, f)),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
                             }
                         }
                     },
@@ -1415,33 +1415,33 @@ fn dev_build_dir(dir) {
 }
 
 fn dev_lex(src) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, diags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, diags, _) => {
             for t in toks {
-                println(tooling.dump_token(t))
+                println(tooling::dump_token(t))
             }
             for d in diags {
-                println(tooling.dump_diag(d))
+                println(tooling::dump_diag(d))
             }
         },
     }
 }
 
 fn dev_parse(src) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(tooling.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match frontend.parse(toks) {
-                    frontend.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         for s in stmts {
-                            tooling.dump_node(s, "")
+                            tooling::dump_node(s, "")
                         }
                         for d in pdiags {
-                            println(tooling.dump_diag(d))
+                            println(tooling::dump_diag(d))
                         }
                     },
                 }
@@ -1451,28 +1451,28 @@ fn dev_parse(src) {
 }
 
 fn dev_check(src) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(tooling.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match frontend.parse(toks) {
-                    frontend.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(tooling.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
                             match fold_script_for_dev(stmts) {
-                                Some(checked_stmts) => match frontend.typecheck_script(checked_stmts) {
-                                    lib.CheckOut.Checked(cdiags, _, binds, _, _) => {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, binds, _, _) => {
                                         for line in binds {
                                             println(line)
                                         }
                                         for d in cdiags {
-                                            println(tooling.dump_diag(d))
+                                            println(tooling::dump_diag(d))
                                         }
                                     },
                                 },
@@ -1487,21 +1487,21 @@ fn dev_check(src) {
 }
 
 fn dev_fmt(src) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, comments) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(tooling.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match frontend.parse(toks) {
-                    frontend.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(tooling.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
-                            match tooling.format_verified(stmts, src, comments) {
+                            match tooling::format_verified(stmts, src, comments) {
                                 Ok(out) => print(out),
                                 Err(msg) => {
                                     eprintln("internal error: " + msg)
@@ -1517,34 +1517,34 @@ fn dev_fmt(src) {
 }
 
 fn dev_dis(src) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(tooling.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match frontend.parse(toks) {
-                    frontend.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(tooling.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
                             match fold_script_for_dev(stmts) {
-                                Some(checked_stmts) => match frontend.typecheck_script(checked_stmts) {
-                                    lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
                                         let mut errs = false
                                         for d in cdiags {
-                                            println(tooling.dump_diag(d))
+                                            println(tooling::dump_diag(d))
                                             if diag_is_error(d) {
                                                 errs = true
                                             }
                                         }
                                         if !errs {
-                                            match bytecode.compile_script(checked_stmts, chan_fors) {
-                                                bytecode.CompileOut.CompileFailed(d, _) => println(tooling.dump_diag(d)),
-                                                bytecode.CompileOut.Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => tooling.dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib.line_starts(src)),
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => tooling::dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib::line_starts(src)),
                                             }
                                         }
                                     },
@@ -1560,34 +1560,34 @@ fn dev_dis(src) {
 }
 
 fn dev_emit_c(src, path) {
-    match frontend.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags, _) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(tooling.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match frontend.parse(toks) {
-                    frontend.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(tooling.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
                             match fold_script_for_dev(stmts) {
-                                Some(checked_stmts) => match frontend.typecheck_script(checked_stmts) {
-                                    lib.CheckOut.Checked(cdiags, _, _, chan_fors, _) => {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
                                         let mut errs = false
                                         for d in cdiags {
-                                            println(tooling.dump_diag(d))
+                                            println(tooling::dump_diag(d))
                                             if diag_is_error(d) {
                                                 errs = true
                                             }
                                         }
                                         if !errs {
-                                            match bytecode.compile_script(checked_stmts, chan_fors) {
-                                                bytecode.CompileOut.CompileFailed(d, _) => println(tooling.dump_diag(d)),
-                                                bytecode.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(backends.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib.line_starts(src)])),
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)])),
                                             }
                                         }
                                     },
