@@ -7,8 +7,8 @@ English | [中文](README.zh-CN.md)
 
 > A burrow, a ring — quiet work underground.
 
-Burryn is a small programming language forged from Go and Rust.
-It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference with zero annotations, a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and an in-progress hand-written x86-64 backend.
+Burryn is a small programming language forged from Go and Rust — a practical tool language for ops scripts, CSP-style concurrent pipelines, and small tools with static guarantees.
+It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference (zero annotations by default, optional signature annotations when you want them), a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and an in-progress hand-written x86-64 backend.
 
 **The compiler is self-hosted.**
 `compiler/` reimplements the whole pipeline — lexer, parser, type checker, bytecode compiler, C code generator, VM, module loader, tooling, and the `bur` CLI — in Burryn itself.
@@ -203,6 +203,7 @@ Stages S1-S7 are done.
 They cover the semantic core, the portable C backend, modules, maps, `select`/`close`, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, compile-time constants (`const`), `defer`, TCP networking, and a fully self-hosted compiler with the Go host removed.
 
 Current work is in S8 and S9.
+The syntax is frozen (S8.2): the formal grammar lives in `docs/grammar.md`, and the path separator `::` (packages, enum variants) is distinct from `.` (record fields).
 The hand-written x86-64 ELF backend is in progress on Linux and currently trails the C backend in feature coverage.
 Row polymorphism, closed records, type aliases, and the remaining editor features are still in progress.
 Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.
@@ -212,6 +213,7 @@ Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindin
 | Document | Purpose |
 | ----------------- | ---------------- |
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language ([中文](tutorial.zh-CN.md)) |
+| [`docs/grammar.md`](docs/grammar.md) | the frozen formal grammar (S8.2) — lexical and syntax reference |
 | [`docs/SPEC.md`](docs/SPEC.md) | design authority — the language design, roadmap, and staged milestones (S1-S10) |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
