@@ -533,6 +533,25 @@ fn x86gen_ord_native() {
     pre + t_ascii + ascii_je + t_2 + try3_jne + dec_2 + cont2_jmp + t_3 + try4_jne + dec_3 + cont3_jmp + dec_4 + cont + done
 }
 
+// x86gen_chr_native: inline UTF-8 encoding of a code point -> str.
+// Stack in: [callee, cp] at r15-16, r15-8. Out: [str] at r15-16.
+// Byte count dispatch: <0x80 -> 1, <0x800 -> 2, <0x10000 -> 3, else 4.
+// Each path allocates [len][bytes] (8B per byte) and returns independently.
+// Clobbers rax, rcx, rdx, r8-r11.
+fn x86gen_chr_native() {
+    let p1 = mov_rr(r11, r12) + mov_mr(r11, 8, rax) + mov_ri64(r10, 1) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 16) + vs_pop_n(1)
+    let p2 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 192) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 24) + vs_pop_n(1)
+    let p3 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 12) + shr_rcl(rax) + mov_ri64(r9, 224) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 10, rax) + mov_ri64(r10, 3) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 32) + vs_pop_n(1)
+    let p4 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 18) + shr_rcl(rax) + mov_ri64(r9, 240) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 12) + shr_rcl(rax) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_rr(rax, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 10, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 11, rax) + mov_ri64(r10, 4) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 40) + vs_pop_n(1)
+    let chk1 = mov_ri64(r9, 128) + cmp_rr(rax, r9) + jge_rel32(str_len(p1) + 5)
+    let chk2 = mov_ri64(r9, 2048) + cmp_rr(rax, r9) + jge_rel32(str_len(p2) + 5)
+    let chk3 = mov_ri64(r9, 65536) + cmp_rr(rax, r9) + jge_rel32(str_len(p3) + 5)
+    let jmp1 = jmp_rel32(str_len(chk2) + str_len(p2) + 5 + str_len(chk3) + str_len(p3) + 5 + str_len(p4))
+    let jmp2 = jmp_rel32(str_len(chk3) + str_len(p3) + 5 + str_len(p4))
+    let jmp3 = jmp_rel32(str_len(p4))
+    mov_rm(rax, r15, 0 - 8) + chk1 + p1 + jmp1 + chk2 + p2 + jmp2 + chk3 + p3 + jmp3 + p4
+}
+
 // x86gen_contains_native: inline code for contains(list, x) -> bool.
 // Linear scan of list elements comparing 8B values (int/ptr) to x.
 // Stack in: [callee, list, x] at r15-24, r15-16, r15-8. Out: [bool].
@@ -2599,7 +2618,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "range" {
                     w(x86gen_range_native())
                     ret_type = "list"
-                } else if callee == "chr" || callee == "byte_chr" {
+                } else if callee == "chr" {
+                    w(x86gen_chr_native())
+                    ret_type = "str"
+                } else if callee == "byte_chr" {
                     w(mov_rm(rax, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(rcx, rcx) + add_ri32(rcx, 1) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rax) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                     ret_type = "str"
                 } else if callee == "char_at" {
