@@ -1,5 +1,10 @@
+// parser.bur — 递归下降解析器（Pratt 表达式 + 语句分派）。
+// / Recursive-descent parser: Pratt expressions plus statement dispatch.
+// 出错时同步到下一个语句边界（花括号配平 + 分号/语句起始 token），一次报告最多 20 条诊断。
+// On error it synchronizes to the next statement boundary (brace balancing + semicolon or a statement starter), capping diagnostics at 20.
 import "burryn.dev/compiler/lib"
 
+// 脚本解析入口 / Script parse entry
 pub fn parse(toks) {
     let mut pos = [0]
     let mut stmts = []
@@ -18,6 +23,7 @@ pub fn parse(toks) {
     Parsed(stmts, diags)
 }
 
+// interface 文件解析（模块导出签名，语法子集）/ Interface-file parse (exported signatures, a syntax subset)
 pub fn parse_interface(toks) {
     let mut pos = [0]
     let mut stmts = []
@@ -36,6 +42,8 @@ pub fn parse_interface(toks) {
     Parsed(stmts, diags)
 }
 
+// 错误同步：跳到下一个语句边界（配平花括号，遇分号或语句起始 token 停）/
+// Error recovery: skip to the next statement boundary (balanced braces, stop at semicolon or a statement starter)
 fn p_synchronize(toks, mut pos) {
     let mut depth = 0
     let mut going = true
@@ -114,6 +122,8 @@ fn p_end_stmt(toks, mut pos) {
     }
 }
 
+// 语句分派：先探标签循环（ident : while/for），再按起始 token 分派 /
+// Statement dispatch: labeled loops (ident : while/for) first, then by starter token
 fn p_statement(toks, mut pos) {
     if p_check(toks, pos, t_ident) && p_check(toks, [pos[0] + 1], t_colon) && (p_check(toks, [pos[0] + 2], t_while) || p_check(toks, [pos[0] + 2], t_for)) {
         let ltok = p_advance(toks, pos)
@@ -294,6 +304,7 @@ fn p_statement(toks, mut pos) {
     }
 }
 
+// interface 文件语句子集：import/enum/pub 声明 / Interface-file statement subset: import, enum, pub declarations
 fn p_interface_statement(toks, mut pos) {
     if p_check(toks, pos, t_import) {
         p_import_decl(toks, pos)
@@ -1426,6 +1437,8 @@ fn p_expression(toks, mut pos) {
     p_pipe_expr(toks, pos)
 }
 
+// 表达式入口：最低优先级是管道（左结合，目标须为函数名/包名，可带实参）/
+// Expression entry: the lowest-precedence operator is the pipe (left-assoc; the target must be a function or package name, optionally with arguments)
 fn p_pipe_expr(toks, mut pos) {
     let mut e = match p_or_expr(toks, pos) {
         Ok(v) => v,
