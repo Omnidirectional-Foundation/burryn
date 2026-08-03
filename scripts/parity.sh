@@ -70,7 +70,7 @@ echo "=== VM vs x86 Behavior Parity ==="
 
 # Collect test programs
 TEST_FILES=()
-for f in examples/programs/*.bur examples/basics/*.bur; do
+for f in examples/programs/*.bur examples/basics/*.bur testdata/regression/*.bur; do
     [ -f "$f" ] && TEST_FILES+=("$f")
 done
 
