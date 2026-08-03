@@ -266,7 +266,7 @@ Three loops: `for x in list`, `for i in range(a, b)` (half-open `[a, b)`), and
 ```rust
 let mut sum = 0
 for i in range(1, 101) {         // 1..100
-    sum = sum + i
+    sum += i
 }
 println("1..100 =", sum)         // 5050
 
@@ -278,7 +278,7 @@ println()
 
 let mut i = 0
 while i < len(words) {
-    i = i + 1
+    i += 1
 }
 ```
 
@@ -566,8 +566,8 @@ import "example.com/hello/shapes"          // import a subpackage
 // import s "example.com/hello/shapes"     // alias it as s
 
 fn main() {
-    let c = shapes.Shape.Circle(2.0)       // access via pkg.name
-    println(shapes.describe(c))
+    let c = shapes::Shape::Circle(2.0)      // access via pkg::name
+    println(shapes::describe(c))
 }
 ```
 
@@ -652,7 +652,7 @@ returns that enum.
 **Standard library modules** (`import "std/..."`)
 - `std/net` — `read_all(h) -> Result<str, str>` (read to EOF), `write_line(h, s)` (write a line)
 - `std/json` — `parse(s) -> Result`, `render(v)`, `pretty(v, indent)`, `get(keys, vals, key) -> Option`
-- `std/testing` — `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)` (for `bur test`)
+- `std/testing` — `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)` (for `bur test`); 包成员一律 `pkg::name` 访问（S8.2 冻结）
 
 `std/json` usage (inside a module):
 
@@ -661,8 +661,8 @@ import "std/json"
 
 fn main() {
     // {{ is a literal opening brace ({ triggers interpolation)
-    match json.parse("{{\"name\":\"bur\"}") {
-        Ok(v) => println(json.render(v)),   // {"name":"bur"}
+    match json::parse("{{\"name\":\"bur\"}") {
+        Ok(v) => println(json::render(v)),   // {"name":"bur"}
         Err(e) => eprintln(e),
     }
 }
@@ -715,11 +715,11 @@ subprocess; a trap or deadlock counts as FAIL.
 import "std/testing"
 
 fn test_add() {
-    testing.assert_eq(1 + 1, 2)
+    testing::assert_eq(1 + 1, 2)
 }
 
 fn test_div_by_zero() {
-    testing.assert_err(safe_div(1, 0))
+    testing::assert_err(safe_div(1, 0))
 }
 ```
 
@@ -739,9 +739,10 @@ helpers: `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)`.
 
 Not in the language yet:
 
-- No **records/structs**: model product types with single-variant enums for
-  now, fields positional.
 - No `sort`, `getenv`, `math`, regex yet; growing as needed.
+- Deep `mut` is binding-level discipline, not a borrow checker: two `mut`
+  bindings may still alias the same list.
+- The x86-64 native backend trails the C backend in feature coverage.
 
 ---
 
@@ -751,5 +752,102 @@ VM, and CLI are written in Burryn under `compiler/` (`frontend/`, `bytecode/`,
 itself to C, `cc` turns that into a native binary, and the binary rebuilds
 itself byte for byte. The Go host that once served as the reference is archived
 on the `archive/go-host` branch. For a real-sized Burryn program to read,
-`compiler/` is the best material. The grammar is not frozen yet; that belongs
-to S8.2.*
+`compiler/` is the best material.*
+
+---
+
+## 18. New in the syntax freeze (S8.2)
+
+The syntax is frozen; the formal grammar lives in `docs/grammar.md` and future
+changes go through its revision process. The freeze added:
+
+**Literal forms**
+
+```rust
+let a = 0xFF          // hex (255)
+let b = 0b1010        // binary (10)
+let c = 1_000_000     // digit separators
+let d = 1.5e-3        // float exponents
+let s = """
+    \line one
+    \line two
+    """               // multiline: leading \ marks content, indentation ignored
+let r = 1..5          // range, desugars to range(1, 5)
+```
+
+**Compound assignment**
+
+```rust
+let mut n = 0
+n += 5                // n = n + 5; also -= *= /= %=
+```
+
+**Type annotations on bindings**
+
+```rust
+let x: int = 5
+const LIMIT: int = 100
+```
+
+**Indexed for loops**
+
+```rust
+let words = ["a", "b", "c"]
+for i, w in words {
+    println(i, w)     // index and element; channels reject the index form
+}
+```
+
+**or-patterns**
+
+```rust
+match code {
+    1 | 2 => println("low"),
+    3 | 4 | 5 => println("mid"),
+    _ => println("high"),
+}
+```
+
+**Labeled loops**
+
+```rust
+outer: for x in xs {
+    for y in ys {
+        if done { break outer }
+    }
+}
+```
+
+**Record patterns**
+
+```rust
+let r = record { x: 10, y: 20 }
+match r {
+    record { x, y } => println(x + y),   // destructures to same-named locals
+    _ => println("no"),
+}
+```
+
+**Receiver methods**
+
+```rust
+enum Point { Point(float, float) }
+
+fn (p: Point) dist() {                   // receiver typed, method table by type
+    match p {
+        Point(x, y) => x * x + y * y,
+    }
+}
+
+let p = Point::Point(3.0, 4.0)
+println(p.dist())                        // 25.0; compiles to dist(p)
+```
+
+**Tuples and destructuring**
+
+```rust
+let t = (10, "hello")                    // tuple literal, >= 2 elements
+println(t[0], t[1])
+let (a, b) = t                           // destructuring let
+let pair: (int, str) = (1, "x")          // tuple type annotation
+```
