@@ -1,6 +1,6 @@
 # SPEC — Burryn 项目规范
 
-> SPEC v0.4.0 | Last updated: 2026-08-03
+> SPEC v0.5 | Last updated: 2026-08-04
 > 状态:最高优先级约束(权威来源) · 编号体系:统一 `S<n>[.<m>]`(见 §5)
 > 相关文档:[`NUMBERING.md`](NUMBERING.md) 旧编号历史映射 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
 
@@ -99,7 +99,7 @@
 |------|------|------|
 | 字节码栈式 VM | 开发与测试基线 + 自举 oracle/种子；已由 Burryn 重写(自举) | 已完成(Go 种子归档于 `archive/go-host`) |
 | **C 后端** | S2 主力：可移植性由目标平台 C 编译器兜底，自举走此路径 | 已有(顺序 + 并发) |
-| 手写 x86-64 + PE | S8.1:核心目标之一，owner 明确想做；不借第三方工具链 | 未动工 |
+| 手写 x86-64 + PE | S8.1:核心目标之一，owner 明确想做；不借第三方工具链 | 开发中(ELF 已实现：list/closure/global/str native/bool/unit/UTF-8 ord+chr/enum/match/record，详见 §5 S8 行) |
 
 - 自举判定标准：**编译器由本语言写成且能编译自己**；输出 C 再经 gcc/clang 落地，完全算自举
 - 「任何架构都能跑」由 C 后端承担；手写后端只承诺 x86-64，其余架构不做手写
@@ -151,7 +151,7 @@
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
 | **S6 生态工具链** | S6.1 依赖解析 **已完成**(MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；std/testing)；S6.5 诊断/DX 批 **已完成**(cgen `#line` + `-g`、runtime/VM trap 带 span stack trace、公开命令 rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议 + loader 诊断接线)；S6.6 std/json + std/testing **已完成**(核心实现 + CI regen+cmp)；S6.7 runtime IO **已完成**(sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成** | 已完成 |
 | **S7 语言特性扩展** | S7.1 字符串插值 **已完成**；S7.2 管道 `|>` **已完成**；S7.3 match guard **已完成**；S7.4 命名参数 + 默认值(**已否决**，编号保留)；S7.5 编译期常量 **已完成**；S7.6 `defer` **已完成**；S7.7 net stdlib **已完成**；S7.8 可选函数签名标注(**已为 S6.1 提前完成**) | 已完成 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 后端：**ELF**(Linux) + **Mach-O**(macOS) + **PE**(Windows)；S8.2 语法冻结 + grammar 文件 **已完成**([`grammar.md`](grammar.md)，定案：`::`/`.` 分工、复合赋值、for 索引、or-pattern、标签循环、record 模式、方法、tuple+解构、字面量扩展、多行字符串、range)；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现**。**x86-64 ELF 后端开发中**（list/closure/global/str native 已完成，match/enum 进行中，详见 §6.7） | 进行中 |
+| **S8 后端与重型类型** | S8.1 手写 x86-64 后端：**ELF**(Linux) + **Mach-O**(macOS) + **PE**(Windows)；S8.2 语法冻结 + grammar 文件 **已完成**([`grammar.md`](grammar.md)，定案：`::`/`.` 分工、复合赋值、for 索引、or-pattern、标签循环、record 模式、方法、tuple+解构、字面量扩展、多行字符串、range)；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现**。**x86-64 ELF 后端开发中**（list/closure/global/str native/bool/unit/UTF-8 ord+chr/ADD concat/enum/match/record 已完成；record 的 str/print/println 格式化、`==`/`!=` 字段级比较、`record { r | f: v }` 更新已实现；eprintln/parse_int 已内联；未实现的 native 调用 emit int3 → SIGTRAP，parity 按 SKIP 处理） | 进行中 |
 | **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段。前置 = S8.2 语法冻结。**S9.1 + S9.2(hover) + S9.3(VSCode 扩展)已落地**；剩余：go-to-def、completion、signature-help、formatting | 部分实现 |
 | **S10 包生态** | 已有 std 包：`json`/`net`/`testing`（S6.6/S7.7 落地）、`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板 + 示例包；S10.3 `bur doc`（导出签名 + 注释 → Markdown）；S10.4 包质量基础设施（CI 模板、测试约定、版本规范）。原则：能纯 Burryn 就不加 native；每包带 bur.mod + *_test.bur，随 std_embed 分发 | 未开工 |
 
@@ -235,7 +235,7 @@ Raw int64，8 字节/槽，**无 tag**。字符串是指针 → `[8B len][conten
 
 #### 内存布局
 
-```
+```text
 ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
                                  ^base_addr+120
 ```
@@ -261,7 +261,7 @@ ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
 **Closure**：`[8B fn_index][8B upval0][8B upval1]...`（8*(1+N) 字节）。fn_index 通过跳转表解析：`shl rax, 3; add rax, r13; mov rax, [rax]; call rax`。Slot 0 of callee frame holds closure ptr; op_get_upval reads `[closure + 8 + 8*idx]`。Copy-at-capture-time 语义（非共享 cell）。
 
 **Enum instance**（堆，由 constructor 调用创建）：
-```
+```text
 [8B: eh][8B: vi][8B: field0][8B: field1]...[8B: fieldN-1]
 ```
 - eh = enum type index；vi = variant index；fields 紧随
@@ -271,7 +271,7 @@ ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
 **Singleton**（data section，CSingleton 常量，即 0 字段 enum instance）：`[8B: eh][8B: vi]`
 
 **Constructor**（data section，CCtor 常量，callable，非 instance）：
-```
+```text
 [8B: 0xFFFFFFFFFFFFFFFF][8B: eh][8B: vi]
 ```
 - Sentinel `-1` at offset 0（永远不可能是有效 fn_index）。op_call 检测 `[callee] == -1` 时分流到 ctor path。
