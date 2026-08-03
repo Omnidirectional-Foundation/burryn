@@ -434,15 +434,21 @@ fn x86gen_epilogue() {
 }
 
 // x86gen_str_native: inline code for str(n) -> str.
-// Divides n by 10 repeatedly, pushes digit bytes, then allocates and fills.
-// Clobbers rax, rcx, rdx, r10, r11, rdi. Non-negative only.
+// Divides |n| by 10 repeatedly, pushes digit bytes, then allocates and fills.
+// A negative n records a '-' flag in r8, negates, and prepends '-' before the
+// digits. Unsigned div (div_r) so INT64_MIN converts without overflow.
+// Clobbers rax, rcx, rdx, r8, r10, r11, rdi.
 fn x86gen_str_native() {
-    let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + idiv_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
+    let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
     let loop_jne = jne_rel32(0 - (str_len(loop_body) + 6))
-    let alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + lea(rcx, r10, 8) + add_rr(r12, rcx) + lea(rdi, r11, 8)
+    let neg_write = mov_ri64(rdx, 45) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 1)
+    let alloc = mov_rr(rdx, r10) + add_rr(rdx, r8) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rcx, rdx, 8) + add_rr(r12, rcx) + lea(rdi, r11, 8) + test_rr(r8, r8) + je_rel32(str_len(neg_write)) + neg_write
     let pop_body = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
     let pop_jne = jne_rel32(0 - (str_len(pop_body) + 6))
-    mov_rm(rax, r15, 0 - 8) + xor_rr(r10, r10) + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+    let neg_path = mov_ri64(r8, 1) + neg_r(rax)
+    let head = mov_rm(rax, r15, 0 - 8) + xor_rr(r8, r8) + test_rr(rax, rax) + jge_rel32(str_len(neg_path))
+    let loop_start = xor_rr(r10, r10)
+    head + neg_path + loop_start + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
 }
 
 // x86gen_push_native: inline code for push(list, val).
@@ -464,14 +470,19 @@ fn x86gen_pop_native() {
 
 // x86gen_str_convert_at: inline int-to-str conversion.
 // Reads int from stack at [r15+off], writes string ptr back to same slot.
-// Clobbers rax,rcx,rdx,r10,r11,rdi.
+// Negative values get a '-' prefix via the r8 flag; unsigned div for INT64_MIN.
+// Clobbers rax,rcx,rdx,r8,r10,r11,rdi.
 fn x86gen_str_convert_at(off) {
-    let div_loop = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + idiv_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
+    let div_loop = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
     let div_jne = jne_rel32(0 - (str_len(div_loop) + 6))
-    let alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + lea(rcx, r10, 8) + add_rr(r12, rcx) + lea(rdi, r11, 8)
+    let neg_write = mov_ri64(rdx, 45) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 1)
+    let alloc = mov_rr(rdx, r10) + add_rr(rdx, r8) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rcx, rdx, 8) + add_rr(r12, rcx) + lea(rdi, r11, 8) + test_rr(r8, r8) + je_rel32(str_len(neg_write)) + neg_write
     let pop_loop = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
     let pop_jne = jne_rel32(0 - (str_len(pop_loop) + 6))
-    mov_rm(rax, r15, off) + xor_rr(r10, r10) + div_loop + div_jne + alloc + pop_loop + pop_jne + mov_mr(r15, off, r11)
+    let neg_path = mov_ri64(r8, 1) + neg_r(rax)
+    let head = mov_rm(rax, r15, off) + xor_rr(r8, r8) + test_rr(rax, rax) + jge_rel32(str_len(neg_path))
+    let loop_start = xor_rr(r10, r10)
+    head + neg_path + loop_start + div_loop + div_jne + alloc + pop_loop + pop_jne + mov_mr(r15, off, r11)
 }
 
 // x86gen_bool_convert_at: inline 0/1 -> "true"/"false" string.
@@ -1036,13 +1047,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     fn const_str(fh, idx) {
         match f_consts[fh][idx] {
-            lib.CVal.CStr(s) => s,
+            lib::CVal::CStr(s) => s,
             _ => "",
         }
     }
     fn fn_const(fh, idx) {
         match f_consts[fh][idx] {
-            lib.CVal.CFn(sub) => sub,
+            lib::CVal::CFn(sub) => sub,
             _ => 0,
         }
     }
@@ -1051,15 +1062,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // Phase 1 never emits).
     fn inst_len(fh, code, ip) {
         let op = code[ip]
-        if op == lib.op_const || op == lib.op_get_local || op == lib.op_set_local || op == lib.op_get_global || op == lib.op_def_global || op == lib.op_set_global || op == lib.op_get_upval || op == lib.op_set_upval || op == lib.op_jump || op == lib.op_jump_if_false || op == lib.op_jump_if_true || op == lib.op_jump_if_false_pop || op == lib.op_loop || op == lib.op_list || op == lib.op_chan_next || op == lib.op_get_field_name {
+        if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
             3
-        } else if op == lib.op_pop_n || op == lib.op_call || op == lib.op_spawn || op == lib.op_end_block || op == lib.op_test_variant || op == lib.op_get_field {
+        } else if op == lib::op_pop_n || op == lib::op_call || op == lib::op_spawn || op == lib::op_end_block || op == lib::op_test_variant || op == lib::op_get_field {
             2
-        } else if op == lib.op_record || op == lib.op_record_update {
+        } else if op == lib::op_record || op == lib::op_record_update {
             4
-        } else if op == lib.op_closure {
+        } else if op == lib::op_closure {
             3 + f_nupvals[fn_const(fh, read_u16(code, ip + 1))] * 3
-        } else if op == lib.op_select {
+        } else if op == lib::op_select {
             let n_arms = code[ip + 1]
             let has_default = code[ip + 2] != 0
             3 + n_arms * 3 + (if has_default {
@@ -1080,16 +1091,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut ip = 0
         while ip < len(code) {
             let op = code[ip]
-            if op == lib.op_jump || op == lib.op_jump_if_false || op == lib.op_jump_if_true || op == lib.op_jump_if_false_pop {
+            if op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop {
                 put(targets, ip + 3 + read_u16(code, ip + 1), true)
                 ip = ip + 3
-            } else if op == lib.op_loop {
+            } else if op == lib::op_loop {
                 put(targets, ip + 3 - read_u16(code, ip + 1), true)
                 ip = ip + 3
-            } else if op == lib.op_chan_next {
+            } else if op == lib::op_chan_next {
                 put(targets, ip + 3 + read_u16(code, ip + 1), true)
                 ip = ip + 3
-            } else if op == lib.op_select {
+            } else if op == lib::op_select {
                 let mut p = ip + 1
                 let n_arms = code[p]
                 let has_default = code[p + 1] != 0
@@ -1119,7 +1130,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut ip = 0
         while ip < len(code) {
             let op = code[ip]
-            if op == lib.op_get_local || op == lib.op_set_local {
+            if op == lib::op_get_local || op == lib::op_set_local {
                 let slot = read_u16(code, ip + 1)
                 if slot > max_slot {
                     max_slot = slot
@@ -1271,17 +1282,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     fn enum_const_key(cv) {
         match cv {
-            lib.CVal.CEnumType(eh) => "e:" + str(eh),
-            lib.CVal.CSingleton(eh, vi) => "s:" + str(eh) + ":" + str(vi),
-            lib.CVal.CCtor(eh, vi) => "c:" + str(eh) + ":" + str(vi),
+            lib::CVal::CEnumType(eh) => "e:" + str(eh),
+            lib::CVal::CSingleton(eh, vi) => "s:" + str(eh) + ":" + str(vi),
+            lib::CVal::CCtor(eh, vi) => "c:" + str(eh) + ":" + str(vi),
             _ => "",
         }
     }
     fn enum_const_bytes(cv) {
         match cv {
-            lib.CVal.CEnumType(eh) => e8(eh),
-            lib.CVal.CSingleton(eh, vi) => e8(eh) + e8(vi),
-            lib.CVal.CCtor(eh, vi) => e8s(0 - 1) + e8(eh) + e8(vi),
+            lib::CVal::CEnumType(eh) => e8(eh),
+            lib::CVal::CSingleton(eh, vi) => e8(eh) + e8(vi),
+            lib::CVal::CCtor(eh, vi) => e8s(0 - 1) + e8(eh) + e8(vi),
             _ => "",
         }
     }
@@ -1291,7 +1302,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut ci = 0
         while ci < len(consts) {
             match consts[ci] {
-                lib.CVal.CStr(s) => {
+                lib::CVal::CStr(s) => {
                     let key = const_slot_key(sf, ci)
                     let dup = match get(const_slot_map, key) {
                         Some(_) => true,
@@ -1305,7 +1316,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         }
                     }
                 },
-                lib.CVal.CEnumType(_) => {
+                lib::CVal::CEnumType(_) => {
                     let ek = enum_const_key(consts[ci])
                     match get(enum_const_map, ek) {
                         Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
@@ -1317,7 +1328,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         },
                     }
                 },
-                lib.CVal.CSingleton(_, _) => {
+                lib::CVal::CSingleton(_, _) => {
                     let ek = enum_const_key(consts[ci])
                     match get(enum_const_map, ek) {
                         Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
@@ -1329,7 +1340,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         },
                     }
                 },
-                lib.CVal.CCtor(_, _) => {
+                lib::CVal::CCtor(_, _) => {
                     let ek = enum_const_key(consts[ci])
                     match get(enum_const_map, ek) {
                         Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
@@ -1374,7 +1385,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut rip = 0
         while rip < len(rcode) {
             let rop = rcode[rip]
-            if rop == lib.op_record || rop == lib.op_record_update {
+            if rop == lib::op_record || rop == lib::op_record_update {
                 let cidx = read_u16(rcode, rip + 2)
                 let enc = const_str(rf, cidx)
                 if str_len(enc) > 0 {
@@ -1451,7 +1462,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut gip = 0
         while gip < len(gcode) {
             let gop = gcode[gip]
-            if gop == lib.op_def_global {
+            if gop == lib::op_def_global {
                 let gidx = read_u16(gcode, gip + 1)
                 let gname = const_str(gf, gidx)
                 let exists = match get(globals_map, gname) {
@@ -1524,7 +1535,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     Some(pd) => pd,
                     None => 0 - 1,
                 }
-                if pal >= 0 && pcode[pit] != lib.op_no_match {
+                if pal >= 0 && pcode[pit] != lib::op_no_match {
                     while len(pshadow_ps) > pal {
                         shadow_pop(pshadow_ps, 1)
                     }
@@ -1533,22 +1544,22 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                 }
                 let pop = pcode[pit]
-                if pop == lib.op_return {
+                if pop == lib::op_return {
                     if len(ptshadow_ps) > 0 {
                         fn_ret_type[ptfh] = ptshadow_ps[len(ptshadow_ps) - 1]
                     }
-                } else if pop == lib.op_const {
+                } else if pop == lib::op_const {
                     let pval = f_consts[ptfh][read_u16(pcode, pit + 1)]
                     push(pshadow_ps, "")
                     match pval {
-                        lib.CVal.CStr(_) => {
+                        lib::CVal::CStr(_) => {
                             push(ptshadow_ps, "str")
                         },
                         _ => {
                             push(ptshadow_ps, "int")
                         },
                     }
-                } else if pop == lib.op_get_local {
+                } else if pop == lib::op_get_local {
                     let pslot = read_u16(pcode, pit + 1)
                     if pslot == 0 {
                         push(pshadow_ps, f_name[ptfh])
@@ -1562,7 +1573,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         }
                         push(ptshadow_ps, pstype)
                     }
-                } else if pop == lib.op_set_local {
+                } else if pop == lib::op_set_local {
                     let pslot = read_u16(pcode, pit + 1)
                     if pslot > 0 && len(ptshadow_ps) > 0 {
                         if len(ppos_types) <= pslot {
@@ -1570,21 +1581,21 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         }
                         ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
                     }
-                } else if pop == lib.op_get_global {
+                } else if pop == lib::op_get_global {
                     let pidx = read_u16(pcode, pit + 1)
                     let pname = const_str(ptfh, pidx)
                     push(pshadow_ps, pname)
                     push(ptshadow_ps, "int")
-                } else if pop == lib.op_set_global {} else if pop == lib.op_def_global {
+                } else if pop == lib::op_set_global {} else if pop == lib::op_def_global {
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
-                } else if pop == lib.op_pop {
+                } else if pop == lib::op_pop {
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
-                } else if pop == lib.op_pop_n {
+                } else if pop == lib::op_pop_n {
                     shadow_pop(pshadow_ps, pcode[pit + 1])
                     shadow_pop(ptshadow_ps, pcode[pit + 1])
-                } else if pop == lib.op_end_block {
+                } else if pop == lib::op_end_block {
                     let pn_eb = pcode[pit + 1]
                     let presult = if len(ptshadow_ps) > 0 {
                         ptshadow_ps[len(ptshadow_ps) - 1]
@@ -1600,7 +1611,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(ptshadow_ps, pn_eb + 1)
                     push(pshadow_ps, presname)
                     push(ptshadow_ps, presult)
-                } else if pop == lib.op_call {
+                } else if pop == lib::op_call {
                     let pn = pcode[pit + 1]
                     let pcallee = if len(pshadow_ps) > pn {
                         pshadow_ps[len(pshadow_ps) - pn - 1]
@@ -1747,49 +1758,49 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             push(ptshadow_ps, "int")
                         }
                     }
-                } else if pop == lib.op_closure {
+                } else if pop == lib::op_closure {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "")
-                } else if pop == lib.op_get_upval {
+                } else if pop == lib::op_get_upval {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "")
-                } else if pop == lib.op_jump {
+                } else if pop == lib::op_jump {
                     put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-                } else if pop == lib.op_loop {
+                } else if pop == lib::op_loop {
                     put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
-                } else if pop == lib.op_jump_if_false || pop == lib.op_jump_if_true {
+                } else if pop == lib::op_jump_if_false || pop == lib::op_jump_if_true {
                     put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-                } else if pop == lib.op_jump_if_false_pop {
+                } else if pop == lib::op_jump_if_false_pop {
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
                     put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-                } else if pop == lib.op_chan_next {
+                } else if pop == lib::op_chan_next {
                     put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib.op_neg {
+                } else if pop == lib::op_neg {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib.op_not {
+                } else if pop == lib::op_not {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "bool")
-                } else if pop == lib.op_true {
+                } else if pop == lib::op_true {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "bool")
-                } else if pop == lib.op_false {
+                } else if pop == lib::op_false {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "bool")
-                } else if pop == lib.op_unit {
+                } else if pop == lib::op_unit {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "unit")
-                } else if pop == lib.op_eq || pop == lib.op_neq || pop == lib.op_gt || pop == lib.op_gt_eq || pop == lib.op_lt || pop == lib.op_lt_eq {
+                } else if pop == lib::op_eq || pop == lib::op_neq || pop == lib::op_gt || pop == lib::op_gt_eq || pop == lib::op_lt || pop == lib::op_lt_eq {
                     shadow_pop(pshadow_ps, 2)
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "bool")
-                } else if pop == lib.op_add {
+                } else if pop == lib::op_add {
                     let add_last = if len(ptshadow_ps) > 0 {
                         ptshadow_ps[len(ptshadow_ps) - 1]
                     } else {
@@ -1808,12 +1819,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         push(ptshadow_ps, "int")
                     }
-                } else if pop == lib.op_sub || pop == lib.op_mul || pop == lib.op_div || pop == lib.op_mod {
+                } else if pop == lib::op_sub || pop == lib::op_mul || pop == lib::op_div || pop == lib::op_mod {
                     shadow_pop(pshadow_ps, 2)
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib.op_list {
+                } else if pop == lib::op_list {
                     let plen = read_u16(pcode, pit + 1)
                     let pelt = if plen > 0 && len(ptshadow_ps) >= 1 {
                         ptshadow_ps[len(ptshadow_ps) - 1]
@@ -1828,7 +1839,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         push(ptshadow_ps, "list-int")
                     }
-                } else if pop == lib.op_index_get {
+                } else if pop == lib::op_index_get {
                     let plt = if len(ptshadow_ps) >= 2 {
                         ptshadow_ps[len(ptshadow_ps) - 2]
                     } else {
@@ -1842,15 +1853,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         push(ptshadow_ps, "int")
                     }
-                } else if pop == lib.op_index_set {
+                } else if pop == lib::op_index_set {
                     shadow_pop(pshadow_ps, 3)
                     shadow_pop(ptshadow_ps, 3)
-                } else if pop == lib.op_len {
+                } else if pop == lib::op_len {
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib.op_record {
+                } else if pop == lib::op_record {
                     let prec_n = pcode[pit + 1]
                     let prec_cidx = read_u16(pcode, pit + 2)
                     let prec_enc = const_str(ptfh, prec_cidx)
@@ -1865,17 +1876,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(ptshadow_ps, prec_n)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "record:" + prec_enc)
-                } else if pop == lib.op_test_variant {
+                } else if pop == lib::op_test_variant {
                     shadow_pop(pshadow_ps, 2)
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib.op_no_match {
+                } else if pop == lib::op_no_match {
                     // Never executes at runtime (exhaustive matches); keep it
                     // fully inert: no depth restore above, no stack effect, no
                     // type merge below, so the linear walk carries the last
                     // arm's block value type through to the match-end merge.
-                } else if pop == lib.op_get_field_name || pop == lib.op_get_field {
+                } else if pop == lib::op_get_field_name || pop == lib::op_get_field {
                     let pg_rt = if len(ptshadow_ps) > 0 {
                         ptshadow_ps[len(ptshadow_ps) - 1]
                     } else {
@@ -1885,7 +1896,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     if is_record_type(pg_rt) {
                         let pg_schema = record_schema(pg_rt)
                         let mut pg_idx = -1
-                        if pop == lib.op_get_field_name {
+                        if pop == lib::op_get_field_name {
                             let pg_cidx = read_u16(pcode, pit + 1)
                             let pg_name = const_str(ptfh, pg_cidx)
                             let mut pg_ei = 0
@@ -1911,7 +1922,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(ptshadow_ps, 1)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, pg_field_t)
-                } else if pop == lib.op_record_update {
+                } else if pop == lib::op_record_update {
                     let pu_cidx = read_u16(pcode, pit + 2)
                     let pu_enc = const_str(ptfh, pu_cidx)
                     let pu_base = if len(ptshadow_ps) > pcode[pit + 1] {
@@ -1927,10 +1938,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         push(ptshadow_ps, "record:" + pu_enc)
                     }
-                } else if pop == lib.op_spawn || pop == lib.op_select {
+                } else if pop == lib::op_spawn || pop == lib::op_select {
                     // conservative: assume these don't affect return type
                 }
-                if pop != lib.op_no_match && len(ptshadow_ps) > 0 {
+                if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
                     let pdepth = len(ptshadow_ps) - 1
                     while len(ppos_types) <= pdepth {
                         push(ppos_types, "")
@@ -1987,30 +1998,30 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
 
         fn emit_inst(ip) {
             let op = code[ip]
-            if op == lib.op_const {
+            if op == lib::op_const {
                 let idx = read_u16(code, ip + 1)
                 match f_consts[fh][idx] {
-                    lib.CVal.CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
-                    lib.CVal.CStr(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
-                    lib.CVal.CEnumType(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
-                    lib.CVal.CSingleton(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
-                    lib.CVal.CCtor(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib::CVal::CInt(v) => w(rex(1, 0, 0, rax) + e1(184) + e8s(v) + vs_push(rax)),
+                    lib::CVal::CStr(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib::CVal::CEnumType(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib::CVal::CSingleton(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib::CVal::CCtor(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
                     _ => w(int3()),
                 }
                 match f_consts[fh][idx] {
-                    lib.CVal.CStr(_) => {
+                    lib::CVal::CStr(_) => {
                         push(shadow, "str")
                         push(type_shadow, "str")
                     },
-                    lib.CVal.CEnumType(_) => {
+                    lib::CVal::CEnumType(_) => {
                         push(shadow, "enumtype")
                         push(type_shadow, "enumtype")
                     },
-                    lib.CVal.CSingleton(_, _) => {
+                    lib::CVal::CSingleton(_, _) => {
                         push(shadow, "enum")
                         push(type_shadow, "enum")
                     },
-                    lib.CVal.CCtor(_, _) => {
+                    lib::CVal::CCtor(_, _) => {
                         push(shadow, "ctor")
                         push(type_shadow, "ctor")
                     },
@@ -2019,28 +2030,28 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         push(type_shadow, "int")
                     },
                 }
-            } else if op == lib.op_unit {
+            } else if op == lib::op_unit {
                 w(vs_push_zero())
                 push(shadow, "")
                 push(type_shadow, "unit")
-            } else if op == lib.op_true {
+            } else if op == lib::op_true {
                 w(e1(73) + e1(199) + modrm(0, 0, r15) + e4(1) + add_ri32(r15, 8))
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_false {
+            } else if op == lib::op_false {
                 w(vs_push_zero())
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_pop {
+            } else if op == lib::op_pop {
                 w(vs_pop_n(1))
                 shadow_pop(shadow, 1)
                 shadow_pop(type_shadow, 1)
-            } else if op == lib.op_pop_n {
+            } else if op == lib::op_pop_n {
                 let n = code[ip + 1]
                 w(vs_pop_n(n))
                 shadow_pop(shadow, n)
                 shadow_pop(type_shadow, n)
-            } else if op == lib.op_end_block {
+            } else if op == lib::op_end_block {
                 let n = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 8) + sub_ri32(r15, 8 * (n + 1)) + mov_mr(r15, 0, rax) + add_ri32(r15, 8))
                 let res_name = if len(shadow) > 0 {
@@ -2057,7 +2068,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, n + 1)
                 push(shadow, res_name)
                 push(type_shadow, res_type)
-            } else if op == lib.op_get_local {
+            } else if op == lib::op_get_local {
                 let slot = read_u16(code, ip + 1)
                 if slot == 0 {
                     w(vs_push_zero())
@@ -2073,7 +2084,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(shadow, "slot:" + str(slot))
                     push(type_shadow, stype)
                 }
-            } else if op == lib.op_set_local {
+            } else if op == lib::op_set_local {
                 let slot = read_u16(code, ip + 1)
                 if slot > 0 && len(type_shadow) > 0 {
                     if len(pos_types) <= slot {
@@ -2082,7 +2093,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     pos_types[slot] = type_shadow[len(type_shadow) - 1]
                 }
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
-            } else if op == lib.op_get_global {
+            } else if op == lib::op_get_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
                 match get(globals_map, name) {
@@ -2095,7 +2106,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     None => "",
                 }
                 push(type_shadow, gtype)
-            } else if op == lib.op_def_global {
+            } else if op == lib::op_def_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
                 let slot = match get(globals_map, name) {
@@ -2110,7 +2121,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 1)
                 shadow_pop(type_shadow, 1)
-            } else if op == lib.op_set_global {
+            } else if op == lib::op_set_global {
                 let idx = read_u16(code, ip + 1)
                 let name = const_str(fh, idx)
                 let slot = match get(globals_map, name) {
@@ -2118,7 +2129,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     None => 0,
                 }
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax))
-            } else if op == lib.op_eq {
+            } else if op == lib::op_eq {
                 let sa_eq = if len(type_shadow) > 1 {
                     type_shadow[len(type_shadow) - 2]
                 } else {
@@ -2148,7 +2159,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_neq {
+            } else if op == lib::op_neq {
                 let sa_neq = if len(type_shadow) > 1 {
                     type_shadow[len(type_shadow) - 2]
                 } else {
@@ -2179,31 +2190,31 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_gt {
+            } else if op == lib::op_gt {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_gt_eq {
+            } else if op == lib::op_gt_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_lt {
+            } else if op == lib::op_lt {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_lt_eq {
+            } else if op == lib::op_lt_eq {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
-            } else if op == lib.op_add {
+            } else if op == lib::op_add {
                 let sa = type_shadow[len(type_shadow) - 2]
                 let sb = type_shadow[len(type_shadow) - 1]
                 if sa == "str" || sb == "str" {
@@ -2220,31 +2231,31 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(shadow, "")
                     push(type_shadow, "int")
                 }
-            } else if op == lib.op_sub {
+            } else if op == lib::op_sub {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + sub_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "int")
-            } else if op == lib.op_mul {
+            } else if op == lib::op_mul {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + imul_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "int")
-            } else if op == lib.op_div {
+            } else if op == lib::op_div {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "int")
-            } else if op == lib.op_mod {
+            } else if op == lib::op_mod {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "int")
-            } else if op == lib.op_list {
+            } else if op == lib::op_list {
                 let n = read_u16(code, ip + 1)
                 let ltag = if n > 0 && type_shadow[len(type_shadow) - 1] == "str" {
                     "list-str"
@@ -2256,7 +2267,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, n)
                 push(shadow, ltag)
                 push(type_shadow, ltag)
-            } else if op == lib.op_index_get {
+            } else if op == lib::op_index_get {
                 let st = type_shadow[len(type_shadow) - 2]
                 if st == "str" {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(r9, r9) + add_ri32(r9, 1) + mov_mr(r11, 0, r9) + mov_rm(r9, rax, 8) + add_rr(r9, rcx) + mov_mr(r11, 8, r9) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
@@ -2275,24 +2286,24 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         push(type_shadow, "int")
                     }
                 }
-            } else if op == lib.op_index_set {
+            } else if op == lib::op_index_set {
                 w(mov_rm(rax, r15, 0 - 24) + mov_rm(r9, r15, 0 - 16) + mov_rm(rdx, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_mr(rax, 0, rdx) + vs_pop_n(3))
                 shadow_pop(shadow, 3)
                 shadow_pop(type_shadow, 3)
-            } else if op == lib.op_len {
+            } else if op == lib::op_len {
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 8, rax))
                 shadow_pop(shadow, 1)
                 shadow_pop(type_shadow, 1)
                 push(shadow, "")
                 push(type_shadow, "int")
-            } else if op == lib.op_test_variant {
+            } else if op == lib::op_test_variant {
                 let vidx = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(r8, rcx, 0) + mov_rm(rdx, rax, 0) + xor_rr(r9, r9) + cmp_rr(rdx, r8) + sete(r9) + mov_rm(r8, rax, 8) + mov_ri64(rdx, vidx) + xor_rr(r10, r10) + cmp_rr(r8, rdx) + sete(r10) + and_rr(r9, r10) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "int")
-            } else if op == lib.op_get_field {
+            } else if op == lib::op_get_field {
                 let fidx = code[ip + 1]
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 16 + 8 * fidx) + mov_mr(r15, 0 - 8, rax))
                 let mut gf_t = "int"
@@ -2316,40 +2327,40 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, 1)
                 push(shadow, "")
                 push(type_shadow, gf_t)
-            } else if op == lib.op_no_match {
+            } else if op == lib::op_no_match {
                 w(int3())
-            } else if op == lib.op_neg {
+            } else if op == lib::op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
                 push(type_shadow, "int")
-            } else if op == lib.op_not {
+            } else if op == lib::op_not {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 8) + cmp_rr(rax, rdx) + sete(rdx) + mov_mr(r15, 0 - 8, rdx))
                 push(type_shadow, "bool")
-            } else if op == lib.op_jump {
+            } else if op == lib::op_jump {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 push(patches, [cur_byte() + 1, target])
                 w(jmp_rel32(0))
-            } else if op == lib.op_jump_if_false {
+            } else if op == lib::op_jump_if_false {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax))
                 push(patches, [cur_byte() + 2, target])
                 w(je_rel32(0))
-            } else if op == lib.op_jump_if_true {
+            } else if op == lib::op_jump_if_true {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax))
                 push(patches, [cur_byte() + 2, target])
                 w(jne_rel32(0))
-            } else if op == lib.op_jump_if_false_pop {
+            } else if op == lib::op_jump_if_false_pop {
                 let target = ip + 3 + read_u16(code, ip + 1)
                 w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + lea(r15, r15, 0 - 8))
                 shadow_pop(shadow, 1)
                 shadow_pop(type_shadow, 1)
                 push(patches, [cur_byte() + 2, target])
                 w(je_rel32(0))
-            } else if op == lib.op_loop {
+            } else if op == lib::op_loop {
                 let target = ip + 3 - read_u16(code, ip + 1)
                 push(patches, [cur_byte() + 1, target])
                 w(jmp_rel32(0))
-            } else if op == lib.op_call {
+            } else if op == lib::op_call {
                 let n = code[ip + 1]
                 let callee = shadow[len(shadow) - n - 1]
                 let handle = find_fn_by_name(callee)
@@ -2732,9 +2743,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(shadow, ret_type)
                     push(type_shadow, ret_type)
                 }
-            } else if op == lib.op_return {
+            } else if op == lib::op_return {
                 w(x86gen_epilogue())
-            } else if op == lib.op_closure {
+            } else if op == lib::op_closure {
                 let idx = read_u16(code, ip + 1)
                 let sub = fn_const(fh, idx)
                 let nup = f_nupvals[sub]
@@ -2755,15 +2766,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 w(add_ri32(r12, 8 * (nup + 1)) + vs_push(r11))
                 push(shadow, "")
                 push(type_shadow, "")
-            } else if op == lib.op_get_upval {
+            } else if op == lib::op_get_upval {
                 let idx = read_u16(code, ip + 1)
                 w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax))
                 push(shadow, "")
                 push(type_shadow, "")
-            } else if op == lib.op_set_upval {
+            } else if op == lib::op_set_upval {
                 let idx = read_u16(code, ip + 1)
                 w(mov_rm(rcx, r14, 0) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 8 + 8 * idx, rax))
-            } else if op == lib.op_record {
+            } else if op == lib::op_record {
                 let n = code[ip + 1]
                 let cidx = read_u16(code, ip + 2)
                 let enc = const_str(fh, cidx)
@@ -2791,7 +2802,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, n)
                 push(shadow, "record")
                 push(type_shadow, "record:" + enc)
-            } else if op == lib.op_get_field_name {
+            } else if op == lib::op_get_field_name {
                 let cidx = read_u16(code, ip + 1)
                 let fname = const_str(fh, cidx)
                 let mut fidx = -1
@@ -2829,7 +2840,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(type_shadow, 1)
                 push(shadow, "")
                 push(type_shadow, gftype)
-            } else if op == lib.op_record_update {
+            } else if op == lib::op_record_update {
                 let n = code[ip + 1]
                 let cidx = read_u16(code, ip + 2)
                 let enc = const_str(fh, cidx)
@@ -2928,7 +2939,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 Some(dvv) => dvv,
                 None => 0 - 1,
             }
-            if dmv >= 0 && code[ip] != lib.op_no_match {
+            if dmv >= 0 && code[ip] != lib::op_no_match {
                 while len(shadow) > dmv {
                     shadow_pop(shadow, 1)
                 }
