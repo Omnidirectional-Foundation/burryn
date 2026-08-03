@@ -1960,6 +1960,18 @@ fn p_match_expr(toks, mut pos) {
                 NoNode
             },
         }
+        // or-pattern：A | B => body 展开为两个臂（同一 guard + body）
+        let mut pats = [pat]
+        while p_match(toks, pos, t_bar) {
+            let p2 = match p_pattern(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            push(pats, p2)
+        }
         // guard 在 pattern 绑定之后求值，语法为 `pattern if expr => body`。/ A guard is evaluated after pattern binding and uses `pattern if expr => body`.
         let has_guard = p_match(toks, pos, t_if)
         let guard = if has_guard {
@@ -1991,7 +2003,9 @@ fn p_match_expr(toks, mut pos) {
                 NoNode
             },
         }
-        push(arms, MatchArm(pat, guard, body, sp_union(span_of(pat), span_of(body))))
+        for p in pats {
+            push(arms, MatchArm(p, guard, body, sp_union(span_of(p), span_of(body))))
+        }
         if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
             return perr("E1104", "", "expected ',' or newline between match arms", sp_of_tok(p_peek(toks, pos)))
         }
