@@ -24,7 +24,8 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 |------|-------------|
 | `hello.bur` | println, let, basic expressions |
 | `fib.bur` | recursion micro-benchmark |
-| `bytes.bur` | UTF-8 byte vs code-point indexing |
+| `bytes.bur` | UTF-8 byte vs code-point indexing, chr vs byte_chr |
+| `numeric.bur` | trunc, to_float, parse_float, parse_int, float_bits |
 | `textproc.bur` | string and list natives: split, trim, join, slice, concat |
 | `interpolation.bur` | string interpolation with `{expr}` and `{{` escape |
 | `cleanup.bur` | defer: LIFO cleanup, closure capture, `?` early exit |
@@ -49,6 +50,7 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 | `multiplex.bur` | `select` over several channels |
 | `streaming.bur` | channel close + for-in drain + recv Option |
 | `pipeline.bur` | buffered-channel producer/consumer |
+| `yield.bur` | explicit cooperative handoff between fibers |
 | `deadlock_trap.bur` | all fibers blocked → fatal deadlock (exit 4, no golden) |
 | `chan_send_trap.bur` | send on closed channel → trap (exit 4, no golden) |
 | `chan_close_trap.bur` | double-close → trap (exit 4, no golden) |
@@ -58,6 +60,7 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 | File | Description |
 |------|-------------|
 | `net_loopback.bur` | listener + dialer dual-fiber echo exchange |
+| `net_nb.bur` | net_nb non-blocking accept/read/write with `__eagain` |
 | `net_errors.bur` | port-in-use, connection-refused, read-EOF, write-to-closed |
 | `net_trap.bur` | net_close on invalid handle → trap (exit 4, no golden) |
 
@@ -65,10 +68,11 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 
 | File | Description |
 |------|-------------|
-| `fs.bur` | read_file/write_file: missing path, round-trip, unwritable path |
+| `fs.bur` | read_file/write_file/file_exists/read_dir: round-trips and error paths |
 | `exec.bur` | synchronous exec: Output destructuring, exit codes, missing binary |
 | `exec_async.bur` | exec_start + exec_poll: async child processes |
 | `sleep.bur` | sleep(0) boundary and sleep(1) continuation |
+| `stdin.bur` | read_stdin / stdin_nb; run with `printf 'helloWORLD' \| bur run stdin.bur` |
 
 ## programs/ — 完整程序
 

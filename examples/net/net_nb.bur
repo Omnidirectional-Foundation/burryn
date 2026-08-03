@@ -1,0 +1,72 @@
+// net_nb: non-blocking socket ops. op 0 = accept, 1 = read, 2 = write.
+// Returns Ok(...) or Err("__eagain") when the operation would block.
+// The server polls a read while the client has not sent yet, then gets the
+// data after the client writes — no fiber blocks, both interleave via yield.
+fn server(lh) {
+    match net_nb(0, lh, "", 0) {
+        Ok(conn_str) => {
+            match parse_int(conn_str) {
+                Some(conn) => {
+                    let mut tries = 0
+                    while tries < 5 {
+                        match net_nb(1, conn, "", 64) {
+                            Ok(data) => {
+                                println("server read:", data)
+                                match net_nb(2, conn, "reply:" + data, 0) {
+                                    Ok(n) => println("server wrote", n, "bytes"),
+                                    Err(e) => println("server write: " + e),
+                                }
+                                net_close(conn)
+                                return
+                            },
+                            Err(e) => {
+                                if e == "__eagain" {
+                                    println("server read: would block (try", tries, ")")
+                                } else {
+                                    println("server read: " + e)
+                                    return
+                                }
+                            },
+                        }
+                        tries = tries + 1
+                        yield()
+                    }
+                },
+                None => println("server accept: bad handle"),
+            }
+        },
+        Err(e) => println("server accept: " + e),
+    }
+}
+
+fn main_loop() {
+    let port = 19877
+    let lh = match tcp_listen("127.0.0.1", port) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln("listen: " + e)
+            exit(1)
+        },
+    }
+
+    spawn server(lh)
+
+    match tcp_dial("127.0.0.1", port) {
+        Ok(conn) => {
+            yield() // let the server see the pending read before we write
+            match net_write(conn, "hello") {
+                Ok(_) => {},
+                Err(e) => println("client write: " + e),
+            }
+            match net_read(conn, 1024) {
+                Ok(data) => println("client read:", data),
+                Err(e) => println("client read: " + e),
+            }
+            net_close(conn)
+        },
+        Err(e) => println("dial: " + e),
+    }
+    net_close(lh)
+}
+
+main_loop()
