@@ -34,16 +34,19 @@ else
     fails=$((fails + 1))
 fi
 
-echo "--- C 后端双级 fixpoint ---"
+echo "--- C 后端三代 fixpoint ---"
+# gen0 = bur 编译（继承旧代内置 std 数据）；gen1 = gen0 编译；gen2 = gen1 编译。
+# 数据世代经一代更新后收敛：判定 gen1 == gen2（与 CI 的 gen2 == gen3 同语义）。
 GEN0=/tmp/td-gen0
 GEN1=/tmp/td-gen1
-if "$BUR" build compiler -o "$GEN0" 2>/dev/null && "$GEN0" build compiler -o "$GEN1" 2>/dev/null && cmp "$GEN0" "$GEN1"; then
-    echo "PASS fixpoint (gen0 == gen1)"
+GEN2=/tmp/td-gen2
+if "$BUR" build compiler -o "$GEN0" 2>/dev/null && "$GEN0" build compiler -o "$GEN1" 2>/dev/null && "$GEN1" build compiler -o "$GEN2" 2>/dev/null && cmp "$GEN1" "$GEN2"; then
+    echo "PASS fixpoint (gen1 == gen2)"
 else
     echo "FAIL fixpoint"
     fails=$((fails + 1))
 fi
-rm -f "$GEN0" "$GEN1" program.c
+rm -f "$GEN0" "$GEN1" "$GEN2" program.c
 
 echo
 if [ $fails -eq 0 ]; then
