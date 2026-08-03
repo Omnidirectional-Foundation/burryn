@@ -102,6 +102,7 @@ to abort — run manually and check the exit code.
 | `testdata/fmt/` | Formatter pairs: `.bur` (messy input) → `.golden` (formatted) |
 | `testdata/pkg/` | Multi-package module fixtures (import, pub, MVS) |
 | `testdata/modcache/` | Committed module cache for offline dependency tests |
+| `testdata/syntax/` | Frozen-grammar samples paired with `.golden`, whole-program verification (driven by `scripts/syntax-verify.sh`) |
 
 ### Verification protocol (simplified) / 验证协议（简化版）
 

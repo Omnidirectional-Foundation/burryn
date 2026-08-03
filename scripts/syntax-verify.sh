@@ -10,7 +10,7 @@ fails=0
 run() {
     local file="$1"
     local out
-    out=$("$BUR" run "examples/syntax/$file" 2>&1)
+    out=$("$BUR" run "testdata/syntax/$file" 2>&1)
     local rc=$?
     if [ $rc -ne 0 ]; then
         echo "FAIL $file: exit $rc"
@@ -18,24 +18,24 @@ run() {
         fails=$((fails + 1))
         return
     fi
-    if ! echo "$out" | diff -q - "examples/syntax/${file%.bur}.golden" >/dev/null 2>&1; then
+    if ! echo "$out" | diff -q - "testdata/syntax/${file%.bur}.golden" >/dev/null 2>&1; then
         echo "FAIL $file: output differs from golden"
-        echo "$out" | diff - "examples/syntax/${file%.bur}.golden" | head -8
+        echo "$out" | diff - "testdata/syntax/${file%.bur}.golden" | head -8
         fails=$((fails + 1))
         return
     fi
     echo "PASS $file"
 }
 
-for f in examples/syntax/*.bur; do
+for f in testdata/syntax/*.bur; do
     name=$(basename "$f")
     [ "$name" = "rowvar.bur" ] && continue
     run "$name"
 done
 
 # 模块样例（目录入口）输出对比 golden
-out=$("$BUR" run examples/syntax/modules 2>&1)
-if echo "$out" | diff -q - examples/syntax/modules.golden >/dev/null 2>&1; then
+out=$("$BUR" run testdata/syntax/modules 2>&1)
+if echo "$out" | diff -q - testdata/syntax/modules.golden >/dev/null 2>&1; then
     echo "PASS modules"
 else
     echo "FAIL modules"
@@ -43,7 +43,7 @@ else
 fi
 
 # 行变量：语法层验证（S8.3 语义未实现，dev parse 应成功）
-if "$BUR" dev parse examples/syntax/rowvar.bur >/dev/null 2>&1; then
+if "$BUR" dev parse testdata/syntax/rowvar.bur >/dev/null 2>&1; then
     echo "PASS rowvar.bur (syntax)"
 else
     echo "FAIL rowvar.bur"
