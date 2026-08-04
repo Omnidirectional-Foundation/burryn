@@ -707,6 +707,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     // cp_function 函数字面量代码生成 / cp_function codegens a function literal
     fn cp_function(ch, lit) {
         match lit {
+            // 函数字面量：编译为独立函数表项，闭包捕获外层局部
+            // Function literals: compile to a separate function-table entry; closures capture outer locals
             frontend::Node::FnLit(params, muts, _, _, _, body, name, lsp) => {
                 let fh = new_func(name, cur_file, len(params))
                 let sub = new_compiler(ch, fh)
@@ -1417,6 +1419,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
 
     // cp_expr 表达式代码生成（带临时槽跟踪）/ cp_expr codegens an expression with temp tracking
     fn cp_expr(ch, e) {
+        // 表达式编译：按形态发射字节码，临时槽跟踪栈深度
+        // Expression compilation: emit per shape, temp tracking mirrors the value stack
         match e {
             frontend::Node::IntLit(v, sp) => {
                 emit_const(ch, lib::CVal::CInt(v), sp)
@@ -1586,6 +1590,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     },
                 }
             },
+            // 索引：target 与下标入栈后 INDEX_GET
+            // Indexing: push the target and index, then INDEX_GET
             frontend::Node::Index(target, idx, sp) => {
                 match cp_expr(ch, target) {
                     Ok(_) => {},
@@ -1642,7 +1648,11 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             },
             frontend::Node::FnLit(_, _, _, _, _, _, _, _) => cp_function(ch, e),
             frontend::Node::Block(_, _) => cp_block_expr(ch, e),
+            // if/while/for 走各自的专用编译路径
+            // if/while/for dispatch to their own compilers
             frontend::Node::IfExpr(cond, then, els, sp) => cp_if(ch, cond, then, els, sp),
+            // match：变体 tag 测试链，字段提取后绑定臂局部
+            // Match: a chain of variant tag tests, field extraction binds arm locals
             frontend::Node::MatchExpr(scrut, arms, sp) => cp_match(ch, scrut, arms, sp),
             frontend::Node::VariantAccess(en, vr, sp) => {
                 let apath = alias_path(en)
@@ -1702,6 +1712,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 emit(ch, lib::op_recv, sp)
                 Ok(true)
             },
+            // record 字面量：字段值入栈后构造对象
+            // Record literals: push field values, then build the object
             frontend::Node::RecordLit(names, vals, sp) => {
                 for v in vals {
                     match cp_expr(ch, v) {
@@ -1813,10 +1825,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     }
                     i = i + 1
                 }
-                emit(ch, lib::op_pop, sp)
                 if c_scope_depth[ch] == 0 {
-                    let _ = pop_local(ch)
-                } else {
+                    emit(ch, lib::op_pop, sp)
                     let _ = pop_local(ch)
                 }
                 Ok(true)
@@ -2002,7 +2012,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             },
             frontend::Node::SpawnStmt(call, sp) => {
                 match call {
-                    frontend::Node::Call(callee, cargs, _) => {
+                    // 调用：callee 与实参入栈后 CALL
+            // Calls: push the callee and args, then CALL
+            frontend::Node::Call(callee, cargs, _) => {
                         match cp_expr(ch, callee) {
                             Ok(_) => {},
                             Err(d) => {
@@ -2064,6 +2076,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
     cp_stmt_ref = cp_stmt
 
+    // 内建枚举与 native 预注册：Option/Result/Output + 全局名表
+    // Builtin enums and native pre-registration: Option/Result/Output plus the global name table
     declare_enum("Option", "", ["Some", "None"], [1, 0])
     declare_enum("Result", "", ["Ok", "Err"], [1, 1])
     declare_enum("Output", "", ["Output"], [3])
@@ -2071,6 +2085,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         put(global_mut, n, false)
     }
 
+    // 包模式：建 <module> 帧，逐包注册枚举后按依赖编译顶层语句
+    // Package mode: a <module> frame, per-package enum registration, then top-level compilation in dependency order
     if is_pkg {
         let module_fn = new_func("<module>", "", 0)
         let c0 = new_compiler(-1, module_fn)
@@ -2084,6 +2100,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             let file_imports = pkgs_imports[pi]
             let n_files = len(files_stmts)
             pkg_decls = map()
+            // 先收声明名（函数/枚举/let），供跨文件引用解析
+            // Collect declared names (fn/enum/let) first, for cross-file reference resolution
             let mut fi = 0
             while fi < n_files {
                 for s in files_stmts[fi] {
@@ -2099,6 +2117,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             fi = 0
             while fi < n_files {
                 cur_file = file_paths[fi]
+                // 注册枚举：变体表与构造器
+                // Register enums: variant tables and constructors
                 for s in files_stmts[fi] {
                     match s {
                         frontend::Node::EnumDecl(name, _, variants, _, sp) => {
