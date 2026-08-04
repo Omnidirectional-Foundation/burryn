@@ -5,7 +5,7 @@
 // State st is a 4-slot int list: st[0] token start, st[1] scan offset, st[2] last token type, st[3] any token emitted yet.
 import "burryn.dev/compiler/lib"
 
-// 词法入口：剥离 UTF-8 BOM 后逐 token 扫描，EOF 前补结尾分号 / Entry: strip a UTF-8 BOM, scan tokens, append a final semicolon before EOF
+// lex 是词法入口：剥离 UTF-8 BOM 后逐 token 扫描，EOF 前补结尾分号 / lex is the entry: strips a UTF-8 BOM, scans tokens, appends a final semicolon before EOF
 pub fn lex(raw) {
     let src = if str_len(raw) >= 3 && substr(raw, 0, 3) == chr(65279) {
         substr(raw, 3, str_len(raw) - 3)
@@ -26,12 +26,12 @@ pub fn lex(raw) {
     lib::LexOut::Lexed(toks, diags, comments)
 }
 
-// 记一条诊断 / Record a diagnostic
+// lex_fail 记录一条诊断 / lex_fail records a diagnostic
 fn lex_fail(mut diags, s, e, code, help, msg) {
     push(diags, lib::DiagT::Diag(true, code, msg, help, s, e))
 }
 
-// 前瞻一个字符（越界返回空串）/ Peek one char, "" past end
+// lex_peek 前瞻一个字符，越界返回空串 / lex_peek peeks one char, "" past end
 fn lex_peek(src, st) {
     if st[1] >= str_len(src) {
         ""
@@ -40,7 +40,7 @@ fn lex_peek(src, st) {
     }
 }
 
-// 前瞻两个字符 / Peek two chars
+// lex_peek2 前瞻两个字符 / lex_peek2 peeks two chars
 fn lex_peek2(src, st) {
     if st[1] + 1 >= str_len(src) {
         ""
@@ -49,19 +49,19 @@ fn lex_peek2(src, st) {
     }
 }
 
-// 取当前字符并前进 / Consume one char
+// lex_advance 取当前字符并前进 / lex_advance consumes one char
 fn lex_advance(src, mut st) {
     let c = char_at(src, st[1])
     st[1] = st[1] + 1
     c
 }
 
-// 前进一个字符 / Advance one char
+// lex_bump 前进一个字符 / lex_bump advances one char
 fn lex_bump(mut st) {
     st[1] = st[1] + 1
 }
 
-// 若下一字符匹配则消费并返回 true / Consume c if it matches next
+// lex_match 若下一字符匹配则消费并返回 true / lex_match consumes c if it matches next
 fn lex_match(src, mut st, c) {
     if lex_peek(src, st) == c {
         st[1] = st[1] + 1
@@ -71,21 +71,21 @@ fn lex_match(src, mut st, c) {
     }
 }
 
-// 发射一个 token 并更新状态 / Emit a token and update state
+// lex_emit 发射一个 token 并更新状态 / lex_emit emits a token and updates state
 fn lex_emit(mut st, mut toks, t, lexeme) {
     push(toks, lib::Token::Tok(t, lexeme, st[0], st[1]))
     st[2] = t
     st[3] = 1
 }
 
-// 自动分号插入：前一个 token 可结束语句且已发射过时补换行分号 / ASI: append a newline semicolon when the last token can end a statement
+// lex_maybe_semi 做自动分号插入：前一个 token 可结束语句且已发射过时补换行分号 / lex_maybe_semi appends a newline semicolon when the last token can end a statement
 fn lex_maybe_semi(mut st, mut toks) {
     if st[3] == 1 && lex_can_end_stmt(st[2]) {
         lex_emit(st, toks, t_semi, "\n")
     }
 }
 
-// 单字符分派：注释（行/块，记为 trivia）、标点、复合操作符、字面量 / Single-char dispatch: comments (as trivia), punctuation, compound operators, literals
+// lex_scan 做单字符分派：注释（行/块，记为 trivia）、标点、复合操作符、字面量 / lex_scan dispatches on the first char: comments (as trivia), punctuation, compound operators, literals
 fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     let c = lex_advance(src, st)
     if c == "#" && st[1] == 1 && lex_peek(src, st) == "!" {
@@ -228,14 +228,13 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     }
 }
 
-// 普通字符串扫描；first 区分开头片段与插值后恢复的片段（后者以 TInterpEnd 结束）/
-// first distinguishes the opening segment from one resumed after an interpolation-closing `}`; the latter ends in TInterpEnd.
+// lex_string 是普通字符串扫描入口；first 区分开头片段与插值后恢复的片段（后者以 TInterpEnd 结束）/
+// lex_string scans an ordinary string; first distinguishes the opening segment from one resumed after an interpolation-closing `}`; the latter ends in TInterpEnd.
 fn lex_string(src, mut st, mut toks, mut diags, mut comments) {
     lex_string_part(src, st, toks, diags, comments, true)
 }
 
-// 字符串片段扫描（含转义与插值切换）/
-// String segment scan (escapes and interpolation switching)
+// lex_string_part 扫描字符串片段（含转义与插值切换）/ lex_string_part scans a string segment (escapes and interpolation switching)
 fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
     let mut parts = []
     let mut seg = st[1]
@@ -295,9 +294,9 @@ fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
     lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
 }
 
-// 三引号多行字符串：""" 后必须换行；每行行首空白忽略后必须是 \ 内容标记，
+// lex_ml_string 扫描三引号多行字符串：""" 后必须换行；每行行首空白忽略后必须是 \ 内容标记，
 // \ 后到行尾为该行内容；全空白行 = 空行；内容行行尾换行进入字面量，结束标记前去掉段尾一个换行；转义与插值照常。
-// / Triple-quoted multiline strings: newline after """ ; leading whitespace ignored, then a \ content marker;
+// / lex_ml_string scans triple-quoted multiline strings: newline after """ ; leading whitespace ignored, then a \ content marker;
 // content runs to end of line; blank lines are empty rows; row-ending newlines are part of the literal,
 // the final one before """ is stripped; escapes and interpolation behave as usual.
 fn lex_ml_string(src, mut st, mut toks, mut diags, mut comments) {
@@ -342,8 +341,8 @@ fn lex_ml_string(src, mut st, mut toks, mut diags, mut comments) {
     lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
 }
 
-// 多行字符串行内扫描：收集字面量到行尾（\n）或嵌套插值；插值恢复时继续本函数。/
-// Inline scan of one multiline row: collects literal bytes to end-of-line or a nested interpolation; resumes here after interpolation.
+// lex_ml_inline 扫描多行字符串的单个内容行：收集字面量到行尾（\n）或嵌套插值；插值恢复时继续本函数。/
+// lex_ml_inline scans one multiline row: collects literal bytes to end-of-line or a nested interpolation; resumes here after interpolation.
 fn lex_ml_inline(src, mut st, mut toks, mut diags, mut comments, mut seg, mut first, mut any_interp) {
     while st[1] < str_len(src) {
         let c = lex_peek(src, st)
@@ -408,9 +407,9 @@ fn lex_ml_inline(src, mut st, mut toks, mut diags, mut comments, mut seg, mut fi
     }
 }
 
-// 插值扫描：按普通表达式 token 直到匹配的 `}`；block、match 与嵌套插值里的花括号先各自配平，再恢复外层字符串模式。
+// lex_interpolation 扫描插值表达式直到匹配的 `}`；block、match 与嵌套插值里的花括号先各自配平，再恢复外层字符串模式。
 // resume 是恢复扫描的回调（普通串或三引号多行串各自的行内扫描）。
-// / Interpolation scan: ordinary expression tokens to the matching `}`; braces inside blocks, match arms,
+// / lex_interpolation scans the interpolation expression up to the matching `}`; braces inside blocks, match arms,
 // and nested interpolations balance before the outer string resumes. resume continues the outer scan.
 fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open, resume) {
     let mut depth = 0
@@ -442,9 +441,9 @@ fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open, resum
     lex_fail(diags, open, open + 1, "E1004", "add a closing '}' before the end of the string", "unterminated string interpolation")
 }
 
-// 数字字面量：hex/二进制前缀 0x 0b（lexeme 原样保留，parser 端转换）、
+// lex_number 扫描数字字面量：hex/二进制前缀 0x 0b（lexeme 原样保留，parser 端转换）、
 // 下划线分隔符（_ 后必须跟数字）、浮点小数点与指数（前瞻判断，避免吞掉标识符如 1e、1ex）。
-// / Number literals: hex/binary prefixes 0x 0b (lexeme kept verbatim, converted by the parser),
+// / lex_number scans number literals: hex/binary prefixes 0x 0b (lexeme kept verbatim, converted by the parser),
 // underscore separators (a digit must follow '_'), float point and exponents (lookahead so 1e/1ex stays an identifier).
 fn lex_number(src, mut st, mut toks, mut diags) {
     let c0 = substr(src, st[1] - 1, 1)
@@ -519,14 +518,12 @@ fn lex_number(src, mut st, mut toks, mut diags) {
     }
 }
 
-// 16 进制数字判断 /
-// Is a hex digit
+// lex_is_hex 判断字符是否为 16 进制数字 / lex_is_hex tells whether c is a hex digit
 fn lex_is_hex(c) {
     lex_is_digit(c) || c >= "a" && c <= "f" || c >= "A" && c <= "F"
 }
 
-// 标识符扫描 + 关键字判定 /
-// Identifier scan + keyword lookup
+// lex_ident 扫描标识符并判定关键字 / lex_ident scans an identifier and looks up keywords
 fn lex_ident(src, mut st, mut toks) {
     while lex_is_alpha(lex_peek(src, st)) || lex_is_digit(lex_peek(src, st)) {
         lex_bump(st)
@@ -535,14 +532,12 @@ fn lex_ident(src, mut st, mut toks) {
     lex_emit(st, toks, lex_keyword(word), word)
 }
 
-// 数字判断 /
-// Is a digit
+// lex_is_digit 判断字符是否为数字 / lex_is_digit tells whether c is a digit
 fn lex_is_digit(c) {
     c >= "0" && c <= "9"
 }
 
-// 字母/下划线判断 /
-// Is alpha or underscore
+// lex_is_alpha 判断字符是否为字母或下划线 / lex_is_alpha tells whether c is alpha or underscore
 fn lex_is_alpha(c) {
     c == "_" || c >= "a" && c <= "z" || c >= "A" && c <= "Z"
 }
