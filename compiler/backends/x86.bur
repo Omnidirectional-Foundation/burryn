@@ -589,7 +589,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
+    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -856,6 +856,28 @@ fn x86gen_args_native() {
     let test = cmp_rr(rdx, r8) + jae_rel32(str_len(body) + 5)
     let back = jmp_rel32(0 - (str_len(test) + str_len(body) + 5))
     head + test + body + back + mov_mr(r15, 0 - 8, r11)
+}
+
+// x86gen_file_exists_native 内联 file_exists：stat syscall，返回 bool
+// x86gen_file_exists_native inlines file_exists: the stat syscall, returning a bool
+// file_exists inline: stat syscall returning a bool
+fn x86gen_file_exists_native() {
+    let not_found = mov_ri64(rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let found = mov_ri64(rax, 1) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1) + jmp_rel32(str_len(not_found))
+    let nul_write = xor_rr(rax, rax) + e1(136) + e1(7) + add_rr(r12, r10) + add_ri32(r12, 1)
+    let copy = mov_rm(r10, r9, 0) + mov_rr(r11, r12) + lea(rsi, r9, 8) + mov_rr(rdi, r11) + mov_rr(rcx, r10) + rep_movsb()
+    let head = mov_rm(r9, r15, 0 - 8) + copy + nul_write + mov_rr(rdi, r11) + sub_ri32(rsp, 144) + mov_rr(rsi, rsp) + sys_mov_rax(4) + syscall() + add_ri32(rsp, 144)
+    head + test_rr(rax, rax) + jne_rel32(str_len(found)) + found + not_found
+}
+
+// x86gen_sleep_native 内联 sleep：nanosleep syscall，毫秒精度
+// x86gen_sleep_native inlines sleep: the nanosleep syscall, millisecond precision
+// sleep inline: nanosleep syscall with millisecond precision
+fn x86gen_sleep_native() {
+    let unit_ret = xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let timespec = sub_ri32(rsp, 16) + mov_rr(rax, r9) + xor_rr(rdx, rdx) + mov_ri64(rcx, 1000) + div_r(rcx) + mov_mr(rsp, 0, rax) + mov_ri64(rcx, 1000000) + imul_rr(rdx, rcx) + mov_mr(rsp, 8, rdx) + mov_rr(rdi, rsp) + xor_rr(rsi, rsi) + sys_mov_rax(35) + syscall() + add_ri32(rsp, 16)
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(timespec)) + timespec + unit_ret
+    head
 }
 
 // x86gen_get_map_native 内联 get：按键查 map / x86gen_get_map_native inlines get: look up a map key
@@ -2681,6 +2703,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "args" {
                     w(x86gen_args_native())
                     ret_type = "list-str"
+                } else if callee == "file_exists" {
+                    w(x86gen_file_exists_native())
+                    ret_type = "bool"
+                } else if callee == "sleep" {
+                    w(x86gen_sleep_native())
+                    ret_type = "unit"
                 } else if callee == "get" || callee == "put" || callee == "delete" {
                     let m_t = type_shadow[len(type_shadow) - n]
                     let k_t = if n >= 2 {
