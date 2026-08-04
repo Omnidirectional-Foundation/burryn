@@ -66,18 +66,26 @@ fn p_synchronize(toks, mut pos) {
     }
 }
 
+// 是否语句起始 token /
+// Is this a statement starter
 fn p_starts_stmt(t) {
     t == t_let || t == t_const || t == t_fn || t == t_enum || t == t_type || t == t_while || t == t_for || t == t_return || t == t_spawn || t == t_select || t == t_defer || t == t_break || t == t_continue || t == t_pub || t == t_import
 }
 
+// 当前 token /
+// Current token
 fn p_peek(toks, pos) {
     toks[pos[0]]
 }
 
+// 当前 token 是否 t /
+// Is the current token t
 fn p_check(toks, pos, t) {
     tok_type(p_peek(toks, pos)) == t
 }
 
+// 前进并返回 token /
+// Advance and return the token
 fn p_advance(toks, mut pos) {
     let t = toks[pos[0]]
     if tok_type(t) != t_eof {
@@ -86,6 +94,8 @@ fn p_advance(toks, mut pos) {
     t
 }
 
+// 匹配则消费 /
+// Consume if it matches
 fn p_match(toks, mut pos, t) {
     if p_check(toks, pos, t) {
         p_advance(toks, pos)
@@ -95,6 +105,8 @@ fn p_match(toks, mut pos, t) {
     }
 }
 
+// 期待 token，否则报错 /
+// Expect a token or error
 fn p_expect(toks, mut pos, t, what) {
     if p_check(toks, pos, t) {
         Ok(p_advance(toks, pos))
@@ -104,12 +116,16 @@ fn p_expect(toks, mut pos, t, what) {
     }
 }
 
+// 跳过连续分号 /
+// Skip consecutive semicolons
 fn p_skip_semis(toks, mut pos) {
     while p_check(toks, pos, t_semi) {
         p_advance(toks, pos)
     }
 }
 
+// 消费语句结束（分号/换行）/
+// Consume a statement end
 fn p_end_stmt(toks, mut pos) {
     if p_check(toks, pos, t_semi) {
         p_advance(toks, pos)
@@ -305,6 +321,8 @@ fn p_statement(toks, mut pos) {
 }
 
 // interface 文件语句子集：import/enum/pub 声明 / Interface-file statement subset: import, enum, pub declarations
+// interface 文件语句 /
+// Interface-file statement
 fn p_interface_statement(toks, mut pos) {
     if p_check(toks, pos, t_import) {
         p_import_decl(toks, pos)
@@ -378,6 +396,8 @@ fn p_interface_statement(toks, mut pos) {
     }
 }
 
+// let 语句：类型标注、mut/pub、元组解构 /
+// Let statement: type annotations, mut/pub, tuple destructuring
 fn p_let_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let is_mut = p_match(toks, pos, t_mut)
@@ -469,6 +489,8 @@ fn p_let_stmt(toks, mut pos) {
     Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
+// const 声明 /
+// Const declaration
 fn p_const_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "constant name") {
@@ -511,6 +533,8 @@ fn p_const_stmt(toks, mut pos) {
     Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
+// pub 声明（导出）/
+// Pub declaration (export)
 fn p_pub_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     if p_check(toks, pos, t_let) {
@@ -568,6 +592,8 @@ fn p_pub_decl(toks, mut pos) {
     }
 }
 
+// import 声明 /
+// Import declaration
 fn p_import_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let mut alias = ""
@@ -593,6 +619,8 @@ fn p_import_decl(toks, mut pos) {
     Ok(ImportDecl(alias, asp, tok_lex(path_tok), sp_of_tok(path_tok), sp_union(sp_of_tok(tok), sp_of_tok(path_tok))))
 }
 
+// 函数声明 /
+// Function declaration
 fn p_fn_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "function name") {
@@ -612,6 +640,8 @@ fn p_fn_decl(toks, mut pos) {
     Ok(FnDecl(tok_lex(name), sp_of_tok(name), false, lit, span_of(lit)))
 }
 
+// receiver 方法声明 /
+// Receiver method declaration
 fn p_method_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     match p_expect(toks, pos, t_lparen, "'(' after fn in method") {
@@ -723,6 +753,8 @@ fn p_method_decl(toks, mut pos) {
     Ok(MethodDecl(rty_name(rty), tok_lex(name), sp_of_tok(name), lit, span_of(lit)))
 }
 
+// 函数返回类型名 /
+// Function return type name
 fn rty_name(ty) {
     match ty {
         TEName(_, n, _, _, _) => n,
@@ -731,6 +763,8 @@ fn rty_name(ty) {
     }
 }
 
+// 函数体解析（参数/返回/体）/
+// Function body parsing (params/return/body)
 fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     match p_expect(toks, pos, t_lparen, "'(' after fn") {
         Ok(_) => {},
@@ -817,6 +851,8 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     }
 }
 
+// 枚举声明：变体可带类型字段，支持泛型参数表 /
+// Enum declaration: typed variant fields, optional type parameters
 fn p_enum_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "enum name") {
@@ -905,6 +941,8 @@ fn p_enum_decl(toks, mut pos) {
     Ok(EnumDecl(tok_lex(name), params, variants, false, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
+// 类型别名声明 /
+// Type alias declaration
 fn p_type_alias_decl(toks, mut pos, is_pub) {
     let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "type alias name") {
@@ -936,6 +974,8 @@ fn p_type_alias_decl(toks, mut pos, is_pub) {
     Ok(TypeAliasDecl(tok_lex(name), te, is_pub, sp_union(sp_of_tok(tok), span_of(te))))
 }
 
+// 类型表达式：名字/泛型应用/list/fn 签名/record 行变量/tuple /
+// Type expressions: names, generic application, lists, fn signatures, record rows, tuples
 fn p_type_expr(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
@@ -1150,6 +1190,8 @@ fn p_type_expr(toks, mut pos) {
     }
 }
 
+// while 语句 /
+// While statement
 fn p_while_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let cond = match p_expression(toks, pos) {
@@ -1169,6 +1211,8 @@ fn p_while_stmt(toks, mut pos) {
     Ok(WhileStmt(cond, body, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
+// for 语句：值遍历或带索引形式（channel 拒绝索引）/
+// For statement: value iteration, optional index form (channels reject the index form)
 fn p_for_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let first = match p_expect(toks, pos, t_ident, "loop variable") {
@@ -1218,6 +1262,8 @@ fn p_for_stmt(toks, mut pos) {
     Ok(ForStmt(v, vsp, idx, isp, iter, false, body, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
+// spawn 语句 /
+// Spawn statement
 fn p_spawn_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let e = match p_expression(toks, pos) {
@@ -1243,6 +1289,8 @@ fn p_spawn_stmt(toks, mut pos) {
     Ok(SpawnStmt(e, sp_union(sp_of_tok(tok), span_of(e))))
 }
 
+// defer 语句 /
+// Defer statement
 fn p_defer_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     if !p_check(toks, pos, t_lbrace) {
@@ -1258,6 +1306,8 @@ fn p_defer_stmt(toks, mut pos) {
     Ok(DeferStmt(body, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
+// select 语句 /
+// Select statement
 fn p_select_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after select") {
@@ -1322,6 +1372,8 @@ fn p_select_stmt(toks, mut pos) {
     Ok(SelectStmt(arms, has_default, dflt, dsp, sp))
 }
 
+// select 臂 /
+// Select arm
 fn p_select_arm(toks, mut pos) {
     let mut is_send = false
     let mut bind = ""
@@ -1402,6 +1454,8 @@ fn p_select_arm(toks, mut pos) {
     Ok(SelectArm(is_send, bind, bind_sp, ch, val, body, sp_union(asp, span_of(body))))
 }
 
+// 块 /
+// Block
 fn p_block(toks, mut pos) {
     let lb = match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "'") {
         Ok(v) => v,
@@ -1433,6 +1487,8 @@ fn p_block(toks, mut pos) {
     Ok(Block(stmts, sp_union(sp_of_tok(lb), sp_of_tok(rb))))
 }
 
+// 表达式入口 /
+// Expression entry
 fn p_expression(toks, mut pos) {
     p_pipe_expr(toks, pos)
 }
@@ -1460,6 +1516,8 @@ fn p_pipe_expr(toks, mut pos) {
     Ok(e)
 }
 
+// 管道目标解析 /
+// Pipe target parsing
 fn p_pipe_target(toks, mut pos, lhs) {
     let first = match p_expect(toks, pos, t_ident, "a pipe target") {
         Ok(v) => v,
@@ -1517,6 +1575,8 @@ fn p_pipe_target(toks, mut pos, lhs) {
     Ok(Pipe(lhs, path, args, sp_union(span_of(lhs), end_sp)))
 }
 
+// 逻辑或（Pratt 层级：||）/
+// Logical or (Pratt level: ||)
 fn p_or_expr(toks, mut pos) {
     let mut e = match p_and_expr(toks, pos) {
         Ok(v) => v,
@@ -1549,6 +1609,8 @@ fn p_or_expr(toks, mut pos) {
     Ok(e)
 }
 
+// 逻辑与（Pratt 层级：&&）/
+// Logical and (Pratt level: &&)
 fn p_and_expr(toks, mut pos) {
     let mut e = match p_equality(toks, pos) {
         Ok(v) => v,
@@ -1571,6 +1633,8 @@ fn p_and_expr(toks, mut pos) {
     Ok(e)
 }
 
+// 相等比较（Pratt 层级：== !=）/
+// Equality (Pratt level: == !=)
 fn p_equality(toks, mut pos) {
     let mut e = match p_comparison(toks, pos) {
         Ok(v) => v,
@@ -1593,6 +1657,8 @@ fn p_equality(toks, mut pos) {
     Ok(e)
 }
 
+// 比较（Pratt 层级：< <= > >=）/
+// Comparison (Pratt level: < <= > >=)
 fn p_comparison(toks, mut pos) {
     let mut e = match p_term(toks, pos) {
         Ok(v) => v,
@@ -1615,6 +1681,8 @@ fn p_comparison(toks, mut pos) {
     Ok(e)
 }
 
+// 加法项（Pratt 层级：+ -）/
+// Additive terms (Pratt level: + -)
 fn p_term(toks, mut pos) {
     let mut e = match p_factor(toks, pos) {
         Ok(v) => v,
@@ -1637,6 +1705,8 @@ fn p_term(toks, mut pos) {
     Ok(e)
 }
 
+// 乘法项（Pratt 层级：* / %）/
+// Multiplicative terms (Pratt level: * / %)
 fn p_factor(toks, mut pos) {
     let mut e = match p_unary(toks, pos) {
         Ok(v) => v,
@@ -1659,6 +1729,8 @@ fn p_factor(toks, mut pos) {
     Ok(e)
 }
 
+// 一元：- ! /
+// Unary: - !
 fn p_unary(toks, mut pos) {
     if p_check(toks, pos, t_bang) || p_check(toks, pos, t_minus) {
         let op = p_advance(toks, pos)
@@ -1685,6 +1757,8 @@ fn p_unary(toks, mut pos) {
     }
 }
 
+// 后缀：调用/索引/字段访问/成员选择，含 record 更新与 tuple 解构/
+// Postfix: calls, indexing, field and member access, record updates, tuple destructuring
 fn p_postfix(toks, mut pos) {
     let mut e = match p_primary(toks, pos) {
         Ok(v) => v,
@@ -1787,6 +1861,8 @@ fn p_postfix(toks, mut pos) {
     Ok(e)
 }
 
+// 字面量 → int（hex/二进制转换）/
+// Literal to int (hex/binary conversion)
 fn lit_to_int(lexeme) {
     let l = str_len(lexeme)
     if l > 2 && substr(lexeme, 0, 2) == "0x" {
@@ -1849,6 +1925,8 @@ fn lit_to_int(lexeme) {
     }
 }
 
+// 原子表达式：字面量/标识符/分组/列表/函数字面量/record/枚举变体/
+// Primary expressions: literals, identifiers, grouping, lists, fn literals, records, enum variants
 fn p_primary(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
@@ -2078,6 +2156,8 @@ fn p_primary(toks, mut pos) {
     }
 }
 
+// 插值字符串解析 /
+// Interpolated string parsing
 fn p_interpolated(toks, mut pos) {
     let start = p_advance(toks, pos)
     let mut out = StrLit(tok_lex(start), sp_of_tok(start))
@@ -2106,6 +2186,8 @@ fn p_interpolated(toks, mut pos) {
     Ok(out)
 }
 
+// if 表达式：条件 + then/else 块（值位置 else 必须）/
+// If expression: condition with then/else blocks (else required when used as a value)
 fn p_if_expr(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let cond = match p_expression(toks, pos) {
@@ -2147,6 +2229,8 @@ fn p_if_expr(toks, mut pos) {
     Ok(IfExpr(cond, then, els, sp))
 }
 
+// match 表达式：穷尽性由 checker 做，这里解析分支（模式 + 可选 guard + 体）/
+// Match expression: exhaustiveness is the checker's job; here we parse arms (pattern + optional guard + body)
 fn p_match_expr(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let scrut = match p_expression(toks, pos) {
@@ -2235,6 +2319,8 @@ fn p_match_expr(toks, mut pos) {
     Ok(MatchExpr(scrut, arms, sp))
 }
 
+// 模式：通配/字面量/绑定/变体/record 模式/
+// Patterns: wildcard, literal, binding, variant, record
 fn p_pattern(toks, mut pos) {
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
