@@ -32,8 +32,8 @@ static void nat_write_joined(Value *args, int argc) {
         bur_write_display(args[i]);
     }
 }
-static Value nat_print(Value *args, int argc) { nat_write_joined(args, argc); return bur_unit(); }
-static Value nat_println(Value *args, int argc) { nat_write_joined(args, argc); fputc('\n', stdout); return bur_unit(); }
+static Value nat_print(Value *args, int argc) { nat_write_joined(args, argc); fflush(stdout); return bur_unit(); }
+static Value nat_println(Value *args, int argc) { nat_write_joined(args, argc); fputc('\n', stdout); fflush(stdout); return bur_unit(); }
 static Value nat_eprintln(Value *args, int argc) {
     Buf b = {0};
     for (int i = 0; i < argc; i++) {
