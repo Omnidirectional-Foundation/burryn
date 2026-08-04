@@ -141,6 +141,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut cur_f = -1
     let mut cur_ip = 0
 
+    // 运行时 trap：打印并 exit(4) /
+    // Runtime trap: print and exit(4)
     fn trap(msg) {
         eprintln("runtime error: " + msg)
         if cur_f >= 0 {
@@ -188,46 +190,62 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         exit(4)
     }
 
+    // 读 u16 操作数 /
+    // Read a u16 operand
     fn rd_u16(code, ip) {
         code[ip] * 256 + code[ip + 1]
     }
 
+    // 值类型判定 /
+    // Value type checks
     fn is_str(v) {
         match v {
             VStr(_) => true,
             _ => false,
         }
     }
+    // 取字符串负载 /
+    // String payload accessor
     fn str_of(v) {
         match v {
             VStr(s) => s,
             _ => "",
         }
     }
+    // int 判定 /
+    // Int check
     fn is_int(v) {
         match v {
             VInt(_) => true,
             _ => false,
         }
     }
+    // 取 int /
+    // Int accessor
     fn int_of(v) {
         match v {
             VInt(n) => n,
             _ => 0,
         }
     }
+    // bool 判定 /
+    // Bool check
     fn is_bool(v) {
         match v {
             VBool(_) => true,
             _ => false,
         }
     }
+    // 取 bool /
+    // Bool accessor
     fn bool_of(v) {
         match v {
             VBool(b) => b,
             _ => false,
         }
     }
+    // 数值判定（int/float）/
+    // Numeric check (int/float)
     fn is_num(v) {
         match v {
             VInt(_) => true,
@@ -235,6 +253,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             _ => false,
         }
     }
+    // 取数值为 float /
+    // Numeric value as float
     fn num_f(v) {
         match v {
             VInt(n) => to_float(n),
@@ -242,12 +262,16 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             _ => 0.0,
         }
     }
+    // 取对象句柄 /
+    // Object handle accessor
     fn obj_h(v) {
         match v {
             VObj(h) => h,
             _ => -1,
         }
     }
+    // tag + 句柄访问 /
+    // Tag + handle accessor
     fn tagged_h(v, t) {
         match v {
             VObj(h) => if o_tag[h] == t {
@@ -259,6 +283,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 值类型名（错误消息用）/
+    // Value type name (error messages)
     fn type_name(v) {
         match v {
             VUnit => "unit",
@@ -295,6 +321,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 值 → 文本（可加引号）/
+    // Value to text (optionally quoted)
     fn format_val(v, quote) {
         match v {
             VUnit => "()",
@@ -373,6 +401,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 值相等（结构比较）/
+    // Value equality (structural)
     fn eq_val(a, b) {
         match a {
             VUnit => match b {
@@ -485,6 +515,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // GC 标记一个值 /
+    // GC mark one value
     fn mark_val(v) {
         match v {
             VObj(h) => {
@@ -496,6 +528,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             _ => {},
         }
     }
+    // GC 标记一个对象 /
+    // GC mark one object
     fn mark_obj(h) {
         if !o_mark[h] {
             o_mark[h] = true
@@ -503,6 +537,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 触发 mark-sweep 回收 /
+    // Trigger a mark-sweep collection
     fn collect() {
         gc_cycles_n = gc_cycles_n + 1
         gray = []
@@ -603,6 +639,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         freed
     }
 
+    // 分配对象槽（空闲链表复用）/
+    // Allocate an object slot (free-list reuse)
     fn alloc_obj(tag) {
         if vm_on && obj_count + 1 > gc_threshold {
             let _ = collect()
@@ -632,24 +670,36 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // fiber 栈压入 /
+    // Fiber stack push
     fn fpush(f, v) {
         push(fb_stack[f], v)
     }
+    // fiber 栈弹出 /
+    // Fiber stack pop
     fn fpop(f) {
         pop(fb_stack[f])
     }
+    // fiber 栈窥视 /
+    // Fiber stack peek
     fn fpeek(f, n) {
         fb_stack[f][len(fb_stack[f]) - 1 - n]
     }
+    // fiber 栈顶 /
+    // Fiber stack top
     fn ftop(f) {
         len(fb_stack[f])
     }
+    // 设置 fiber 栈顶 /
+    // Set fiber stack top
     fn fsettop(f, n) {
         while len(fb_stack[f]) > n {
             let _ = pop(fb_stack[f])
         }
     }
 
+    // 构造枚举实例 /
+    // Build an enum instance
     fn make_inst(eh, variant, fields) {
         let h = alloc_obj(ot_enuminst)
         o_i1[h] = eh
@@ -657,21 +707,29 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         o_vals[h] = fields
         VObj(h)
     }
+    // Some 构造 /
+    // Some constructor
     fn make_some(f, v) {
         fpush(f, v)
         let r = make_inst(opt_enum, 0, [fpeek(f, 0)])
         let _ = fpop(f)
         r
     }
+    // None 构造 /
+    // None constructor
     fn make_none() {
         make_inst(opt_enum, 1, [])
     }
+    // Ok 构造 /
+    // Ok constructor
     fn make_ok(f, v) {
         fpush(f, v)
         let r = make_inst(res_enum, 0, [fpeek(f, 0)])
         let _ = fpop(f)
         r
     }
+    // Err 构造 /
+    // Err constructor
     fn make_err(f, v) {
         fpush(f, v)
         let r = make_inst(res_enum, 1, [fpeek(f, 0)])
@@ -679,11 +737,15 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         r
     }
 
+    // 调度：fiber 入就绪队列 /
+    // Schedule: enqueue a fiber
     fn schedule(f) {
         fb_status[f] = fs_ready
         push(ready, f)
     }
 
+    // exec 结果转换 /
+    // exec result conversion
     fn conv_exec_result(f, r) {
         match r {
             Ok(o) => match o {
@@ -696,6 +758,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 清等待注册表 /
+    // Clear wait registrations
     fn wait_reset() {
         wait_fiber = []
         wait_kind = []
@@ -703,6 +767,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         wait_handle = []
     }
 
+    // 注册定时器等待 /
+    // Register a timer wait
     fn wait_add_timer(f, deadline) {
         push(wait_fiber, f)
         push(wait_kind, wait_timer)
@@ -710,6 +776,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         push(wait_handle, -1)
     }
 
+    // 注册进程等待 /
+    // Register a process wait
     fn wait_add_exec(f, h) {
         push(wait_fiber, f)
         push(wait_kind, wait_exec)
@@ -717,6 +785,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         push(wait_handle, h)
     }
 
+    // 注册全部阻塞 fiber 的 fd /
+    // Register all blocked fibers' fds
     fn wait_register_all() {
         wait_reset()
         let mut i = 0
@@ -735,6 +805,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // poll IO 就绪 /
+    // Poll for IO readiness
     fn wait_poll_io() {
         let mut i = 0
         while i < len(wait_fiber) {
@@ -755,6 +827,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // poll 网络就绪 /
+    // Poll for network readiness
     fn wait_poll_net() {
         let mut i = 0
         while i < len(fb_status) {
@@ -817,6 +891,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // poll stdin 就绪 /
+    // Poll for stdin readiness
     fn wait_poll_stdin() {
         let mut i = 0
         while i < len(fb_status) {
@@ -842,6 +918,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 最近定时器 /
+    // Nearest timer deadline
     fn wait_nearest_timer() {
         let mut nearest = -1.0
         let mut i = 0
@@ -856,6 +934,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         nearest
     }
 
+    // 唤醒到期定时器 /
+    // Wake due timers
     fn wake_due_timers() {
         let now = clock()
         let mut going = true
@@ -879,6 +959,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 空闲等待（无就绪 fiber）/
+    // Idle wait (nothing ready)
     fn wait_idle() {
         while len(ready) == 0 {
             wait_register_all()
@@ -904,6 +986,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 创建 fiber /
+    // Create a fiber
     fn new_fiber(cl, args) {
         push(fb_stack, [VObj(cl)])
         push(fb_status, fs_ready)
@@ -933,6 +1017,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         f
     }
 
+    // 唤醒等待者 /
+    // Wake waiters
     fn wake_waiters(ch) {
         if len(o_h3[ch]) > 0 {
             for w in o_h3[ch] {
@@ -943,6 +1029,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             o_h3[ch] = []
         }
     }
+    // 移除等待者 /
+    // Remove a waiter
     fn remove_waiter(ch, f) {
         let mut kept = []
         for w in o_h3[ch] {
@@ -952,12 +1040,18 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
         o_h3[ch] = kept
     }
+    // channel 接收就绪 /
+    // Channel receive ready
     fn chan_recv_ready(ch) {
         len(o_vals[ch]) > 0 || len(o_h1[ch]) > 0 || o_b1[ch]
     }
+    // channel 发送就绪 /
+    // Channel send ready
     fn chan_send_ready(ch) {
         o_b1[ch] || len(o_h2[ch]) > 0 || len(o_vals[ch]) < o_i1[ch]
     }
+    // channel 尝试接收 /
+    // Channel try-receive
     fn chan_try_recv(ch) {
         if len(o_vals[ch]) > 0 {
             let v = o_vals[ch][0]
@@ -982,6 +1076,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // upvalue 读取 /
+    // Upvalue read
     fn uv_get(h) {
         if o_b1[h] {
             fb_stack[o_i1[h]][o_i2[h]]
@@ -989,6 +1085,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             o_v1[h]
         }
     }
+    // upvalue 写入 /
+    // Upvalue write
     fn uv_set(h, v) {
         if o_b1[h] {
             fb_stack[o_i1[h]][o_i2[h]] = v
@@ -996,6 +1094,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             o_v1[h] = v
         }
     }
+    // 捕获 upvalue（开放时引用 (fiber, slot)）/
+    // Capture an upvalue ((fiber, slot) while open)
     fn capture_upvalue(f, slot) {
         let mut found = -1
         for uh in fb_openuv[f] {
@@ -1015,6 +1115,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             h
         }
     }
+    // 作用域退出时关闭 upvalue /
+    // Close upvalues at scope exit
     fn close_upvalues(f, from) {
         let mut kept = []
         for uh in fb_openuv[f] {
@@ -1028,6 +1130,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         fb_openuv[f] = kept
     }
 
+    // map 查找 /
+    // Map lookup
     fn map_find(mh, k) {
         match k {
             VInt(n) => match get(o_idxi[mh], n) {
@@ -1041,6 +1145,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             _ => -2,
         }
     }
+    // map 插入（保持插入序）/
+    // Map insert (preserves insertion order)
     fn map_index_put(mh, k, pos) {
         match k {
             VInt(n) => put(o_idxi[mh], n, pos),
@@ -1049,6 +1155,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // native 分派：按注册表调用（与 C runtime 的 bur_register_native 对齐）/
+    // Native dispatch: call by id (aligned with bur_register_native in the C runtime)
     fn do_native(f, id, argc) {
         let nm = lib::native_names[id]
         if nm == "print" || nm == "println" || nm == "eprintln" {
@@ -1702,6 +1810,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 值调用（闭包/native/构造器分派）/
+    // Call a value (closure/native/ctor dispatch)
     fn call_value(f, argc) {
         let callee = fpeek(f, argc)
         let h = obj_h(callee)
@@ -1758,6 +1868,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 算术操作符名（错误消息）/
+    // Arithmetic operator name (error messages)
     fn arith_name(op) {
         if op == lib::op_add {
             "+"
@@ -1771,6 +1883,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             "%"
         }
     }
+    // 算术执行 /
+    // Arithmetic execution
     fn do_arith(f, op) {
         let b = fpeek(f, 0)
         let a = fpeek(f, 1)
@@ -1853,6 +1967,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             trap("cannot apply " + lib::go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
         }
     }
+    // 比较执行 /
+    // Comparison execution
     fn do_compare(f, op) {
         let b = fpop(f)
         let a = fpop(f)
@@ -1900,6 +2016,8 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
 
+    // 主解释循环（opcode 分派）/
+    // Main interpreter loop (opcode dispatch)
     fn exec_fiber(f) {
         let mut budget = vm_time_slice
         cur_f = f

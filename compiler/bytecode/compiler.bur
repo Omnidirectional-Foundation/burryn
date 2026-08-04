@@ -16,6 +16,8 @@ pub fn compile_script(stmts, chan_fors) {
     compile_program([[stmts]], [[""]], false, [""], [[[]]], chan_fors)
 }
 
+// 全程序编译入口（多包）/
+// Whole-program compile entry (multi-package)
 pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports, chan_fors) {
     let mut f_name = []
     let mut f_file = []
@@ -61,6 +63,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     let mut c_lbl_pending = [""]
     let mut cur_file = ""
 
+    // 新函数记录 /
+    // New function record
     fn new_func(name, file, arity) {
         push(f_name, name)
         push(f_file, file)
@@ -71,6 +75,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push(f_consts, [])
         len(f_name) - 1
     }
+    // 新编译上下文 /
+    // New compile context
     fn new_compiler(enc, fh) {
         push(c_enclosing, enc)
         push(c_fn, fh)
@@ -93,6 +99,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push(c_lbl_pending, "")
         len(c_fn) - 1
     }
+    // 压入局部变量 /
+    // Push a local
     fn push_local(ch, name, depth, slot, is_mut, tempsbelow) {
         push(c_l_name[ch], name)
         push(c_l_depth[ch], depth)
@@ -101,6 +109,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push(c_l_captured[ch], false)
         push(c_l_tempsbelow[ch], tempsbelow)
     }
+    // 弹出局部变量 /
+    // Pop a local
     fn pop_local(ch) {
         let _ = pop(c_l_name[ch])
         let _ = pop(c_l_depth[ch])
@@ -109,10 +119,14 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         let _ = pop(c_l_captured[ch])
         let _ = pop(c_l_tempsbelow[ch])
     }
+    // 当前局部数 /
+    // Local count
     fn n_locals(ch) {
         len(c_l_name[ch])
     }
 
+    // 名字限定（跨包引用）/
+    // Qualify a name (cross-package)
     fn qualify(name) {
         if cur_pkg == "" {
             name
@@ -120,12 +134,16 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             cur_pkg + "." + name
         }
     }
+    // import 别名解析 /
+    // Import alias resolution
     fn alias_path(name) {
         match get(cur_aliases, name) {
             Some(p) => p,
             None => "",
         }
     }
+    // 声明名 mangling /
+    // Declared-name mangling
     fn mangle_if_decl(name) {
         let hit = match get(pkg_decls, name) {
             Some(_) => true,
@@ -138,6 +156,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
+    // 登记枚举 /
+    // Register an enum
     fn declare_enum(qual, prefix, vnames, varities) {
         push(en_qual, qual)
         push(en_vnames, vnames)
@@ -147,6 +167,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         put(global_mut, qual, false)
         len(en_qual) - 1
     }
+    // 查变体 /
+    // Find a variant
     fn find_variant(name) {
         let mut found = -1
         let mut idx = -1
@@ -177,6 +199,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             [found, idx]
         }
     }
+    // 查局部枚举 /
+    // Find a local enum
     fn local_enum(name) {
         match get(enum_by, qualify(name)) {
             Some(eh) => eh,
@@ -193,31 +217,45 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
+    // 发射一个字节（带诊断 span）/
+    // Emit one byte with a diagnostic span
     fn emit(ch, b, sp) {
         push(f_code[c_fn[ch]], b)
         push(f_spans[c_fn[ch]], sp)
     }
+    // 发射 u16 /
+    // Emit a u16
     fn emit_u16(ch, v, sp) {
         emit(ch, v / 256, sp)
         emit(ch, v % 256, sp)
     }
+    // 当前代码长度 /
+    // Current code length
     fn code_len(ch) {
         len(f_code[c_fn[ch]])
     }
+    // 加入常量表（去重）/
+    // Add a constant (dedup)
     fn add_const(ch, cv) {
         push(f_consts[c_fn[ch]], cv)
         len(f_consts[c_fn[ch]]) - 1
     }
+    // 发射常量加载 /
+    // Emit a constant load
     fn emit_const(ch, cv, sp) {
         let idx = add_const(ch, cv)
         emit(ch, lib::op_const, sp)
         emit_u16(ch, idx, sp)
     }
+    // 发射跳转并记录回填点 /
+    // Emit a jump and remember the patch point
     fn emit_jump(ch, op, sp) {
         emit(ch, op, sp)
         emit_u16(ch, 65535, sp)
         code_len(ch) - 2
     }
+    // 回填跳转偏移 /
+    // Patch a jump offset
     fn patch_jump(ch, at) {
         let dist = code_len(ch) - (at + 2)
         if dist > 65535 {
@@ -227,6 +265,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         f_code[c_fn[ch]][at + 1] = dist % 256
         Ok(true)
     }
+    // 循环回跳 /
+    // Loop back-edge
     fn emit_loop(ch, to, sp) {
         emit(ch, lib::op_loop, sp)
         let dist = code_len(ch) + 2 - to
@@ -237,6 +277,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // 下一可用槽 /
+    // Next free slot
     fn next_slot(ch) {
         let n = n_locals(ch)
         if n > 0 {
@@ -245,6 +287,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             c_temps[ch]
         }
     }
+    // 声明局部（分配槽）/
+    // Declare a local (allocate a slot)
     fn declare_local(ch, name, is_mut, sp) {
         let slot = next_slot(ch)
         if slot > 65534 {
@@ -253,9 +297,13 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push_local(ch, name, c_scope_depth[ch], slot, is_mut, c_temps[ch])
         Ok(true)
     }
+    // 作用域管理：局部变量计数 /
+    // Scope management: local counter
     fn begin_scope(ch) {
         c_scope_depth[ch] = c_scope_depth[ch] + 1
     }
+    // 作用域结束（弹局部 + 关 upvalue）/
+    // End a scope (pop locals, close upvalues)
     fn end_scope(ch, sp) {
         c_scope_depth[ch] = c_scope_depth[ch] - 1
         while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
@@ -267,6 +315,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             pop_local(ch)
         }
     }
+    // 表达式位置的块结束 /
+    // Block end in expression position
     fn end_scope_expr(ch, sp) {
         c_scope_depth[ch] = c_scope_depth[ch] - 1
         let mut n = 0
@@ -283,6 +333,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
         Ok(true)
     }
+    // 局部变量查找 /
+    // Resolve a local
     fn resolve_local(ch, name) {
         let mut i = n_locals(ch) - 1
         let mut hit = -1
@@ -294,6 +346,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
         hit
     }
+    // 添加 upvalue（引用 (fiber, slot)，开放时安全跨 fiber 切换）/
+    // Add an upvalue ((fiber, slot) while open, safe across fiber switches)
     fn add_upvalue(ch, index, is_local, is_mut, sp) {
         let mut i = 0
         while i < len(c_u_index[ch]) {
@@ -311,6 +365,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         f_nupvals[c_fn[ch]] = len(c_u_index[ch])
         Ok(len(c_u_index[ch]) - 1)
     }
+    // 解析 upvalue /
+    // Resolve an upvalue
     fn resolve_upvalue(ch, name, sp) {
         if c_enclosing[ch] < 0 {
             return Ok(-1)
@@ -334,6 +390,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(-1)
     }
 
+    // 发射变体构造 /
+    // Emit variant construction
     fn emit_variant(ch, eh, idx, sp) {
         if en_varities[eh][idx] == 0 {
             emit_const(ch, lib::CVal::CSingleton(eh, idx), sp)
@@ -341,6 +399,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             emit_const(ch, lib::CVal::CCtor(eh, idx), sp)
         }
     }
+    // 按名构造变体 /
+    // Construct a variant by name
     fn emit_variant_of(ch, eh, variant, sp) {
         let mut i = 0
         while i < len(en_vnames[eh]) {
@@ -352,6 +412,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
         frontend::perr("E2016", "", "enum \"" + en_qual[eh] + "\" has no variant \"" + variant + "\"", sp)
     }
+    // 变体身份测试 /
+    // Variant identity test
     fn emit_variant_test(ch, eh, idx, scrut_slot, sp) {
         emit(ch, lib::op_get_local, sp)
         emit_u16(ch, scrut_slot, sp)
@@ -361,6 +423,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(emit_jump(ch, lib::op_jump_if_false_pop, sp))
     }
 
+    // 定义全局 /
+    // Define a global
     fn define_global(ch, name, is_mut, sp) {
         let qual = qualify(name)
         let exists = match get(global_mut, qual) {
@@ -383,6 +447,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // 注册枚举声明 /
+    // Register an enum declaration
     fn register_enum_decl(_ch, name, variants, sp) {
         let qual = qualify(name)
         let exists = match get(enum_by, qual) {
@@ -415,6 +481,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(declare_enum(qual, cur_pkg, vnames, varities))
     }
 
+    // 循环栈压入 /
+    // Push a loop
     fn push_loop(ch, base, cont_to) {
         push(c_lp_base[ch], base)
         push(c_lp_contto[ch], cont_to)
@@ -422,6 +490,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         push(c_lp_conts[ch], [])
         push(c_lp_labels[ch], c_lbl_pending[ch])
     }
+    // 循环栈弹出 /
+    // Pop a loop
     fn pop_loop(ch) {
         let _ = pop(c_lp_base[ch])
         let _ = pop(c_lp_contto[ch])
@@ -429,6 +499,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         let _ = pop(c_lp_conts[ch])
         let _ = pop(c_lp_labels[ch])
     }
+    // 标签循环登记 /
+    // Register a labeled loop
     fn labeled_loop(ch, lb, sp) {
         let mut li = len(c_lp_labels[ch]) - 1
         while li >= 0 {
@@ -449,6 +521,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
         frontend::perr("E2018", "", "no loop labeled `" + lb + "` in scope", sp)
     }
+    // break/continue 回跳 /
+    // Back-edge for break/continue
     fn unwind_to_loop(ch, sp) {
         if len(c_lp_base[ch]) == 0 {
             return frontend::perr("E2013", "", "break/continue outside of a loop", sp)
@@ -474,6 +548,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // 标识符代码生成 /
+    // Identifier codegen
     fn cp_ident(ch, name, sp) {
         let li = resolve_local(ch, name)
         if li >= 0 {
@@ -514,6 +590,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // 赋值代码生成 /
+    // Assignment codegen
     fn cp_assign(ch, target, val, sp) {
         match target {
             frontend::Node::Ident(name, _) => {
@@ -592,6 +670,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
+    // 块语句代码生成 /
+    // Block statement codegen
     fn cp_block_stmts(ch, blk) {
         begin_scope(ch)
         match blk {
@@ -611,6 +691,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // 块表达式：值栈与作用域出栈对齐 /
+    // Block expression: align the value stack with scope exit
     fn cp_block_expr(ch, blk) {
         begin_scope(ch)
         match blk {
@@ -660,6 +742,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
+    // 函数字面量代码生成 /
+    // Function literal codegen
     fn cp_function(ch, lit) {
         match lit {
             frontend::Node::FnLit(params, muts, _, _, _, body, name, lsp) => {
@@ -711,6 +795,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
+    // if 代码生成 /
+    // If codegen
     fn cp_if(ch, cond, then, els, sp) {
         match cp_expr_ref(ch, cond) {
             Ok(_) => {},
@@ -757,6 +843,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         patch_jump(ch, end_j)
     }
 
+    // while 代码生成 /
+    // While codegen
     fn cp_while(ch, cond, body, sp) {
         let start = code_len(ch)
         push_loop(ch, next_slot(ch), start)
@@ -798,6 +886,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // for 代码生成 /
+    // For codegen
     fn cp_for(ch, v, idx, iter, body, sp) {
         begin_scope(ch)
         match cp_expr_ref(ch, iter) {
@@ -912,6 +1002,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // channel for-in 排空 /
+    // Channel for-in drain
     fn cp_for_chan(ch, v, iter, body, sp) {
         begin_scope(ch)
         match cp_expr_ref(ch, iter) {
@@ -984,6 +1076,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // select 代码生成 /
+    // Select codegen
     fn cp_select(ch, arms, has_default, dflt, dsp, sp) {
         let base_temps = c_temps[ch]
         for arm in arms {
@@ -1122,6 +1216,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // match：变体测试（枚举身份 + tag）+ 字段提取，无哈希无反射 /
+    // Match: variant tests (enum identity + tag) and field extraction, no hashing, no reflection
     fn cp_match(ch, scrut, arms, msp) {
         begin_scope(ch)
         match cp_expr_ref(ch, scrut) {
@@ -1363,6 +1459,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
+    // 表达式代码生成（含 temp 追踪）/
+    // Expression codegen with temp tracking
     fn cp_expr(ch, e) {
         match e {
             frontend::Node::IntLit(v, sp) => {
@@ -1710,6 +1808,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
     cp_expr_ref = cp_expr
 
+    // 语句代码生成 /
+    // Statement codegen
     fn cp_stmt(ch, s) {
         match s {
             frontend::Node::DestructLet(names, nspans, is_mut, init, sp) => {

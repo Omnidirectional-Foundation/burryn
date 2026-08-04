@@ -18,6 +18,8 @@ let mut lsp_arena_tn = []
 let mut lsp_arena_ta = []
 let mut lsp_arena_tr = []
 
+// 记录表达式类型（hover 用）/
+// Record an expression type (for hover)
 fn lsp_record_type(sp, h, file) {
     match sp {
         Sp(s, e) => {
@@ -29,6 +31,8 @@ fn lsp_record_type(sp, h, file) {
     }
 }
 
+// 按偏移查类型 /
+// Type lookup by offset
 pub fn lsp_type_at(file, offset) {
     let mut best = -1
     let mut best_len = -1
@@ -50,10 +54,14 @@ pub fn lsp_type_at(file, offset) {
     }
 }
 
+// 开/关类型记录 /
+// Toggle type recording
 pub fn lsp_set_recording(b: bool) {
     lsp_recording = b
 }
 
+// 新建具名类型（list/map/Option 等构造函数）/
+// Fresh named type (list/map/Option constructors)
 fn ty_new_con(mut tk, mut tn, mut ta, mut tr, mut tl, name, cargs) {
     push(tk, 0)
     push(tn, name)
@@ -63,6 +71,8 @@ fn ty_new_con(mut tk, mut tn, mut ta, mut tr, mut tl, name, cargs) {
     len(tk) - 1
 }
 
+// 新建函数类型 /
+// Fresh function type
 fn ty_new_fn(mut tk, mut tn, mut ta, mut tr, mut tl, params, ret) {
     push(tk, 1)
     push(tn, "")
@@ -72,6 +82,8 @@ fn ty_new_fn(mut tk, mut tn, mut ta, mut tr, mut tl, params, ret) {
     len(tk) - 1
 }
 
+// 新建类型变量（带泛化 level 与可选约束）/
+// Fresh type variable (with generalization level and optional constraint)
 fn ty_new_var(mut tk, mut tn, mut ta, mut tr, mut tl, level, con) {
     push(tk, 2)
     push(tn, con)
@@ -81,6 +93,8 @@ fn ty_new_var(mut tk, mut tn, mut ta, mut tr, mut tl, level, con) {
     len(tk) - 1
 }
 
+// 沿指针链解析类型变量到具体类型 /
+// Resolve a variable along its pointer chain
 fn ty_resolve(tk, tr, h) {
     let mut cur = h
     while tk[cur] == 2 && tr[cur] != -1 {
@@ -89,6 +103,8 @@ fn ty_resolve(tk, tr, h) {
     cur
 }
 
+// 调整变量 level /
+// Adjust a variable level
 fn ty_adjust_level(tk, tn, ta, tr, mut tl, h, level) {
     let x = ty_resolve(tk, tr, h)
     if tk[x] == 2 {
@@ -107,6 +123,8 @@ fn ty_adjust_level(tk, tn, ta, tr, mut tl, h, level) {
     }
 }
 
+// occurs 检查：变量是否出现在类型中（防递归类型）/
+// Occurs check: is the variable inside the type? (blocks recursive types)
 fn ty_occurs(tk, ta, tr, v, h) {
     let x = ty_resolve(tk, tr, h)
     if tk[x] == 2 {
@@ -130,6 +148,8 @@ fn ty_occurs(tk, ta, tr, v, h) {
     }
 }
 
+// 深 mut 堆遍历 /
+// Deep-mut heap walk
 fn dm_heap_walk(tk, tn, ta, tr, h) {
     let x = ty_resolve(tk, tr, h)
     if tk[x] != 0 {
@@ -150,6 +170,8 @@ fn dm_heap_walk(tk, tn, ta, tr, h) {
     found
 }
 
+// 复制新鲜名字 /
+// Copy fresh names
 fn fresh_name_copy(src) {
     let mut out = map()
     for name in keys(src) {
@@ -158,6 +180,8 @@ fn fresh_name_copy(src) {
     out
 }
 
+// 收集新鲜模式名 /
+// Collect fresh pattern names
 fn fresh_pattern_names(p, mut names) {
     match p {
         PatBinding(name, _) => put(names, name, true),
@@ -170,6 +194,8 @@ fn fresh_pattern_names(p, mut names) {
     }
 }
 
+// 是否新鲜来源 /
+// Is a fresh source
 fn is_fresh_source(e, lookup, b_mut, b_kind, fresh_names) {
     match e {
         IntLit(_, _) => true,
@@ -222,6 +248,8 @@ fn is_fresh_source(e, lookup, b_mut, b_kind, fresh_names) {
     }
 }
 
+// 约束转集合文本 /
+// Constraint set text
 fn con_set(con) {
     match con {
         "num" => ["int", "float"],
@@ -234,6 +262,8 @@ fn con_set(con) {
     }
 }
 
+// 约束是否允许名 /
+// Does the constraint allow the name
 fn con_allows(con, name) {
     if con == "" {
         true
@@ -242,10 +272,14 @@ fn con_allows(con, name) {
     }
 }
 
+// 约束文本连接 /
+// Join constraint text
 fn con_join(con, sep) {
     join(con_set(con), sep)
 }
 
+// 合并约束 /
+// Merge constraints
 fn con_merge(a, b) {
     if a == "" {
         b
@@ -281,6 +315,8 @@ fn con_merge(a, b) {
     }
 }
 
+// 类型美化打印 /
+// Pretty-print a type
 fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
     let x = ty_resolve(tk, tr, h)
     if tk[x] == 2 {
@@ -336,12 +372,16 @@ fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
     }
 }
 
+// 单类型美化 /
+// Pretty-print one type
 fn ty_pretty1(tk, tn, ta, tr, h) {
     let mut names = map()
     let mut cnt = [0]
     ty_pretty(tk, tn, ta, tr, h, names, cnt)
 }
 
+// 合一：两个类型句柄合并，失败记 E0308；行变量与 record 逐字段配对 /
+// Unification: merges two type handles, E0308 on mismatch; row vars and records pair field by field
 fn ty_unify(tk, mut tn, ta, mut tr, mut tl, ah, bh) {
     let a = ty_resolve(tk, tr, ah)
     let b = ty_resolve(tk, tr, bh)
@@ -408,6 +448,8 @@ fn ty_unify(tk, mut tn, ta, mut tr, mut tl, ah, bh) {
     "expected `" + ty_pretty1(tk, tn, ta, tr, a) + "`, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
 }
 
+// 泛化：低于阈值的自由变量升级为多态 /
+// Generalize: free variables below the level threshold become polymorphic
 fn ty_generalize_walk(tk, tn, ta, tr, tl, h, level, mut vars, mut seen) {
     let x = ty_resolve(tk, tr, h)
     if tk[x] == 2 {
@@ -431,6 +473,8 @@ fn ty_generalize_walk(tk, tn, ta, tr, tl, h, level, mut vars, mut seen) {
     }
 }
 
+// 实例化：多态方案复制并替换约束变量 /
+// Instantiate: copy a polymorphic scheme, substituting constraint variables
 fn ty_instantiate_cp(mut tk, mut tn, mut ta, mut tr, mut tl, h, subst) {
     let x = ty_resolve(tk, tr, h)
     if tk[x] == 2 {
@@ -454,6 +498,8 @@ fn ty_instantiate_cp(mut tk, mut tn, mut ta, mut tr, mut tl, h, subst) {
     }
 }
 
+// SCC 分组（依赖序）/
+// SCC groups (dependency order)
 fn scc_groups(adj) {
     let n = len(adj)
     let mut sidx = []
@@ -469,6 +515,8 @@ fn scc_groups(adj) {
     let mut stk = []
     let mut counter = 0
     let mut comps = []
+    // SCC 连接（Tarjan）/
+    // SCC connection (Tarjan)
     fn connect(v) {
         sidx[v] = counter
         slow[v] = counter
@@ -511,6 +559,8 @@ fn scc_groups(adj) {
     comps
 }
 
+// record 类型名 /
+// Record type name
 fn rec_type_name(names) {
     let mut s = "@rec"
     for n in names {
@@ -519,6 +569,8 @@ fn rec_type_name(names) {
     s
 }
 
+// 解析 record 字段名 /
+// Parse record field names
 fn rec_parse_names(tname) {
     let mut out = []
     let mut i = 5
@@ -539,10 +591,14 @@ fn rec_parse_names(tname) {
     out
 }
 
+// 脚本类型检查入口 /
+// Script typecheck entry
 pub fn typecheck_script(stmts) {
     typecheck_program([[stmts]], [[""]], false, [""], [[[]]])
 }
 
+// 全程序类型检查：包级两遍注册 + 依赖序 /
+// Whole-program typecheck: two-pass package registration plus dependency order
 pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports) {
     let mut tk = []
     let mut tn = []
@@ -601,18 +657,28 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     lsp_ty_handles = []
     lsp_ty_files = []
 
+    // 新类型变量（带 level）/
+    // Fresh type variable (level-carrying)
     fn fresh(con) {
         ty_new_var(tk, tn, ta, tr, tl, level, con)
     }
+    // 零参具名类型 /
+    // Named type, no args
     fn con0(name) {
         ty_new_con(tk, tn, ta, tr, tl, name, [])
     }
+    // 单参具名类型 /
+    // Named type, one arg
     fn con1(name, a) {
         ty_new_con(tk, tn, ta, tr, tl, name, [a])
     }
+    // 双参具名类型 /
+    // Named type, two args
     fn con2(name, a, b) {
         ty_new_con(tk, tn, ta, tr, tl, name, [a, b])
     }
+    // 函数类型构造 /
+    // Function type constructor
     fn tfn(params, ret) {
         ty_new_fn(tk, tn, ta, tr, tl, params, ret)
     }
@@ -622,14 +688,20 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let h_str = con0("str")
     let h_unit = con0("unit")
 
+    // 多态方案（类型变量表 + 类型）/
+    // Polymorphic scheme (var list + type)
     fn new_scheme(vars, t) {
         push(s_vars, vars)
         push(s_t, t)
         len(s_t) - 1
     }
+    // 单态方案（无自由变量）/
+    // Monomorphic scheme
     fn mono(t) {
         new_scheme([], t)
     }
+    // 实例化方案（复制并替换变量）/
+    // Instantiate a scheme
     fn instantiate(sh) {
         if len(s_vars[sh]) == 0 {
             s_t[sh]
@@ -641,6 +713,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             ty_instantiate_cp(tk, tn, ta, tr, tl, s_t[sh], subst)
         }
     }
+    // 泛化类型（低于阈值的变量多态化）/
+    // Generalize a type
     fn generalize(t) {
         let mut vars = []
         let mut seen = map()
@@ -648,6 +722,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         new_scheme(vars, t)
     }
 
+    // 包内名字 → 限定名（<包>.<名>）/
+    // Package-local name to qualified name
     fn qual_name(name) {
         if cur_pkg == "" {
             name
@@ -656,6 +732,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 错误诊断 /
+    // Error diagnostic
     fn cerr(sp, code, help, msg) {
         match sp {
             Sp(s, e) => {
@@ -664,6 +742,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
         }
     }
+    // 警告诊断 /
+    // Warning diagnostic
     fn cwarn(sp, code, help, msg) {
         match sp {
             Sp(s, e) => {
@@ -672,6 +752,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
         }
     }
+    // 带修复建议的警告 /
+    // Warning with a fix suggestion
     fn cwarn_fix(sp, code, msg, desc, rep) {
         match sp {
             Sp(s, e) => {
@@ -680,18 +762,26 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
         }
     }
+    // 脚本中 pub 报错 /
+    // Error: pub in a script
     fn err_pub_script(sp) {
         cerr(sp, "E0449", "`pub` exports items from a package (a directory with bur.mod); remove it here", "`pub` is not allowed here")
     }
+    // 带位置上下文的合一 /
+    // Unification with a source context
     fn unify_at(a, b, sp, context) {
         let e = ty_unify(tk, tn, ta, tr, tl, a, b)
         if e != "" {
             cerr(sp, "E0308", "", "mismatched types " + context + ": " + e)
         }
     }
+    // 类型句柄 → 可读文本 /
+    // Type handle to readable text
     fn pretty_of(h) {
         ty_pretty1(tk, tn, ta, tr, h)
     }
+    // 深 mut 检查：容器内容需 mut 绑定 /
+    // Deep-mut check: container contents need mut bindings
     fn check_deep_mut(t, fresh, sp, help, msg) {
         let r = ty_resolve(tk, tr, t)
         if tk[r] == 0 {
@@ -709,6 +799,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 登记绑定（变量 + mut 性 + 类别）/
+    // Register a binding (name, mutability, kind)
     fn new_binding(sch, is_mut, kind, sp) {
         push(b_scheme, sch)
         push(b_mut, is_mut)
@@ -724,11 +816,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         put(b_muts, len(b_scheme), [])
         len(b_scheme) - 1
     }
+    // 声明名字（含冲突检查）/
+    // Declare a name (with conflict check)
     fn declare(name, sch, is_mut, kind, sp) {
         let bh = new_binding(sch, is_mut, kind, sp)
         put(scopes[len(scopes) - 1], name, bh)
         bh
     }
+    // 按名字查方案 /
+    // Look up a scheme by name
     fn lookup(name) {
         let mut i = len(scopes) - 1
         while i >= 0 {
@@ -742,12 +838,18 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
         -1
     }
+    // 压入作用域 /
+    // Push a scope
     fn push_scope() {
         push(scopes, map())
     }
+    // _ 前缀名（unused 豁免）/
+    // Underscore-prefixed (unused exemption)
     fn starts_underscore(name) {
         str_len(name) > 0 && char_at(name, 0) == "_"
     }
+    // 弹出作用域 /
+    // Pop a scope
     fn pop_scope() {
         let top = scopes[len(scopes) - 1]
         for name in keys(top) {
@@ -768,6 +870,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         let _ = pop(scopes)
     }
 
+    // 枚举签名（变体表）/
+    // Enum signature (variant table)
     fn enum_sig(name) {
         match get(enum_by_name, qual_name(name)) {
             Some(eh) => eh,
@@ -784,6 +888,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // import 别名解析 /
+    // Import alias resolution
     fn alias_path(name) {
         match get(cur_aliases, name) {
             Some(p) => p,
@@ -791,6 +897,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 跨包枚举查找 /
+    // Cross-package enum lookup
     fn lookup_pkg_enum(pkg, name, sp) {
         let known = match get(pkg_seen, pkg) {
             Some(_) => true,
@@ -817,6 +925,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 包访问推导（限定名解析）/
+    // Infer package access (qualified name)
     fn infer_pkg_access(pkg, name, sp) {
         let known = match get(pkg_seen, pkg) {
             Some(_) => true,
@@ -850,6 +960,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 类型表达式校验（标注处）/
+    // Validate a type expression (annotations)
     fn validate_type_expr(te, pm) {
         match te {
             TEName(pkg, name, constraint, targs, sp) => {
@@ -924,6 +1036,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 注册枚举（两遍：先名字后字段）/
+    // Register an enum (two passes: names, then fields)
     fn register_enum(n) {
         match n {
             EnumDecl(name, params, variants, is_pub, sp) => {
@@ -960,6 +1074,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 校验枚举字段类型 /
+    // Validate enum field types
     fn validate_enum_fields(n) {
         match n {
             EnumDecl(_, params, variants, _, _) => {
@@ -982,6 +1098,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 类型表达式 → 类型句柄 /
+    // Type expression to type handle
     fn convert_type_expr(te, subst, prefix) {
         match te {
             TEName(pkg, name, _, targs, _) => {
@@ -1048,6 +1166,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 收集标注中的行变量（S8.3 语法）/
+    // Collect row vars in annotations
     fn collect_annotation_vars(te, mut subst) {
         match te {
             TEName(pkg, name, constraint, targs, sp) => {
@@ -1102,6 +1222,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 是否为类型表达式节点 /
+    // Is the node a type expression
     fn is_type_expr_node(n) {
         match n {
             TEName(_, _, _, _, _) => true,
@@ -1112,6 +1234,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 类型变量名 /
+    // Interface type variable name
     fn iface_var_name(i) {
         if i < 26 {
             chr(97 + i)
@@ -1120,6 +1244,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 枚举名 /
+    // Interface enum name
     fn iface_enum_name(eh) {
         let prefix = e_prefix[eh]
         if prefix == "" {
@@ -1129,6 +1255,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 类型收集 /
+    // Interface type collection
     fn iface_collect_type(h, mut local_enums, mut external_pkgs) {
         let x = ty_resolve(tk, tr, h)
         if tk[x] == 0 {
@@ -1153,6 +1281,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 类型表达式收集 /
+    // Interface type-expression collection
     fn iface_collect_te(te, mut local_enums, mut external_pkgs) {
         match te {
             TEName(pkg, name, _, targs, _) => {
@@ -1193,6 +1323,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 类型表达式渲染 /
+    // Interface type-expression rendering
     fn iface_render_te(te, aliases) {
         match te {
             TEName(pkg, name, constraint, targs, _) => {
@@ -1240,6 +1372,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 类型渲染 /
+    // Interface type rendering
     fn iface_render_type(h, aliases, mut var_names, mut shown, mut next_var) {
         let x = ty_resolve(tk, tr, h)
         if tk[x] == 2 {
@@ -1299,6 +1433,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // interface 类型上下文（需要哪些名字）/
+    // Interface type context (names needed)
     fn iface_type_context(sh) {
         let mut names = map()
         let mut i = 0
@@ -1309,6 +1445,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         names
     }
 
+    // interface 枚举渲染 /
+    // Interface enum rendering
     fn iface_render_enum(eh, aliases) {
         let mut out = if e_pub[eh] {
             "pub enum "
@@ -1334,6 +1472,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         out + "}"
     }
 
+    // interface 绑定渲染 /
+    // Interface binding rendering
     fn iface_render_binding(name, b, aliases) {
         let sh = b_scheme[b]
         let mut vars = iface_type_context(sh)
@@ -1366,6 +1506,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 生成包 interface 文件 /
+    // Generate a package interface file
     fn render_package_interface(top) {
         let mut local_enums = map()
         let mut external_pkgs = map()
@@ -1443,6 +1585,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         out
     }
 
+    // 枚举实例化（泛型参数替换）/
+    // Enum instantiation (generic substitution)
     fn instantiate_enum(eh, mut subst) {
         let mut cargs = []
         for p in e_params[eh] {
@@ -1453,6 +1597,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         ty_new_con(tk, tn, ta, tr, tl, e_qual[eh], cargs)
     }
 
+    // 变体字段类型 /
+    // Variant field types
     fn variant_type(eh, idx) {
         let mut subst = map()
         let enum_ty = instantiate_enum(eh, subst)
@@ -1468,6 +1614,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 查找变体签名 /
+    // Find a variant signature
     fn find_variant_sig(name) {
         let mut found = -1
         let mut idx = -1
@@ -1499,6 +1647,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 扫描约束变量 /
+    // Scan constraint variables
     fn scan_bound(sc, name) {
         let mut i = len(sc) - 1
         let mut hit = false
@@ -1515,9 +1665,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
         hit
     }
+    // 扫描绑定（名字收集）/
+    // Scan a binding (name collection)
     fn scan_bind(mut sc, name) {
         put(sc[len(sc) - 1], name, true)
     }
+    // 扫描自由变量 /
+    // Scan free variables
     fn scan_free(n, mut sc, mut seen, mut out) {
         match n {
             Ident(name, _) => {
@@ -1669,6 +1823,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 要求 mut 根（深 mut 规则）/
+    // Require a mut root (deep-mut rule)
     fn require_mut_root(e0, what) {
         let mut root = e0
         let mut walking = true
@@ -1730,6 +1886,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     }
     let mut infer_stmt_ref = fn(_s) {}
 
+    // 块语句推导 /
+    // Infer block statements
     fn infer_block_stmts(blk) {
         match blk {
             Block(ss, _) => {
@@ -1741,6 +1899,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 无新作用域的块推导 /
+    // Infer a block without a new scope
     fn infer_block_noscope(blk) {
         match blk {
             Block(ss, _) => {
@@ -1775,6 +1935,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 块表达式推导 /
+    // Infer a block expression
     fn infer_block_expr(blk) {
         push_scope()
         let t = infer_block_noscope(blk)
@@ -1782,6 +1944,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         t
     }
 
+    // let 初始化推导 /
+    // Infer a let initializer
     fn infer_let_init(init) {
         let is_fnlit = match init {
             FnLit(_, _, _, _, _, _, _, _) => true,
@@ -1797,6 +1961,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 调用推导（实参/泛化/未决诊断）/
+    // Infer a call (args, generalization, pending diagnostics)
     fn infer_call(callee, cargs, csp) {
         match callee {
             FieldAccess(obj, mname, _) => {
@@ -1944,6 +2110,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // ? 传播推导 /
+    // Infer try (?) propagation
     fn infer_try(inner, tsp) {
         let t = infer_expr_ref(inner)
         if len(ret_tys) == 0 {
@@ -1982,6 +2150,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // 冲刷延迟的 ? 判定 /
+    // Flush deferred try decisions
     fn flush_tries() {
         let mut done = []
         let mut i = 0
@@ -2036,6 +2206,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         pt_file = []
     }
 
+    // 冲刷延迟的深 mut 判定 /
+    // Flush deferred deep-mut decisions
     fn flush_deep_mut() {
         let mut i = 0
         while i < len(dm_type) {
@@ -2058,6 +2230,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         dm_file = []
     }
 
+    // match 推导（穷尽性 + 臂类型合一）/
+    // Infer a match (exhaustiveness + arm unification)
     fn infer_match(scrut, arms, msp) {
         let scrut_t = infer_expr_ref(scrut)
         let res_t = fresh("")
@@ -2279,6 +2453,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         res_t
     }
 
+    // 表达式推导（核心分派）/
+    // Infer an expression (core dispatch)
     fn infer_expr(e) {
         let h = match e {
             IntLit(_, _) => h_int,
@@ -2605,6 +2781,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     }
     infer_expr_ref = infer_expr
 
+    // 语句推导 /
+    // Infer a statement
     fn infer_stmt(s) {
         match s {
             LetStmt(name, nsp, is_mut, is_pub, ty, init, ssp) => {
@@ -2852,9 +3030,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     push_scope()
 
+    // 类型表达式句柄（标注解析处）/
+    // Type-expression handle (annotation parsing)
     fn te(name) {
         TEName("", name, "", [], Sp(0, 0))
     }
+    // 内建枚举（Option/Result 等）/
+    // Builtin enums (Option, Result, ...)
     fn builtin_enum(name, params, vnames, vfieldss) {
         let mut vhs = []
         let mut i = 0
@@ -2875,9 +3057,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     builtin_enum("Result", ["a", "e"], ["Ok", "Err"], [[te("a")], [te("e")]])
     builtin_enum("Output", [], ["Output"], [[te("int"), te("str"), te("str")]])
 
+    // 约束类型变量 /
+    // Constrained type variable
     fn qvar(con) {
         ty_new_var(tk, tn, ta, tr, tl, 1, con)
     }
+    // 声明 native（类型签名表）/
+    // Declare a native (signature table)
     fn decl_native(name, sch) {
         let _ = declare(name, sch, false, "native", Sp(0, 0))
     }
@@ -3342,6 +3528,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     lib::CheckOut::Checked(sorted_diags, sorted_files, bind_lines, chan_fors, interface_sources)
 }
 
+// 诊断起点 /
+// Diagnostic start
 fn diag_start(d) {
     match d {
         lib::DiagT::Diag(_, _, _, _, s, _) => s,
@@ -3349,6 +3537,8 @@ fn diag_start(d) {
     }
 }
 
+// 双键排序 /
+// Two-key sort
 fn sort_order2(ranks, starts) {
     let n = len(ranks)
     let mut taken = []
@@ -3377,6 +3567,8 @@ fn sort_order2(ranks, starts) {
     out
 }
 
+// 字符串排序 /
+// Sort strings
 fn sort_strs(xs) {
     let n = len(xs)
     let mut taken = []
