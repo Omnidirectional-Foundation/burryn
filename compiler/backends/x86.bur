@@ -2950,6 +2950,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             }
         }
 
+        // 函数序言后逐指令发射；深度图驱动影子栈裁剪
+        // After the prologue, emit instruction by instruction; depth maps drive shadow-stack truncation
         w(x86gen_prologue(arity, locals))
         let dm = p_depth_maps[nfn - 1 - fh]
         let mut ip = 0
@@ -2970,6 +2972,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             emit_inst(ip)
             ip = ip + inst_len(fh, code, ip)
         }
+        // 跳转补丁：回填 rel32 偏移（字节位置差）
+        // Patch jumps: fill in rel32 offsets (byte-position deltas)
         let mut fbytes = join(out, "")
         let mut pi = 0
         while pi < len(patches) {
@@ -2988,12 +2992,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         fh = fh + 1
     }
 
+    // 跳转表：每个函数一个入口地址，供闭包按 fn 索引调用
+    // Jump table: one entry per function, closures call by fn index
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
         jt_bytes = jt_bytes + e8(base_addr + 120 + const_data_len + func_offsets[jh])
         jh = jh + 1
     }
+    // 布局：常量区 + 函数体 + 跳转表 + _start，装配 ELF
+    // Layout: constants + function bodies + jump table + _start, then assemble the ELF
     let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn, n_globals)
     emit_elf(const_data + funcs_bytes + jt_bytes + start_bytes, start_off)
