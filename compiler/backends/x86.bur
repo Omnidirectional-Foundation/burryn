@@ -589,7 +589,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "args" || name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
+    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -672,10 +672,12 @@ fn x86gen_list_format_at(off, is_str) {
     let sep1_bytes = add_ri32(rcx, 2)
     let sep1 = test_rr(r11, r11) + je_rel32(str_len(sep1_bytes)) + sep1_bytes
     let next1_wo = add_ri32(r11, 1)
+    let int1_neg = add_ri32(rcx, 1) + neg_r(rax)
+    let int1_head = test_rr(rax, rax) + jge_rel32(str_len(int1_neg))
     let tail1 = if is_str {
         str1
     } else {
-        int1 + int1_loop + int1_loop_jne + int1_add
+        int1 + int1_head + int1_neg + int1_loop + int1_loop_jne + int1_add
     }
     let test1 = cmp_rr(r11, r8) + jae_rel32(str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5)
     let next1 = next1_wo + jmp_rel32(0 - (str_len(test1) + str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5))
@@ -685,7 +687,9 @@ fn x86gen_list_format_at(off, is_str) {
     let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
     let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
     let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
-    let int2 = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    let int2_neg = mb(45) + add_ri32(rdi, 1) + neg_r(rax)
+    let int2_head = test_rr(rax, rax) + jge_rel32(str_len(int2_neg))
+    let int2 = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + int2_head + int2_neg + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
     let str2 = mb(34) + add_ri32(rdi, 1) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rcx, rdx, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
     let e2_load = mov_rr(rsi, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r10) + mov_rm(rdx, rsi, 0)
     let sep2_bytes = mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
@@ -835,6 +839,23 @@ fn x86gen_str_find_native(as_option) {
 // map() inline: empty map
 fn x86gen_map_native() {
     mov_rr(r11, r12) + xor_rr(rdx, rdx) + mov_mr(r11, 0, rdx) + mov_mr(r11, 8, rdx) + mov_mr(r11, 16, rdx) + mov_mr(r11, 24, rdx) + add_ri32(r12, 32) + mov_mr(r15, 0 - 8, r11)
+}
+
+// x86gen_args_native 内联 args：读启动栈 argv，构造 str 列表（排除 argv[0]）
+// x86gen_args_native inlines args: read argv from the startup stack, build a string list (excluding argv[0])
+// args inline: read argv from the startup stack (excluding argv[0])
+fn x86gen_args_native() {
+    let head = mov_rm(rax, rbx, 0 - 8) + mov_rm(r8, rax, 0) + sub_ri32(r8, 1) + mov_rr(r11, r12) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, r8) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rcx, r8) + xor_rr(r9, r9) + add_ri32(r9, 3) + shl_rcl(rcx) + add_ri32(rcx, 24) + add_rr(r12, rcx) + xor_rr(rdx, rdx)
+    let load = mov_rr(rsi, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, rax) + add_ri32(rsi, 16) + mov_rm(rsi, rsi, 0)
+    let sl_test = e1(128) + e1(62) + e1(0)
+    let sl_yes = add_ri32(rsi, 1) + add_ri32(r9, 1)
+    let sl_je = je_rel32(str_len(sl_yes) + 5)
+    let sl_loop = sl_test + sl_je + sl_yes + jmp_rel32(0 - (str_len(sl_test) + str_len(sl_je) + str_len(sl_yes) + 5))
+    let mkstr = sub_rr(rsi, r9) + mov_rr(rcx, r12) + mov_mr(rcx, 0, r9) + lea(rdi, rcx, 8) + add_rr(r12, r9) + add_ri32(r12, 8) + mov_mr(r10, 0, rcx) + add_ri32(r10, 8) + mov_rr(rcx, r9) + rep_movsb()
+    let body = load + xor_rr(r9, r9) + sl_loop + mkstr + add_ri32(rdx, 1)
+    let test = cmp_rr(rdx, r8) + jae_rel32(str_len(body) + 5)
+    let back = jmp_rel32(0 - (str_len(test) + str_len(body) + 5))
+    head + test + body + back + mov_mr(r15, 0 - 8, r11)
 }
 
 // x86gen_get_map_native 内联 get：按键查 map / x86gen_get_map_native inlines get: look up a map key
@@ -1085,7 +1106,7 @@ fn x86gen_range_native() {
 // x86gen_start emits _start: mmap the heap, set the register conventions, call main
 // _start: mmap the heap, set register conventions, call main
 fn x86gen_start(nfn, n_globals) {
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
 }
 
 // x86gen_program_to_buf 是 x86 后端入口：字节码表 → x86-64 ELF 二进制字节
@@ -2598,6 +2619,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         w(x86gen_bool_convert_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     } else if str_arg_t == "str" {
                         w(mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    } else if str_arg_t == "unit" {
+                        w(x86gen_unit_convert_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    } else if str_arg_t == "list-str" {
+                        w(x86gen_list_format_at(0 - 8, true) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    } else if str_arg_t == "list-int" {
+                        w(x86gen_list_format_at(0 - 8, false) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     } else {
                         w(x86gen_str_native())
                     }
@@ -2651,6 +2678,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "map" {
                     w(x86gen_map_native())
                     ret_type = "map"
+                } else if callee == "args" {
+                    w(x86gen_args_native())
+                    ret_type = "list-str"
                 } else if callee == "get" || callee == "put" || callee == "delete" {
                     let m_t = type_shadow[len(type_shadow) - n]
                     let k_t = if n >= 2 {
