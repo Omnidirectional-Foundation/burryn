@@ -18,6 +18,26 @@ let mut lsp_arena_tn = []
 let mut lsp_arena_ta = []
 let mut lsp_arena_tr = []
 
+// LSP go-to-definition：记录每个名字使用区间与其定义位置（跨文件），供按文件+偏移查询
+// Go-to-definition support: record each name use span and its definition location (cross-file), queried by file + offset
+let mut lsp_def_starts = []
+let mut lsp_def_ends = []
+let mut lsp_def_files = []
+let mut lsp_def_toffs = []
+let mut lsp_def_tfiles = []
+
+// record 字段定义表：字段名 → 最近一次 record 字面量/更新的位置（结构类型无唯一声明点）
+// Record field definitions: field name → position of the most recent record literal/update
+let mut rec_field_keys = []
+let mut rec_field_offs = []
+let mut rec_field_files = []
+
+// import 定义表：有效别名 → import 语句位置
+// Import definitions: effective alias → import statement location
+let mut imp_keys = []
+let mut imp_offs = []
+let mut imp_files = []
+
 // lsp_record_type 记录表达式的推断类型（供 hover 查询）/
 // lsp_record_type records an expression type (for hover)
 fn lsp_record_type(sp, h, file) {
@@ -56,6 +76,38 @@ pub fn lsp_type_at(file, offset) {
 // lsp_set_recording 开关类型记录 / lsp_set_recording toggles type recording
 pub fn lsp_set_recording(b: bool) {
     lsp_recording = b
+}
+
+// lsp_record_def 记录一个名字使用区间及其定义位置 / lsp_record_def records a use span and its definition location
+fn lsp_record_def(s, e, file, toff, tfile) {
+    push(lsp_def_starts, s)
+    push(lsp_def_ends, e)
+    push(lsp_def_files, file)
+    push(lsp_def_toffs, toff)
+    push(lsp_def_tfiles, tfile)
+}
+
+// lsp_def_at 按文件与偏移查询定义位置，返回 Some((偏移, 文件))，未命中返回 None
+// lsp_def_at looks up a definition by file and offset, returning Some((offset, file)) or None
+pub fn lsp_def_at(file, offset) {
+    let mut best = -1
+    let mut best_len = -1
+    let mut i = 0
+    while i < len(lsp_def_starts) {
+        if lsp_def_files[i] == file && offset >= lsp_def_starts[i] && offset < lsp_def_ends[i] {
+            let span_len = lsp_def_ends[i] - lsp_def_starts[i]
+            if best < 0 || span_len < best_len {
+                best = i
+                best_len = span_len
+            }
+        }
+        i = i + 1
+    }
+    if best < 0 {
+        None
+    } else {
+        Some((lsp_def_toffs[best], lsp_def_tfiles[best]))
+    }
 }
 
 // ty_new_con 构造命名类型（list/map/Option 等构造器）/ ty_new_con builds a fresh named type (list/map/Option constructors)
@@ -367,6 +419,8 @@ fn ty_pretty1(tk, tn, ta, tr, h) {
 
 // ty_unify 合并两个类型句柄，不匹配报 E0308；行变量与 record 逐字段配对
 // ty_unify merges two type handles, E0308 on mismatch; row vars and records pair field by field
+// ty_unify 先解引用两侧，再按类型形态分派合并
+// ty_unify resolves both sides, then merges by type kind
 fn ty_unify(tk, mut tn, ta, mut tr, mut tl, ah, bh) {
     // 先解析指针链（可能 a == b，同句柄直接成功）/
     // Resolve pointer chains first (a == b short-circuits)
@@ -546,6 +600,13 @@ fn scc_groups(adj) {
     comps
 }
 
+// sp_start 取区间起点偏移 / sp_start returns a span's start offset
+fn sp_start(sp) {
+    match sp {
+        Sp(s, _) => s,
+    }
+}
+
 // rec_type_name 取 record 类型名字 / rec_type_name extracts the record type name
 fn rec_type_name(names) {
     let mut s = "@rec"
@@ -607,6 +668,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut enum_by_name = map()
     let mut v_name = []
     let mut v_fields = []
+    let mut v_span = []
+    let mut v_file = []
     let mut scopes = []
     let mut level = 0
     let mut ret_tys = []
@@ -640,6 +703,52 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     lsp_ty_ends = []
     lsp_ty_handles = []
     lsp_ty_files = []
+    lsp_def_starts = []
+    lsp_def_ends = []
+    lsp_def_files = []
+    lsp_def_toffs = []
+    lsp_def_tfiles = []
+    rec_field_keys = []
+    rec_field_offs = []
+    rec_field_files = []
+    imp_keys = []
+    imp_offs = []
+    imp_files = []
+
+    // record_pkg_use 记录包名区间到 import 语句定义（pkg.name 的前半段）/
+    // record_pkg_use records the package-name segment of a pkg.name use to its import statement
+    fn record_pkg_use(sp, pkg, cfile) {
+        let mut di = len(imp_keys) - 1
+        let mut dh = -1
+        while di >= 0 {
+            if imp_keys[di] == pkg {
+                dh = di
+            }
+            di = di - 1
+        }
+        if dh >= 0 {
+            match sp {
+                Sp(us, ue) => {
+                    let pkg_end = us + str_len(pkg)
+                    if pkg_end <= ue {
+                        lsp_record_def(us, pkg_end, cfile, imp_offs[dh], imp_files[dh])
+                    }
+                },
+            }
+        }
+    }
+    // rec_field_def_at 按字段名查 record 字段定义（最近字面量），未命中返回 -1
+    // rec_field_def_at looks up a record field definition by name (most recent literal), -1 when absent
+    fn rec_field_def_at(field) {
+        let mut di = len(rec_field_keys) - 1
+        while di >= 0 {
+            if rec_field_keys[di] == field {
+                return di
+            }
+            di = di - 1
+        }
+        -1
+    }
 
     // fresh 构造带级别的类型变量 / fresh builds a level-carrying type variable
     fn fresh(con) {
@@ -887,7 +996,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     }
 
     // infer_pkg_access 推断包访问（限定名）/ infer_pkg_access infers package access (qualified name)
-    fn infer_pkg_access(pkg, name, sp) {
+    fn infer_pkg_access(pkg, name, sp, alias_len) {
         let known = match get(pkg_seen, pkg) {
             Some(_) => true,
             None => false,
@@ -902,6 +1011,18 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         cerr(sp, "E0603", "mark it `pub` in package `" + pkg + "` to export it", "`" + name + "` is private to package `" + pkg + "`")
                     }
                     b_used[b] = true
+                    if lsp_recording {
+                        match sp {
+                            Sp(us, ue) => match b_span[b] {
+                                Sp(ds, _) => {
+                                    let name_start = us + alias_len + 1
+                                    if name_start <= ue {
+                                        lsp_record_def(name_start, ue, cur_file, ds, b_file[b])
+                                    }
+                                },
+                            },
+                        }
+                    }
                     instantiate(b_scheme[b])
                 },
                 None => {
@@ -1012,9 +1133,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     let mut vhs = []
                     for vd in variants {
                         match vd {
-                            EnumVariantDecl(vn, _, vtypes, _) => {
+                            EnumVariantDecl(vn, _, vtypes, vsp) => {
                                 push(v_name, vn)
                                 push(v_fields, vtypes)
+                                push(v_span, vsp)
+                                push(v_file, cur_file)
                                 push(vhs, len(v_name) - 1)
                             },
                             _ => {},
@@ -1612,7 +1735,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         put(sc[len(sc) - 1], name, true)
     }
     // scan_free 扫描自由变量 / scan_free scans free variables
+    // scan_free 收集表达式中自由变量的绑定句柄（泛化前用）
+    // scan_free collects the free-variable bindings of an expression (used before generalization)
     fn scan_free(n, mut sc, mut seen, mut out) {
+        // 自由变量收集：绑定命中且未被遮蔽则入 out，seen 防重复
+        // Free-variable collection: bindings not shadowed join out; seen prevents duplicates
         match n {
             Ident(name, _) => {
                 if !scan_bound(sc, name) {
@@ -1676,6 +1803,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     scan_free(a, sc, seen, out)
                 }
             },
+            // 列表字面量：所有元素合一成元素类型
+            // List literals: unify all elements into the element type
             ListLit(elems, _) => {
                 for a in elems {
                     scan_free(a, sc, seen, out)
@@ -1898,7 +2027,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     // infer_call 推断调用（实参、泛化、挂起诊断）/
     // infer_call infers a call (args, generalization, pending diagnostics)
+    // infer_call 解析被调者（名字/包成员/方法），参数逐一推断后合一
+    // infer_call resolves the callee (name/package member/method), infers args, then unifies
     fn infer_call(callee, cargs, csp) {
+        // 先探方法调用（receiver.mname），再按名字/包成员解析被调者
+        // Method calls (receiver.mname) first, then resolve by name or package member
         match callee {
             FieldAccess(obj, mname, _) => {
                 let ot = infer_expr_ref(obj)
@@ -1977,6 +2110,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
             _ => -1,
         }
+        // 可变容器操作：第一实参需可 mut 别名
+        // Mutable container ops: the first argument must alias mutably
         if (callee_name == "push" || callee_name == "pop" || callee_name == "put" || callee_name == "delete") && len(cargs) > 0 {
             let b = lookup(callee_name)
             if b >= 0 && b_kind[b] == "native" {
@@ -2164,15 +2299,23 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     // infer_match 推断 match（穷尽性 + 臂合一）/
     // infer_match infers a match (exhaustiveness + arm unification)
+    // infer_match 推断 scrutinee，逐臂模式绑定 + 体合一，末了检查穷尽性
+    // infer_match infers the scrutinee, binds patterns per arm, unifies bodies, then checks exhaustiveness
     fn infer_match(scrut, arms, msp) {
+        // 先推断 scrutinee，模式分析决定每臂绑定与覆盖集合
+        // Infer the scrutinee first; pattern analysis decides per-arm bindings and coverage
         let scrut_t = infer_expr_ref(scrut)
         let res_t = fresh("")
+        // covered 记录已覆盖的变体，穷尽性检查用它判漏
+        // covered tracks handled variants; the exhaustiveness check looks for gaps
         let mut covered = map()
         let mut has_catch_all = false
 
         for arm in arms {
             match arm {
                 MatchArm(pat, guard, body, _) => {
+                    // 逐臂：模式绑定入作用域，guard 为 bool，体与整体合一
+                    // Per arm: pattern bindings enter scope, guard is bool, the body unifies with the match type
                     push_scope()
                     let unguarded = match guard {
                         NoNode => true,
@@ -2392,6 +2535,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             FloatLit(_, _) => h_float,
             StrLit(_, _) => h_str,
             BoolLit(_, _) => h_bool,
+            // 名字解析：局部/全局绑定命中则实例化，未命中尝试裸变体
+            // Names: instantiate on binding hit, else try a bare variant
             Ident(name, isp) => {
                 let b = lookup(name)
                 if b >= 0 {
@@ -2399,6 +2544,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         assert(b_ready[b], "internal: `" + name + "` used before its inference group")
                     }
                     b_used[b] = true
+                    if lsp_recording {
+                        match isp {
+                            Sp(us, ue) => match b_span[b] {
+                                Sp(ds, _) => lsp_record_def(us, ue, cur_file, ds, b_file[b]),
+                            },
+                        }
+                    }
                     instantiate(b_scheme[b])
                 } else {
                     let fv = find_variant_sig(name)
@@ -2406,6 +2558,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         cerr(isp, "E0659", "qualify it, e.g. `SomeEnum." + name + "`", "`" + name + "` is a variant of several enums")
                         fresh("")
                     } else if fv[1] >= 0 {
+                        if lsp_recording {
+                            let vh = e_variants[fv[0]][fv[1]]
+                            match isp {
+                                Sp(us, ue) => match v_span[vh] {
+                                    Sp(ds, _) => lsp_record_def(us, ue, cur_file, ds, v_file[vh]),
+                                },
+                            }
+                        }
                         variant_type(fv[0], fv[1])
                     } else {
                         cerr(isp, "E0425", "", "cannot find `" + name + "` in this scope")
@@ -2413,10 +2573,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     }
                 }
             },
+            // 变体访问：包内枚举的变体名
+            // Variants: a variant of a local enum
             VariantAccess(en, vr, vsp) => {
                 let apath = alias_path(en)
                 if apath != "" {
-                    infer_pkg_access(apath, vr, vsp)
+                    if lsp_recording {
+                        record_pkg_use(vsp, en, cur_file)
+                    }
+                    infer_pkg_access(apath, vr, vsp, str_len(en))
                 } else {
                     let seh = enum_sig(en)
                     match if seh >= 0 {
@@ -2434,6 +2599,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                 i = i + 1
                             }
                             if idx >= 0 {
+                                if lsp_recording {
+                                    let vh = e_variants[eh][idx]
+                                    match vsp {
+                                        Sp(us, ue) => match v_span[vh] {
+                                            Sp(ds, _) => lsp_record_def(us, ue, cur_file, ds, v_file[vh]),
+                                        },
+                                    }
+                                }
                                 variant_type(eh, idx)
                             } else {
                                 cerr(vsp, "E0599", "", "enum `" + en + "` has no variant `" + vr + "`")
@@ -2447,13 +2620,21 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     }
                 }
             },
-            PkgAccess(pkg, name, psp) => infer_pkg_access(pkg, name, psp),
+            PkgAccess(pkg, name, psp) => {
+                if lsp_recording {
+                    record_pkg_use(psp, pkg, cur_file)
+                }
+                infer_pkg_access(pkg, name, psp, str_len(pkg))
+            },
             QualVariantAccess(pkg, en, vr, qsp) => {
                 let apath = alias_path(pkg)
                 if apath == "" {
                     cerr(qsp, "E0433", "", "cannot find package `" + pkg + "`")
                     fresh("")
                 } else {
+                    if lsp_recording {
+                        record_pkg_use(qsp, pkg, cur_file)
+                    }
                     let eh = lookup_pkg_enum(apath, en, qsp)
                     if eh < 0 {
                         fresh("")
@@ -2467,6 +2648,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                             i = i + 1
                         }
                         if idx >= 0 {
+                            if lsp_recording {
+                                let vh = e_variants[eh][idx]
+                                match qsp {
+                                    Sp(us, ue) => match v_span[vh] {
+                                        Sp(ds, _) => lsp_record_def(us, ue, cur_file, ds, v_file[vh]),
+                                    },
+                                }
+                            }
                             variant_type(eh, idx)
                         } else {
                             cerr(qsp, "E0599", "", "enum `" + en + "` has no variant `" + vr + "`")
@@ -2475,6 +2664,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     }
                 }
             },
+            // 一元：- 约束数字、! 约束 bool
+            // Unary: - constrains to a number, ! to bool
             Unary(op, rhs, usp) => {
                 let t = infer_expr(rhs)
                 if op == t_minus {
@@ -2485,6 +2676,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     h_bool
                 }
             },
+            // 二元：+ 可拼字符串，算术约束数字，比较/逻辑约束 bool
+            // Binary: + may concat strings, arithmetic needs numbers, comparisons/logic need bools
             Binary(op, lhs, rhs, bsp) => {
                 let lt = infer_expr(lhs)
                 let rt = infer_expr(rhs)
@@ -2519,6 +2712,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 h_bool
             },
             Call(callee, cargs, csp) => infer_call(callee, cargs, csp),
+            // 索引：target 必须能索引（list/str/map 键），类型由目标决定
+            // Indexing: the target must be indexable; the result type follows the target
             Index(target, idx, _) => {
                 let el = fresh("")
                 let tt = infer_expr(target)
@@ -2565,6 +2760,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 ty_new_con(tk, tn, ta, tr, tl, "@tup", ets)
             },
+            // 函数字面量：参数入作用域，返回类型与体合一
+            // Function literals: parameters enter scope, return type unifies with the body
             FnLit(params, muts, pspans, param_tys, ret_ty, body, _, _) => {
                 push_scope()
                 let mut annotation_vars = map()
@@ -2617,6 +2814,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 pop_scope()
                 t
             },
+            // if：条件约束 bool，两分支合一（无 else 时 unit）
+            // If: the condition is bool, both branches unify (unit without else)
             IfExpr(cond, then, els, _) => {
                 let ct = infer_expr(cond)
                 unify_at(ct, h_bool, span_of(cond), "in this `if` condition")
@@ -2642,7 +2841,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 unify_at(ct, con1("chan", el), rsp, "with `<-` (need a channel)")
                 el
             },
-            RecordLit(names, vals, _) => {
+            RecordLit(names, vals, rsp) => {
                 let mut field_types = []
                 let mut i = 0
                 while i < len(names) {
@@ -2650,10 +2849,36 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     push(field_types, ft)
                     i = i + 1
                 }
+                if lsp_recording {
+                    match rsp {
+                        Sp(rs, _) => {
+                            let mut ri = 0
+                            while ri < len(names) {
+                                push(rec_field_keys, names[ri])
+                                push(rec_field_offs, rs)
+                                push(rec_field_files, cur_file)
+                                ri = ri + 1
+                            }
+                        },
+                    }
+                }
                 ty_new_con(tk, tn, ta, tr, tl, rec_type_name(names), field_types)
             },
-            RecordUpdate(base, names, vals, _) => {
+            RecordUpdate(base, names, vals, usp) => {
                 let bt = infer_expr(base)
+                if lsp_recording {
+                    match usp {
+                        Sp(us, _) => {
+                            let mut ri = 0
+                            while ri < len(names) {
+                                push(rec_field_keys, names[ri])
+                                push(rec_field_offs, us)
+                                push(rec_field_files, cur_file)
+                                ri = ri + 1
+                            }
+                        },
+                    }
+                }
                 let mut i = 0
                 while i < len(names) {
                     let ft = infer_expr(vals[i])
@@ -2679,6 +2904,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             },
             FieldAccess(base, field, fsp) => {
                 let bt = infer_expr(base)
+                if lsp_recording {
+                    let dh = rec_field_def_at(field)
+                    if dh >= 0 {
+                        match fsp {
+                            Sp(us, ue) => lsp_record_def(us, ue, cur_file, rec_field_offs[dh], rec_field_files[dh]),
+                        }
+                    }
+                }
                 let resolved = ty_resolve(tk, tr, bt)
                 if tk[resolved] == 0 && str_len(tn[resolved]) > 4 && substr(tn[resolved], 0, 4) == "@rec" {
                     let fnames = rec_parse_names(tn[resolved])
@@ -2714,6 +2947,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
     // infer_stmt 推断语句 / infer_stmt infers a statement
     fn infer_stmt(s) {
+        // 语句推断：声明入作用域，表达式语句检查 must_use
+        // Statement inference: declarations enter scope, expression statements check must_use
         match s {
             LetStmt(name, nsp, is_mut, is_pub, ty, init, ssp) => {
                 if is_pub {
@@ -2971,6 +3206,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         while i < len(vnames) {
             push(v_name, vnames[i])
             push(v_fields, vfieldss[i])
+            push(v_span, Sp(0, 0))
+            push(v_file, cur_file)
             push(vhs, len(v_name) - 1)
             i = i + 1
         }
@@ -3084,6 +3321,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     b_special[bc1] = "chan"
 
     let n_pkgs = len(pkgs_stmts)
+    // 扁平文件表：诊断按文件过滤的索引
+    // Flat file table: index for diagnostics filtered by file
     let mut flat_files = []
     let mut pi = 0
     while pi < n_pkgs {
@@ -3092,10 +3331,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
         pi = pi + 1
     }
+    // 依赖分组：按引用关系做 SCC，函数组内相互递归
+    // Dependency grouping: SCC over references, functions in a group may recurse mutually
     let mut bind_names = []
     let mut bind_by = map()
     let mut interface_sources = []
 
+    // 第一遍：逐包注册枚举（先名字后字段）与函数/全局签名
+    // Pass 1: per package, register enums (names then fields) and fn/global signatures
     pi = 0
     while pi < n_pkgs {
         cur_pkg = pkg_paths[pi]
@@ -3112,6 +3355,26 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         while fi < n_files {
             cur_file = file_paths[fi]
             cur_aliases = aliases_of(file_imports[fi])
+            // import 语句由 module 层收集进 file_imports，这里登记别名 → 语句位置
+            // Imports live in file_imports (module layer); register alias → statement position here
+            for imp in file_imports[fi] {
+                match imp {
+                    ImportDecl(alias, asp, path, _, isp) => {
+                        let al = import_alias(alias, path)
+                        let dsp = match asp {
+                            Sp(s, _) => if s == 0 {
+                                isp
+                            } else {
+                                asp
+                            },
+                        }
+                        push(imp_keys, al)
+                        push(imp_offs, sp_start(dsp))
+                        push(imp_files, cur_file)
+                    },
+                    _ => {},
+                }
+            }
             for s in files_stmts[fi] {
                 match s {
                     EnumDecl(_, _, _, _, _) => {
@@ -3132,6 +3395,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             validate_enum_fields(reg_decls[ri])
             ri = ri + 1
         }
+        // 预声明：函数与 let 先用占位类型注册，供相互引用
+        // Pre-declare: functions and lets register with placeholder types for mutual references
         let mut pre = map()
         let mut fnames = []
         let mut fname_idx = map()
@@ -3390,6 +3655,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             }
         }
         push(interface_sources, render_package_interface(top))
+        // 第二遍：逐组推断表达式类型（依赖顺序内），类型记录供 LSP
+        // Pass 2: infer expression types group by group (dependency order); type recording feeds the LSP
         put(pkg_seen, cur_pkg, true)
         let _ = pop(scopes)
         cur_aliases = map()

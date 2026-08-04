@@ -448,7 +448,7 @@ fn lsp_handle_initialize(id, params) {
             module::lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.4.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.4.0")])]))
 }
 
 // lsp_handle_did_open 处理 didOpen / lsp_handle_did_open handles didOpen
@@ -510,6 +510,42 @@ fn lsp_handle_hover(id, params) {
     }
 }
 
+// lsp_handle_definition 处理 go-to-definition / lsp_handle_definition handles textDocument/definition
+fn lsp_handle_definition(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match module::lsp_doc_get(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    match frontend::lsp_def_at(path, offset) {
+        Some(t) => {
+            let (doff, dfile) = t
+            let dpath = dfile
+            let dstarts = lsp_line_starts_for(dpath, [], [])
+            let dpos = lsp_offset_to_pos(dstarts, doff)
+            lsp_respond(id, jobj(["uri", "range"], [json::Json::JStr(lsp_path_to_uri(dpath)), jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(dpos[0]), json::Json::JInt(dpos[1])]), jobj(["line", "character"], [json::Json::JInt(dpos[0]), json::Json::JInt(dpos[1])])])]))
+        },
+        None => {
+            lsp_respond(id, json::Json::JNull)
+        },
+    }
+}
+
 // lsp_serve 是 LSP 主循环 / lsp_serve is the LSP main loop
 pub fn lsp_serve() {
     let mut shutdown_requested = false
@@ -546,6 +582,8 @@ pub fn lsp_serve() {
                     lsp_handle_did_close(params)
                 } else if method == "textDocument/hover" {
                     lsp_handle_hover(id, params)
+                } else if method == "textDocument/definition" {
+                    lsp_handle_definition(id, params)
                 } else if has_id {
                     lsp_write_message(jobj(["jsonrpc", "id", "error"], [json::Json::JStr("2.0"), id, jobj(["code", "message"], [json::Json::JInt(-32601), json::Json::JStr("Method not found")])]))
                 }
