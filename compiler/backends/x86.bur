@@ -1481,6 +1481,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             pnew
         } else if is_map_type(pcur) && is_map_type(pnew) {
             refine_map_arg(pcur, map_key_type(pnew), map_val_type(pnew))
+        } else if pnew == "" {
+            pcur
         } else {
             pnew
         }
@@ -1772,6 +1774,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         phAlloc = phAlloc + 1
     }
     let mut p_depth_maps = []
+    let mut pglobal_type = map()
     let mut round = 0
     while round < 4 {
         let mut pti = nfn
@@ -1855,8 +1858,20 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let pidx = read_u16(pcode, pit + 1)
                     let pname = const_str(ptfh, pidx)
                     push(pshadow_ps, pname)
-                    push(ptshadow_ps, "int")
+                    let pgtype = match get(pglobal_type, pname) {
+                        Some(pt) => pt,
+                        None => "int",
+                    }
+                    push(ptshadow_ps, pgtype)
                 } else if pop == lib::op_set_global {} else if pop == lib::op_def_global {
+                    let pdt = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
+                    let pdidx = read_u16(pcode, pit + 1)
+                    let pdname = const_str(ptfh, pdidx)
+                    put(pglobal_type, pdname, pdt)
                     shadow_pop(pshadow_ps, 1)
                     shadow_pop(ptshadow_ps, 1)
                 } else if pop == lib::op_pop {
@@ -1965,6 +1980,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 },
                                 None => {},
                             }
+                        } else if str_len(mslot) > 0 {
+                            let pg_cur = match get(pglobal_type, mslot) {
+                                Some(pgt) => pgt,
+                                None => "",
+                            }
+                            put(pglobal_type, mslot, merge_type(pg_cur, refined))
                         }
                         push(pshadow_ps, "")
                         if pcallee == "get" {
@@ -2974,15 +2995,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         ret_type = "unit"
                     }
                     let msh = shadow[len(shadow) - n]
+                    let refined = if callee == "put" {
+                        refine_map_arg(m_t, k_t, v_t)
+                    } else {
+                        refine_map_arg(m_t, k_t, "")
+                    }
                     if str_len(msh) > 5 && substr(msh, 0, 5) == "slot:" {
                         match parse_int(substr(msh, 5, str_len(msh) - 5)) {
                             Some(sn) => {
                                 if sn > 0 {
-                                    let refined = if callee == "put" {
-                                        refine_map_arg(m_t, k_t, v_t)
-                                    } else {
-                                        refine_map_arg(m_t, k_t, "")
-                                    }
                                     if len(pos_types) <= sn {
                                         while len(pos_types) <= sn {
                                             push(pos_types, "")
@@ -2993,6 +3014,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             },
                             None => {},
                         }
+                    } else if str_len(msh) > 0 {
+                        put(global_type, msh, merge_type(m_t, refined))
                     }
                 } else if callee == "keys" {
                     let k_t = type_shadow[len(type_shadow) - n]
