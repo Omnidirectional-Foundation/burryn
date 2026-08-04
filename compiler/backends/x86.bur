@@ -589,7 +589,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_stdin" || name == "recv" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "yield" || name == "chan"
+    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "recv" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "yield" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -918,6 +918,17 @@ fn x86gen_sleep_native() {
     let unit_ret = xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
     let timespec = sub_ri32(rsp, 16) + mov_rr(rax, r9) + xor_rr(rdx, rdx) + mov_ri64(rcx, 1000) + div_r(rcx) + mov_mr(rsp, 0, rax) + mov_ri64(rcx, 1000000) + imul_rr(rdx, rcx) + mov_mr(rsp, 8, rdx) + mov_rr(rdi, rsp) + xor_rr(rsi, rsi) + sys_mov_rax(35) + syscall() + add_ri32(rsp, 16)
     let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(timespec)) + timespec + unit_ret
+    head
+}
+
+// x86gen_read_stdin_native 内联 read_stdin：read syscall，同步阻塞读 stdin 为 str
+// x86gen_read_stdin_native inlines read_stdin: a synchronous read syscall into a str
+// read_stdin inline: synchronous read of stdin into a str
+fn x86gen_read_stdin_native() {
+    let empty_str = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_mr(r15, 0 - 16, r8) + vs_pop_n(1)
+    let read_seq = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + lea(rsi, r8, 8) + mov_rr(rdx, r9) + xor_rr(rdi, rdi) + sys_mov_rax(0) + syscall() + mov_mr(r8, 0, rax) + add_ri32(r12, 8) + add_rr(r12, rax) + mov_mr(r15, 0 - 16, r8) + vs_pop_n(1)
+    let skip = jmp_rel32(str_len(empty_str))
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(read_seq + skip)) + read_seq + skip + empty_str
     head
 }
 
@@ -2756,6 +2767,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "write_file" {
                     w(x86gen_write_file_native())
                     ret_type = "enum"
+                } else if callee == "read_stdin" {
+                    w(x86gen_read_stdin_native())
+                    ret_type = "str"
                 } else if callee == "get" || callee == "put" || callee == "delete" {
                     let m_t = type_shadow[len(type_shadow) - n]
                     let k_t = if n >= 2 {
