@@ -24,37 +24,37 @@ pub let r13 = 13
 pub let r14 = 14
 pub let r15 = 15
 
-// x86-64 SysV 参数寄存器（前 6 个）/ SysV argument registers (first six)
+// arg_regs 列出 x86-64 SysV 参数寄存器（前 6 个）/
+// arg_regs lists the SysV argument registers (first six)
 pub fn arg_regs() {
     [rdi, rsi, rdx, rcx, r8, r9]
 }
 
-// 发射 1 字节
+// e1 发射 1 字节 / e1 emits one byte
 // Emit one byte
 pub fn e1(b) {
     byte_chr(b)
 }
 
-// 发射 2 字节小端
+// e2 发射 2 字节小端 / e2 emits two little-endian bytes
 // Emit two bytes, little-endian
 pub fn e2(w) {
     byte_chr(w % 256) + byte_chr(w / 256 % 256)
 }
 
-// 发射 4 字节小端
+// e4 发射 4 字节小端 / e4 emits four little-endian bytes
 // Emit four bytes, little-endian
 pub fn e4(v) {
     byte_chr(v % 256) + byte_chr(v / 256 % 256) + byte_chr(v / 65536 % 256) + byte_chr(v / 16777216 % 256)
 }
 
-// 发射 8 字节小端
+// e8 发射 8 字节小端 / e8 emits eight little-endian bytes
 // Emit eight bytes, little-endian
 pub fn e8(v) {
     e4(v % 4294967296) + e4(v / 4294967296)
 }
 
-// 有符号 int8（补码折叠进 0..255）/
-// Signed int8, folded into 0..255 (two's complement)
+// sb 把有符号 int8 折叠进 0..255（补码）/ sb folds a signed int8 into 0..255 (two's complement)
 pub fn sb(v) {
     let m = v % 256
     if m < 0 {
@@ -64,7 +64,7 @@ pub fn sb(v) {
     }
 }
 
-// 有符号 4 字节
+// e4s 发射有符号 4 字节 / e4s emits a signed 4-byte value
 // Signed four bytes
 pub fn e4s(v) {
     if v < 0 {
@@ -74,7 +74,7 @@ pub fn e4s(v) {
     }
 }
 
-// 有符号 8 字节
+// e8s 发射有符号 8 字节 / e8s emits a signed 8-byte value
 // Signed eight bytes
 pub fn e8s(v) {
     if v >= 0 {
@@ -95,14 +95,12 @@ pub fn e8s(v) {
     }
 }
 
-// REX 是否需要
-// Is a REX prefix needed
+// rex_needed 判断是否需要 REX 前缀 / rex_needed tells whether a REX prefix is needed
 fn rex_needed(w, r, x, b) {
     w != 0 || r >= 8 || x >= 8 || b >= 8
 }
 
-// 发射 REX 前缀（W/R/X/B 位）/
-// Emit a REX prefix (W/R/X/B bits)
+// rex 发射 REX 前缀（W/R/X/B 位）/ rex emits a REX prefix (W/R/X/B bits)
 pub fn rex(w, r, x, b) {
     if !rex_needed(w, r, x, b) {
         ""
@@ -124,31 +122,31 @@ pub fn rex(w, r, x, b) {
     }
 }
 
-// 发射 ModRM 字节
-// Emit a ModRM byte
+// modrm 发射 ModRM 字节 / modrm emits a ModRM byte
 pub fn modrm(mod, reg, rm) {
     e1(mod % 4 * 64 + reg % 8 * 8 + rm % 8)
 }
 
-// ModRM（寄存器寻址）/
-// ModRM (register addressing)
+// modrm_reg 发射寄存器寻址的 ModRM / modrm_reg emits ModRM (register addressing)
 fn modrm_reg(reg, rm) {
     modrm(3, reg, rm)
 }
 
-// mov dst, src
-// mov dst, src
+// mov_rr 发射 mov dst, src / mov_rr emits mov dst, src
+// mov_rr 发射 mov dst, src / mov_rr emits mov dst, src
 pub fn mov_rr(dst, src) {
     rex(1, src, 0, dst) + e1(137) + modrm_reg(src, dst)
 }
 
-// movabs 64 位立即数
+// mov_ri64 发射 movabs（64 位立即数）/
+// mov_ri64 emits movabs (64-bit immediate)
 // movabs 64-bit immediate
 pub fn mov_ri64(dst, imm) {
     rex(1, 0, 0, dst) + e1(184 + dst % 8) + e8(imm)
 }
 
-// mov 32 位立即数（高位清零）/
+// mov_ri32 发射 mov（32 位立即数，高位清零）/
+// mov_ri32 emits mov (32-bit immediate, upper bits cleared)
 // mov 32-bit immediate (zero-extends)
 pub fn mov_ri32(dst, imm) {
     if dst >= 8 {
@@ -158,8 +156,7 @@ pub fn mov_ri32(dst, imm) {
     }
 }
 
-// SIB 字节
-// SIB byte
+// sib_for 生成 SIB 字节 / sib_for builds a SIB byte
 fn sib_for(base) {
     if base % 8 == 4 {
         byte_chr(36)
@@ -168,8 +165,7 @@ fn sib_for(base) {
     }
 }
 
-// 内存 → 寄存器
-// Memory to register
+// mov_rm 发射内存到寄存器 / mov_rm emits memory-to-register
 pub fn mov_rm(dst, base, disp) {
     if disp == 0 && base % 8 != 5 {
         rex(1, dst, 0, base) + e1(139) + modrm(0, dst, base) + sib_for(base)
@@ -180,8 +176,7 @@ pub fn mov_rm(dst, base, disp) {
     }
 }
 
-// 寄存器 → 内存
-// Register to memory
+// mov_mr 发射寄存器到内存 / mov_mr emits register-to-memory
 pub fn mov_mr(base, disp, src) {
     if disp == 0 && base % 8 != 5 {
         rex(1, src, 0, base) + e1(137) + modrm(0, src, base) + sib_for(base)
@@ -192,73 +187,74 @@ pub fn mov_mr(base, disp, src) {
     }
 }
 
-// push
-// push
+// push_r 发射 push 指令 / push_r emits a push instruction
+// push_r 发射 push 指令 / push_r emits a push instruction
 pub fn push_r(reg) {
     rex(0, 0, 0, reg) + e1(80 + reg % 8)
 }
 
-// pop
-// pop
+// pop_r 发射 pop 指令 / pop_r emits a pop instruction
+// pop_r 发射 pop 指令 / pop_r emits a pop instruction
 pub fn pop_r(reg) {
     rex(0, 0, 0, reg) + e1(88 + reg % 8)
 }
 
-// add
-// add
+// add_rr 发射 add 指令 / add_rr emits an add instruction
+// add_rr 发射 add 指令 / add_rr emits an add instruction
 pub fn add_rr(dst, src) {
     rex(1, src, 0, dst) + e1(1) + modrm_reg(src, dst)
 }
 
-// sub
-// sub
+// sub_rr 发射 sub 指令 / sub_rr emits a sub instruction
+// sub_rr 发射 sub 指令 / sub_rr emits a sub instruction
 pub fn sub_rr(dst, src) {
     rex(1, src, 0, dst) + e1(41) + modrm_reg(src, dst)
 }
 
-// and
-// and
+// and_rr 发射 and 指令 / and_rr emits an and instruction
+// and_rr 发射 and 指令 / and_rr emits an and instruction
 pub fn and_rr(dst, src) {
     rex(1, src, 0, dst) + e1(33) + modrm_reg(src, dst)
 }
 
-// or
-// or
+// or_rr 发射 or 指令 / or_rr emits an or instruction
+// or_rr 发射 or 指令 / or_rr emits an or instruction
 pub fn or_rr(dst, src) {
     rex(1, src, 0, dst) + e1(9) + modrm_reg(src, dst)
 }
 
-// xor
-// xor
+// xor_rr 发射 xor 指令 / xor_rr emits an xor instruction
+// xor_rr 发射 xor 指令 / xor_rr emits an xor instruction
 pub fn xor_rr(dst, src) {
     rex(1, src, 0, dst) + e1(49) + modrm_reg(src, dst)
 }
 
-// cmp
-// cmp
+// cmp_rr 发射 cmp 指令 / cmp_rr emits a cmp instruction
+// cmp_rr 发射 cmp 指令 / cmp_rr emits a cmp instruction
 pub fn cmp_rr(a, b) {
     rex(1, b, 0, a) + e1(57) + modrm_reg(b, a)
 }
 
-// test
-// test
+// test_rr 发射 test 指令 / test_rr emits a test instruction
+// test_rr 发射 test 指令 / test_rr emits a test instruction
 pub fn test_rr(a, b) {
     rex(1, b, 0, a) + e1(133) + modrm_reg(b, a)
 }
 
-// neg
-// neg
+// neg_r 发射 neg 指令 / neg_r emits a neg instruction
+// neg_r 发射 neg 指令 / neg_r emits a neg instruction
 pub fn neg_r(reg) {
     rex(1, 0, 0, reg) + e1(247) + modrm_reg(3, reg)
 }
 
-// imul
-// imul
+// imul_rr 发射 imul 指令 / imul_rr emits an imul instruction
+// imul_rr 发射 imul 指令 / imul_rr emits an imul instruction
 pub fn imul_rr(dst, src) {
     rex(1, dst, 0, src) + e1(15) + e1(175) + modrm_reg(dst, src)
 }
 
-// add 立即数（小值用短编码）/
+// add_ri32 发射 add 立即数（小值用短编码）/
+// add_ri32 emits add immediate (short encoding for small values)
 // add immediate (short form for small values)
 pub fn add_ri32(dst, imm) {
     if imm >= -128 && imm <= 127 {
@@ -268,7 +264,7 @@ pub fn add_ri32(dst, imm) {
     }
 }
 
-// sub 立即数
+// sub_ri32 发射 sub 立即数 / sub_ri32 emits sub immediate
 // sub immediate
 pub fn sub_ri32(dst, imm) {
     if imm >= -128 && imm <= 127 {
@@ -278,26 +274,22 @@ pub fn sub_ri32(dst, imm) {
     }
 }
 
-// shl by CL
-// shift left by CL
+// shl_rcl 发射按 CL 左移 / shl_rcl emits a shift-left-by-CL
 pub fn shl_rcl(dst) {
     rex(1, 0, 0, dst) + e1(211) + modrm_reg(4, dst)
 }
 
-// shr by CL
-// shift right (logical) by CL
+// shr_rcl 发射按 CL 逻辑右移 / shr_rcl emits a logical shift-right by CL
 pub fn shr_rcl(dst) {
     rex(1, 0, 0, dst) + e1(211) + modrm_reg(5, dst)
 }
 
-// sar by CL
-// shift right (arithmetic) by CL
+// sar_rcl 发射按 CL 算术右移 / sar_rcl emits an arithmetic shift-right by CL
 pub fn sar_rcl(dst) {
     rex(1, 0, 0, dst) + e1(211) + modrm_reg(7, dst)
 }
 
-// lea：base + disp 地址计算
-// lea: address computation
+// lea 发射 lea 地址计算 / lea emits lea (address computation)
 pub fn lea(dst, base, disp) {
     if disp == 0 && base % 8 != 5 {
         rex(1, dst, 0, base) + e1(141) + modrm(0, dst, base) + sib_for(base)
@@ -308,98 +300,102 @@ pub fn lea(dst, base, disp) {
     }
 }
 
-// ret
-// ret
+// ret 发射 ret 指令 / ret emits a ret instruction
+// ret 发射 ret 指令 / ret emits a ret instruction
 pub fn ret() {
     e1(195)
 }
 
-// 间接调用
-// Indirect call
+// call_r 发射间接调用 / call_r emits an indirect call
 pub fn call_r(reg) {
     rex(0, 0, 0, reg) + e1(255) + modrm_reg(2, reg)
 }
 
-// 间接跳转
-// Indirect jump
+// jmp_r 发射间接跳转 / jmp_r emits an indirect jump
 pub fn jmp_r(reg) {
     rex(0, 0, 0, reg) + e1(255) + modrm_reg(4, reg)
 }
 
-// 相对跳转
+// jmp_rel32 发射相对跳转 / jmp_rel32 emits a relative jump
 // Relative jump
 pub fn jmp_rel32(off) {
     e1(233) + e4s(off)
 }
 
-// je rel32
-// je rel32
+// je_rel32 发射 je rel32 / je_rel32 emits je rel32
+// je_rel32 发射 je rel32 / je_rel32 emits je rel32
 pub fn je_rel32(off) {
     e1(15) + e1(132) + e4s(off)
 }
 
-// jne rel32
-// jne rel32
+// jne_rel32 发射 jne rel32 / jne_rel32 emits jne rel32
+// jne_rel32 发射 jne rel32 / jne_rel32 emits jne rel32
 pub fn jne_rel32(off) {
     e1(15) + e1(133) + e4s(off)
 }
 
-// jl rel32（有符号小于）/
+// jl_rel32 发射 jl rel32（有符号小于）/
+// jl_rel32 emits jl rel32 (signed less-than)
 // jl rel32 (signed less)
 pub fn jl_rel32(off) {
     e1(15) + e1(140) + e4s(off)
 }
 
-// jg rel32（有符号大于）/
+// jg_rel32 发射 jg rel32（有符号大于）/
+// jg_rel32 emits jg rel32 (signed greater-than)
 // jg rel32 (signed greater)
 pub fn jg_rel32(off) {
     e1(15) + e1(143) + e4s(off)
 }
 
-// jle rel32
-// jle rel32
+// jle_rel32 发射 jle rel32 / jle_rel32 emits jle rel32
+// jle_rel32 发射 jle rel32 / jle_rel32 emits jle rel32
 pub fn jle_rel32(off) {
     e1(15) + e1(142) + e4s(off)
 }
 
-// jge rel32（有符号大于等于）/
+// jge_rel32 发射 jge rel32（有符号大于等于）/
+// jge_rel32 emits jge rel32 (signed greater-or-equal)
 // jge rel32 (signed greater-or-equal)
 pub fn jge_rel32(off) {
     e1(15) + e1(141) + e4s(off)
 }
 
-// ja rel32（无符号大于）/
+// ja_rel32 发射 ja rel32（无符号大于）/
+// ja_rel32 emits ja rel32 (unsigned greater-than)
 // ja rel32 (unsigned above)
 pub fn ja_rel32(off) {
     e1(15) + e1(135) + e4s(off)
 }
 
-// jb rel32（无符号小于）/
+// jb_rel32 发射 jb rel32（无符号小于）/
+// jb_rel32 emits jb rel32 (unsigned less-than)
 // jb rel32 (unsigned below)
 pub fn jb_rel32(off) {
     e1(15) + e1(130) + e4s(off)
 }
 
-// jae rel32（无符号大于等于）/
+// jae_rel32 发射 jae rel32（无符号大于等于）/
+// jae_rel32 emits jae rel32 (unsigned greater-or-equal)
 // jae rel32 (unsigned above-or-equal)
 pub fn jae_rel32(off) {
     e1(15) + e1(131) + e4s(off)
 }
 
-// jbe rel32（无符号小于等于）/
+// jbe_rel32 发射 jbe rel32（无符号小于等于）/
+// jbe_rel32 emits jbe rel32 (unsigned less-or-equal)
 // jbe rel32 (unsigned below-or-equal)
 pub fn jbe_rel32(off) {
     e1(15) + e1(134) + e4s(off)
 }
 
-// 相对调用
+// call_rel32 发射相对调用 / call_rel32 emits a relative call
 // Relative call
 pub fn call_rel32(off) {
     e1(232) + e4s(off)
 }
 
-// 原生栈帧序言
-// Native stack-frame prologue
+// prologue 发射栈帧开场 / prologue emits the stack-frame prologue
 pub fn prologue(frame_size) {
     let code = push_r(rbp) + mov_rr(rbp, rsp)
     if frame_size > 0 {
@@ -409,133 +405,126 @@ pub fn prologue(frame_size) {
     }
 }
 
-// 原生栈帧尾声
-// Native stack-frame epilogue
+// epilogue 发射栈帧收场 / epilogue emits the stack-frame epilogue
 pub fn epilogue() {
     mov_rr(rsp, rbp) + pop_r(rbp) + ret()
 }
 
-// nop
-// nop
+// nop 发射 nop 指令 / nop emits a nop
+// nop 发射 nop 指令 / nop emits a nop
 pub fn nop() {
     e1(144)
 }
 
-// int3：未实现 native 的 trap（parity 按 SIGTRAP skip）/
+// int3 发射 int3：未实现 native 的 trap（parity 按 SIGTRAP skip）/
+// int3 emits int3: the unimplemented-native trap (parity treats it as a SIGTRAP skip)
 // int3: trap for unimplemented natives (parity skips on SIGTRAP)
 pub fn int3() {
     e1(204)
 }
 
-// rep movsb：批量复制
-// rep movsb: bulk copy
+// rep_movsb 发射 rep movsb（批量拷贝）/ rep_movsb emits rep movsb: bulk copy
 pub fn rep_movsb() {
     e1(243) + e1(164)
 }
 
-// repe cmpsb：批量相等比较
-// repe cmpsb: bulk equality compare
+// repe_cmpsb 发射 repe cmpsb（批量相等比较）/ repe_cmpsb emits repe cmpsb: bulk equality compare
 pub fn repe_cmpsb() {
     e1(243) + e1(166)
 }
 
-// setcc：按标志置 0/1
-// setcc: set 0/1 from flags
+// sete 发射 sete（按 ZF 置 0/1）/ sete emits sete (set 0/1 from flags)
 pub fn sete(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(148) + modrm_reg(0, dst)
 }
 
-// setne
-// setne
+// setne 发射 setne 指令 / setne emits a setne instruction
+// setne 发射 setne 指令 / setne emits a setne instruction
 pub fn setne(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(149) + modrm_reg(0, dst)
 }
 
-// setl
-// setl
+// setl 发射 setl 指令 / setl emits a setl instruction
+// setl 发射 setl 指令 / setl emits a setl instruction
 pub fn setl(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(156) + modrm_reg(0, dst)
 }
 
-// setg
-// setg
+// setg 发射 setg 指令 / setg emits a setg instruction
+// setg 发射 setg 指令 / setg emits a setg instruction
 pub fn setg(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(159) + modrm_reg(0, dst)
 }
 
-// 有符号除法（商 rax，余 rdx）/
-// Signed divide (quotient rax, remainder rdx)
+// idiv_r 发射有符号除法（商 rax、余 rdx）/ idiv_r emits signed divide (quotient rax, remainder rdx)
 pub fn idiv_r(reg) {
     rex(1, 0, 0, reg) + e1(247) + modrm_reg(7, reg)
 }
 
-// 无符号除法
-// Unsigned divide
+// div_r 发射无符号除法 / div_r emits unsigned divide
 pub fn div_r(reg) {
     rex(1, 0, 0, reg) + e1(247) + modrm_reg(6, reg)
 }
 
-// cqo：rax 符号扩展进 rdx（idiv 前导）/
-// cqo: sign-extend rax into rdx (idiv prefix)
+// cqo 发射 cqo（rax 符号扩展进 rdx，idiv 前缀）/ cqo emits cqo: sign-extend rax into rdx (idiv prefix)
 pub fn cqo() {
     e1(72) + e1(153)
 }
 
-// setge
-// setge
+// setge 发射 setge 指令 / setge emits a setge instruction
+// setge 发射 setge 指令 / setge emits a setge instruction
 pub fn setge(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(157) + modrm_reg(0, dst)
 }
 
-// setle
-// setle
+// setle 发射 setle 指令 / setle emits a setle instruction
+// setle 发射 setle 指令 / setle emits a setle instruction
 pub fn setle(dst) {
     rex(0, 0, 0, dst) + e1(15) + e1(158) + modrm_reg(0, dst)
 }
 
-// movzx：al 零扩展到 eax
-// movzx: zero-extend al to eax
+// movzx_eax_al 发射 movzx（al 零扩展到 eax）/ movzx_eax_al emits movzx: zero-extend al to eax
 pub fn movzx_eax_al() {
     e1(15) + e1(182) + modrm_reg(0, 0)
 }
 
-// lea rip 相对寻址
+// lea_rip_rel32 发射 lea rip 相对寻址 / lea_rip_rel32 emits lea rip-relative addressing
 // lea rip-relative addressing
 pub fn lea_rip_rel32(dst, rel32) {
     rex(1, dst, 0, 0) + e1(141) + modrm(0, dst, 5) + e4s(rel32)
 }
 
-// 值栈压入（r15 指向栈顶）/
-// Push a value onto the value stack (r15 is the top)
+// vs_push 把值压入值栈（r15 为栈顶）/ vs_push pushes a value onto the value stack (r15 is the top)
 pub fn vs_push(reg) {
     mov_mr(r15, 0, reg) + add_ri32(r15, 8)
 }
 
-// 值栈压入 0
-// Push zero onto the value stack
+// vs_push_zero 把 0 压入值栈 / vs_push_zero pushes zero onto the value stack
 pub fn vs_push_zero() {
     e1(73) + e1(199) + modrm(0, 0, r15) + e4(0) + add_ri32(r15, 8)
 }
 
-// 值栈弹出 n 槽
-// Pop n slots from the value stack
+// vs_pop_n 从值栈弹出 n 个槽 / vs_pop_n pops n slots from the value stack
 pub fn vs_pop_n(n) {
     sub_ri32(r15, 8 * n)
 }
 
-// 函数序言：保存 caller 基、按 arity 建帧基
+// x86gen_prologue 生成函数序言：保存 caller 基、按 arity 建帧基
+// x86gen_prologue emits the prologue: save the caller base, build the frame base by arity
 // Function prologue: save caller base, set frame base by arity
 fn x86gen_prologue(arity, _locals) {
     push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1))
 }
 
-// 函数尾声：返回值落栈并恢复帧
+// x86gen_epilogue 生成函数尾声：返回值落栈并恢复帧
+// x86gen_epilogue emits the epilogue: push the return value and restore the frame
 // Function epilogue: place the return value and restore the frame
 fn x86gen_epilogue() {
     mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + pop_r(rbp) + ret()
 }
 
-// str(int) 内联：带符号十进制，逐位除 10 + 负号
+// x86gen_str_native 内联 str(int)：带符号十进制，逐位除 10 + 负号
+// x86gen_str_native inlines str(int): signed decimal, digit-wise /10 plus the sign
 // str(int) inline: signed decimal, digit-by-digit div-10 with a minus sign
 fn x86gen_str_native() {
     let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
@@ -550,7 +539,8 @@ fn x86gen_str_native() {
     head + neg_path + loop_start + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
 }
 
-// push 内联：容量不足时翻倍增长并复制
+// x86gen_push_native 内联 push：容量不足时翻倍增长并复制
+// x86gen_push_native inlines push: double-and-copy when the capacity is short
 // push inline: double capacity and copy when full
 fn x86gen_push_native() {
     let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(4) + add_ri32(r10, 4) + mov_rr(r11, r12) + mov_rm(rsi, rax, 16) + mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_rr(rdi, r11) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
@@ -558,13 +548,15 @@ fn x86gen_push_native() {
     mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rm(r10, rax, 8) + cmp_rr(rcx, r10) + jne_rel32(str_len(growth)) + growth + store
 }
 
-// pop 内联：长度减一，返回末元素
+// x86gen_pop_native 内联 pop：长度减一，返回末元素
+// x86gen_pop_native inlines pop: decrement the length, return the last element
 // pop inline: decrement length, return the last element
 fn x86gen_pop_native() {
     mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + sub_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_rm(r9, r11, 0) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1)
 }
 
-// 通用 int→str 转换（作用于 [r15+off]，str()/拼接复用）/
+// x86gen_str_convert_at 生成通用 int→str 转换（作用于 [r15+off]，str()/拼接复用）/
+// x86gen_str_convert_at emits the shared int-to-str conversion (operates on [r15+off]; reused by str() and concat)
 // Generic int-to-str conversion at [r15+off] (shared by str() and concat)
 fn x86gen_str_convert_at(off) {
     let div_loop = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
@@ -579,7 +571,8 @@ fn x86gen_str_convert_at(off) {
     head + neg_path + loop_start + div_loop + div_jne + alloc + pop_loop + pop_jne + mov_mr(r15, off, r11)
 }
 
-// bool→str 转换：true/false 常量字符串
+// x86gen_bool_convert_at 生成 bool→str 转换：true/false 常量字符串
+// x86gen_bool_convert_at emits bool-to-str: true/false constant strings
 // bool-to-str: the constant strings true/false
 fn x86gen_bool_convert_at(off) {
     let fpath = mov_rr(r11, r12) + mov_ri64(r10, 5) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 435728179558) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11)
@@ -587,19 +580,20 @@ fn x86gen_bool_convert_at(off) {
     mov_rm(rax, r15, off) + test_rr(rax, rax) + je_rel32(str_len(tpath)) + tpath + fpath
 }
 
-// unit→str 转换：()
+// x86gen_unit_convert_at 生成 unit→str 转换：()
+// x86gen_unit_convert_at emits unit-to-str: ()
 // unit-to-str: ()
 fn x86gen_unit_convert_at(off) {
     mov_rm(rax, r15, off) + mov_rr(r11, r12) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 10536) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + mov_mr(r15, off, r11)
 }
 
-// 未实现 native 清单（发射 int3）/
-// Unimplemented native list (emits int3)
+// is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
     name == "args" || name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "file_exists" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "read_dir" || name == "read_file" || name == "read_stdin" || name == "recv" || name == "sleep" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "write_file" || name == "yield" || name == "chan"
 }
 
-// ord 内联：解码首码点（1-4 字节 UTF-8）/
+// x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
+// x86gen_ord_native inlines ord: decode the first codepoint (1-4 byte UTF-8)
 // ord inline: decode the first code point (1-4 byte UTF-8)
 fn x86gen_ord_native() {
     let pre = mov_rm(rcx, r15, 0 - 8) + lea(rsi, rcx, 8) + xor_rr(rax, rax) + e1(172)
@@ -622,7 +616,8 @@ fn x86gen_ord_native() {
     pre + t_ascii + ascii_je + t_2 + try3_jne + dec_2 + cont2_jmp + t_3 + try4_jne + dec_3 + cont3_jmp + dec_4 + cont + done
 }
 
-// chr 内联：UTF-8 编码（1-4 字节码点分派）/
+// x86gen_chr_native 内联 chr：UTF-8 编码（1-4 字节码点分派）/
+// x86gen_chr_native inlines chr: UTF-8 encoding (1-4 byte codepoint dispatch)
 // chr inline: UTF-8 encoding (1-4 byte code point dispatch)
 fn x86gen_chr_native() {
     let p1 = mov_rr(r11, r12) + mov_mr(r11, 8, rax) + mov_ri64(r10, 1) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 16) + vs_pop_n(1)
@@ -638,7 +633,8 @@ fn x86gen_chr_native() {
     mov_rm(rax, r15, 0 - 8) + chk1 + p1 + jmp1 + chk2 + p2 + jmp2 + chk3 + p3 + jmp3 + p4
 }
 
-// contains 内联：8B 值线性扫描
+// x86gen_contains_native 内联 contains：8B 值线性扫描
+// x86gen_contains_native inlines contains: linear scan of 8-byte values
 // contains inline: linear scan over 8-byte values
 fn x86gen_contains_native() {
     let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rsi, r9, 0) + mov_rm(r10, r9, 16) + xor_rr(r11, r11)
@@ -651,13 +647,15 @@ fn x86gen_contains_native() {
     head + test + access + inc + back + notfound + found
 }
 
-// slice 内联：复制 [start, end) 元素到新列表
+// x86gen_slice_native 内联 slice：复制 [start, end) 元素到新列表
+// x86gen_slice_native inlines slice: copy [start, end) elements into a new list
 // slice inline: copy elements [start, end) into a new list
 fn x86gen_slice_native() {
     mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + sub_rr(r9, r8) + mov_rm(r10, rax, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rr(r11, r12) + mov_mr(r11, 0, r9) + mov_mr(r11, 8, r9) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rsi, rdx) + mov_rr(rdi, r10) + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(rdx, r11) + mov_rr(r12, rdx) + mov_mr(r15, 0 - 32, r11) + vs_pop_n(3)
 }
 
-// 列表格式化（两遍：先算总长，再写内容）/
+// x86gen_list_format_at 生成列表格式化（两遍：先算总长，再写内容）/
+// x86gen_list_format_at emits list formatting (two passes: total length, then contents)
 // List formatting (two passes: total length, then contents)
 fn x86gen_list_format_at(off, is_str) {
     let mb_al = e1(136) + e1(7)
@@ -704,13 +702,13 @@ fn x86gen_list_format_at(off, is_str) {
     h1 + test1 + sep1 + e1_load + tail1 + next1 + alloc_zone + test2 + sep2 + e2_load + tail2 + next2 + endfill
 }
 
-// concat 内联：两列表拼接
+// x86gen_concat_native 内联 concat：两列表拼接 / x86gen_concat_native inlines concat: join two lists
 // concat inline: concatenate two lists
 fn x86gen_concat_native() {
     mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rcx, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rcx, rdx) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, r9, 16) + mov_rr(rdi, r10) + mov_rm(rdx, r9, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rsi, r8, 16) + mov_rm(rdx, r8, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rax, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rax, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + add_rr(rax, r11) + mov_rr(r12, rax) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
 }
 
-// 字符串相等比较
+// x86gen_eq_str 生成字符串相等比较 / x86gen_eq_str emits string equality
 // String equality compare
 fn x86gen_eq_str() {
     let cmp_body = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(r10)
@@ -718,7 +716,8 @@ fn x86gen_eq_str() {
     mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
 }
 
-// join 内联：字符串列表用分隔符连接
+// x86gen_join_native 内联 join：字符串列表用分隔符连接
+// x86gen_join_native inlines join: connect a string list with a separator
 // join inline: join string lists with a separator
 fn x86gen_join_native() {
     let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + xor_rr(rdx, rdx) + xor_rr(rax, rax)
@@ -741,7 +740,7 @@ fn x86gen_join_native() {
     head + loop_len + done_len_tail + loop_copy + done_copy
 }
 
-// trim 内联：去首尾空白
+// x86gen_trim_native 内联 trim：去首尾空白 / x86gen_trim_native inlines trim: strip leading and trailing whitespace
 // trim inline: strip leading/trailing whitespace
 fn x86gen_trim_native() {
     let read = mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rax, rsi, 0) + mov_ri64(r10, 255) + and_rr(rax, r10)
@@ -766,7 +765,8 @@ fn x86gen_trim_native() {
     head + loop1 + loop2 + done
 }
 
-// parse_int 内联：带符号十进制扫描 + 逐位溢出检查
+// x86gen_parse_int_native 内联 parse_int：带符号十进制扫描 + 逐位溢出检查
+// x86gen_parse_int_native inlines parse_int: signed decimal scan with digit-wise overflow checks
 // parse_int inline: signed decimal scan with per-digit overflow checks
 fn x86gen_parse_int_native() {
     let trim = x86gen_trim_native()
@@ -792,7 +792,7 @@ fn x86gen_parse_int_native() {
     trim + head + empty_check + sign_read + minus_cmp + sign_jmp + plus + minus + digit_check + limit_set + limit_neg + loop_head + digit_parse + overflow_check + accumulate + back + success + positive + none
 }
 
-// split 内联：按分隔符拆分
+// x86gen_split_native 内联 split：按分隔符拆分 / x86gen_split_native inlines split: divide by a separator
 // split inline: split on a separator
 fn x86gen_split_native() {
     let push = mov_mr(r15, 0 - 24, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rdi, r15, 0 - 8) + mov_rm(rsi, r15, 0 - 24) + mov_mr(rdi, 0, rsi) + add_ri32(rdi, 8) + mov_mr(r15, 0 - 8, rdi)
@@ -809,7 +809,8 @@ fn x86gen_split_native() {
     head + loop_head + no_match + back + matched + matched_back + done
 }
 
-// str_contains/str_index_of 内联：子串查找
+// x86gen_str_find_native 内联 str_contains/str_index_of：子串查找
+// x86gen_str_find_native inlines str_contains/str_index_of: substring search
 // str_contains/str_index_of inline: substring search
 fn x86gen_str_find_native(as_option) {
     let some = if as_option {
@@ -830,13 +831,13 @@ fn x86gen_str_find_native(as_option) {
     head + loop_head + next + back + none + some
 }
 
-// map() 内联：空 map
+// x86gen_map_native 内联 map()：空 map / x86gen_map_native inlines map(): an empty map
 // map() inline: empty map
 fn x86gen_map_native() {
     mov_rr(r11, r12) + xor_rr(rdx, rdx) + mov_mr(r11, 0, rdx) + mov_mr(r11, 8, rdx) + mov_mr(r11, 16, rdx) + mov_mr(r11, 24, rdx) + add_ri32(r12, 32) + mov_mr(r15, 0 - 8, r11)
 }
 
-// get 内联：按键查 map
+// x86gen_get_map_native 内联 get：按键查 map / x86gen_get_map_native inlines get: look up a map key
 // get inline: lookup by key
 fn x86gen_get_map_native(key_is_str) {
     let some_body = mov_rm(rax, r9, 0) + mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
@@ -857,7 +858,7 @@ fn x86gen_get_map_native(key_is_str) {
     head + loop_head + body + advance + back + none + some_body
 }
 
-// put 内联：插入或更新键
+// x86gen_put_map_native 内联 put：插入或更新键 / x86gen_put_map_native inlines put: insert or update a key
 // put inline: insert or update a key
 fn x86gen_put_map_native(key_is_str) {
     let done = xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + vs_pop_n(3)
@@ -885,7 +886,7 @@ fn x86gen_put_map_native(key_is_str) {
     head1 + growth + post_head + loop_head + body + advance + back + not_found + found + done
 }
 
-// delete 内联：删除键
+// x86gen_delete_map_native 内联 delete：删除键 / x86gen_delete_map_native inlines delete: remove a key
 // delete inline: remove a key
 fn x86gen_delete_map_native(key_is_str) {
     let finish = xor_rr(rax, rax) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
@@ -912,14 +913,15 @@ fn x86gen_delete_map_native(key_is_str) {
     head + loop_head + body + advance + back + not_found + found_body + finish
 }
 
-// keys 内联：键列表
+// x86gen_keys_map_native 内联 keys：键列表 / x86gen_keys_map_native inlines keys: the key list
 // keys inline: list of keys
 fn x86gen_keys_map_native() {
     let tail = mov_rm(rdx, r11, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(r12, rdx) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
     mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r10) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + tail
 }
 
-// map 格式化（插入序输出）/
+// x86gen_map_format_at 生成 map 格式化（插入序输出）/
+// x86gen_map_format_at emits map formatting (insertion-order output)
 // Map formatting (insertion order)
 fn x86gen_map_format_at(off, key_is_str, val_is_str) {
     let mb_al = e1(136) + e1(7)
@@ -981,7 +983,8 @@ fn x86gen_map_format_at(off, key_is_str, val_is_str) {
     h1 + loop1 + alloc_zone + reload2 + loop2 + endfill
 }
 
-// record 格式化：字段名 + 值
+// x86gen_record_format_at 生成 record 格式化：字段名 + 值
+// x86gen_record_format_at emits record formatting: field names plus values
 // Record formatting: field names and values
 fn x86gen_record_format_at(off, names, ftypes) {
     let mb_al = e1(136) + e1(7)
@@ -1046,7 +1049,8 @@ fn x86gen_record_format_at(off, names, ftypes) {
     p1 + p1f + alloc + p2h + p2f + p2t
 }
 
-// record 相等：逐字段比较
+// x86gen_record_eq 生成 record 相等：逐字段比较
+// x86gen_record_eq emits record equality: field-by-field comparison
 // Record equality: field-by-field compare
 fn x86gen_record_eq(ftypes) {
     let mut body = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_ri64(r11, 1)
@@ -1065,7 +1069,7 @@ fn x86gen_record_eq(ftypes) {
     body + done
 }
 
-// range 内联：整数区间列表
+// x86gen_range_native 内联 range：整数区间列表 / x86gen_range_native inlines range: an integer interval list
 // range inline: integer interval list
 fn x86gen_range_native() {
     let fill_loop = mov_mr(rdi, 0, rax) + add_ri32(rdi, 8) + add_ri32(rax, 1) + sub_ri32(r9, 1)
@@ -1074,40 +1078,40 @@ fn x86gen_range_native() {
     mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rr(rax, r9) + sub_rr(rax, r8) + mov_rr(rcx, rax) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + test_rr(rcx, rcx) + je_rel32(str_len(fill_all)) + mov_rr(rdi, r10) + mov_rr(rax, r8) + mov_rr(r9, rcx) + fill_all + mov_rr(r10, rcx) + mov_ri32(rcx, 3) + shl_rcl(r10) + add_ri32(r10, 24) + add_rr(r10, r11) + mov_rr(r12, r10) + vs_pop_n(3) + vs_push(r11)
 }
 
-// _start：mmap 堆 + 设置寄存器约定 + 调 main
+// x86gen_start 生成 _start：mmap 堆 + 设置寄存器约定 + 调 main
+// x86gen_start emits _start: mmap the heap, set the register conventions, call main
 // _start: mmap the heap, set register conventions, call main
-// _start：mmap 堆 + 设置寄存器约定 + 调 main
+// x86gen_start 生成 _start：mmap 堆 + 设置寄存器约定 + 调 main
+// x86gen_start emits _start: mmap the heap, set the register conventions, call main
 // _start: mmap the heap, set register conventions, call main
 fn x86gen_start(nfn, n_globals) {
     lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
 }
 
-// 入口：字节码表 → x86-64 ELF 二进制字节
+// x86gen_program_to_buf 是 x86 后端入口：字节码表 → x86-64 ELF 二进制字节
+// x86gen_program_to_buf is the x86 backend entry: bytecode tables to x86-64 ELF binary bytes
 // Entry: bytecode tables to x86-64 ELF binary bytes
 pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, _en_qual, _en_vnames, _en_varities) {
-    // 读 u16 操作数
+    // read_u16 读 u16 操作数 / read_u16 reads a u16 operand
     // Read a u16 operand
     fn read_u16(code, at) {
         code[at] * 256 + code[at + 1]
     }
-    // 字符串常量字节
-    // String constant bytes
+    // const_str 生成字符串常量字节 / const_str builds string constant bytes
     fn const_str(fh, idx) {
         match f_consts[fh][idx] {
             lib::CVal::CStr(s) => s,
             _ => "",
         }
     }
-    // 函数常量字节
-    // Function constant bytes
+    // fn_const 生成函数常量字节 / fn_const builds function constant bytes
     fn fn_const(fh, idx) {
         match f_consts[fh][idx] {
             lib::CVal::CFn(sub) => sub,
             _ => 0,
         }
     }
-    // 指令长度
-    // Instruction length
+    // inst_len 取指令长度 / inst_len returns the instruction length
     fn inst_len(fh, code, ip) {
         let op = code[ip]
         if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
@@ -1130,8 +1134,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             1
         }
     }
-    // 跳转目标表
-    // Jump target table
+    // jump_targets 构建跳转目标表 / jump_targets builds the jump target table
     fn jump_targets(fh) {
         let code = f_code[fh]
         let mut targets = map()
@@ -1170,8 +1173,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         targets
     }
-    // 局部变量数
-    // Local count
+    // count_locals 统计局部变量数 / count_locals counts locals
     fn count_locals(fh) {
         let code = f_code[fh]
         let mut max_slot = f_arity[fh]
@@ -1188,8 +1190,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         max_slot + 1
     }
-    // 按名查函数
-    // Find a function by name
+    // find_fn_by_name 按名字查找函数 / find_fn_by_name finds a function by name
     fn find_fn_by_name(name) {
         let mut i = 0
         while i < len(f_name) {
@@ -1200,8 +1201,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         0 - 1
     }
-    // 影子栈弹出
-    // Shadow stack pop
+    // shadow_pop 弹出影子栈 n 项 / shadow_pop pops n entries from the shadow stack
     fn shadow_pop(mut lst, n) {
         let mut k = 0
         while k < n && len(lst) > 0 {
@@ -1209,8 +1209,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             k = k + 1
         }
     }
-    // 类型特异度（重载选择）/
-    // Type specificity (overload selection)
+    // type_specificity 类型特异度（重载选择）/ type_specificity scores a type (overload selection)
     fn type_specificity(t) {
         if t == "" {
             0
@@ -1224,18 +1223,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             4
         }
     }
-    // 是否更特异
-    // Is more specific
+    // is_more_specific 判断是否更特异 / is_more_specific tells whether a is more specific
     fn is_more_specific(a, b) {
         type_specificity(a) > type_specificity(b)
     }
-    // 是否 map 类型
-    // Is a map type
+    // is_map_type 判断是否为 map 类型 / is_map_type tells whether t is a map type
     fn is_map_type(t) {
         str_len(t) >= 3 && substr(t, 0, 3) == "map"
     }
-    // map 键类型
-    // Map key type
+    // map_key_type 取 map 键类型 / map_key_type extracts the map key type
     fn map_key_type(t) {
         if t == "map-str" || t == "map-str-int" || t == "map-str-str" {
             "str"
@@ -1245,8 +1241,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             ""
         }
     }
-    // map 值类型
-    // Map value type
+    // map_val_type 取 map 值类型 / map_val_type extracts the map value type
     fn map_val_type(t) {
         if t == "map-str-int" || t == "map-int-int" {
             "int"
@@ -1256,8 +1251,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             ""
         }
     }
-    // 精化 map 类型
-    // Refine a map type
+    // refine_map_type 细化 map 类型 / refine_map_type refines a map type
     fn refine_map_type(k, v) {
         if k == "" {
             "map"
@@ -1267,8 +1261,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             "map-" + k + "-" + v
         }
     }
-    // 精化 map 实参
-    // Refine a map argument
+    // refine_map_arg 细化 map 实参 / refine_map_arg refines a map argument
     fn refine_map_arg(arg_t, k, v) {
         if arg_t == "" || is_map_type(arg_t) {
             let cur_k = map_key_type(arg_t)
@@ -1288,13 +1281,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             arg_t
         }
     }
-    // 是否 record 类型
-    // Is a record type
+    // is_record_type 判断是否为 record 类型 / is_record_type tells whether t is a record type
     fn is_record_type(t) {
         t == "record" || str_len(t) >= 7 && substr(t, 0, 7) == "record:"
     }
-    // record 字段表
-    // Record field schema
+    // record_schema 取 record 字段 schema / record_schema fetches a record's field schema
     fn record_schema(t) {
         if str_len(t) >= 7 && substr(t, 0, 7) == "record:" {
             substr(t, 7, str_len(t) - 7)
@@ -1302,8 +1293,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             ""
         }
     }
-    // 合并类型追踪
-    // Merge type tracking
+    // merge_type 合并类型跟踪 / merge_type merges type tracking
     fn merge_type(cur, new) {
         if cur == "" {
             new
@@ -1315,8 +1305,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             new
         }
     }
-    // 合并位置类型
-    // Merge positional types
+    // merge_pos 合并位置类型 / merge_pos merges positional types
     fn merge_pos(pcur, pnew) {
         if pcur == "" || pnew == pcur {
             pnew
@@ -1331,13 +1320,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut const_data = ""
     let mut const_slot_map = map()
     let mut enum_const_map = map()
-    // 常量槽键
-    // Constant slot key
+    // const_slot_key 生成常量槽键 / const_slot_key keys a constant slot
     fn const_slot_key(f, i) {
         f * 100000 + i
     }
-    // 枚举常量键
-    // Enum constant key
+    // enum_const_key 生成枚举常量键 / enum_const_key keys an enum constant
     fn enum_const_key(cv) {
         match cv {
             lib::CVal::CEnumType(eh) => "e:" + str(eh),
@@ -1346,8 +1333,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             _ => "",
         }
     }
-    // 枚举常量字节
-    // Enum constant bytes
+    // enum_const_bytes 生成枚举常量字节 / enum_const_bytes builds enum constant bytes
     fn enum_const_bytes(cv) {
         match cv {
             lib::CVal::CEnumType(eh) => e8(eh),
@@ -1421,8 +1407,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let _ = str_len(const_data)
     let mut record_encs = []
     let mut record_offs = []
-    // 登记 record 编码
-    // Register a record encoding
+    // add_record_enc 注册 record 编码 / add_record_enc registers a record encoding
     fn add_record_enc(enc) {
         let mut i = 0
         while i < len(record_encs) {
@@ -1456,8 +1441,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         rf = rf + 1
     }
     let mut record_field_types = map()
-    // 编码字段名
-    // Encoded field names
+    // enc_names 取编码字段名 / enc_names lists the encoded field names
     fn enc_names(enc) {
         let mut names = []
         let mut pos = 0
@@ -1481,8 +1465,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         names
     }
     let const_data_len = str_len(const_data)
-    // 编码中查字段
-    // Find a field in an encoding
+    // find_field_in_enc 在编码中查找字段 / find_field_in_enc finds a field in an encoding
     fn find_field_in_enc(enc, fname) {
         let mut i = 0
         let mut pos = 0
@@ -1507,8 +1490,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         0 - 1
     }
-    // 常量地址
-    // Constant address
+    // const_addr 取常量地址 / const_addr returns a constant's address
     fn const_addr(f, i) {
         match get(const_slot_map, const_slot_key(f, i)) {
             Some(off) => base_addr + 120 + off,
@@ -2030,18 +2012,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             pseed_e = pseed_e + 1
         }
         let mut ip_to_byte = map()
-        // 追加字节
+        // w 追加字节 / w appends bytes
         // Append bytes
         fn w(s) {
             push(out, s)
         }
-        // 当前字节位置
+        // cur_byte 取当前字节位置 / cur_byte returns the current byte position
         // Current byte position
         fn cur_byte() {
             str_len(join(out, ""))
         }
 
-        // 单条指令发射
+        // emit_inst 发射单条指令 / emit_inst emits one instruction
         // Emit one instruction
         fn emit_inst(ip) {
             let op = code[ip]
