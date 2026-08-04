@@ -106,7 +106,9 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
         }
         let mut e_n0 = []
         let mut e_v0 = []
-        let mut progress = true
+        // 不动点迭代：每轮解析一个依赖就绪的 const，直到不再有进展
+    // Fixed-point iteration: each round resolves one dependency-ready const, until no progress
+    let mut progress = true
         while progress {
             progress = false
             ci = 0
@@ -133,6 +135,8 @@ pub fn fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
                 ci = ci + 1
             }
         }
+        // 收敛后仍未解析 = 循环依赖，报 E0391 并置毒值
+        // Still unresolved after convergence = a cycle: report E0391 and poison the value
         let mut cycled = map()
         ci = 0
         while ci < len(c_name) {
@@ -216,12 +220,16 @@ fn fc_of_val(v, label, sp, mut adiags) {
 // fc_eval 求值常量表达式：支持字面量、const/变量引用、算术比较、逻辑、字符串拼接
 // fc_eval evaluates constant expressions: literals, const/variable references, arithmetic, comparisons, logic, string concat
 fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
+    // 常量表达式求值：字面量直返，标识符查环境/包，运算递归
+    // Constant evaluation: literals return, identifiers consult env/package tables, operators recurse
     match e {
         IntLit(v, _) => FRVal(FVInt(v)),
         FloatLit(v, _) => FRVal(FVFloat(v)),
         StrLit(v, _) => FRVal(FVStr(v)),
         BoolLit(v, _) => FRVal(FVBool(v)),
         Ident(n, sp) => {
+            // 标识符：局部环境优先，再查包内常量，pending 表示依赖未就绪
+            // Identifiers: local env first, then package consts; pending marks not-yet-ready deps
             let mut hit = -1
             let mut i = len(env_names) - 1
             while i >= 0 {
@@ -265,6 +273,8 @@ fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
             let rr = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
             fc_combine(lr, rr, op, sp, adiags)
         },
+        // 逻辑运算：短路可用时按类型提前返回
+        // Logical ops: short-circuit when the type allows it
         Logical(op, lhs, rhs, _) => {
             let lr = fc_eval(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
             match lr {
@@ -300,6 +310,8 @@ fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
 // fc_type 折叠表达式的类型：const 的类型在编译期解析（行变量/记录类型同样折叠）/
 // fc_type folds an expression's type: a const's type resolves at compile time (row vars and record types fold the same way)
 fn fc_type(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
+    // 常量类型折叠：字面量直返类型，运算按操作符判定合法性
+    // Constant type folding: literals return their type, operators gate legality
     match e {
         IntLit(_, _) => FTType(0),
         FloatLit(_, _) => FTType(1),
@@ -751,6 +763,8 @@ fn fr_stmts(stmts, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, 
 // fr_stmt 折叠单条语句：把 const 声明替换为折叠后的字面量声明
 // fr_stmt folds one statement: replaces const declarations with their folded literal forms
 fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    // 语句重写：const 换折叠字面量，绑定入环境，其余递归
+    // Statement rewriting: consts become folded literals, bindings enter the env, the rest recurse
     match s {
         ConstDecl(name, nsp, is_pub, ty, init, sp) => {
             let mut adiags = []

@@ -133,6 +133,8 @@ fn p_end_stmt(toks, mut pos) {
 // p_statement 做语句分派：先探标签循环（ident : while/for），再按起始 token 分派
 // p_statement dispatches statements: labeled loops (ident : while/for) first, then by starter token
 fn p_statement(toks, mut pos) {
+    // 先探标签循环（ident : while/for），再按起始 token 分派
+    // Labeled loops first (ident : while/for), then dispatch by starter token
     if p_check(toks, pos, t_ident) && p_check(toks, [pos[0] + 1], t_colon) && (p_check(toks, [pos[0] + 2], t_while) || p_check(toks, [pos[0] + 2], t_for)) {
         let ltok = p_advance(toks, pos)
         let _ = p_advance(toks, pos)
@@ -145,6 +147,8 @@ fn p_statement(toks, mut pos) {
         }
         return Ok(LabelStmt(tok_lex(ltok), inner, sp_union(sp_of_tok(ltok), span_of(inner))))
     }
+    // 语句形态分派：声明/定义/控制流/表达式语句
+    // Statement dispatch: declarations, definitions, control flow, expression statements
     if p_check(toks, pos, t_let) {
         p_let_stmt(toks, pos)
     } else if p_check(toks, pos, t_const) {
@@ -390,6 +394,8 @@ fn p_interface_statement(toks, mut pos) {
 fn p_let_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let is_mut = p_match(toks, pos, t_mut)
+    // 元组解构 let 与普通 let 两条路径
+    // Two paths: tuple-destructuring let and plain let
     if p_check(toks, pos, t_lparen) {
         p_advance(toks, pos)
         let mut names = []
@@ -445,6 +451,8 @@ fn p_let_stmt(toks, mut pos) {
             lib::Token::Tok(0, "", 0, 0)
         },
     }
+    // 可选类型标注 + = 初始化 + 语句结束
+    // Optional type annotation, = initializer, statement end
     let ty = if p_match(toks, pos, t_colon) {
         match p_type_expr(toks, pos) {
             Ok(v) => v,
@@ -628,6 +636,8 @@ fn p_fn_decl(toks, mut pos) {
 // p_method_decl 解析 receiver 方法声明，receiver 作为第一个参数并入签名 / p_method_decl parses a receiver method; the receiver becomes the first parameter
 fn p_method_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
+    // receiver 方法：recv: Type 并入参数表首位
+    // Receiver methods: recv: Type joins the parameter list first
     match p_expect(toks, pos, t_lparen, "'(' after fn in method") {
         Ok(_) => {},
         Err(d) => {
@@ -749,6 +759,8 @@ fn rty_name(ty) {
 // p_fn_rest 解析函数体（参数/返回类型/体；interface 模式只取签名）/
 // p_fn_rest parses the function body (params/return/body; interface mode takes the signature only)
 fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
+    // 参数列表：可选 mut 与类型标注；interface 模式强制标注
+    // Parameters: optional mut and annotations; interface mode requires annotations
     match p_expect(toks, pos, t_lparen, "'(' after fn") {
         Ok(_) => {},
         Err(d) => {
@@ -839,6 +851,8 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
 fn p_enum_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     let name = match p_expect(toks, pos, t_ident, "enum name") {
+        // 枚举：可选泛型参数表 + 变体列表（变体可带类型字段）
+        // Enums: optional type parameters plus variants (variants may carry typed fields)
         Ok(v) => v,
         Err(d) => {
             return Err(d)
@@ -959,6 +973,8 @@ fn p_type_alias_decl(toks, mut pos, is_pub) {
 // p_type_expr 解析类型表达式：名字/泛型应用/list/fn 签名/record 行变量/tuple
 // p_type_expr parses type expressions: names, generic application, lists, fn signatures, record rows, tuples
 fn p_type_expr(toks, mut pos) {
+    // 类型表达式分派：list/record 行/tuple/fn 签名/具名类型
+    // Type-expression dispatch: list, record rows, tuples, fn signatures, named types
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
     if t == t_lbracket {
@@ -979,6 +995,8 @@ fn p_type_expr(toks, mut pos) {
         }
         Ok(TEList(el, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     } else if t == t_record {
+        // record 类型：字段名: 类型列表 + 可选行变量（| r）
+        // Record types: field-name: type pairs plus an optional row variable (| r)
         p_advance(toks, pos)
         match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record` in type") {
             Ok(_) => {},
@@ -1736,6 +1754,8 @@ fn p_postfix(toks, mut pos) {
             NoNode
         },
     }
+    // 后缀链：调用/索引/try/:: 限定/字段访问
+    // Postfix chain: calls, indexing, try, :: qualification, field access
     let mut going = true
     while going {
         if p_check(toks, pos, t_lparen) {
@@ -1897,6 +1917,8 @@ fn lit_to_int(lexeme) {
 // p_primary 解析原子表达式：字面量/标识符/分组/列表/函数字面量/record/枚举变体/
 // p_primary parses primaries: literals, identifiers, grouping, lists, fn literals, records, enum variants
 fn p_primary(toks, mut pos) {
+    // 原子表达式分派：字面量/标识符/分组/列表/函数/if/match/块
+    // Primary dispatch: literals, identifiers, grouping, lists, functions, if, match, blocks
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
     if t == t_int {
@@ -2201,6 +2223,8 @@ fn p_if_expr(toks, mut pos) {
 // p_match_expr parses match: exhaustiveness is the checker's job; here we parse arms (pattern + optional guard + body)
 fn p_match_expr(toks, mut pos) {
     let tok = p_advance(toks, pos)
+    // match：scrutinee 后解析模式臂（or-pattern 展开 + 可选 guard）
+    // Match: scrutinee, then pattern arms (or-patterns expand, optional guards)
     let scrut = match p_expression(toks, pos) {
         Ok(v) => v,
         Err(d) => {
@@ -2290,6 +2314,8 @@ fn p_match_expr(toks, mut pos) {
 // p_pattern 解析模式：通配/字面量/绑定/变体/record 模式/
 // p_pattern parses patterns: wildcard, literal, binding, variant, record
 fn p_pattern(toks, mut pos) {
+    // 模式分派：record 模式/字面量/负数字面量/标识符（绑定、变体、通配）
+    // Pattern dispatch: record, literals, negated literals, identifiers (binding, variant, wildcard)
     let tok = p_peek(toks, pos)
     let t = tok_type(tok)
     if t == t_record {
@@ -2348,6 +2374,8 @@ fn p_pattern(toks, mut pos) {
             _ => perr("E1111", "", "'-' in pattern must precede a number", sp_of_tok(tok)),
         }
     } else if t == t_ident {
+        // 标识符模式：_ 通配；:: 限定变体；() 后接字段绑定
+        // Identifier patterns: _ wildcard; :: qualified variants; () binds fields
         p_advance(toks, pos)
         if tok_lex(tok) == "_" {
             Ok(PatWildcard(sp_of_tok(tok)))
