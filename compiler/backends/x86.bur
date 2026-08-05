@@ -589,7 +589,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "yield" || name == "chan"
+    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "yield" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -942,6 +942,28 @@ fn x86gen_read_stdin_native() {
     let read_seq = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + lea(rsi, r8, 8) + mov_rr(rdx, r9) + xor_rr(rdi, rdi) + sys_mov_rax(0) + syscall() + mov_mr(r8, 0, rax) + add_ri32(r12, 8) + add_rr(r12, rax) + mov_mr(r15, 0 - 16, r8) + vs_pop_n(1)
     let skip = jmp_rel32(str_len(empty_str))
     let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(read_seq + skip)) + read_seq + skip + empty_str
+    head
+}
+
+// x86gen_stdin_nb_native 内联 stdin_nb：fcntl 非阻塞 + 单次 read，返回 Result<str, str>
+// x86gen_stdin_nb_native inlines stdin_nb: fcntl non-blocking plus a single read into Result<str, str>
+// stdin_nb inline: fcntl non-blocking plus a single read into Result<str, str>
+fn x86gen_stdin_nb_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let eagain_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 7955997313370251103) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let empty_str = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8)
+    let empty_ok = empty_str + ok_inst
+    let tail = add_rr(rsp, r9) + err_str + err_inst + jmp_rel32(str_len(empty_ok))
+    let eagain_tail = add_rr(rsp, r9) + eagain_str + err_inst + jmp_rel32(str_len(tail) + str_len(empty_ok))
+    let ok_tail = add_rr(rsp, r9) + ok_inst + jmp_rel32(str_len(eagain_tail) + str_len(tail) + str_len(empty_ok))
+    let make_str = mov_rr(r8, r12) + mov_mr(r8, 0, rax) + mov_rr(rsi, rsp) + lea(rdi, r8, 8) + mov_rr(rcx, rax) + rep_movsb() + add_ri32(r12, 8) + add_rr(r12, rax)
+    let errno_seq = mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(make_str) + str_len(ok_tail)) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(make_str) + str_len(ok_tail)) + jmp_rel32(str_len(make_str) + str_len(ok_tail) + str_len(eagain_tail))
+    let read_seq = sub_rr(rsp, r9) + xor_rr(rdi, rdi) + mov_rr(rsi, rsp) + mov_rr(rdx, r9) + sys_mov_rax(0) + syscall() + test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(errno_seq)) + neg_r(rax) + errno_seq
+    let read_path = read_seq + make_str + ok_tail + eagain_tail + tail
+    let set_nonblock = xor_rr(rdi, rdi) + mov_ri64(rsi, 3) + xor_rr(rdx, rdx) + sys_mov_rax(72) + syscall() + mov_rr(r8, rax) + mov_ri64(rdx, 2048) + or_rr(rdx, r8) + xor_rr(rdi, rdi) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(set_nonblock) + str_len(read_path)) + set_nonblock + read_path + empty_ok
     head
 }
 
@@ -2217,6 +2239,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else if pcallee == "read_file" {
                         push(pshadow_ps, "")
                         push(ptshadow_ps, enum_payload_enc("Result", [["str"], ["str"]]))
+                    } else if pcallee == "stdin_nb" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, enum_payload_enc("Result", [["str"], ["str"]]))
                     } else if pcallee == "write_file" {
                         push(pshadow_ps, "")
                         push(ptshadow_ps, enum_payload_enc("Result", [["unit"], ["str"]]))
@@ -3272,6 +3297,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "read_stdin" {
                     w(x86gen_read_stdin_native())
                     ret_type = "str"
+                } else if callee == "stdin_nb" {
+                    w(x86gen_stdin_nb_native())
+                    ret_type = enum_payload_enc("Result", [["str"], ["str"]])
                 } else if callee == "read_dir" {
                     w(x86gen_read_dir_native())
                     ret_type = enum_payload_enc("Result", [["list-str"], ["str"]])
