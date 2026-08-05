@@ -589,7 +589,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "type_of" || name == "yield" || name == "chan"
+    name == "clock" || name == "close" || name == "exec" || name == "exec_poll" || name == "exec_start" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "stdin_nb" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "yield" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -865,6 +865,19 @@ fn x86gen_nul_path_at(off) {
     let nul_write = xor_rr(rax, rax) + e1(136) + e1(7) + add_rr(r12, r10) + add_ri32(r12, 1)
     let copy = mov_rm(r10, r9, 0) + mov_rr(r11, r12) + lea(rsi, r9, 8) + mov_rr(rdi, r11) + mov_rr(rcx, r10) + rep_movsb()
     mov_rm(r9, r15, off) + copy + nul_write
+}
+
+// x86gen_str_const_at 在堆上构造编译期字符串并写回 [r15+off] /
+// x86gen_str_const_at builds a compile-time string on the heap and stores it at [r15+off]
+fn x86gen_str_const_at(off, s) {
+    let mut store = mov_rr(r11, r12) + mov_ri64(r9, str_len(s)) + mov_mr(r11, 0, r9) + lea(rdi, r11, 8)
+    let mut ci = 0
+    while ci < str_len(s) {
+        store = store + mov_ri64(r10, byte_at(s, ci)) + mov_mr(rdi, 0, r10) + add_ri32(rdi, 1)
+        ci = ci + 1
+    }
+    store = store + add_rr(r12, r9) + add_ri32(r12, 8) + mov_mr(r15, off, r11)
+    store
 }
 
 // x86gen_file_exists_native 内联 file_exists：stat syscall，返回 bool
@@ -1261,7 +1274,7 @@ fn x86gen_start(nfn, n_globals) {
 // x86gen_program_to_buf 是 x86 后端入口：字节码表 → x86-64 ELF 二进制字节
 // x86gen_program_to_buf is the x86 backend entry: bytecode tables to x86-64 ELF binary bytes
 // Entry: bytecode tables to x86-64 ELF binary bytes
-pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, _en_qual, _en_vnames, _en_varities) {
+pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, en_qual, en_vnames, _en_varities) {
     // read_u16 读 u16 操作数 / read_u16 reads a u16 operand
     // Read a u16 operand
     fn read_u16(code, at) {
@@ -1616,6 +1629,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // enum_field_types 枚举 payload 字段类型表 / enum_field_types holds enum payload field types
     // key = "enum:<qual>|variant0,f0,f1;variant1,f0" (variant 分隔 ";", 字段分隔 ",")
     let mut enum_field_types = map()
+    // enum_variant_types 用户枚举 variant 字段类型（key = "v:<eh>:<vi>"）/
+    // enum_variant_types holds user enum variant field types (key = "v:<eh>:<vi>")
+    let mut enum_variant_types = map()
+    // enum_variant_fields 取用户枚举某 variant 字段类型 / enum_variant_fields fetches a user enum variant's field types
+    fn enum_variant_fields(eh, vidx) {
+        match get(enum_variant_types, "v:" + str(eh) + ":" + str(vidx)) {
+            Some(vf) => vf,
+            None => [],
+        }
+    }
     // enum_field_key 生成枚举字段类型表 key / enum_field_key builds an enum field-type table key
     fn enum_field_key(qual, vts) {
         let mut key = "enum:" + qual
@@ -1652,6 +1675,140 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     fn is_enum_enc(t) {
         str_len(t) >= 5 && substr(t, 0, 5) == "enum:"
     }
+    // enum_fields_resolve 从枚举编码解析 variant 字段类型（先全表后用户 variant 表）/
+    // enum_fields_resolve resolves a variant's field types (full table first, then the user variant table)
+    fn enum_fields_resolve(enc, vidx) {
+        let full = enum_fields_for_variant(enc, vidx)
+        if len(full) > 0 {
+            full
+        } else if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
+            let eh_s = substr(enc, 6, str_len(enc) - 6)
+            match parse_int(eh_s) {
+                Some(eh_v) => enum_variant_fields(eh_v, vidx),
+                None => [],
+            }
+        } else {
+            []
+        }
+    }
+    // enum_variant_name 取用户枚举 variant 名 / enum_variant_name fetches a user enum variant name
+    fn enum_variant_name(eh, vidx) {
+        if eh >= 0 && eh < len(en_vnames) && vidx >= 0 && vidx < len(en_vnames[eh]) {
+            en_vnames[eh][vidx]
+        } else {
+            "?" + str(vidx)
+        }
+    }
+    // x86gen_enum_format_at 生成枚举格式化：variant 名 + 字段（str 加引号）
+    // x86gen_enum_format_at emits enum formatting: variant name plus fields (str quoted)
+    fn x86gen_enum_format_at(off, eh, vts) {
+        let mb_al = e1(136) + e1(7)
+        let mb = fn(c) {
+            e1(198) + e1(7) + sb(c)
+        }
+        let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+        let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+        let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+        let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+        let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+        let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+        // pass 1: 按运行时 variant 索引计算长度（每个 variant 独立块 + 分发链）
+        // pass 1: compute the length for the runtime variant index (per-variant blocks plus a dispatch chain)
+        let mut lblocks = []
+        let mut vi1 = 0
+        while vi1 < len(vts) {
+            let vname = enum_variant_name(eh, vi1)
+            let fts = vts[vi1]
+            let mut lb = mov_rm(r10, r15, off) + lea(r10, r10, 16) + mov_ri64(rcx, 2)
+            lb = lb + add_ri32(rcx, str_len(vname))
+            let mut fi1 = 0
+            while fi1 < len(fts) {
+                if fi1 > 0 {
+                    lb = lb + add_ri32(rcx, 2)
+                }
+                if fts[fi1] == "str" {
+                    lb = lb + mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+                } else {
+                    let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+                    let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+                    lb = lb + mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+                }
+                lb = lb + add_ri32(r10, 8)
+                fi1 = fi1 + 1
+            }
+            push(lblocks, lb)
+            vi1 = vi1 + 1
+        }
+        // 长度分发链：每块 = [jne skip][lb][jmp end]；alloc 跟在最后块后
+        // length dispatch: each block = [jne skip][lb][jmp end]; alloc follows the last block
+        let mut lchain = ""
+        let mut li = 0
+        while li < len(lblocks) {
+            let mut ltail = 0
+            let mut lj = li + 1
+            while lj < len(lblocks) {
+                ltail = ltail + 10 + 3 + 6 + str_len(lblocks[lj]) + 5
+                lj = lj + 1
+            }
+            lchain = lchain + mov_ri64(rdx, li) + cmp_rr(r11, rdx) + jne_rel32(str_len(lblocks[li]) + 5) + lblocks[li] + jmp_rel32(ltail)
+            li = li + 1
+        }
+        // 分配缓冲
+        // allocate the buffer
+        let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9)
+        // pass 2: 按运行时 variant 索引写对应文本
+        // pass 2: write the text for the runtime variant index
+        let mut p2 = ""
+        let mut wblocks = []
+        let mut vi2 = 0
+        while vi2 < len(vts) {
+            let vname = enum_variant_name(eh, vi2)
+            let fts = vts[vi2]
+            let mut wb = ""
+            let mut nb2 = 0
+            while nb2 < str_len(vname) {
+                wb = wb + mb(byte_at(vname, nb2)) + add_ri32(rdi, 1)
+                nb2 = nb2 + 1
+            }
+            wb = wb + mb(40) + add_ri32(rdi, 1)
+            let mut fi2 = 0
+            while fi2 < len(fts) {
+                if fi2 > 0 {
+                    wb = wb + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+                }
+                if fts[fi2] == "str" {
+                    wb = wb + mov_rm(rax, r10, 0) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+                } else {
+                    wb = wb + mov_rm(rdx, r10, 0) + int_write
+                }
+                wb = wb + add_ri32(r10, 8)
+                fi2 = fi2 + 1
+            }
+            wb = wb + mb(41) + add_ri32(rdi, 1)
+            push(wblocks, wb)
+            vi2 = vi2 + 1
+        }
+        // 拼接：variant 索引分发（[jne skip][block][jmp end][skip:] 链）
+        // dispatch on the variant index ([jne skip][block][jmp end][skip:] chain)
+        let load_v = mov_rm(rax, r15, off) + mov_rm(r11, rax, 8)
+        let mut wchain = ""
+        let mut wi = 0
+        while wi < len(wblocks) {
+            // 计算本块之后所有后续块的完整长度（每个后续块 = mov(10) + cmp(3) + jne(6) + block + jmp(5)）
+            // tail length after this block: each later block contributes mov(10) + cmp(3) + jne(6) + block + jmp(5)
+            let mut wtail = 0
+            let mut wj = wi + 1
+            while wj < len(wblocks) {
+                wtail = wtail + 10 + 3 + 6 + str_len(wblocks[wj]) + 5
+                wj = wj + 1
+            }
+            wchain = wchain + mov_ri64(rdx, wi) + cmp_rr(r11, rdx) + jne_rel32(str_len(wblocks[wi]) + 5) + wblocks[wi] + jmp_rel32(wtail)
+            wi = wi + 1
+        }
+        let p2h = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+        let p2t = pop_r(r9) + mov_mr(r15, off, r9)
+        load_v + lchain + alloc + p2h + wchain + p2t
+    }
     // enum_qual 取枚举编码名 / enum_qual extracts the qualifier of an enum encoding
     fn enum_qual(t) {
         let bar = match str_index_of(t, "|") {
@@ -1663,6 +1820,39 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         } else {
             ""
         }
+    }
+    // enum_qual_to_eh 从 qualifier 名查枚举 handle / enum_qual_to_eh looks up an enum handle by qualifier
+    fn enum_qual_to_eh(qual) {
+        let mut qei = 0
+        while qei < len(en_qual) {
+            if en_qual[qei] == qual {
+                return qei
+            }
+            qei = qei + 1
+        }
+        0 - 1
+    }
+    // enum_format_for_enc 为任意枚举编码生成格式化 / enum_format_for_enc emits formatting for any enum encoding
+    fn enum_format_for_enc(off, enc) {
+        let feh = if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
+            match parse_int(substr(enc, 6, str_len(enc) - 6)) {
+                Some(fehv) => fehv,
+                None => 0,
+            }
+        } else {
+            enum_qual_to_eh(enum_qual(enc))
+        }
+        let mut fvts = []
+        let mut fvi = 0
+        let mut fmax = 0
+        if feh >= 0 && feh < len(en_vnames) {
+            fmax = len(en_vnames[feh])
+        }
+        while fvi < fmax {
+            push(fvts, enum_fields_resolve(enc, fvi))
+            fvi = fvi + 1
+        }
+        x86gen_enum_format_at(off, feh, fvts)
     }
     // reg_enum_type 注册枚举实例类型 / reg_enum_type registers an enum instance type
     // qual = 枚举限定名, vts = 各 variant 字段类型列表; 返回编码字符串
@@ -1823,12 +2013,21 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                 } else if pop == lib::op_const {
                     let pval = f_consts[ptfh][read_u16(pcode, pit + 1)]
-                    push(pshadow_ps, "")
                     match pval {
                         lib::CVal::CStr(_) => {
+                            push(pshadow_ps, "")
                             push(ptshadow_ps, "str")
                         },
+                        lib::CVal::CSingleton(peh, pvi) => {
+                            push(pshadow_ps, "ctor:" + str(peh) + ":" + str(pvi))
+                            push(ptshadow_ps, "enum:e" + str(peh))
+                        },
+                        lib::CVal::CCtor(peh, pvi) => {
+                            push(pshadow_ps, "ctor:" + str(peh) + ":" + str(pvi))
+                            push(ptshadow_ps, "enum")
+                        },
                         _ => {
+                            push(pshadow_ps, "")
                             push(ptshadow_ps, "int")
                         },
                     }
@@ -1913,10 +2112,27 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                     shadow_pop(pshadow_ps, pn + 1)
                     shadow_pop(ptshadow_ps, pn + 1)
-                    if pcallee == "ctor" {
+                    if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "ctor:" {
+                        // 预扫 ctor：按 eh:vi 注册字段类型 / pre-scan ctor: register field types by eh:vi
+                        let pctor_rest = substr(pcallee, 5, str_len(pcallee) - 5)
+                        let pctor_eh = match str_index_of(pctor_rest, ":") {
+                            Some(pcei) => match parse_int(substr(pctor_rest, 0, pcei)) {
+                                Some(pcev) => pcev,
+                                None => 0,
+                            },
+                            None => 0,
+                        }
+                        let pctor_vi = match str_index_of(pctor_rest, ":") {
+                            Some(pcei) => match parse_int(substr(pctor_rest, pcei + 1, str_len(pctor_rest) - pcei - 1)) {
+                                Some(pciv) => pciv,
+                                None => 0,
+                            },
+                            None => 0,
+                        }
+                        put(enum_variant_types, "v:" + str(pctor_eh) + ":" + str(pctor_vi), p_arg_t)
                         push(pshadow_ps, "")
-                        push(ptshadow_ps, "enum")
-                    } else if pcallee == "substr" || pcallee == "chr" || pcallee == "char_at" || pcallee == "byte_chr" || pcallee == "str" {
+                        push(ptshadow_ps, "enum:e" + str(pctor_eh))
+                    } else if pcallee == "substr" || pcallee == "chr" || pcallee == "char_at" || pcallee == "byte_chr" || pcallee == "str" || pcallee == "type_of" {
                         push(pshadow_ps, "")
                         push(ptshadow_ps, "str")
                     } else if pcallee == "range" {
@@ -2189,7 +2405,27 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
-                } else if pop == lib::op_no_match {} else if pop == lib::op_get_field_name || pop == lib::op_get_field {
+                } else if pop == lib::op_no_match {} else if pop == lib::op_try {
+                    let pt_t = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
+                    let pt_payload = if is_enum_enc(pt_t) {
+                        let pt_var = enum_fields_resolve(pt_t, 0)
+                        if len(pt_var) > 0 {
+                            pt_var[0]
+                        } else {
+                            "int"
+                        }
+                    } else {
+                        "int"
+                    }
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, pt_payload)
+                } else if pop == lib::op_get_field_name || pop == lib::op_get_field {
                     let pg_rt = if len(ptshadow_ps) > 0 {
                         ptshadow_ps[len(ptshadow_ps) - 1]
                     } else {
@@ -2221,7 +2457,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             None => {},
                         }
                     } else if is_enum_enc(pg_rt) {
-                        let pg_var = enum_fields_for_variant(pg_rt, pcur_variant)
+                        let pg_var = enum_fields_resolve(pg_rt, pcur_variant)
                         let pg_fidx = pcode[pit + 1]
                         if pg_fidx < len(pg_var) {
                             pg_field_t = pg_var[pg_fidx]
@@ -2330,12 +2566,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         push(shadow, "enumtype")
                         push(type_shadow, "enumtype")
                     },
-                    lib::CVal::CSingleton(_, _) => {
-                        push(shadow, "enum")
-                        push(type_shadow, "enum")
+                    lib::CVal::CSingleton(seh, svi) => {
+                        push(shadow, "ctor:" + str(seh) + ":" + str(svi))
+                        push(type_shadow, "enum:e" + str(seh))
                     },
-                    lib::CVal::CCtor(_, _) => {
-                        push(shadow, "ctor")
+                    lib::CVal::CCtor(ceh, cvi) => {
+                        push(shadow, "ctor:" + str(ceh) + ":" + str(cvi))
                         push(type_shadow, "ctor")
                     },
                     _ => {
@@ -2636,7 +2872,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         None => {},
                     }
                 } else if is_enum_enc(gf_rt) {
-                    let gf_var = enum_fields_for_variant(gf_rt, cur_variant)
+                    let gf_var = enum_fields_resolve(gf_rt, cur_variant)
                     if fidx < len(gf_var) {
                         gf_t = gf_var[fidx]
                     }
@@ -2647,6 +2883,31 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(type_shadow, gf_t)
             } else if op == lib::op_no_match {
                 w(int3())
+            } else if op == lib::op_try {
+                // '?' 解包：variant==0 取 payload[0]，否则以该值返回当前函数
+                // '?' unwrap: variant==0 takes payload[0], otherwise return the value from the current function
+                let t_t = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                let t_payload = if is_enum_enc(t_t) {
+                    let t_var = enum_fields_resolve(t_t, 0)
+                    if len(t_var) > 0 {
+                        t_var[0]
+                    } else {
+                        "int"
+                    }
+                } else {
+                    "int"
+                }
+                let ok_path = mov_rm(rdx, rax, 16) + mov_mr(r15, 0 - 8, rdx)
+                let epi = x86gen_epilogue()
+                w(mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 8) + test_rr(rcx, rcx) + jne_rel32(str_len(ok_path) + 5) + ok_path + jmp_rel32(str_len(epi)) + epi)
+                shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
+                push(shadow, "")
+                push(type_shadow, t_payload)
             } else if op == lib::op_neg {
                 w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
                 push(type_shadow, "int")
@@ -2723,6 +2984,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                             None => {},
                                         }
                                     }
+                                } else if is_enum_enc(atype) {
+                                    w(enum_format_for_enc(0 - 8 * (n - ci), atype))
                                 } else if atype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - ci)))
                                 }
@@ -2784,6 +3047,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                             None => {},
                                         }
                                     }
+                                } else if is_enum_enc(btype) {
+                                    w(enum_format_for_enc(0 - 8 * (n - cj), btype))
                                 } else if btype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - cj)))
                                 }
@@ -2845,6 +3110,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                             None => {},
                                         }
                                     }
+                                } else if is_enum_enc(btype) {
+                                    w(enum_format_for_enc(0 - 8 * (n - cj), btype))
                                 } else if btype != "str" {
                                     w(x86gen_str_convert_at(0 - 8 * (n - cj)))
                                 }
@@ -2942,6 +3209,48 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let err_path = mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rcx, 0) + lea(rsi, rcx, 8) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + e1(106) + e1(10) + mov_rr(rsi, rsp) + sys_mov_rdx(1) + sys_mov_rdi(1) + sys_mov_rax(1) + syscall() + pop_r(rax) + sys_mov_rdi(1) + sys_mov_rax(60) + syscall()
                     let done_path = xor_rr(rax, rax) + vs_pop_n(n + 1) + vs_push_zero()
                     w(mov_rm(rax, r15, 0 - 16) + test_rr(rax, rax) + jne_rel32(str_len(err_path)) + err_path + done_path)
+                } else if callee == "type_of" {
+                    // type_of：静态类型名（编译期 type_shadow → 运行时字符串）
+                    // type_of: static type name (compile-time type_shadow to a runtime string)
+                    let to_t = if n >= 1 && len(type_shadow) >= n {
+                        type_shadow[len(type_shadow) - n]
+                    } else {
+                        ""
+                    }
+                    let mut to_name = ""
+                    if to_t == "str" {
+                        to_name = "string"
+                    } else if to_t == "int" {
+                        to_name = "int"
+                    } else if to_t == "bool" {
+                        to_name = "bool"
+                    } else if to_t == "unit" {
+                        to_name = "unit"
+                    } else if to_t == "list-str" || to_t == "list-int" {
+                        to_name = "list"
+                    } else if is_map_type(to_t) {
+                        to_name = "map"
+                    } else if is_enum_enc(to_t) {
+                        if str_len(to_t) > 6 && substr(to_t, 0, 6) == "enum:e" {
+                            let to_eh = match parse_int(substr(to_t, 6, str_len(to_t) - 6)) {
+                                Some(to_ehv) => to_ehv,
+                                None => 0 - 1,
+                            }
+                            if to_eh >= 0 && to_eh < len(en_qual) {
+                                to_name = en_qual[to_eh]
+                            } else {
+                                to_name = enum_qual(to_t)
+                            }
+                        } else {
+                            to_name = enum_qual(to_t)
+                        }
+                    } else if is_record_type(to_t) {
+                        to_name = "record"
+                    } else {
+                        to_name = "unknown"
+                    }
+                    w(x86gen_str_const_at(0 - 16, to_name) + vs_pop_n(1))
+                    ret_type = "str"
                 } else if callee == "map" {
                     w(x86gen_map_native())
                     ret_type = "map"
@@ -3085,11 +3394,40 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let closure_path = mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
                     w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
                 }
+                let mut ctor_arg_types = []
+                let mut cai = 0
+                while cai < n {
+                    if len(type_shadow) >= n - cai {
+                        push(ctor_arg_types, type_shadow[len(type_shadow) - n + cai])
+                    } else {
+                        push(ctor_arg_types, "")
+                    }
+                    cai = cai + 1
+                }
                 shadow_pop(shadow, n + 1)
                 shadow_pop(type_shadow, n + 1)
-                if callee == "ctor" {
+                if str_len(callee) > 5 && substr(callee, 0, 5) == "ctor:" {
+                    // ctor 调用：按 eh:vi 注册字段类型，类型为 enum:e<eh>
+                    // ctor call: register field types by eh:vi, type is enum:e<eh>
+                    let ctor_rest = substr(callee, 5, str_len(callee) - 5)
+                    let ctor_eh = match str_index_of(ctor_rest, ":") {
+                        Some(cei) => match parse_int(substr(ctor_rest, 0, cei)) {
+                            Some(cev) => cev,
+                            None => 0,
+                        },
+                        None => 0,
+                    }
+                    let ctor_vi = match str_index_of(ctor_rest, ":") {
+                        Some(cei) => match parse_int(substr(ctor_rest, cei + 1, str_len(ctor_rest) - cei - 1)) {
+                            Some(civ) => civ,
+                            None => 0,
+                        },
+                        None => 0,
+                    }
+                    let ev_key = "v:" + str(ctor_eh) + ":" + str(ctor_vi)
+                    put(enum_variant_types, ev_key, ctor_arg_types)
                     push(shadow, "enum")
-                    push(type_shadow, "enum")
+                    push(type_shadow, "enum:e" + str(ctor_eh))
                 } else {
                     push(shadow, ret_type)
                     push(type_shadow, ret_type)
