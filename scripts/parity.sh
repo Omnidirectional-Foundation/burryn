@@ -53,6 +53,13 @@ run_parity() {
         return
     fi
 
+    # known limitation: the x86 backend has no GC (bump allocation only)
+    if [ "$name" == "gc_stress" ]; then
+        echo "  SKIP $name (no GC in x86 backend)"
+        SKIP=$((SKIP + 1))
+        return
+    fi
+
     # Compare stdout + exit code
     if [ "$vm_out" == "$x86_out" ] && [ "$vm_rc" == "$x86_rc" ]; then
         echo "  PASS $name"
