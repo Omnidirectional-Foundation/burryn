@@ -600,9 +600,9 @@ fn x86gen_unit_convert_at(off) {
 }
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
-fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "float_bits" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "chan"
-}
+ fn is_unimpl_native(name) {
+     name == "clock" || name == "close" || name == "float_bits" || name == "net_nb" || name == "parse_float" || name == "recv" || name == "to_float" || name == "trunc" || name == "chan"
+ }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
 // x86gen_ord_native inlines ord: decode the first codepoint (1-4 byte UTF-8)
@@ -977,6 +977,140 @@ fn x86gen_stdin_nb_native() {
     let set_nonblock = xor_rr(rdi, rdi) + mov_ri64(rsi, 3) + xor_rr(rdx, rdx) + sys_mov_rax(72) + syscall() + mov_rr(r8, rax) + mov_ri64(rdx, 2048) + or_rr(rdx, r8) + xor_rr(rdi, rdi) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
     let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(set_nonblock) + str_len(read_path)) + set_nonblock + read_path + empty_ok
     head
+}
+
+// x86gen_parse_ip_at 解析 [r15+off] 的 str 为 IPv4 四字节（内存序）到 [rsp+0..3]
+// 成功 rax=0，失败 rax=-1。寄存器：rsi 字符指针、rdi 结束、r8 移位数(0/8/16/24)、r9 累加、r10 段值、r11 段位数
+// x86gen_parse_ip_at parses the str at [r15+off] as four IPv4 bytes (memory order) into [rsp]
+// Returns rax=0 on success, rax=-1 on failure
+fn x86gen_parse_ip_at(off) {
+    let fail = mov_ri64(rax, -1)
+    let s0 = xor_rr(r10, r10) + xor_rr(r11, r11)
+    let d1cmp = cmp_rr(rsi, rdi)
+    let d2a1 = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 48) + cmp_rr(rax, rcx)
+    let d2b1 = sub_ri32(rax, 48) + mov_ri64(rcx, 9) + cmp_rr(rax, rcx)
+    let d3a = mov_ri64(rcx, 10) + imul_rr(r10, rcx) + add_rr(r10, rax) + add_ri32(r11, 1) + mov_ri64(rcx, 3) + cmp_rr(r11, rcx)
+    let d4add = add_ri32(rsi, 1)
+    let s1t = test_rr(r11, r11)
+    let s2 = mov_ri64(rcx, 255) + cmp_rr(r10, rcx)
+    let s3a = mov_rr(rcx, r8) + mov_rr(rax, r10) + shl_rcl(rax) + or_rr(r9, rax) + add_ri32(r8, 8)
+    let s3cmp = cmp_rr(rsi, rdi)
+    let s4a1 = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 46) + cmp_rr(rax, rcx)
+    let s4b1 = add_ri32(rsi, 1) + mov_ri64(rcx, 32) + cmp_rr(r8, rcx)
+    let f1succ = mov_mr(rsp, 0, r9) + xor_rr(rax, rax) + jmp_rel32(str_len(fail))
+    let f1jne = mov_ri64(rcx, 32) + cmp_rr(r8, rcx) + jne_rel32(str_len(f1succ))
+    let d1jae = jae_rel32(str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d2ajl = jl_rel32(str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d2bja = ja_rel32(str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d4jmp = jmp_rel32(0 - (str_len(d1cmp) + 6 + str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5))
+    let s1je = je_rel32(str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s2ja = ja_rel32(str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s3je = je_rel32(str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5)
+    let s4ajne = jne_rel32(str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s4bjae = jae_rel32(5 + str_len(f1jne) + str_len(f1succ))
+    let s5jmp = jmp_rel32(0 - (str_len(s0) + str_len(d1cmp) + 6 + str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5 + str_len(s1t) + 6 + str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5))
+    let d3ja = ja_rel32(str_len(d4add) + 5 + str_len(s1t) + 6 + str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let head = mov_rm(r9, r15, off) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rm(rdi, r9, 0) + add_rr(rdi, rsi) + xor_rr(r8, r8) + xor_rr(r9, r9) + s0 + d1cmp + d1jae + d2a1 + d2ajl + d2b1 + d2bja + d3a + d3ja + d4add + d4jmp + s1t + s1je + s2 + s2ja + s3a + s3cmp + s3je + s4a1 + s4ajne + s4b1 + s4bjae + s5jmp + f1jne + f1succ + fail
+    head
+}
+
+// x86gen_sockaddr_at 构建 sockaddr_in（AF_INET）到 [rsp+16..31]：r9 = port、[rsp+0..3] = IP 四字节
+// x86gen_sockaddr_at builds an AF_INET sockaddr_in at [rsp+16..31]: r9 = port, [rsp+0..3] = four IP bytes
+fn x86gen_sockaddr_at() {
+    let f1 = mov_ri64(rax, 2) + mov_mr(rsp, 16, rax)
+    let f2 = mov_rr(rax, r9) + mov_ri64(rcx, 8) + mov_rr(rdx, rax) + shr_rcl(rdx) + mov_ri64(rcx, 255) + and_rr(rdx, rcx) + and_rr(rax, rcx) + mov_ri64(rcx, 8) + shl_rcl(rdx) + or_rr(rax, rdx) + mov_mr(rsp, 18, rax)
+    let f3 = mov_rm(rax, rsp, 0) + mov_mr(rsp, 20, rax)
+    let f4 = xor_rr(rax, rax) + mov_mr(rsp, 24, rax)
+    f1 + f2 + f3 + f4
+}
+
+// x86gen_tcp_listen_native 内联 tcp_listen：socket/bind/listen syscalls，返回 Result<int, str>
+// x86gen_tcp_listen_native inlines tcp_listen: socket/bind/listen syscalls, returning Result<int, str>
+fn x86gen_tcp_listen_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 32)
+    let fail_close = mov_rr(rdi, r9) + sys_mov_rax(3) + syscall() + fail
+    let listen_ok = mov_rr(rax, r9) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    let listen_fail = test_rr(rax, rax) + jl_rel32(str_len(listen_ok))
+    let listen_seq = mov_rr(rdi, r9) + mov_ri64(rsi, 128) + sys_mov_rax(50) + syscall()
+    let bind_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(49) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let reuse_seq = mov_ri64(rax, 1) + mov_mr(rsp, 4, rax) + mov_rr(rdi, r9) + mov_ri64(rsi, 1) + mov_ri64(rdx, 2) + lea(r10, rsp, 4) + mov_ri64(r8, 4) + sys_mov_rax(54) + syscall()
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let sockaddr = x86gen_sockaddr_at()
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
+    head + sockaddr + socket_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close
+}
+
+// x86gen_tcp_accept_native 内联 tcp_accept：阻塞式 accept syscall，返回 Result<int, str>
+// x86gen_tcp_accept_native inlines tcp_accept: a blocking accept syscall, returning Result<int, str>
+fn x86gen_tcp_accept_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 8, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 8, rcx) + vs_pop_n(1)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    let ok_path = ok_inst + jmp_rel32(str_len(fail))
+    let accept_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(ok_path) + str_len(fail))
+    accept_seq + ok_path + fail
+}
+
+// x86gen_tcp_dial_native 内联 tcp_dial：socket/connect syscalls，返回 Result<int, str>
+// x86gen_tcp_dial_native inlines tcp_dial: socket/connect syscalls, returning Result<int, str>
+fn x86gen_tcp_dial_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 32)
+    let fail_close = mov_rr(rdi, r9) + sys_mov_rax(3) + syscall() + fail
+    let connect_ok = mov_rr(rax, r9) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    let connect_fail = test_rr(rax, rax) + jl_rel32(str_len(connect_ok))
+    let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(connect_seq) + str_len(connect_fail) + str_len(connect_ok))
+    let sockaddr = x86gen_sockaddr_at()
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(connect_seq) + str_len(connect_fail) + str_len(connect_ok))
+    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
+    head + sockaddr + socket_seq + connect_seq + connect_fail + connect_ok + fail_close
+}
+
+// x86gen_net_read_native 内联 net_read：read syscall 进新 str，返回 Result<str, str>
+// x86gen_net_read_native inlines net_read: a read syscall into a fresh str, returning Result<str, str>
+fn x86gen_net_read_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    let ok_path = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(fail))
+    let read_seq = mov_rm(rdi, r15, 0 - 16) + mov_rr(rdx, r10) + sys_mov_rax(0) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(ok_path) + str_len(fail)) + ok_path
+    let alloc_seq = mov_rr(r10, r11) + mov_rr(r8, r12) + mov_mr(r8, 0, r10) + lea(rsi, r8, 8) + add_rr(r12, r10) + add_ri32(r12, 8)
+    let empty_ok = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(alloc_seq) + str_len(read_seq) + str_len(ok_path) + str_len(fail))
+    let max_seq = mov_rm(r11, r15, 0 - 8) + test_rr(r11, r11) + jl_rel32(str_len(empty_ok) + str_len(alloc_seq) + str_len(read_seq) + str_len(ok_path) + str_len(fail)) + je_rel32(str_len(empty_ok))
+    max_seq + empty_ok + alloc_seq + read_seq + ok_path + fail
+}
+
+// x86gen_net_write_native 内联 net_write：循环 write syscall 直到写完，返回 Result<unit, str>
+// x86gen_net_write_native inlines net_write: looping write syscalls until done, returning Result<unit, str>
+fn x86gen_net_write_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    let done = ok_inst + jmp_rel32(str_len(fail))
+    let w1 = mov_rr(rdx, r10) + neg_r(rdx) + mov_rm(rax, r9, 0) + add_rr(rdx, rax) + mov_rr(rdi, r11) + mov_rr(rsi, r9) + add_rr(rsi, r10) + add_ri32(rsi, 8) + sys_mov_rax(1) + syscall() + test_rr(rax, rax)
+    let w3 = add_rr(r10, rax)
+    let w2 = jle_rel32(str_len(w3) + 5 + str_len(done) + str_len(fail))
+    let loop_check = mov_rm(rdx, r9, 0) + cmp_rr(r10, rdx) + jae_rel32(str_len(w1) + str_len(w2) + str_len(w3) + 5)
+    let j_back = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + str_len(w3)))
+    let head = mov_rm(r9, r15, 0 - 8) + mov_rm(r11, r15, 0 - 16) + xor_rr(r10, r10) + jmp_rel32(str_len(done))
+    head + loop_check + w1 + w2 + w3 + j_back + done + fail
+}
+
+// x86gen_net_close_native 内联 net_close：close syscall，返回 unit
+// x86gen_net_close_native inlines net_close: a close syscall, returning unit
+fn x86gen_net_close_native() {
+    let close_seq = mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(3) + syscall() + xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax) + vs_pop_n(1)
+    close_seq
 }
 
 // x86gen_read_dir_native 内联 read_dir：open/getdents64/close syscall + 名字排序，返回 Result<[str], str>
@@ -2659,6 +2793,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         } else {
                             push(ptshadow_ps, "unit")
                         }
+                    } else if pcallee == "tcp_listen" || pcallee == "tcp_accept" || pcallee == "tcp_dial" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, enum_payload_enc("Result", [["int"], ["str"]]))
+                    } else if pcallee == "net_read" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, enum_payload_enc("Result", [["str"], ["str"]]))
+                    } else if pcallee == "net_write" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, enum_payload_enc("Result", [["unit"], ["str"]]))
+                    } else if pcallee == "net_close" {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "unit")
                     } else if pcallee == "read_file" {
                         push(pshadow_ps, "")
                         push(ptshadow_ps, enum_payload_enc("Result", [["str"], ["str"]]))
@@ -3030,6 +3176,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             if pseed_e - 1 < len(fn_param_types[fh]) {
                 pos_types[pseed_e] = fn_param_types[fh][pseed_e - 1]
             }
+            // 参数槽的值在调用帧里（无 set_local）：标记权威
+            // parameter slots hold values in the call frame (no set_local): mark them authoritative
+            pos_auth[pseed_e] = true
             pseed_e = pseed_e + 1
         }
         let mut ip_to_byte = map()
@@ -3832,6 +3981,25 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     ret_type = "bool"
                 } else if callee == "sleep" {
                     w(x86gen_sleep_native())
+                    ret_type = "unit"
+                } else if callee == "tcp_listen" || callee == "tcp_dial" {
+                    if callee == "tcp_listen" {
+                        w(x86gen_tcp_listen_native())
+                    } else {
+                        w(x86gen_tcp_dial_native())
+                    }
+                    ret_type = enum_payload_enc("Result", [["int"], ["str"]])
+                } else if callee == "tcp_accept" {
+                    w(x86gen_tcp_accept_native())
+                    ret_type = enum_payload_enc("Result", [["int"], ["str"]])
+                } else if callee == "net_read" {
+                    w(x86gen_net_read_native())
+                    ret_type = enum_payload_enc("Result", [["str"], ["str"]])
+                } else if callee == "net_write" {
+                    w(x86gen_net_write_native())
+                    ret_type = enum_payload_enc("Result", [["unit"], ["str"]])
+                } else if callee == "net_close" {
+                    w(x86gen_net_close_native())
                     ret_type = "unit"
                 } else if callee == "yield" {
                     // 无调度器：空操作，返回 unit
