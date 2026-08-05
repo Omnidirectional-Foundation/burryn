@@ -525,14 +525,14 @@ pub fn vs_pop_n(n) {
 // x86gen_prologue emits the prologue: save the caller base, build the frame base by arity
 // Function prologue: save caller base, set frame base by arity
 fn x86gen_prologue(arity, _locals) {
-    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1))
+    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1)) + sub_ri32(rsp, 8) + xor_rr(rax, rax) + mov_mr(rsp, 0, rax)
 }
 
 // x86gen_epilogue 生成函数尾声：返回值落栈并恢复帧
 // x86gen_epilogue emits the epilogue: push the return value and restore the frame
 // Function epilogue: place the return value and restore the frame
 fn x86gen_epilogue() {
-    mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + pop_r(rbp) + ret()
+    mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + add_ri32(rsp, 8) + pop_r(rbp) + ret()
 }
 
 // x86gen_str_native 内联 str(int)：带符号十进制，逐位除 10 + 负号
@@ -1118,6 +1118,15 @@ fn x86gen_tuple_format_at(off, types) {
     }
     l2 = l2 + mb(41) + add_ri32(rdi, 1)
     l1 + alloc + l2 + mov_mr(r15, off, r9)
+}
+
+// x86gen_defer_loop 生成函数返回时的 defer 链执行（LIFO，闭包无参调用，链头在 [rsp]）/
+// x86gen_defer_loop emits the defer-chain execution at function return (LIFO, zero-arg closure calls, head at [rsp])
+fn x86gen_defer_loop() {
+    let body = mov_rm(r8, rax, 0) + mov_rm(r9, rax, 8) + mov_mr(rsp, 0, r8) + mov_mr(r15, 0, r9) + add_ri32(r15, 8) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rcx, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
+    let loop_head = mov_rm(rax, rsp, 0) + test_rr(rax, rax) + je_rel32(str_len(body) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + 5))
+    loop_head + body + back
 }
 
 // x86gen_err_inst 构造 Err("os error") 实例（rax 返回）/
@@ -2967,6 +2976,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         push(ptshadow_ps, "record:" + pu_enc)
                     }
+                } else if pop == lib::op_defer {
+                    shadow_pop(pshadow_ps, 1)
+                    shadow_pop(ptshadow_ps, 1)
                 } else if pop == lib::op_spawn || pop == lib::op_select {}
                 if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
                     let pdepth = len(ptshadow_ps) - 1
@@ -4013,7 +4025,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(type_shadow, ret_type)
                 }
             } else if op == lib::op_return {
-                w(x86gen_epilogue())
+                // 先执行 defer 链（LIFO），再 epilogue
+                // run the defer chain (LIFO) before the epilogue
+                w(x86gen_defer_loop() + x86gen_epilogue())
+            } else if op == lib::op_defer {
+                // 栈顶闭包压入 [rsp] 链头（[next][closure] 节点）
+                // push the stack-top closure onto the [rsp] defer chain ([next][closure] nodes)
+                let push_node = mov_rm(rcx, r15, 0 - 8) + mov_rr(r11, r12) + mov_rm(rdx, rsp, 0) + mov_mr(r11, 0, rdx) + mov_mr(r11, 8, rcx) + mov_mr(rsp, 0, r11) + add_ri32(r12, 16)
+                w(push_node + vs_pop_n(1))
+                shadow_pop(shadow, 1)
+                shadow_pop(type_shadow, 1)
             } else if op == lib::op_closure {
                 let idx = read_u16(code, ip + 1)
                 let sub = fn_const(fh, idx)
