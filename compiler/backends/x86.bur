@@ -601,7 +601,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "float_bits" || name == "gc" || name == "gc_cycles" || name == "heap_objects" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "yield" || name == "chan"
+    name == "clock" || name == "close" || name == "float_bits" || name == "net_close" || name == "net_nb" || name == "net_read" || name == "net_write" || name == "parse_float" || name == "recv" || name == "tcp_accept" || name == "tcp_dial" || name == "tcp_listen" || name == "to_float" || name == "trunc" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -1071,6 +1071,54 @@ let proc_complete = 16456
 let proc_consumed = 16464
 let proc_size = 16472
 let pipe2_nonblock_cloexec = 526336
+
+// x86gen_tuple_format_at 生成 tuple 格式化：(e0, e1, ...)，元素按静态类型展开
+// x86gen_tuple_format_at emits tuple formatting: (e0, e1, ...), elements expanded from static types
+// tuple formatting: (e0, e1, ...) with per-element static types
+fn x86gen_tuple_format_at(off, types) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let mut l1 = mov_rm(r9, r15, off) + mov_rr(r10, r9) + mov_ri64(rcx, 2)
+    let mut i = 0
+    while i < len(types) {
+        if i > 0 {
+            l1 = l1 + add_ri32(rcx, 2)
+        }
+        let t = types[i]
+        if t == "str" {
+            l1 = l1 + mov_rm(rax, r10, 8 + 8 * i) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+        } else {
+            let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+            let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+            l1 = l1 + mov_rm(rax, r10, 8 + 8 * i) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+        }
+        i = i + 1
+    }
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + mb(40) + add_ri32(rdi, 1)
+    let mut l2 = ""
+    let mut j = 0
+    while j < len(types) {
+        if j > 0 {
+            l2 = l2 + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+        }
+        let t2 = types[j]
+        if t2 == "str" {
+            l2 = l2 + mov_rm(rax, r10, 8 + 8 * j) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+        } else {
+            let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+            let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+            let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+            let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+            let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+            l2 = l2 + mov_rm(rax, r10, 8 + 8 * j) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+        }
+        j = j + 1
+    }
+    l2 = l2 + mb(41) + add_ri32(rdi, 1)
+    l1 + alloc + l2 + mov_mr(r15, off, r9)
+}
 
 // x86gen_err_inst 构造 Err("os error") 实例（rax 返回）/
 // x86gen_err_inst builds an Err("os error") instance (returned in rax)
@@ -1584,7 +1632,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let op = code[ip]
         if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
             3
-        } else if op == lib::op_pop_n || op == lib::op_call || op == lib::op_spawn || op == lib::op_end_block || op == lib::op_test_variant || op == lib::op_get_field {
+        } else if op == lib::op_pop_n || op == lib::op_call || op == lib::op_spawn || op == lib::op_end_block || op == lib::op_test_variant || op == lib::op_get_field || op == lib::op_tuple {
             2
         } else if op == lib::op_record || op == lib::op_record_update {
             4
@@ -2773,6 +2821,26 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(pshadow_ps, "")
                     if plt == "list-str" || plt == "str" {
                         push(ptshadow_ps, "str")
+                    } else if str_len(plt) > 4 && substr(plt, 0, 4) == "tup:" {
+                        let mut pel_t = "int"
+                        let ppt = if pit >= 3 {
+                            pcode[pit - 3]
+                        } else {
+                            255
+                        }
+                        if ppt == lib::op_const {
+                            let ppidx = read_u16(pcode, pit - 2)
+                            match f_consts[ptfh][ppidx] {
+                                lib::CVal::CInt(ppv) => {
+                                    let pelems = split(substr(plt, 4, str_len(plt) - 4), "\n")
+                                    if ppv >= 0 && ppv < len(pelems) {
+                                        pel_t = pelems[ppv]
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                        push(ptshadow_ps, pel_t)
                     } else {
                         push(ptshadow_ps, "int")
                     }
@@ -2784,6 +2852,22 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(ptshadow_ps, 1)
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
+                } else if pop == lib::op_tuple {
+                    let ptup_n = pcode[pit + 1]
+                    let mut ptup_ts = []
+                    let mut ptup_i = 0
+                    while ptup_i < ptup_n {
+                        if len(ptshadow_ps) >= ptup_n - ptup_i {
+                            push(ptup_ts, ptshadow_ps[len(ptshadow_ps) - ptup_n + ptup_i])
+                        } else {
+                            push(ptup_ts, "int")
+                        }
+                        ptup_i = ptup_i + 1
+                    }
+                    shadow_pop(pshadow_ps, ptup_n)
+                    shadow_pop(ptshadow_ps, ptup_n)
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "tup:" + join(ptup_ts, "\n"))
                 } else if pop == lib::op_record {
                     let prec_n = pcode[pit + 1]
                     let prec_cidx = read_u16(pcode, pit + 2)
@@ -3255,12 +3339,42 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(type_shadow, ltag)
             } else if op == lib::op_index_get {
                 let st = type_shadow[len(type_shadow) - 2]
+
                 if st == "str" {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rr(r11, r12) + xor_rr(r9, r9) + add_ri32(r9, 1) + mov_mr(r11, 0, r9) + mov_rm(r9, rax, 8) + add_rr(r9, rcx) + mov_mr(r11, 8, r9) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
                     shadow_pop(type_shadow, 2)
                     push(shadow, "str")
                     push(type_shadow, "str")
+                } else if str_len(st) > 4 && substr(st, 0, 4) == "tup:" {
+                    // tuple 索引：元素 = [tuple + 8 + 8*idx]
+                    // tuple index: element at [tuple + 8 + 8*idx]
+                    let addr = mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rr(rdx, r9) + mov_ri32(rcx, 3) + shl_rcl(rdx) + lea(r8, rax, 8) + add_rr(r8, rdx) + mov_rm(rdx, r8, 0)
+                    w(addr + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                    // 类型：索引常量（解构场景）回看前一条 CONST；运行时索引回退 int
+                    // type: for constant indices (destructuring) peek at the preceding CONST; runtime indices fall back to int
+                    let mut el_t = "int"
+                    let pt = if ip >= 3 {
+                        code[ip - 3]
+                    } else {
+                        255
+                    }
+                    if pt == lib::op_const {
+                        let pidx = read_u16(code, ip - 2)
+                        match f_consts[fh][pidx] {
+                            lib::CVal::CInt(pv) => {
+                                let elems = split(substr(st, 4, str_len(st) - 4), "\n")
+                                if pv >= 0 && pv < len(elems) {
+                                    el_t = elems[pv]
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "")
+                    push(type_shadow, el_t)
                 } else {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_rm(rdx, rax, 0) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
@@ -3408,6 +3522,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - ci), true))
                                 } else if atype == "list-int" {
                                     w(x86gen_list_format_at(0 - 8 * (n - ci), false))
+                                } else if str_len(atype) > 4 && substr(atype, 0, 4) == "tup:" {
+                                    w(x86gen_tuple_format_at(0 - 8 * (n - ci), split(substr(atype, 4, str_len(atype) - 4), "\n")))
                                 } else if is_map_type(atype) {
                                     w(x86gen_map_format_at(0 - 8 * (n - ci), map_key_type(atype) == "str", map_val_type(atype) == "str"))
                                 } else if is_record_type(atype) {
@@ -3471,6 +3587,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), true))
                                 } else if btype == "list-int" {
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), false))
+                                } else if str_len(btype) > 4 && substr(btype, 0, 4) == "tup:" {
+                                    w(x86gen_tuple_format_at(0 - 8 * (n - cj), split(substr(btype, 4, str_len(btype) - 4), "\n")))
                                 } else if is_map_type(btype) {
                                     w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str"))
                                 } else if is_record_type(btype) {
@@ -3534,6 +3652,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), true))
                                 } else if btype == "list-int" {
                                     w(x86gen_list_format_at(0 - 8 * (n - cj), false))
+                                } else if str_len(btype) > 4 && substr(btype, 0, 4) == "tup:" {
+                                    w(x86gen_tuple_format_at(0 - 8 * (n - cj), split(substr(btype, 4, str_len(btype) - 4), "\n")))
                                 } else if is_map_type(btype) {
                                     w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str"))
                                 } else if is_record_type(btype) {
@@ -3701,6 +3821,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if callee == "sleep" {
                     w(x86gen_sleep_native())
                     ret_type = "unit"
+                } else if callee == "yield" {
+                    // 无调度器：空操作，返回 unit
+                    // no scheduler: a no-op returning unit
+                    w(xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax))
+                    ret_type = "unit"
+                } else if callee == "gc" || callee == "heap_objects" || callee == "gc_cycles" {
+                    // 无 GC（bump 分配）：返回占位 0
+                    // no GC (bump allocation): return a placeholder 0
+                    w(xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax))
+                    ret_type = "int"
                 } else if callee == "read_file" {
                     w(x86gen_read_file_native())
                     ret_type = enum_payload_enc("Result", [["str"], ["str"]])
@@ -3913,6 +4043,30 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else if op == lib::op_set_upval {
                 let idx = read_u16(code, ip + 1)
                 w(mov_rm(rcx, r14, 0) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 8 + 8 * idx, rax))
+            } else if op == lib::op_close_upvalue {
+                // no-op：x86 闭包捕获即拷贝，无 open upvalue cell 需关闭
+                // no-op: x86 closures capture by copy, there is no open upvalue cell to close
+                w("")
+            } else if op == lib::op_tuple {
+                let n = code[ip + 1]
+                let alloc = mov_rr(r11, r12) + mov_ri64(rdx, 8 + 8 * n) + add_rr(r12, rdx) + mov_ri64(rdx, n) + mov_mr(r11, 0, rdx)
+                let copy = lea(rsi, r15, 0 - 8 * n) + lea(rdi, r11, 8) + mov_ri64(rcx, 8 * n) + rep_movsb()
+                let tail = sub_ri32(r15, 8 * n) + vs_push(r11)
+                w(alloc + copy + tail)
+                let mut tup_types = []
+                let mut tti = 0
+                while tti < n {
+                    if len(type_shadow) >= n - tti {
+                        push(tup_types, type_shadow[len(type_shadow) - n + tti])
+                    } else {
+                        push(tup_types, "int")
+                    }
+                    tti = tti + 1
+                }
+                shadow_pop(shadow, n)
+                shadow_pop(type_shadow, n)
+                push(shadow, "")
+                push(type_shadow, "tup:" + join(tup_types, "\n"))
             } else if op == lib::op_record {
                 let n = code[ip + 1]
                 let cidx = read_u16(code, ip + 2)
