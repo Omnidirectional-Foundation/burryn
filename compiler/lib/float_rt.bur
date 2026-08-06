@@ -1,0 +1,954 @@
+// float_core.bur — dtoa/strtod 大整数核心，VM 对拍 glibc
+// bigint = list of limbs, base 2^30, little-endian, NL limbs
+// 注意：Burryn 无位运算操作符，全部用 + - * / % 表达
+let NL = 56
+let BASE = 1073741824
+let TWO_52 = 4503599627370496
+let INF_BITS = 9218868437227405312
+let SIGN_BIT = 0 - 9223372036854775807 - 1
+
+fn bi_zero() {
+    let mut a = []
+    let mut i = 0
+    while i < NL {
+        push(a, 0)
+        i = i + 1
+    }
+    a
+}
+
+fn bi_copy(a) {
+    let mut c = bi_zero()
+    let mut i = 0
+    while i < NL {
+        c[i] = a[i]
+        i = i + 1
+    }
+    c
+}
+
+fn bi_set_u64(mut a, v) {
+    let mut i = 0
+    while i < NL {
+        a[i] = 0
+        i = i + 1
+    }
+    a[0] = v % BASE
+    if v >= BASE {
+        a[1] = v / BASE
+    }
+    a
+}
+
+fn bi_cmp(a, b) {
+    let mut i = NL - 1
+    while i >= 0 {
+        if a[i] != b[i] {
+            if a[i] > b[i] {
+                return 1
+            } else {
+                return 0 - 1
+            }
+        }
+        i = i - 1
+    }
+    0
+}
+
+fn bi_is_zero(a) {
+    let mut i = 0
+    while i < NL {
+        if a[i] != 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    1
+}
+
+fn bi_bitlen(a) {
+    let mut i = NL - 1
+    while i >= 0 {
+        if a[i] != 0 {
+            let mut b = i * 30
+            let mut v = a[i]
+            while v > 0 {
+                v = v / 2
+                b = b + 1
+            }
+            return b
+        }
+        i = i - 1
+    }
+    0
+}
+
+fn bi_shl1(mut a) {
+    let mut carry = 0
+    let mut i = 0
+    while i < NL {
+        let mut v = a[i] * 2 + carry
+        if v >= BASE {
+            v = v - BASE
+            carry = 1
+        } else {
+            carry = 0
+        }
+        a[i] = v
+        i = i + 1
+    }
+    a
+}
+
+fn bi_shl_bits(mut a, k) {
+    let ls = k / 30
+    let bs = k % 30
+    if ls > 0 {
+        let mut i = NL - 1
+        while i >= ls {
+            a[i] = a[i - ls]
+            i = i - 1
+        }
+        let mut j = 0
+        while j < ls {
+            a[j] = 0
+            j = j + 1
+        }
+    }
+    if bs > 0 {
+        let mut p = 1
+        let mut j = 0
+        while j < bs {
+            p = p * 2
+            j = j + 1
+        }
+        let mut q = 1
+        let mut j2 = 0
+        while j2 < 30 - bs {
+            q = q * 2
+            j2 = j2 + 1
+        }
+        let mut carry = 0
+        let mut i = 0
+        while i < NL {
+            let old = a[i]
+            a[i] = (old * p + carry) % BASE
+            carry = old / q
+            i = i + 1
+        }
+    }
+    {}
+}
+
+fn bi_shr_bits(mut a, k) {
+    let ls = k / 30
+    let bs = k % 30
+    if ls > 0 {
+        let mut i = 0
+        while i < NL - ls {
+            a[i] = a[i + ls]
+            i = i + 1
+        }
+        let mut j = NL - ls
+        while j < NL {
+            a[j] = 0
+            j = j + 1
+        }
+    }
+    if bs > 0 {
+        let mut p = 1
+        let mut j = 0
+        while j < bs {
+            p = p * 2
+            j = j + 1
+        }
+        let mut q = 1
+        let mut j2 = 0
+        while j2 < 30 - bs {
+            q = q * 2
+            j2 = j2 + 1
+        }
+        let mut carry = 0
+        let mut i = NL - 1
+        while i >= 0 {
+            let old = a[i]
+            a[i] = old / p + carry
+            carry = (old % p) * q
+            i = i - 1
+        }
+    }
+    {}
+}
+
+fn bi_add(mut a, b) {
+    let mut carry = 0
+    let mut i = 0
+    while i < NL {
+        let mut t = a[i] + b[i] + carry
+        if t >= BASE {
+            t = t - BASE
+            carry = 1
+        } else {
+            carry = 0
+        }
+        a[i] = t
+        i = i + 1
+    }
+    a
+}
+
+fn bi_add_small(mut a, v) {
+    a[0] = a[0] + v
+    let mut i = 0
+    while i < NL - 1 && a[i] >= BASE {
+        a[i] = a[i] - BASE
+        i = i + 1
+        a[i] = a[i] + 1
+    }
+    a
+}
+
+fn bi_sub(mut a, b) {
+    let mut borrow = 0
+    let mut i = 0
+    while i < NL {
+        let mut v = a[i] - b[i] - borrow
+        if v < 0 {
+            v = v + BASE
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        a[i] = v
+        i = i + 1
+    }
+    a
+}
+
+fn bi_mul_small(mut a, small) {
+    let mut carry = 0
+    let mut i = 0
+    while i < NL {
+        let v = a[i] * small + carry
+        a[i] = v % BASE
+        carry = v / BASE
+        i = i + 1
+    }
+    a
+}
+
+fn bi_bit(a, i) {
+    let limb = i / 30
+    let bit = i % 30
+    let mut p = 1
+    let mut j = 0
+    while j < bit {
+        p = p * 2
+        j = j + 1
+    }
+    let v = a[limb] / p
+    v % 2
+}
+
+fn bi_has_low_bits(a, n) {
+    let mut i = 0
+    while i < n {
+        if bi_bit(a, i) == 1 {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn bi_set_bit(mut a, i) {
+    let limb = i / 30
+    let bit = i % 30
+    let mut p = 1
+    let mut j = 0
+    while j < bit {
+        p = p * 2
+        j = j + 1
+    }
+    a[limb] = a[limb] + p
+}
+
+// q = num // den（就地写 q），返回余数 r
+fn bi_divmod(num, den, mut q) {
+    let mut i = 0
+    while i < NL {
+        q[i] = 0
+        i = i + 1
+    }
+    let mut r = bi_zero()
+    let mut b = bi_bitlen(num) - 1
+    while b >= 0 {
+        bi_shl1(r)
+        let bitv = bi_bit(num, b)
+        if bitv == 1 {
+            r[0] = r[0] + 1
+        }
+        if bi_cmp(r, den) >= 0 {
+            bi_sub(r, den)
+            bi_set_bit(q, b)
+        }
+        b = b - 1
+    }
+    r
+}
+
+fn bi_pow10(k) {
+    let mut a = bi_zero()
+    a[0] = 1
+    let mut i = 0
+    while i < k {
+        bi_mul_small(a, 10)
+        i = i + 1
+    }
+    a
+}
+
+fn bi_to_u64(a) {
+    a[0] + a[1] * BASE
+}
+
+fn pow10_int(k) {
+    let mut v = 1
+    let mut i = 0
+    while i < k {
+        v = v * 10
+        i = i + 1
+    }
+    v
+}
+
+fn i64_decstr(v) {
+    if v == 0 {
+        return "0"
+    }
+    let mut s = ""
+    let mut x = v
+    while x > 0 {
+        s = chr(48 + (x % 10)) + s
+        x = x / 10
+    }
+    s
+}
+
+fn zeros(n) {
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        s = s + "0"
+        i = i + 1
+    }
+    s
+}
+
+fn rstrip_zeros(s) {
+    let mut n = str_len(s)
+    while n > 0 && char_at(s, n - 1) == "0" {
+        n = n - 1
+    }
+    substr(s, 0, n)
+}
+
+// ---- 十进制度量 ----
+
+// 比较 10^k 与 m*2^e：返回 bi_cmp 语义（-1/0/1）
+fn pow10_vs(m, e, k) {
+    let mut res = 0
+    if k >= 0 {
+        let mut p = bi_pow10(k)
+        if e >= 0 {
+            let mut v = bi_set_u64(bi_zero(), m)
+            bi_shl_bits(v, e)
+            res = bi_cmp(p, v)
+        } else {
+            bi_shl_bits(p, 0 - e)
+            let mut v = bi_set_u64(bi_zero(), m)
+            res = bi_cmp(p, v)
+        }
+    } else {
+        let nk = 0 - k
+        if e >= 0 {
+            let mut v = bi_set_u64(bi_zero(), m)
+            let mut i = 0
+            while i < nk {
+                bi_mul_small(v, 10)
+                i = i + 1
+            }
+            bi_shl_bits(v, e)
+            res = bi_cmp(bi_set_u64(bi_zero(), 1), v)
+        } else {
+            let mut v = bi_set_u64(bi_zero(), m)
+            let mut i = 0
+            while i < nk {
+                bi_mul_small(v, 10)
+                i = i + 1
+            }
+            let mut d = bi_set_u64(bi_zero(), 1)
+            bi_shl_bits(d, 0 - e)
+            res = bi_cmp(d, v)
+        }
+    }
+    res
+}
+
+fn exp10_of(m, e) {
+    let mut bl = 0
+    let mut v = m
+    while v > 0 {
+        v = v / 2
+        bl = bl + 1
+    }
+    let mut exp10 = ((bl + e - 1) * 30103) / 100000
+    while pow10_vs(m, e, exp10) == 1 {
+        exp10 = exp10 - 1
+    }
+    while pow10_vs(m, e, exp10 + 1) == 0 - 1 {
+        exp10 = exp10 + 1
+    }
+    exp10
+}
+
+// ---- 有理数 → double bits（单次四舍五入，含次正规数）----
+fn bi_rational_to_bits(num, den) {
+    if bi_is_zero(num) == 1 {
+        return 0
+    }
+    let Ln = bi_bitlen(num)
+    let Ld = bi_bitlen(den)
+    let mut sh = 55 + Ld - Ln
+    let mut num2 = bi_copy(num)
+    let mut den2 = bi_copy(den)
+    if sh > 0 {
+        bi_shl_bits(num2, sh)
+        {}
+    } else {
+        if sh < 0 {
+            bi_shl_bits(den2, 0 - sh)
+            {}
+        }
+    }
+    let mut q = bi_zero()
+    let r = bi_divmod(num2, den2, q)
+    let bl = bi_bitlen(q)
+    let e2 = bl - 1 - sh
+    if e2 >= 1024 {
+        return INF_BITS
+    }
+    let mut target_bits = 53
+    let mut target_exp = e2 - 52
+    if e2 < 0 - 1022 {
+        if e2 + 1075 <= 0 {
+            let mut nb = bi_copy(num)
+            bi_shl_bits(nb, 1075)
+            if bi_cmp(nb, den) > 0 {
+                return 1
+            }
+            return 0
+        }
+        target_bits = e2 + 1075
+        target_exp = 0 - 1074
+    }
+    let drop = bl - target_bits
+    let round_bit = bi_bit(q, drop - 1)
+    let mut sticky = bi_has_low_bits(q, drop - 1)
+    if bi_is_zero(r) == 0 {
+        sticky = 1
+    }
+    let mut S = bi_copy(q)
+    bi_shr_bits(S, drop)
+    let mut up = 0
+    if round_bit == 1 {
+        if sticky == 1 {
+            up = 1
+        } else {
+            if bi_bit(S, 0) == 1 {
+                up = 1
+            }
+        }
+    }
+    if up == 1 {
+        bi_add_small(S, 1)
+        if bi_bitlen(S) > target_bits {
+            bi_shr_bits(S, 1)
+            target_exp = target_exp + 1
+            if target_exp == 0 - 1073 {
+                return 1 * TWO_52
+            }
+        }
+    }
+    let mut out = 0
+    if target_exp >= 0 - 1022 {
+        if target_exp + 1075 >= 2047 {
+            out = INF_BITS
+        } else {
+            let mant = bi_to_u64(S) - TWO_52
+            out = (target_exp + 1075) * TWO_52 + mant
+        }
+    } else {
+        out = bi_to_u64(S)
+    }
+    out
+}
+
+// ---- 解析字符串 → double bits ----
+fn parse_float_bits(s) {
+    let mut i = 0
+    let mut j = str_len(s)
+    while i < j && is_space(char_at(s, i)) == 1 {
+        i = i + 1
+    }
+    while j > i && is_space(char_at(s, j - 1)) == 1 {
+        j = j - 1
+    }
+    if j - i == 0 || j - i >= 128 {
+        return [0, 0]
+    }
+    let body = substr(s, i, j - i)
+    let n = str_len(body)
+    let mut p = 0
+    let mut neg = 0
+    let c0 = char_at(body, 0)
+    if c0 == "+" {
+        p = 1
+    } else {
+        if c0 == "-" {
+            p = 1
+            neg = 1
+        }
+    }
+    if p >= n {
+        return [0, 0]
+    }
+    let rest = substr(body, p, n - p)
+    let lr = lower(rest)
+    if lr == "inf" || lr == "infinity" {
+        if neg == 1 {
+            return [1, INF_BITS + SIGN_BIT]
+        }
+        return [1, INF_BITS]
+    }
+    if str_len(lr) >= 3 && substr(lr, 0, 3) == "nan" {
+        return [1, INF_BITS + TWO_52]
+    }
+    if str_len(rest) >= 2 && char_at(rest, 0) == "0" && (char_at(rest, 1) == "x" || char_at(rest, 1) == "X") {
+        return parse_hex(rest, neg)
+    }
+    let mut digs = ""
+    let mut frac = ""
+    let mut q2 = 0
+    while q2 < n - p && is_digit(char_at(rest, q2)) == 1 {
+        digs = digs + char_at(rest, q2)
+        q2 = q2 + 1
+    }
+    if q2 < n - p && char_at(rest, q2) == "." {
+        q2 = q2 + 1
+        while q2 < n - p && is_digit(char_at(rest, q2)) == 1 {
+            frac = frac + char_at(rest, q2)
+            q2 = q2 + 1
+        }
+    }
+    if str_len(digs) == 0 && str_len(frac) == 0 {
+        return [0, 0]
+    }
+    let mut eexp = 0
+    if q2 < n - p && (char_at(rest, q2) == "e" || char_at(rest, q2) == "E") {
+        q2 = q2 + 1
+        let mut es = 1
+        if q2 < n - p && char_at(rest, q2) == "+" {
+            q2 = q2 + 1
+        } else {
+            if q2 < n - p && char_at(rest, q2) == "-" {
+                es = 0 - 1
+                q2 = q2 + 1
+            }
+        }
+        if q2 >= n - p || is_digit(char_at(rest, q2)) == 0 {
+            return [0, 0]
+        }
+        while q2 < n - p && is_digit(char_at(rest, q2)) == 1 {
+            eexp = eexp * 10 + (ord(char_at(rest, q2)) - 48)
+            q2 = q2 + 1
+        }
+        eexp = eexp * es
+    }
+    if q2 < n - p {
+        return [0, 0]
+    }
+    let all = digs + frac
+    let al = str_len(all)
+    let mut k = 0
+    while k < al && char_at(all, k) == "0" {
+        k = k + 1
+    }
+    if k == al {
+        if neg == 1 {
+            return [1, SIGN_BIT]
+        }
+        return [1, 0]
+    }
+    let dstr = substr(all, k, al - k)
+    let mut D = bi_zero()
+    let mut i2 = 0
+    while i2 < str_len(dstr) {
+        let d = ord(char_at(dstr, i2)) - 48
+        bi_mul_small(D, 10)
+        bi_add_small(D, d)
+        i2 = i2 + 1
+    }
+    let E = eexp - str_len(frac)
+    let mut out_ok = 0
+    let mut out_bits = 0
+    if E >= 0 {
+        if E > 320 {
+            out_ok = 1
+            out_bits = INF_BITS
+        } else {
+            let mut i3 = 0
+            while i3 < E {
+                bi_mul_small(D, 10)
+                i3 = i3 + 1
+            }
+            let num = D
+            let mut den = bi_set_u64(bi_zero(), 1)
+            let bits = bi_rational_to_bits(num, den)
+            out_ok = 1
+            out_bits = bits
+        }
+    } else {
+        let nE = 0 - E
+        if nE > 450 {
+            out_ok = 1
+        } else {
+            let num = D
+            let mut den = bi_pow10(nE)
+            let bits = bi_rational_to_bits(num, den)
+            out_ok = 1
+            out_bits = bits
+        }
+    }
+    if neg == 1 {
+        out_bits = out_bits + SIGN_BIT
+    }
+    [out_ok, out_bits]
+}
+
+fn parse_hex(rest, neg) {
+    let n = str_len(rest)
+    let mut j = 2
+    let mut hd = ""
+    let mut hf = ""
+    while j < n && is_hexdigit(char_at(rest, j)) == 1 {
+        hd = hd + char_at(rest, j)
+        j = j + 1
+    }
+    if j < n && char_at(rest, j) == "." {
+        j = j + 1
+        while j < n && is_hexdigit(char_at(rest, j)) == 1 {
+            hf = hf + char_at(rest, j)
+            j = j + 1
+        }
+    }
+    if str_len(hd) == 0 && str_len(hf) == 0 {
+        return [0, 0]
+    }
+    let mut pexp = 0
+    if j < n && (char_at(rest, j) == "p" || char_at(rest, j) == "P") {
+        j = j + 1
+        let mut ps = 1
+        if j < n && char_at(rest, j) == "+" {
+            j = j + 1
+        } else {
+            if j < n && char_at(rest, j) == "-" {
+                ps = 0 - 1
+                j = j + 1
+            }
+        }
+        if j >= n || is_digit(char_at(rest, j)) == 0 {
+            return [0, 0]
+        }
+        while j < n && is_digit(char_at(rest, j)) == 1 {
+            pexp = pexp * 10 + (ord(char_at(rest, j)) - 48)
+            j = j + 1
+        }
+        pexp = pexp * ps
+    }
+    if j < n {
+        return [0, 0]
+    }
+    let all = hd + hf
+    let al = str_len(all)
+    let mut k = 0
+    while k < al && char_at(all, k) == "0" {
+        k = k + 1
+    }
+    if k == al {
+        if neg == 1 {
+            return [1, SIGN_BIT]
+        }
+        return [1, 0]
+    }
+    let hstr = substr(all, k, al - k)
+    let mut H = bi_zero()
+    let mut i = 0
+    while i < str_len(hstr) {
+        let c = char_at(hstr, i)
+        let mut dv = 0
+        if is_digit(c) == 1 {
+            dv = ord(c) - 48
+        } else {
+            let o = ord(c)
+            if o >= 97 {
+                dv = o - 87
+            } else {
+                dv = o - 55
+            }
+        }
+        bi_mul_small(H, 16)
+        bi_add_small(H, dv)
+        i = i + 1
+    }
+    let E2 = pexp - 4 * str_len(hf)
+    let mut num = H
+    let mut out_ok = 0
+    let mut out_bits = 0
+    if E2 >= 0 {
+        if E2 >= 1024 {
+            out_ok = 1
+            out_bits = INF_BITS
+        } else {
+            bi_shl_bits(num, E2)
+            let mut den = bi_set_u64(bi_zero(), 1)
+            let bits = bi_rational_to_bits(num, den)
+            out_ok = 1
+            out_bits = bits
+        }
+    } else {
+        let nE2 = 0 - E2
+        if nE2 > 1600 {
+            out_ok = 1
+        } else {
+            let mut den = bi_set_u64(bi_zero(), 1)
+            bi_shl_bits(den, nE2)
+            let bits = bi_rational_to_bits(num, den)
+            out_ok = 1
+            out_bits = bits
+        }
+    }
+    if neg == 1 {
+        out_bits = out_bits + SIGN_BIT
+    }
+    [out_ok, out_bits]
+}
+
+// ---- 字符工具 ----
+fn is_space(c) {
+    let o = ord(c)
+    if o == 32 || o == 9 || o == 10 || o == 13 {
+        return 1
+    }
+    0
+}
+
+fn is_digit(c) {
+    let o = ord(c)
+    if o >= 48 && o <= 57 {
+        return 1
+    }
+    0
+}
+
+fn is_hexdigit(c) {
+    let o = ord(c)
+    if o >= 48 && o <= 57 {
+        return 1
+    }
+    if o >= 97 && o <= 102 {
+        return 1
+    }
+    if o >= 65 && o <= 70 {
+        return 1
+    }
+    0
+}
+
+fn lower(s) {
+    let n = str_len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let o = ord(char_at(s, i))
+        if o >= 65 && o <= 90 {
+            out = out + chr(o + 32)
+        } else {
+            out = out + char_at(s, i)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// ---- dtoa：double bits → 字符串 ----
+fn assemble(digits, exp10, p, neg) {
+    let mut out = ""
+    if exp10 < 0 - 4 || exp10 >= p {
+        out = char_at(digits, 0)
+        let frac = rstrip_zeros(substr(digits, 1, p - 1))
+        if str_len(frac) > 0 {
+            out = out + "." + frac
+        }
+        out = out + "e"
+        let mut ee = exp10
+        if ee >= 0 {
+            out = out + "+"
+        } else {
+            out = out + "-"
+            ee = 0 - ee
+        }
+        if ee < 10 {
+            out = out + "0"
+        }
+        out = out + i64_decstr(ee)
+    } else {
+        if exp10 >= 0 {
+            let intpart = substr(digits, 0, exp10 + 1)
+            let frac = rstrip_zeros(substr(digits, exp10 + 1, p - exp10 - 1))
+            out = intpart
+            if str_len(frac) > 0 {
+                out = out + "." + frac
+            }
+        } else {
+            out = "0"
+            let frac = rstrip_zeros(zeros(0 - exp10 - 1) + digits)
+            if str_len(frac) > 0 {
+                out = out + "." + frac
+            }
+        }
+    }
+    if neg == 1 {
+        out = "-" + out
+    }
+    out
+}
+
+fn format_g(m, e, p, neg) {
+    let exp10 = exp10_of(m, e)
+    let k = exp10 - p + 1
+    let mut num = bi_zero()
+    let mut den = bi_zero()
+    if k >= 0 {
+        if e >= 0 {
+            num = bi_set_u64(num, m)
+            bi_shl_bits(num, e)
+            den = bi_pow10(k)
+        } else {
+            num = bi_set_u64(num, m)
+            den = bi_pow10(k)
+            bi_shl_bits(den, 0 - e)
+            {}
+        }
+    } else {
+        let nk = 0 - k
+        if e >= 0 {
+            num = bi_set_u64(num, m)
+            bi_shl_bits(num, e)
+            let mut i = 0
+            while i < nk {
+                bi_mul_small(num, 10)
+                i = i + 1
+            }
+            den = bi_set_u64(den, 1)
+        } else {
+            num = bi_set_u64(num, m)
+            let mut i = 0
+            while i < nk {
+                bi_mul_small(num, 10)
+                i = i + 1
+            }
+            den = bi_set_u64(den, 1)
+            bi_shl_bits(den, 0 - e)
+            {}
+        }
+    }
+    let mut q = bi_zero()
+    let r = bi_divmod(num, den, q)
+    let mut rr = bi_copy(r)
+    bi_shl1(rr)
+    let c = bi_cmp(rr, den)
+    let mut up = 0
+    if c > 0 {
+        up = 1
+    } else {
+        if c == 0 && bi_bit(q, 0) == 1 {
+            up = 1
+        }
+    }
+    if up == 1 {
+        bi_add_small(q, 1)
+        {}
+    }
+    let mut qv = bi_to_u64(q)
+    let mut e10 = exp10
+    if qv == pow10_int(p) {
+        qv = pow10_int(p - 1)
+        e10 = exp10 + 1
+    }
+    let digits = i64_decstr(qv)
+    assemble(digits, e10, p, neg)
+}
+
+fn append_dot0(s) {
+    if str_contains(s, ".") || str_contains(s, "e") || str_contains(s, "E") {
+        return s
+    }
+    s + ".0"
+}
+
+fn format_float(bits) {
+    let mut neg = 0
+    let mut bb = bits
+    if bb < 0 {
+        neg = 1
+        bb = bits - SIGN_BIT
+    }
+    let expfield = (bb / TWO_52) % 2048
+    let mant = bb % TWO_52
+    if expfield == 2047 {
+        if mant == 0 {
+            if neg == 1 {
+                return "-Inf"
+            }
+            return "+Inf"
+        }
+        return "NaN"
+    }
+    if expfield == 0 && mant == 0 {
+        if neg == 1 {
+            return "-0.0"
+        }
+        return "0.0"
+    }
+    let mut m = 0
+    let mut e = 0
+    if expfield == 0 {
+        m = mant
+        e = 0 - 1074
+    } else {
+        m = mant + TWO_52
+        e = expfield - 1075
+    }
+    let mut s = ""
+    let mut p = 1
+    while p <= 17 {
+        s = format_g(m, e, p, neg)
+        let res = parse_float_bits(s)
+        if res[0] == 1 && res[1] == bits {
+            return append_dot0(s)
+        }
+        p = p + 1
+    }
+    s
+}
