@@ -214,7 +214,7 @@
 
 ### x86-64 后端架构（S8.1，开发中）
 
-单文件 `compiler/backends/x86.bur`（~930 行）+ ELF64 发射 `compiler/backends/elf.bur`。无 cc 依赖，手写 ELF。
+单文件 `compiler/backends/x86.bur`（~4400 行）+ ELF64 发射 `compiler/backends/elf.bur`。无 cc 依赖，手写 ELF。
 
 #### 寄存器约定
 
@@ -302,13 +302,13 @@ op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
 #### Opcode 覆盖
 
-**已实现**：const(CInt/CStr), unit, true, false, pop, pop_n, end_block, get_local, set_local, get_global, def_global, set_global, eq, neq, gt, gt_eq, lt, lt_eq, add(str concat dispatch), sub, mul, div, mod, list, index_get(list+str), index_set, len, neg, not, jump, jump_if_false, jump_if_true, jump_if_false_pop, loop, call(natives + user fn + closure dispatch), return, closure, get_upval, set_upval
+**已实现**：const(CInt/CStr), unit, true, false, pop, pop_n, end_block, get_local, set_local, get_global, def_global, set_global, eq, neq, gt, gt_eq, lt, lt_eq, add(str concat dispatch), sub, mul, div, mod, list, index_get(list+str), index_set, len, neg, not, jump, jump_if_false, jump_if_true, jump_if_false_pop, loop, call(natives + user fn + closure + ctor dispatch), return, closure, get_upval, set_upval, test_variant, get_field, get_field_name, no_match, try, defer, record, record_update, close_upvalue, tuple
 
-**未实现**（int3）：test_variant, get_field, get_field_name, no_match, try, spawn, send, recv, chan_next, select, defer, record, record_update, close_upvalue
+**未实现**（int3）：spawn, send, recv, chan_next, select — 全部 CSP 并发 opcode，见 Phase 3 的 deferred 说明
 
-### Opcode 实现 spec（未实现 opcode）
+### Opcode 实现 spec
 
-每个 spec：opcode 号、字节长度、栈 I/O、VM 语义、C 参考、x86 编码方案。
+每个 spec：opcode 号、字节长度、栈 I/O、VM 语义、C 参考、x86 编码方案。Phase 2A/2B/2C（match/enum、records、error handling）均已实现，保留作参考；Phase 3（CSP）仍 deferred。
 
 #### Phase 2A: match/enum（阻塞使用 match 的程序自举）
 
