@@ -500,6 +500,137 @@ pub fn movzx_eax_al() {
     e1(15) + e1(182) + modrm_reg(0, 0)
 }
 
+// ---- SSE 编码 helper（装箱 float 用；内存一律走 GPR，避免对齐要求）----
+// ---- SSE encoders (for boxed floats; memory always via GPR to dodge alignment) ----
+// movq xmm<xdst>, r<src>：GPR → XMM 位搬移 / movq xmm<xdst>, r<src>: GPR-to-XMM bit move
+// 注意：REX 必须跟在强制前缀（66/F2）之后，GNU as 即 66-then-REX；REX 在前会被解码成 32 位 movd
+// Note: REX must follow the mandatory prefix (66/F2); GNU as emits 66-then-REX; REX-first decodes as 32-bit movd
+pub fn movq_xmm_gpr(xdst, src) {
+    e1(102) + rex(1, xdst, 0, src) + e1(15) + e1(110) + modrm(3, xdst, src)
+}
+
+// movq r<dst>, xmm<xsrc>：XMM → GPR 位搬移 / movq r<dst>, xmm<xsrc>: XMM-to-GPR bit move
+pub fn movq_gpr_xmm(dst, xsrc) {
+    e1(102) + rex(1, dst, 0, xsrc) + e1(15) + e1(126) + modrm(3, dst, xsrc)
+}
+
+// cvtsi2sd xmm<xdst>, r<src>：有符号 int64 → double / cvtsi2sd xmm<xdst>, r<src>: signed int64 to double
+pub fn cvtsi2sd_xmm(xdst, src) {
+    e1(242) + rex(1, xdst, 0, src) + e1(15) + e1(42) + modrm(3, xdst, src)
+}
+
+// cvttsd2si r<dst>, xmm<xsrc>：double 截断转 int64（向零）/ cvttsd2si r<dst>, xmm<xsrc>: double truncated to int64 (toward zero)
+pub fn cvttsd2si_gpr(dst, xsrc) {
+    e1(242) + rex(1, dst, 0, xsrc) + e1(15) + e1(44) + modrm(3, dst, xsrc)
+}
+
+// addsd xmm<xdst>, xmm<xsrc>：double 加（dst ^= src）/ addsd: double add (dst ^= src)
+pub fn addsd_xmm(xdst, xsrc) {
+    e1(242) + rex(0, xdst, 0, xsrc) + e1(15) + e1(88) + modrm(3, xdst, xsrc)
+}
+
+// subsd xmm<xdst>, xmm<xsrc>：double 减 / subsd: double subtract
+pub fn subsd_xmm(xdst, xsrc) {
+    e1(242) + rex(0, xdst, 0, xsrc) + e1(15) + e1(92) + modrm(3, xdst, xsrc)
+}
+
+// mulsd xmm<xdst>, xmm<xsrc>：double 乘 / mulsd: double multiply
+pub fn mulsd_xmm(xdst, xsrc) {
+    e1(242) + rex(0, xdst, 0, xsrc) + e1(15) + e1(89) + modrm(3, xdst, xsrc)
+}
+
+// divsd xmm<xdst>, xmm<xsrc>：double 除 / divsd: double divide
+pub fn divsd_xmm(xdst, xsrc) {
+    e1(242) + rex(0, xdst, 0, xsrc) + e1(15) + e1(94) + modrm(3, xdst, xsrc)
+}
+
+// ucomisd xmm<xdst>, xmm<xsrc>：double 无序比较（置 CF/ZF/PF）/ ucomisd: unordered double compare (sets CF/ZF/PF)
+pub fn ucomisd_xmm(xdst, xsrc) {
+    e1(102) + rex(0, xdst, 0, xsrc) + e1(15) + e1(46) + modrm(3, xdst, xsrc)
+}
+
+// cmpsd xmm<xdst>, xmm<xsrc>, imm：带立即数的 double 比较（结果 = 全 1/全 0 掩码，NaN 按无序处理）/
+// cmpsd xmm<xdst>, xmm<xsrc>, imm: double compare with immediate (result = all-ones/zeros mask; NaN is unordered)
+// imm: 0=eq 1=lt 2=le 3=unord 4=neq 5=nlt 6=nle 7=nord
+pub fn cmpsd_xmm(xdst, xsrc, imm) {
+    e1(242) + rex(0, xdst, 0, xsrc) + e1(15) + e1(194) + modrm(3, xdst, xsrc) + e1(imm)
+}
+
+// setp 发射 setp（按 PF 置 0/1，ucomisd 后判 NaN）/ setp emits setp (set from PF; NaN test after ucomisd)
+pub fn setp(dst) {
+    rex(0, 0, 0, dst) + e1(15) + e1(154) + modrm_reg(0, dst)
+}
+
+// fld 用到的 64 位立即数寄存器装载：movabs 已由 mov_ri64 提供，无需新增
+
+// x86gen_float_box_at 生成"把 r15+off 处的 8B 位模式装箱"：新盒存位模式、回写指针
+// x86gen_float_box_at boxes an 8-byte bit pattern sitting at [r15+off] into a fresh heap box
+// Box an 8-byte bit pattern at [r15+off] into a fresh heap box, writing the box pointer back
+fn x86gen_float_box_at(off) {
+    mov_rm(rax, r15, off) + mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + mov_mr(r15, off, r11)
+}
+
+// x86gen_float_const 生成 float 字面量装箱：movabs 位模式 + 新盒 / x86gen_float_const boxes a float literal: movabs bits + fresh box
+fn x86gen_float_const(bits) {
+    mov_rr(r11, r12) + mov_ri64(rax, bits) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + vs_push(r11)
+}
+
+// x86gen_float_unbox 生成"把 r15+off 处指针所指盒的 8B 位模式读到 rax" / x86gen_float_unbox reads the 8-byte bit pattern of the box pointed at [r15+off] into rax
+fn x86gen_float_unbox(off) {
+    mov_rm(rax, r15, off) + mov_rm(rax, rax, 0)
+}
+
+// x86gen_float_unbox_to 生成"把 [r15+off] 指针所指盒的位模式写入 r15+dst_off" / x86gen_float_unbox_to copies the box bits at [r15+off] to [r15+dst_off]
+fn x86gen_float_unbox_to(src_off, dst_off) {
+    mov_rm(rax, r15, src_off) + mov_rm(rax, rax, 0) + mov_mr(r15, dst_off, rax)
+}
+
+// x86gen_float_box_rax 生成"把 rax 的位模式装箱并写回 r15+off" / x86gen_float_box_rax boxes rax's bit pattern and writes the pointer to [r15+off]
+fn x86gen_float_box_rax(off) {
+    mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + mov_mr(r15, off, r11)
+}
+
+// x86gen_float_binop 生成装箱 float 二元运算：两盒读位模式 → SSE 运算 → 新盒落 r15-16
+// x86gen_float_binop emits a boxed float binary op: unbox both, SSE op, fresh box at [r15-16]
+fn x86gen_float_binop(op) {
+    let bin = if op == "add" {
+        addsd_xmm(0, 1)
+    } else if op == "sub" {
+        subsd_xmm(0, 1)
+    } else if op == "mul" {
+        mulsd_xmm(0, 1)
+    } else {
+        divsd_xmm(0, 1)
+    }
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_rm(rcx, rcx, 0) + movq_xmm_gpr(0, rax) + movq_xmm_gpr(1, rcx) + bin + movq_gpr_xmm(rax, 0) + x86gen_float_box_rax(0 - 16) + vs_pop_n(1)
+}
+
+// x86gen_float_cmp 生成装箱 float 比较：结果 bool 落 r15-16（cmpsd 掩码 → neg → 0/1）
+// x86gen_float_cmp emits a boxed float comparison: bool to [r15-16] (cmpsd mask negated to 0/1)
+// cmp 取值：eq/neq/lt/le/gt/ge
+fn x86gen_float_cmp(cmp) {
+    let c = if cmp == "eq" {
+        cmpsd_xmm(0, 1, 0)
+    } else if cmp == "neq" {
+        cmpsd_xmm(0, 1, 4)
+    } else if cmp == "lt" {
+        cmpsd_xmm(0, 1, 1)
+    } else if cmp == "le" {
+        cmpsd_xmm(0, 1, 2)
+    } else if cmp == "gt" {
+        cmpsd_xmm(1, 0, 1)
+    } else {
+        cmpsd_xmm(1, 0, 2)
+    }
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_rm(rcx, rcx, 0) + movq_xmm_gpr(0, rax) + movq_xmm_gpr(1, rcx) + c + movq_gpr_xmm(rax, 0) + neg_r(rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+}
+
+// x86gen_float_neg 生成装箱 float 取负：0.0 - x（匹配 VM，±0.0 都得 +0.0），新盒落 r15-8
+// x86gen_float_neg emits boxed float negation: 0.0 - x (matches the VM; +/-0.0 both yield +0.0), fresh box at [r15-8]
+fn x86gen_float_neg() {
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + movq_xmm_gpr(1, rax) + xor_rr(rax, rax) + movq_xmm_gpr(0, rax) + subsd_xmm(0, 1) + movq_gpr_xmm(rax, 0) + x86gen_float_box_rax(0 - 8)
+}
+
 // lea_rip_rel32 发射 lea rip 相对寻址 / lea_rip_rel32 emits lea rip-relative addressing
 // lea rip-relative addressing
 pub fn lea_rip_rel32(dst, rel32) {
@@ -600,9 +731,9 @@ fn x86gen_unit_convert_at(off) {
 }
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
- fn is_unimpl_native(name) {
-     name == "clock" || name == "close" || name == "float_bits" || name == "net_nb" || name == "parse_float" || name == "recv" || name == "to_float" || name == "trunc" || name == "chan"
- }
+fn is_unimpl_native(name) {
+    name == "clock" || name == "close" || name == "net_nb" || name == "parse_float" || name == "recv" || name == "chan"
+}
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
 // x86gen_ord_native inlines ord: decode the first codepoint (1-4 byte UTF-8)
@@ -2907,8 +3038,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "int")
                 } else if pop == lib::op_neg {
+                    let neg_last = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
                     push(pshadow_ps, "")
-                    push(ptshadow_ps, "int")
+                    if neg_last == "float" {
+                        push(ptshadow_ps, "float")
+                    } else {
+                        push(ptshadow_ps, "int")
+                    }
                 } else if pop == lib::op_not {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "bool")
@@ -2942,14 +3082,30 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(pshadow_ps, "")
                     if add_last == "str" || add_prev == "str" {
                         push(ptshadow_ps, "str")
+                    } else if add_last == "float" || add_prev == "float" {
+                        push(ptshadow_ps, "float")
                     } else {
                         push(ptshadow_ps, "int")
                     }
                 } else if pop == lib::op_sub || pop == lib::op_mul || pop == lib::op_div || pop == lib::op_mod {
+                    let sub_last = if len(ptshadow_ps) > 0 {
+                        ptshadow_ps[len(ptshadow_ps) - 1]
+                    } else {
+                        ""
+                    }
+                    let sub_prev = if len(ptshadow_ps) > 1 {
+                        ptshadow_ps[len(ptshadow_ps) - 2]
+                    } else {
+                        ""
+                    }
                     shadow_pop(pshadow_ps, 2)
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
-                    push(ptshadow_ps, "int")
+                    if pop != lib::op_mod && (sub_last == "float" || sub_prev == "float") {
+                        push(ptshadow_ps, "float")
+                    } else {
+                        push(ptshadow_ps, "int")
+                    }
                 } else if pop == lib::op_list {
                     let plen = read_u16(pcode, pit + 1)
                     let pelt = if plen > 0 && len(ptshadow_ps) >= 1 {
@@ -3207,6 +3363,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     lib::CVal::CEnumType(_) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
                     lib::CVal::CSingleton(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
                     lib::CVal::CCtor(_, _) => w(mov_ri64(rax, const_addr(fh, idx)) + vs_push(rax)),
+                    lib::CVal::CFloat(fl) => w(x86gen_float_const(float_bits(fl))),
                     _ => w(int3()),
                 }
                 match f_consts[fh][idx] {
@@ -3225,6 +3382,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     lib::CVal::CCtor(ceh, cvi) => {
                         push(shadow, "ctor:" + str(ceh) + ":" + str(cvi))
                         push(type_shadow, "ctor")
+                    },
+                    lib::CVal::CFloat(_) => {
+                        push(shadow, "float")
+                        push(type_shadow, "float")
                     },
                     _ => {
                         push(shadow, "")
@@ -3376,6 +3537,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         enum_eq_enc(sb_eq)
                     }
                     w(x86gen_enum_eq_at(eq_enc2))
+                } else if sa_eq == "float" && sb_eq == "float" {
+                    w(x86gen_float_cmp("eq"))
                 } else {
                     w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 }
@@ -3415,6 +3578,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         enum_eq_enc(sb_neq)
                     }
                     w(x86gen_enum_eq_at(neq_enc2) + mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + sete(r8) + mov_mr(r15, 0 - 8, r8))
+                } else if sa_neq == "float" && sb_neq == "float" {
+                    w(x86gen_float_cmp("neq"))
                 } else {
                     w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 }
@@ -3423,25 +3588,61 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(shadow, "")
                 push(type_shadow, "bool")
             } else if op == lib::op_gt {
-                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                let s_gt = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_gt == "float" {
+                    w(x86gen_float_cmp("gt"))
+                } else {
+                    w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                }
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
             } else if op == lib::op_gt_eq {
-                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                let s_ge = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_ge == "float" {
+                    w(x86gen_float_cmp("ge"))
+                } else {
+                    w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                }
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
             } else if op == lib::op_lt {
-                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                let s_lt = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_lt == "float" {
+                    w(x86gen_float_cmp("lt"))
+                } else {
+                    w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                }
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
                 push(type_shadow, "bool")
             } else if op == lib::op_lt_eq {
-                w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                let s_le = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_le == "float" {
+                    w(x86gen_float_cmp("le"))
+                } else {
+                    w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
+                }
                 shadow_pop(shadow, 2)
                 shadow_pop(type_shadow, 2)
                 push(shadow, "")
@@ -3455,6 +3656,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(type_shadow, 2)
                     push(shadow, "str")
                     push(type_shadow, "str")
+                } else if sa == "float" && sb == "float" {
+                    w(x86gen_float_binop("add"))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "float")
+                    push(type_shadow, "float")
                 } else {
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + add_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
@@ -3463,23 +3670,62 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     push(type_shadow, "int")
                 }
             } else if op == lib::op_sub {
-                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + sub_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                shadow_pop(shadow, 2)
-                shadow_pop(type_shadow, 2)
-                push(shadow, "")
-                push(type_shadow, "int")
+                let s_sub = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_sub == "float" {
+                    w(x86gen_float_binop("sub"))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "float")
+                    push(type_shadow, "float")
+                } else {
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + sub_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "")
+                    push(type_shadow, "int")
+                }
             } else if op == lib::op_mul {
-                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + imul_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                shadow_pop(shadow, 2)
-                shadow_pop(type_shadow, 2)
-                push(shadow, "")
-                push(type_shadow, "int")
+                let s_mul = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_mul == "float" {
+                    w(x86gen_float_binop("mul"))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "float")
+                    push(type_shadow, "float")
+                } else {
+                    w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + imul_rr(rax, rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "")
+                    push(type_shadow, "int")
+                }
             } else if op == lib::op_div {
-                w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                shadow_pop(shadow, 2)
-                shadow_pop(type_shadow, 2)
-                push(shadow, "")
-                push(type_shadow, "int")
+                let s_div = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_div == "float" {
+                    w(x86gen_float_binop("div"))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "float")
+                    push(type_shadow, "float")
+                } else {
+                    w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                    push(shadow, "")
+                    push(type_shadow, "int")
+                }
             } else if op == lib::op_mod {
                 w(mov_rm(rax, r15, 0 - 16) + cqo() + mov_rm(rcx, r15, 0 - 8) + idiv_r(rcx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1))
                 shadow_pop(shadow, 2)
@@ -3622,8 +3868,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(shadow, "")
                 push(type_shadow, t_payload)
             } else if op == lib::op_neg {
-                w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
-                push(type_shadow, "int")
+                let s_neg = if len(type_shadow) > 0 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                if s_neg == "float" {
+                    w(x86gen_float_neg())
+                    push(type_shadow, "float")
+                } else {
+                    w(mov_rm(rax, r15, 0 - 8) + neg_r(rax) + mov_mr(r15, 0 - 8, rax))
+                    push(type_shadow, "int")
+                }
             } else if op == lib::op_not {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 8) + cmp_rr(rax, rdx) + sete(rdx) + mov_mr(r15, 0 - 8, rdx))
                 push(type_shadow, "bool")
@@ -4095,6 +4351,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         ret_type = "list-int"
                     }
+                } else if callee == "to_float" {
+                    w(mov_rm(rax, r15, 0 - 8) + cvtsi2sd_xmm(0, rax) + movq_gpr_xmm(rax, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
+                    ret_type = "float"
+                } else if callee == "trunc" {
+                    w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + movq_xmm_gpr(0, rax) + cvttsd2si_gpr(rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    ret_type = "int"
+                } else if callee == "float_bits" {
+                    w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    ret_type = "int"
                 } else if is_unimpl_native(callee) {
                     w(int3())
                 } else if callee == "contains" {
