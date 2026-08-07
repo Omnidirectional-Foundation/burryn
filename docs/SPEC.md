@@ -1,6 +1,6 @@
 # SPEC — Burryn 项目规范
 
-> SPEC v0.5 | Last updated: 2026-08-04
+> SPEC v0.5 | Last updated: 2026-08-07
 > 状态:最高优先级约束(权威来源) · 编号体系:统一 `S<n>[.<m>]`(见 §5)
 > 相关文档:[`NUMBERING.md`](NUMBERING.md) 旧编号历史映射 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
 
@@ -20,14 +20,14 @@
 
 ### 显式优先
 
-语法糖允许存在，但任何语义不得隐藏在语法糖背后——读者看到代码即可推断全部行为，无需查阅"这个上下文里它其实还做了 X"。隐式转换、隐式 coercion、magic method、隐式控制流转移(异常)均在拒绝清单。`?` 是显式早退(看到 `?` 就知道这里可能返回)；`defer` 是显式清理(看到 `defer` 就知道退出时跑)；插值是显式拼接的糖(`{expr}` 内必须是 str，非 str 编译错而非隐式 `str()`)；record 字面量带 `record` 关键字(不与 block 混淆)。类型推导是唯一的"隐式"——但 S7.8 可选标注使显式标注随时可用。
+语法糖允许存在，但任何语义不得隐藏在语法糖背后——读者看到代码即可推断全部行为，无需查阅"这个上下文里它其实还做了 X"。隐式转换、隐式 coercion、magic method、隐式控制流转移(异常)均在拒绝清单。`?` 是显式早退(看到 `?` 就知道这里可能返回)；`defer` 是显式清理(看到 `defer` 就知道退出时跑)；插值是显式拼接的糖(`{expr}` 内必须是 str，非 str 编译错而非隐式 `str()`)；record 字面量带 `record` 关键字(不与 block 混淆)。类型推导是唯一的"隐式"——但可选签名标注使显式标注随时可用。
 
 ### 类型系统
 
 - 静态，Hindley-Milner 全程序推导；函数参数/返回值零标注，仅枚举字段声明类型
-- **可选函数签名标注(S7.8)**：「零标注」从「不能标」收窄为「不必标」——不标注的程序语义与推导结果不变；显式标注为 opt-in，用于诊断锚定与包边界 API 冻结，推导须与标注 unify，冲突报错
+- **可选函数签名标注**：「零标注」从「不能标」收窄为「不必标」——不标注的程序语义与推导结果不变；显式标注为 opt-in，用于诊断锚定与包边界 API 冻结，推导须与标注 unify，冲突报错
 - 参数多态函数 + 泛型枚举；运算符用 SML 式受约束类型变量(`num` / `addord`)
-- **受约束标注类型参数**：小写类型参数可在函数签名标注与接口文件中写为 `a:addord`；同一签名后续出现的 `a` 复用该变量。允许现有 checker 的 `num`、`addord`、`key`、`int`、`float`、`str` 约束；重复标注按既有约束交集规则合并，空交集报静态错。该语法只表达既有 HM 约束，不增加运行时语义。
+- **受约束标注类型参数**：小写类型参数可在函数签名标注中写为 `a:addord`；同一签名后续出现的 `a` 复用该变量。允许 `num`、`addord`、`key`、`int`、`float`、`str` 约束；重复标注按既有约束交集规则合并，空交集报静态错。该语法只表达既有 HM 约束，不增加运行时语义。
 - 禁止一切隐式转换
 - **多态运行时表示：统一装箱(uniform boxing)**。
   不做单态化(monomorphization)，该决策覆盖字节码 VM 与全部原生后端
@@ -44,12 +44,9 @@
   明确不做所有权/借用检查
 - **`mut` 为深语义、绑定级纪律**：经由 `let` 绑定名不可修改其值(含容器内容)；push/元素修改要求 `mut`。
   不可变性挂在**绑定**上而非值上——无借用检查器与 move 语义，别名可绕过(实测 `let mut b = a` 后改 `b` 可见于 `a`)，故**不承诺值级不可变**。
-  补强定案：checker 增加流规则——`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)，违者 error。
-  **只对堆类型(list/map 及含其的类型)生效**：int/float/bool/str/unit 为拷贝语义、无别名危害，豁免；**chan 整体豁免、不论元素类型**(send/recv/close 在现行纪律里本就不要求 mut，chan 别名是 CSP 语义本体，如 examples/concurrency/sieve.bur 的链式重绑)；if/match 作来源时递归看各臂尾表达式，皆新鲜则整体新鲜；来源类型未解时延迟判定(复用 S6.8 的组尾 flush 机制)。
-  实现侧定案：检查点含 mut 绑定的**再赋值 RHS**(与初始化同规则，堵同源别名漏洞)；mut 形参实参检查走**旁路表**——绑定挂 mut-mask(init 为 FnLit 或包级 fn 声明时记录)，callee 为裸名/`pkg.name` 且解析到带 mask 的绑定才检查，经变量/参数的间接调用不查，fn 类型本身不携带 mut 标志；组尾 flush 时来源类型仍未解(已 generalize 的多态变量)**判 error**(宁滥勿缺)；错误码 **E0597**(与 E0596 直接改不可变绑定分码)。
-  落地顺序：先迁移 burc 自身堆类型违例(约 10 处，见 §6.5 S6.8 条目，开工须重新插桩摸底)再启用规则，否则新 checker 编不过自己
-- **参数默认不可变；`fn f(mut xs)` 声明可变参数**——已定，S2.5 实现(stdlib 原地操作与自举编译器的 emit 累积模式需要)。
-  调用点无标记，与「无借用检查器 + GC」的定位一致，属 Go 式取舍
+  **流规则**：`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)，违者 error。
+  **只对堆类型(list/map 及含其的类型)生效**：int/float/bool/str/unit 为拷贝语义、无别名危害，豁免；**chan 整体豁免、不论元素类型**(send/recv/close 在现行纪律里本就不要求 mut，chan 别名是 CSP 语义本体)；if/match 作来源时递归看各臂尾表达式，皆新鲜则整体新鲜；来源类型未解时延迟判 error(宁滥勿缺)。
+- **参数默认不可变；`fn f(mut xs)` 声明可变参数**——调用点无标记，与「无借用检查器 + GC」的定位一致，属 Go 式取舍。
 
 ### 字符串
 
@@ -65,7 +62,7 @@
   纤程调度 + 时间片抢占，不做真并行——无借用检查器时真并行 + 深 mut 会引入数据竞争，且单线程使 GC 与原生运行时简化一个量级。
   此承诺覆盖全部后端
 - **确定性承诺收窄**：纯计算程序跨后端逐字节确定；含 IO 程序不承诺调度顺序(IO 完成时序来自外部世界，与真 IO 重叠原理上互斥)。
-  提供 opt-in 确定性模式(环境变量 `BUR_DETERMINISTIC=1`，IO 全串行化、timer 唤醒按 deadline + fiber 创建序双键排序)，`bur test`(S6.4)默认启用
+  提供 opt-in 确定性模式(环境变量 `BUR_DETERMINISTIC=1`，IO 全串行化、timer 唤醒按 deadline + fiber 创建序双键排序)，`bur test` 默认启用
 
 ### 错误处理
 
@@ -73,14 +70,14 @@
 
 ### 模块与导出
 
-- 模块系统为 S2.2 必做项(自举前提)；形态：目录即包，去中心化 import path(与工具链设计一致)，细节待定——**动工前先与 owner 对齐方案**
+- 模块系统：目录即包，去中心化 import path(与工具链设计一致)
 - **导出语法：`pub` 关键字**，不用首字母大写
 
 ### 语法
 
 - 参考系：Rust(`let`/`mut`、`match`、带字段枚举、`?`、表达式导向、遮蔽)+ Go(`spawn`、channel 语法、自动分号插入)
-- 补充定案：`defer`(资源清理，脚本场景刚需)——归 **S7.6**，倾向块作用域(表达式导向下比 Go 的函数作用域干净)
-- **语法已冻结(S8.2)**，正式 grammar 见 [`grammar.md`](grammar.md)。S8.2 定案摘要：`::` = 路径限定、`.` = 成员访问(字段/方法)；复合赋值 `+= -= *= /= %=`；`for i, x in xs` 索引遍历；or-pattern `A | B`；标签循环 `label:` + `break label`；record 模式 `record { x, y }`；方法 `fn (s: Type) name()`；tuple `(a, b)` + 解构 `let (a, b) = t`；hex/二进制/指数/下划线数字字面量；多行字符串 `"""` + `\` 行标记；range `1..10` 脱糖；`\r` 转义；shebang。`default`(select 臂特判)与 `chan`(native 函数)非关键字。冻结后语法变更须走修订流程(见 grammar.md §10)
+- **`defer`**(资源清理，脚本场景刚需)：块作用域(表达式导向下比 Go 的函数作用域干净)
+- **表层语法见 [`grammar.md`](grammar.md)**(与 `compiler/frontend/` 实现逐条对应)；语法变更走 grammar.md §10 修订流程。
 
 ### 明确拒绝清单(护住简洁，不接受重新提案)
 
@@ -95,27 +92,80 @@
 
 ## 3. 后端路线
 
-| 后端 | 角色 | 状态 |
-|------|------|------|
-| 字节码栈式 VM | 开发与测试基线 + 自举 oracle/种子；已由 Burryn 重写(自举) | 已完成(Go 种子归档于 `archive/go-host`) |
-| **C 后端** | S2 主力：可移植性由目标平台 C 编译器兜底，自举走此路径 | 已有(顺序 + 并发) |
-| 手写 x86-64 + PE | S8.1:核心目标之一，owner 明确想做；不借第三方工具链 | 开发中(ELF 已实现：list/closure/global/str native/bool/unit/UTF-8 ord+chr/enum/match/record，详见 §5 S8 行) |
+### 后端矩阵
 
-- 自举判定标准：**编译器由本语言写成且能编译自己**；输出 C 再经 gcc/clang 落地，完全算自举
-- 「任何架构都能跑」由 C 后端承担；手写后端只承诺 x86-64，其余架构不做手写
-- 双后端互为测试参照：同一程序在 VM / C 后端 / 手写后端输出必须一致，纳入测试
-- 原生运行时：GC 为 **shadow stack 精确扫描**；单线程承诺使运行时无需线程同步
+| 后端 | 值表示 | GC / CSP | 工具链依赖 | 平台覆盖 | 发布形态 |
+|---|---|---|---|---|---|
+| 字节码栈式 VM | 16B tagged Value(开发/测试基线、自举 oracle) | 已完整(burrt.h:mark-sweep + ucontext) | 自举期 cc(构建 `bur` 本身) | 天然跨平台(POSIX,两处 #ifdef) | 并入核心 `bur` |
+| **C 后端** | 16B tagged Value | 已完整(同 VM,链接 burrt.c) | `cc`/`gcc`/`clang`(任一) | 天然跨平台 | 并入核心 `bur`,`bur build` 运行期探测 cc |
+| **手写 x86-64** | 8B raw int64,无 tag | 独立实现(shadow stack 编译期类型跟踪;并发 opcode 待设计) | **无**(硬约束) | Linux ELF(已做);macOS Mach-O / Windows PE 待序列化层 | 并入核心 `bur` |
+| **LLVM 后端** | 复用 C runtime 16B tagged | 链接 burrt.c,免费获得 | `clang`(必须是 clang) | 三平台(随 clang target) | 并入核心 `bur`,运行期探测 clang |
+| **Cranelift 后端** | 复用 C runtime 16B tagged | 链接 burrt.c | 构建期 `cargo`;运行期 `cranelift-driver` + 系统链接器(`cc`/`ld`)落地 `.o` | 三平台(随 driver 编译目标) | codegen 在核心 `bur`;**独立 `cranelift-driver` 二进制** |
+| **WASM 后端** | 16B tagged(仅 GC 子集) | GC 链接 wasm32 版 burrt.c;**CSP 不能链接 ucontext**,须独立状态机或等 WASM Stack Switching 提案 | `clang --target=wasm32` + `wasm-ld` | 平台无关(wasm 本身) | 并入核心 `bur`,运行期探测 clang |
 
-### 全自举终局
+**单二进制交付(§1)精化**:`bur` 一个二进制打包 VM + C + x86 + WASM(codegen) + LLVM(codegen) 五种后端的 codegen 逻辑。真正"零外部工具链"的只有 x86;C/WASM/LLVM 三个后端在运行期需要机器上有 clang 才能产出可执行文件,Cranelift 还需独立 `cranelift-driver` 二进制 + 系统链接器。简言之:**发行的编译器本身自包含,非所有后端都自包含**。
 
-- **终局 = 全自举，只留 C 底座**：工具链里非 Burryn 的只剩 C 运行时 + 目标平台 cc；**Go 整棵树最终清零**——编译器前端、VM、CLI driver 全用 Burryn 重写
-- **VM 由 Burryn 重写、经 cc 编成原生**；cc 成**工具链构建**的硬依赖(站 Rust 侧，自觉代价)。放弃"零 cc 工具链兜底"。
-  注：VM 二进制建好后 `bur run` 运行期仍不需 cc；需 cc 的是构建工具链与 `bur build`。
-  单二进制交付(§1)不变
-- **分阶段**：S3 自举编译器前端 → S4 Burryn 重写 VM → S5 Burryn 写 CLI + 从 main 删 Go(先推留档分支 `archive/go-host`，重新接生靠 checkout 它)。
-  每段自举判定 + parity 全绿才进下一段。
-  **S3/S4/S5 已全部完成**：main 上 Go 整棵树已清零，`bur` 经 cc 逐字节重建自身；Go 种子归档于 `archive/go-host`
-- 自举判定(输出 C 经 cc 落地 = 自举)、双后端互为测试参照、S8 手写 x86-64 + PE 才是 Go 级零工具链终局——这些不变
+### 后端次序
+
+主线先 x86(Linux ELF → macOS Mach-O → Windows PE),其后并行铺多后端公共基础(runtime 平台抽象、工具链探测),再开 LLVM → Cranelift → WASM。**次序原因**:
+- x86 是唯一真正零工具链依赖的后端,先做完校验"无 cc 也能产出可执行"这个路线核心假设。
+- 后续三原生后端(LLVM/Cranelift/WASM)在 CSP 上都间接依赖平台抽象层,平台抽象比 x86 序列化层更优先。
+- WASM 的 CSP 不能靠链接现有代码得到,工作量被低估,单独排期(见下)。
+
+### 工具链探测:按工具聚类,判定独立
+
+四个非 x86 后端共享底层工具(主要 clang),但**判定逻辑不合并**——机器只装 `gcc` 没装 `clang` 时若合并探测,LLVM/WASM 会被误判可跑,运行时才报错比探测期 skip 更差:
+
+- 探测原语(`find_binary`、`clang_supports_target` 等)共享实现,放 `shared/toolchain-probe.bur`,避免四份重复样板
+- 每后端在自己模块内声明依赖组合(C 要 `cc/gcc/clang` 任一;LLVM 要 clang;WASM 要 clang + `wasm32` target;Cranelift 要 `cranelift-driver` + `cc`/`ld`),不合并成统一布尔
+- CI 保持每后端独立 job(出现"有 clang 无 wasm32 target"时,LLVM 跑、WASM skip,合并 job 无法表达)。
+
+### Runtime 平台抽象
+
+调度器平台差异从 `runtime/burrt.c` 拆出独立模块(`#ifdef` 分支):
+- POSIX(Linux/macOS)继续走 ucontext
+- Windows 改走 Fibers API(`CreateFiber`/`SwitchToFiber`/`DeleteFiber`)
+- WASM **不复用此层**——CSP 不能链接 ucontext,见下
+
+平台抽象先做,优先于 x86 三平台序列化层。理由:它直接决定 LLVM/Cranelift 后端能不能在 Windows 上跑,而 `pe.bur`(x86 的 Windows 文件格式层)与调度器互不阻塞,可并行推进。
+
+### WASM CSP 修正
+
+WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burrt.c 的 CSP 调用 `ucontext.h`(POSIX 系统调用级),wasm32 freestanding target 下没有这套东西,编译期直接失败,不是链接期报错。
+
+修正:WASM 第一版只能链接 GC 子集(`bur_alloc`/`bur_gc_collect`/`bur_mark_value`/`bur_gc_trace`,这些不碰 ucontext);CSP(spawn/send/recv/select)要么编译期状态机转换重写,要么等 WASM Stack Switching 提案成熟。**不存在"链接现有代码就免费拿到 CSP"这条路**,这点上 WASM 与 x86 的 CSP 处境类似(都要独立造轮子),各后端的 CSP 路径需独立设计。
+
+### 自举判定与原生运行时
+
+- 自举判定标准:**编译器由本语言写成且能编译自己**;输出 C 再经 gcc/clang 落地,完全算自举
+- 「任何架构都能跑」由 C 后端承担;手写后端只承诺 x86-64,其余架构不做手写
+- 双后端互为测试参照:同一程序在 VM / C 后端 / 手写后端输出必须一致,纳入测试
+- 原生运行时:GC 为 **shadow stack 精确扫描**;单线程承诺使运行时无需线程同步
+
+### Release 产物
+
+**命名**:`burryn-<version>-<os>-<arch>.<ext>` 综合包;`burryn-<backend>-<version>-<os>-<arch>.<ext>` 单后端产物。
+- 架构命名统一 `amd64`/`arm64`(对齐 GHA runner、Docker tag),不用 Rust 的 `x86_64`/`aarch64`
+- 归档格式按平台走:Windows `.zip`、Linux/macOS `.tar.gz`
+- 版本号进文件名(脱离 release 页上下文仍可辨识)
+- `cranelift-driver` 随 Cranelift 后端产物打包,不独立发
+
+**预编译矩阵(6 cell + 1 跨系统 wasm)**:
+
+| 系统 \ 架构 | amd64 | arm64 |
+|---|---|---|
+| Linux | 5 后端(x86/C/LLVM/Cranelift/WASM) | 4 后端(无 x86 自写) |
+| macOS | 5 后端 | 4 后端(无 x86 自写) |
+| Windows | 5 后端 | 4 后端(无 x86 自写,Windows arm64 条件成熟再上) |
+| WASM | 跨系统共享,独立 zip | — |
+
+→ **7 个综合包** + 各后端单产物(22 个,扣除不可能的 cell)。
+
+**Release 页组织**:正文手写 Markdown 表,行 = 后端(含 Full Bundle 一行),列 = 6 平台架构,每格直链具体 asset。原生 Assets 面板留作自动化抓取入口 + `SHA256SUMS.txt` 落脚点。
+
+**`SHA256SUMS.txt`**:每次发布生成,汇总所有产物哈希,脚本化校验单一入口。
+
+**冷门架构与移动平台**:riscv64/ppc64le/i386/armv7 等 32 位架构、iOS/Android 等移动平台**不进预编译矩阵**——32 位/冷门架构走 `docs/build-exotic.md` 自行产出,移动平台走 `docs/mobile-future.md`(未规划)。
 
 ## 4. 工具链设计(单一二进制，cargo 式一体化)
 
@@ -149,18 +199,17 @@
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析 **已完成**(MVS / `bur.sum` / 缓存包 import、interface declaration pipeline、disk interface cache/fallback、子包测试发现与 import-driven tidy)；S6.2 网络拉取 **已完成**(mod_fetch + `bur mod` 家族 + `bur get`)；S6.3 `bur fmt` **已完成**(全 AST + 注释重插 + 验证器 + 公开命令 + burc 全树已格式化)；S6.4 `bur test` **已完成**(子进程隔离 + `--run`/`-v` + 死锁/trap 归为失败；std/testing)；S6.5 诊断/DX 批 **已完成**(cgen `#line` + `-g`、runtime/VM trap 带 span stack trace、公开命令 rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议 + loader 诊断接线)；S6.6 std/json + std/testing **已完成**(核心实现 + CI regen+cmp)；S6.7 runtime IO **已完成**(sleep/timer + 异步 exec + idle-wait + 确定性模式)；S6.8 checker 债批 **已完成**(SCC 依赖序 + 枚举两遍注册 + `?` 延迟判定)；deep-mut checker 流规则 **已完成** | 已完成 |
-| **S7 语言特性扩展** | S7.1 字符串插值 **已完成**；S7.2 管道 `|>` **已完成**；S7.3 match guard **已完成**；S7.4 命名参数 + 默认值(**已否决**，编号保留)；S7.5 编译期常量 **已完成**；S7.6 `defer` **已完成**；S7.7 net stdlib **已完成**；S7.8 可选函数签名标注(**已为 S6.1 提前完成**) | 已完成 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 后端：**ELF**(Linux) + **Mach-O**(macOS) + **PE**(Windows)；S8.2 语法冻结 + grammar 文件 **已完成**([`grammar.md`](grammar.md)，定案：`::`/`.` 分工、复合赋值、for 索引、or-pattern、标签循环、record 模式、方法、tuple+解构、字面量扩展、多行字符串、range)；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现**。**x86-64 ELF 后端开发中**（list/closure/global/str native/bool/unit/UTF-8 ord+chr/ADD concat/enum/match/record 已完成；record 的 str/print/println 格式化、`==`/`!=` 字段级比较、`record { r | f: v }` 更新已实现；eprintln/parse_int 已内联；未实现的 native 调用 emit int3 → SIGTRAP，parity 按 SKIP 处理） | 进行中 |
-| **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段。前置 = S8.2 语法冻结。**S9.1 + S9.2(hover) + S9.3(VSCode 扩展)已落地**；剩余：go-to-def、completion、signature-help、formatting | 部分实现 |
-| **S10 包生态** | 已有 std 包：`json`/`net`/`testing`（S6.6/S7.7 落地）、`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板 + 示例包；S10.3 `bur doc`（导出签名 + 注释 → Markdown）；S10.4 包质量基础设施（CI 模板、测试约定、版本规范）。原则：能纯 Burryn 就不加 native；每包带 bur.mod + *_test.bur，随 std_embed 分发 | 未开工 |
+| **S6 生态工具链** | S6.1 依赖解析；S6.2 网络拉取；S6.3 `bur fmt`；S6.4 `bur test`；S6.5 诊断/DX；S6.6 std/json + std/testing；S6.7 runtime IO；S6.8 checker 债批 | 已完成 |
+| **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `|>`；S7.3 match guard；S7.4 命名参数(**已否决**，编号保留)；S7.5 编译期常量；S7.6 `defer`；S7.7 net stdlib；S7.8 可选函数签名标注 | 已完成 |
+| **S8 后端与重型类型** | S8.1 手写 x86-64 后端(**ELF**/Linux + **Mach-O**/macOS + **PE**/Windows)；S8.2 语法冻结 + [`grammar.md`](grammar.md) **已完成**；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现** | 进行中 |
+| **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段。前置 = S8.2 语法冻结 | 部分实现 |
+| **S10 包生态** | 已有 std 包：`json`/`net`/`testing`/`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板 + 示例包；S10.3 `bur doc`(导出签名 + 注释 → Markdown)；S10.4 包质量基础设施(CI 模板、测试约定、版本规范)。原则：能纯 Burryn 就不加 native；每包带 bur.mod + `*_test.bur`，随 std_embed 分发 | 未开工 |
 
-- S1–S5 为自举闭环，已全部达成：`bur` 由本语言写成、经 cc 逐字节重建自身，main 上 Go 整棵树已清零
-- 自举判定标准：**编译器由本语言写成且能编译自己**；输出 C 再经 gcc/clang 落地，完全算自举
-- stdlib 按「够自举用 + owner 真实脚本需求」逐个生长(os/exec、fs、json、net 优先)，不追大而全
+- S1–S5 为自举闭环：`bur` 由本语言写成、经 cc 逐字节重建自身，main 上 Go 整棵树已清零，Go 种子归档 `archive/go-host`
+- stdlib 按「够自举用 + owner 真实脚本需求」逐个生长，不追大而全
 - 编译速度是硬指标：任何特性提案先回答「是否显著拖慢编译」
-- 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S6.8、S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
-- **S8 内部推进顺序**：S8.3 row poly → S8.4 封闭 records → S8.1 ELF 后端 → S8.5 PE。类型先行(日常效用高于第二后端)。**S8 全部子项由 LLM 实现**。S8 之后进 S9 LSP 与编辑器生态
+- 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
+- **S8 内部推进顺序**：S8.3 row poly → S8.4 封闭 records → S8.1 ELF → S8.5 PE。类型先行(日常效用高于第二后端)。S8 之后进 S9
 
 ## 6. 工程规范
 
@@ -169,52 +218,20 @@
 - 测试：自举 parity + 示例 golden test 覆盖全链路；自举判定为一等验收(`bur build burc` 逐字节重建自身)；重构类改动必须先有测试安全网再动手
 - 诊断质量是卖点本体：错误信息按 rustc 标准要求自己(精确 span、指出修法)
 
-## 6.5 S6 生态工具链（全部完成）
+## 6.1 S8 后端与类型系统扩展
 
-- **S6.1 依赖管理**：离线 MVS + `bur.sum` lockfile + 网络拉取 + 缓存加载 + interface declaration pipeline + disk interface cache/fallback + 子包测试发现 + import-driven tidy。`bur mod init/tidy/download/verify` + `bur get`。`$BURCACHE` 默认 `~/.burryn/pkg/`。`std/` 随工具链内嵌分发。
-- **S6.2 网络拉取**：shell-out `exec("git",["clone",...])` 零新 native。clone URL = `https://<module path>`，`$BURGITBASE` 换前缀。树哈希 `h1:<base64>`。
-- **S6.3 `bur fmt`**：全 AST + 注释重插 + 验证器（reparse + `ast_eq` + 注释计数）。`bur fmt <file|dir|->`，`--check`。
-- **S6.4 `bur test`**：子进程隔离（`bur dev run-test <dir> <fn>`，`BUR_DETERMINISTIC=1`）。`*_test.bur` + `fn test_*()` 自动发现。trap/死锁 = FAIL。`std/testing`（`assert_eq`/`assert_ok`/`assert_err`）。
-- **S6.5 诊断/DX**：cgen `#line` + `-g`（gdb 映射 .bur 行）；runtime trap 带 span stack trace；rustc 风格诊断渲染 + 多 span 标注 + 结构化修复建议。
-- **S6.6 std/json + std/testing**：`Json` enum + `parse`/`render`/`pretty`/`get`。内嵌表 `std_embed.bur` checked in，CI 有 regen+cmp。
-- **S6.7 runtime IO**：`sleep(ms)`/`exec_start`/`exec_poll` 三 native。调度器 idle-wait（fd poll + timer deadline）。`BUR_DETERMINISTIC=1` 串行化。
-- **S6.8 checker 债批**：SCC 依赖序推导 + 枚举两遍注册 + `?` 延迟判定。deep-mut 流规则。seed 定基 `seed-base-1`（= `bc8a40a`），三段链。
+**类型系统扩展决策**(S8 工程评估):
 
-## 6.6 轻量语法/语义扩展（S7，全部完成）
-
-- **S7.1 字符串插值**：`{}` 内须为 str 值，非 str 编译错提示 `str()`。`{{` 转义。
-- **S7.2 管道 `|>`**：Elixir 式 `lhs |> target` 脱糖为 lhs 作首参调用。`|>` 最低优先级、左结合。RHS = `path (“(“ args? “)”)?`（裸名/包成员/带参）。`?` 绑定紧于 `|>`。保留 Pipe AST 节点供 formatter 重建表层。
-- **S7.3 match guard**：compiler 加条件跳转。
-- **S7.4 命名参数**：**已否决**。
-- **S7.5 编译期常量**：`const N = <可折叠式>`，包级（可 `pub`）与块级。初始化式限编译期可折叠（字面量、const 引用、算术/比较/bool、str 拼接）。折叠中溢出 = 编译错。不可 mut。
-- **S7.6 defer**：挂包围函数，退出时 LIFO 执行。块是闭包、按闭包语义捕获。fiber 正常 return 执行；trap/死锁 = abort 不执行。
-- **S7.7 net**：最小 TCP 面，6 native（`tcp_listen`/`tcp_accept`/`tcp_dial`/`net_read`/`net_write`/`net_close`），全部 fiber 级阻塞。调度器通用 fd 注册接口（socket/exec/timer 同入口，底层 poll）。
-- **S7.8 可选签名标注**：参数 `name: type`、返回值 `-> type`。类型表达式复用 enum 字段语法。受约束变量 `a:addord`。标注可省略、语义不变。随 S6.1 接口缓存落地。
-
-配套定案：调度器通用 fd 注册接口；DNS 解析(getaddrinfo)v1 同步阻塞整个调度器，标注为已知限制，真实需求出现再议异步 DNS；v1 不做 UDP/unix socket/TLS；`BUR_DETERMINISTIC=1` 下 net IO 与 exec 同策略串行化；测试用 loopback 端到端(listener + dialer 双 fiber)，不依赖外网；附带最小 `std/net` 包装包——`read_all(h) -> Result<str, str>`(读到 EOF)与 `write_line(h, s) -> Result<unit, str>`，随 std_embed 分发；burc 自身不调用 net native，vm.bur `do_native` 委托沿用 S6.7 两段提交纪律(先加 native 不消费、重建二进制后再接线)。
-
-**net IO 挂起现状与演进计划(backlog)**：fiber 级阻塞已实现，但两个 runtime 的等待机制不一致——VM 侧走**忙轮询**(`wait_poll_net` 每调度循环重试 `net_nb`，EAGAIN 继续挂)，C runtime 侧已用 `poll(2)` **事件等待**(`bur_wait_poll` 统一等所有注册 fd)。两档 runtime 差距留作 backlog，**与 S8.2 语法冻结完全正交**(纯 runtime 工程，语法面零改动)：① VM 忙轮询改事件等待，与 C runtime 行为对齐；② `poll(2)` 升级 `epoll`(大规模并发 fd 性能，poll 全量扫描 vs epoll 事件触发)。真实需求出现再实施。
-
-## 6.7 重型类型系统扩展评估(工程视角，对应 S8)
-
-| 项 | 原评估 | 复评 | 理由 |
-|---|---|---|---|
-| Row Polymorphism | 高 / S8 | **S8.3** 首位，紧接封闭 record(S8.4) | 复用现有 var/generalize 加「行 var」，扁平 if-链撑得住；是结构化接口的公共地基，唯一值得投入的重型项 |
-| Effects | S8+ | 明确排除 | 与现有 CSP(fiber/channel/select)竞争控制流转移；CSP 已覆盖 IO/并发大半；类型侧 effect row 还依赖 row poly |
-| Refinement Types | 中 / 长期 backlog | 明确排除 | 无 constraint solver 地基，须从零造子系统；与轻标注工程气质冲突(Rust 未上) |
-| GADTs | 暂不做 | 明确排除 | 通用工程价值最低，动 HM 最微妙处 |
-| Linear(全局) | 永不 | 同意 | — |
-| 局部 Affine(资源) | 未列 | 补进 backlog | file/socket/channel 的 use-after-close 检查，流敏感 lint 级，不碰 GC，能把 close-of-closed-channel 运行时 trap 提前为编译期错 |
-
-**排除说明**：Refinement——无求解器地基，须从零造子系统，明确排除；Effects——与现有 CSP(fiber/channel/select)竞争控制流转移，CSP 已覆盖 IO/并发大半实用场景，边际价值与代价不成比例，明确排除。
-
-**S8.1 大方向**：调用约定 = System V AMD64 ABI；GC 根扫描 = 沿用 C 后端的 shadow stack 精确 GC 语义(cgen 的根栈纪律照搬到手写代码生成)。该方向不阻塞 S6/S7 任何批次。**前置缺口**：语言目前无构造任意原始字节的能力——`chr(n)` 把 128–255 编为多字节 UTF-8，无法产出单字节 `0x80`–`0xFF`；ELF 发射(机器码、header、重定位表)需要全字节范围。修法 = 新增 `byte_chr(n: int) -> str`(0–255 → 单字节 str，越界 trap)，配合现有 `+` 拼接与 `write_file`(`fopen("wb")` + `fwrite`，已支持原始字节)即够。归 S8.1 前置小批，不触及类型系统核心。
-
-**S8 分工**：S8 全部子项(S8.1–S8.5)由 LLM 实现，owner 审查设计与验收。
+- **纳入**:row polymorphism(S8.3,首位) → 封闭 record(S8.4)。复用现有 var/generalize 加「行 var」,扁平 if-链撑得住;是结构化接口的公共地基,唯一值得投入的重型项
+- **排除**:Effects——与现有 CSP(fiber/channel/select)竞争控制流转移,CSP 已覆盖 IO/并发大半实用场景,边际价值与代价不成比例
+- **排除**:Refinement Types——无 constraint solver 地基,须从零造子系统;与轻标注工程气质冲突(Rust 未上)
+- **排除**:GADTs——动 HM 最微妙处,通用工程价值最低
+- **排除**:Linear(全局)——永不
+- **backlog**:局部 Affine(资源)——file/socket/channel 的 use-after-close 检查,流敏感 lint 级,不碰 GC,能把 close-of-closed-channel 运行时 trap 提前为编译期错
 
 ### x86-64 后端架构（S8.1，开发中）
 
-单文件 `compiler/backends/x86.bur`（~4400 行）+ ELF64 发射 `compiler/backends/elf.bur`。无 cc 依赖，手写 ELF。
+单文件 `compiler/backends/x86.bur`（5036 行）+ ELF64 发射 `compiler/backends/elf.bur`（75 行）。无 cc 依赖,手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义(cgen 的根栈纪律照搬到手写代码生成)。
 
 #### 寄存器约定
 
@@ -231,7 +248,7 @@
 
 #### 值表示
 
-Raw int64，8 字节/槽，**无 tag**。字符串是指针 → `[8B len][content bytes]`（data section 或堆）。
+Raw int64，8 字节/槽，**无 tag**。字符串是指针 → `[8B len][content bytes]`（data section 或堆）。**float 装箱(boxed)**：值栈/字段/列表元素/闭包 upval 里存 8B **指针** → 指向堆上 `[8B bits]` 盒（IEEE-754 double 位模式）；算术/比较/取负走 SSE（`addsd`/`subsd`/`mulsd`/`divsd`/`cmpsd`），`to_float`/`trunc`/`float_bits`/`parse_float` 在盒与 int/str 间转换。
 
 #### 内存布局
 
@@ -249,8 +266,10 @@ ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
 每个值 push 记录一个 shadow 条目（编译期 `[]` 字符串数组，不进入输出二进制）：
 - `""` = int/unknown
 - `"str"` = string pointer
+- `"float"` = 装箱 float（盒指针）
 - `"list"` = list pointer
 - 函数名 = 用于 call dispatch
+（另有扩展 `type_shadow` 多态编码如 `list-<elem>` / `tup:` / `record:` / `map` / `enum:`，驱动格式化分派与字段类型推断）
 
 #### 堆对象布局
 
@@ -276,6 +295,12 @@ ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
 ```
 - Sentinel `-1` at offset 0（永远不可能是有效 fn_index）。op_call 检测 `[callee] == -1` 时分流到 ctor path。
 
+**Float box**（堆，8 字节）：`[8B bits]`——IEEE-754 double 位模式。值栈/字段/元素/upval 存盒指针，算术比较走 SSE。
+
+**Tuple**（堆）：`[8B n][8B elem0]...[8B elemN-1]`（8+8n 字节），构造时从值栈 rep movsb 复制元素。
+
+**Record**（堆）：`[8B n_fields][8B cidx][8B field0]...[8B fieldN-1]`,与 op_record 配套字段名编码查表。
+
 **不加 type tag 的理由**：类型检查器保证 op_test_variant 和 op_get_field 只收到 enum instance。运行时类型区分只在 op_call（closure vs constructor）需要，sentinel 处理。
 
 #### 调用约定
@@ -285,86 +310,19 @@ Callee prologue: `push rbp; mov rbp, r14; lea r14, [r15 - 8*(arity+1)]`。
 Callee epilogue: peek return value, collapse to r14, restore rbp, ret。
 op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
-#### 已实现 native
+### Phase 3: CSP opcode（未完成设计 spec）
 
-| Native | Args | 说明 |
-|--------|------|------|
-| exit(n) | 1 | sys_exit |
-| print(s) | 1 | write(1, s+8, [s]) |
-| println(s) | 1 | write + newline |
-| str_len(s) | 1 | reads [s+0] |
-| substr(s, start, len) | 3 | allocates + rep movsb |
-| byte_chr(n) | 1 | allocates [1][byte] |
-| str(n) | 1 | div-by-10 loop, non-negative only |
-| len(x) | 1 | reads [x+0] (list and str) |
-| push(list, val) | 2 | grows elements if len==cap |
-| pop(list) | 1 | decrements len, returns last element |
-
-#### Opcode 覆盖
-
-**已实现**：const(CInt/CStr), unit, true, false, pop, pop_n, end_block, get_local, set_local, get_global, def_global, set_global, eq, neq, gt, gt_eq, lt, lt_eq, add(str concat dispatch), sub, mul, div, mod, list, index_get(list+str), index_set, len, neg, not, jump, jump_if_false, jump_if_true, jump_if_false_pop, loop, call(natives + user fn + closure + ctor dispatch), return, closure, get_upval, set_upval, test_variant, get_field, get_field_name, no_match, try, defer, record, record_update, close_upvalue, tuple
-
-**未实现**（int3）：spawn, send, recv, chan_next, select — 全部 CSP 并发 opcode，见 Phase 3 的 deferred 说明
-
-### Opcode 实现 spec
-
-每个 spec：opcode 号、字节长度、栈 I/O、VM 语义、C 参考、x86 编码方案。Phase 2A/2B/2C（match/enum、records、error handling）均已实现，保留作参考；Phase 3（CSP）仍 deferred。
-
-#### Phase 2A: match/enum（阻塞使用 match 的程序自举）
-
-**op_test_variant (40)**, 2 bytes: `[op][vidx:1B]`
-- 栈入: `[cand][etv]` ← top
-- 栈出: `[bool]`
-- VM: pop etv, pop cand; cand 是 enuminst 且 enum type 匹配且 variant == vidx → push true/false
-- x86: 比较 `[cand] == [etv]`（both eh at offset 0）and `[cand+8] == vidx`
-- shadow: pop 2, push ""
-- data section: CEnumType 常量需预分配 `[8B: eh]` 条目
-
-**op_get_field (41)**, 2 bytes: `[op][fidx:1B]`
-- 栈入: `[instance]` ← top
-- 栈出: `[field_value]`
-- x86: `mov_rm(rax, r15, 0-8)` + `mov_rm(rax, rax, 16 + 8*fidx)` + vs_pop_n(1) + vs_push(rax)
-- shadow: pop 1, push ""
-
-**op_const 扩展**（CEnumType / CSingleton / CCtor）
-- CEnumType(eh): `mov_ri64(rax, const_addr)` + vs_push(rax) — 指向 data section `[8B: eh]`
-- CSingleton(eh, vi): 同上 — 指向 `[8B: eh][8B: vi]`
-- CCtor(eh, vi): 同上 — 指向 `[8B: -1][8B: eh][8B: vi]`
-- shadow: CEnumType → "enumtype", CSingleton → "enum", CCtor → "ctor"
-- 预扫描: 扩展 string pre-scan 以收集 CEnumType/CSingleton/CCtor 常量并分配 data section 偏移
-
-**op_call constructor dispatch**（修改现有 else 分支）
-- 加载 `[callee]` 后检查 sentinel `-1`：`cmp_ri32(rcx, -1)` → `je ctor_path`
-- closure path（现有）: `mov_rr(rax, rcx)` + shl + add r13 + load + call
-- ctor_path: 从 constructor 读 eh/vi → bump alloc instance `[eh][vi][fields...]` → rep movsb 复制 n 个 args → 覆盖 callee slot → vs_pop_n(n) → push shadow "enum"
-
-**op_no_match (42)**, 1 byte: emit `int3()`（SIGTRAP）。类型检查器防止 well-typed 程序到达此处。
-
-#### Phase 2B: records（阻塞使用 record 类型的程序）
-
-**op_record (50)**, 4 bytes: `[op][n:1B][cidx:2B]` — 堆布局 `[8B: n_fields][8B: cidx][8B: field0]...[8B: fieldN-1]`，rep movsb 复制 fields。shadow: pop n, push "record"
-
-**op_get_field_name (51)**, 3 bytes: `[op][cidx:2B]` — 编译期将 field name 映射为 numeric index，直接偏移访问（需跨指令分析）。或运行时存储 name→index 映射。**待实现时决策**。
-
-**op_record_update (52)**, 4 bytes: `[op][n:1B][cidx:2B]` — 分配新 record，复制旧 fields，覆写 n 个更新字段。
-
-#### Phase 2C: error handling
-
-**op_try (43)**, 1 byte: 检查栈顶是否 Err variant（读 `[value]` for eh, `[value+8]` for vi，比较 Err 的 eh+vi）。Err → jump to handler or trap；Ok → fall through。依赖 enum 布局（Phase 2A 先行）。
-
-#### Phase 3: CSP（独立设计——不阻塞非并发代码自举）
-
-全部 CSP opcode 需要 fiber scheduler + ucontext（POSIX）或等价物。x86 后端无 scheduler。**deferred**：
+x86 后端无 fiber scheduler + 无 ucontext(`mmap MAP_JIT` 在自写后端不需,但调度器本身不存)。下列 CSP opcode **deferred**,需独立设计阻塞、park/wake、上下文切换机制:
 
 - **op_spawn (44)**: 2 bytes `[op][argc:1B]`。需 fiber struct + 独立栈 + 上下文切换。
 - **op_send (45)**: 2 bytes。需 channel struct + sendq/recvq + park/wake。
 - **op_recv (46)**: 2 bytes。同 send。
 - **op_chan_next (47)**: 3 bytes `[op][cidx:2B]`。channel 迭代。
-- **op_select (48)**: variable。多路 select，最复杂 CSP opcode。
-- **op_defer (49)**: 1 byte。需 per-frame defer stack（可与 CSP 并发独立实现，但仍需 defer 栈管理）。
+- **op_select (48)**: variable。多路 select,最复杂 CSP opcode。
+- **op_defer (49)**: 1 byte。需 per-frame defer stack(可与 CSP 并发独立实现,但仍需 defer 栈管理)。
 - **close_upvalue**: 跳过——当前 copy-at-capture 语义不产生 open upvalues。
 
-## 6.8 LSP 与编辑器生态(工程视角，对应 S9)
+## 6.2 LSP 与编辑器生态(工程视角，对应 S9)
 
 **架构定案**：LSP 服务器用 Burryn 写(延续自举原则)，作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0(LSP 3.17 规范)。所有语言智能在服务器端；编辑器插件是**薄客户端**——只转发 LSP 消息 + 渲染 UI，不含语言逻辑。新增编辑器支持 = 实现 LSP client 协议，零服务器改动。
 
@@ -372,13 +330,13 @@ op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
 **文档同步**：Full sync 模式(didOpen/didChange/didClose 全量内容)，服务器维护内存文档表，checker 读内存覆盖磁盘。增量 sync(delta)为后续优化，v1 不做。
 
-**诊断推送**：didOpen 与 didChange(防抖)后重跑 check 管线(lex → parse → check)，DiagT/DiagX 转 LSP Diagnostic 推送。需要 check 管线支持从内存源码运行(现只从磁盘读文件)——这是 LSP 的核心工程改造点。
+**诊断推送**：didOpen 与 didChange(防抖)后重跑 check 管线(lex → parse → check)，DiagT/DiagX 转 LSP Diagnostic 推送。check 管线须支持从内存源码运行(LSP 核心工程改造点)。
 
 **语言特性(S9.2)**：
 - hover：显示推导类型/签名(复用 checker 推导结果)
 - go-to-definition：从名字使用处跳到绑定处(需 AST span → 定义 span 映射，跨文件走 module loader)
 - completion：作用域感知名字补全(局部变量、函数名、包成员 `pkg.`)
-- formatting：调 `bur fmt -`(stdin→stdout，已就绪)
+- formatting：调 `bur fmt -`(stdin→stdout)
 - signature-help：函数调用时显示参数信息
 
 **编辑器客户端**：
