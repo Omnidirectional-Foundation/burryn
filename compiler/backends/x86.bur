@@ -799,8 +799,9 @@ fn x86gen_slice_native() {
 
 // x86gen_list_format_at 生成列表格式化（两遍：先算总长，再写内容）/
 // x86gen_list_format_at emits list formatting (two passes: total length, then contents)
-// List formatting (two passes: total length, then contents)
-fn x86gen_list_format_at(off, is_str, is_float, ff_h) {
+// List formatting (two passes: total length, then contents). str/int/float elements use
+// inline handlers; bool/unit/container elements call the prebuilt elem_code formatter
+fn x86gen_list_format_at(off, elem_type, elem_code, ff_h) {
     let mb_al = e1(136) + e1(7)
     let mb = fn(c) {
         e1(198) + e1(7) + sb(c)
@@ -818,12 +819,17 @@ fn x86gen_list_format_at(off, is_str, is_float, ff_h) {
     let int1_neg = add_ri32(rcx, 1) + neg_r(rax)
     let int1_head = test_rr(rax, rax) + jge_rel32(str_len(int1_neg))
     let float1 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rcx) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + add_rr(rcx, rsi)
-    let tail1 = if is_float {
+    // 非 str/int/float 元素：拷入值栈临时槽，调元素 formatter，读 box 长度
+    // non-str/int/float elements: copy into a value-stack temp slot, call the element formatter, read the box length
+    let wrap1 = push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rcx) + vs_push(rdx) + elem_code + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + add_rr(rcx, rsi)
+    let tail1 = if elem_type == "float" {
         float1
-    } else if is_str {
+    } else if elem_type == "str" {
         str1
-    } else {
+    } else if elem_type == "int" {
         int1 + int1_head + int1_neg + int1_loop + int1_loop_jne + int1_add
+    } else {
+        wrap1
     }
     let test1 = cmp_rr(r11, r8) + jae_rel32(str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5)
     let next1 = next1_wo + jmp_rel32(0 - (str_len(test1) + str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5))
@@ -838,16 +844,21 @@ fn x86gen_list_format_at(off, is_str, is_float, ff_h) {
     let int2 = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + int2_head + int2_neg + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
     let str2 = mb(34) + add_ri32(rdi, 1) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rcx, rdx, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
     let float2 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rdi) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + rep_movsb()
+    // pass 2 非 str/int/float 元素：写元素 formatter 结果字节
+    // pass 2 non-str/int/float elements: write the element formatter result bytes
+    let wrap2 = push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rdi) + vs_push(rdx) + elem_code + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + rep_movsb()
     let e2_load = mov_rr(rsi, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r10) + mov_rm(rdx, rsi, 0)
     let sep2_bytes = mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
     let sep2 = test_rr(r11, r11) + je_rel32(str_len(sep2_bytes)) + sep2_bytes
     let next2_wo = add_ri32(r11, 1)
-    let tail2 = if is_float {
+    let tail2 = if elem_type == "float" {
         float2
-    } else if is_str {
+    } else if elem_type == "str" {
         str2
-    } else {
+    } else if elem_type == "int" {
         int2
+    } else {
+        wrap2
     }
     let test2 = cmp_rr(r11, r8) + jae_rel32(str_len(sep2) + str_len(e2_load) + str_len(tail2) + str_len(next2_wo) + 5)
     let next2 = next2_wo + jmp_rel32(0 - (str_len(test2) + str_len(sep2) + str_len(e2_load) + str_len(tail2) + str_len(next2_wo) + 5))
@@ -2617,6 +2628,55 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         out
     }
+    // is_list_type 判断是否为 list 类型 / is_list_type tells whether t is a list type
+    fn is_list_type(t) {
+        str_len(t) > 5 && substr(t, 0, 5) == "list-"
+    }
+    // list_elem_type 取 list 元素类型（非 list 类型返回 ""）/
+    // list_elem_type extracts the list element type (returns "" for non-list types)
+    fn list_elem_type(t) {
+        if is_list_type(t) {
+            substr(t, 5, str_len(t) - 5)
+        } else {
+            ""
+        }
+    }
+    // list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）/
+    // list_elem_format_code emits the element formatter code for a list element type ("" for str/int/float, which use inline handlers)
+    fn list_elem_format_code_core(et, ff_h) {
+        if et == "str" || et == "int" || et == "float" {
+            ""
+        } else if et == "bool" {
+            x86gen_bool_convert_at(0 - 8)
+        } else if et == "unit" {
+            x86gen_unit_convert_at(0 - 8)
+        } else if is_list_type(et) {
+            let iet = list_elem_type(et)
+            x86gen_list_format_at(0 - 8, iet, list_elem_format_code_core(iet, ff_h), ff_h)
+        } else if is_map_type(et) {
+            x86gen_map_format_at(0 - 8, map_key_type(et) == "str", map_val_type(et) == "str", map_val_type(et) == "float", ff_h)
+        } else if is_record_type(et) {
+            let ets = record_schema(et)
+            if str_len(ets) > 0 {
+                match get(record_field_types, ets) {
+                    Some(etf) => {
+                        if len(etf) > 0 {
+                            x86gen_record_format_at(0 - 8, enc_names(ets), etf, ff_h)
+                        } else {
+                            ""
+                        }
+                    },
+                    None => "",
+                }
+            } else {
+                ""
+            }
+        } else if is_enum_enc(et) {
+            enum_format_for_enc(0 - 8, et)
+        } else {
+            ""
+        }
+    }
     // x86gen_tuple_format_at 生成 tuple 格式化：(e0, e1, ...)，元素按静态类型展开，容器元素递归格式化
     // x86gen_tuple_format_at emits tuple formatting: (e0, e1, ...), elements expanded from static types, containers nested
     fn x86gen_tuple_format_at(off, types, ff_h) {
@@ -2636,8 +2696,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 icode = x86gen_bool_convert_at(0 - 8)
             } else if it == "unit" {
                 icode = x86gen_unit_convert_at(0 - 8)
-            } else if it == "list-str" || it == "list-int" || it == "list-float" {
-                icode = x86gen_list_format_at(0 - 8, it == "list-str", it == "list-float", ff_h)
+            } else if is_list_type(it) {
+                let iet = list_elem_type(it)
+                let ilec = if str_len(iet) > 4 && substr(iet, 0, 4) == "tup:" {
+                    x86gen_tuple_format_at(0 - 8, tup_elems(iet), ff_h)
+                } else {
+                    list_elem_format_code_core(iet, ff_h)
+                }
+                icode = x86gen_list_format_at(0 - 8, iet, ilec, ff_h)
             } else if is_map_type(it) {
                 icode = x86gen_map_format_at(0 - 8, map_key_type(it) == "str", map_val_type(it) == "str", map_val_type(it) == "float", ff_h)
             } else if is_record_type(it) {
@@ -2710,6 +2776,44 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         l2 = l2 + mb(41) + add_ri32(rdi, 1)
         l1 + alloc + l2 + mov_mr(r15, off, r9)
+    }
+    // list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）/
+    // list_elem_format_code emits the element formatter code for a list element type ("" for str/int/float, which use inline handlers)
+    fn list_elem_format_code(et, ff_h) {
+        if et == "str" || et == "int" || et == "float" {
+            ""
+        } else if et == "bool" {
+            x86gen_bool_convert_at(0 - 8)
+        } else if et == "unit" {
+            x86gen_unit_convert_at(0 - 8)
+        } else if is_list_type(et) {
+            let iet = list_elem_type(et)
+            x86gen_list_format_at(0 - 8, iet, list_elem_format_code(iet, ff_h), ff_h)
+        } else if is_map_type(et) {
+            x86gen_map_format_at(0 - 8, map_key_type(et) == "str", map_val_type(et) == "str", map_val_type(et) == "float", ff_h)
+        } else if is_record_type(et) {
+            let ets = record_schema(et)
+            if str_len(ets) > 0 {
+                match get(record_field_types, ets) {
+                    Some(etf) => {
+                        if len(etf) > 0 {
+                            x86gen_record_format_at(0 - 8, enc_names(ets), etf, ff_h)
+                        } else {
+                            ""
+                        }
+                    },
+                    None => "",
+                }
+            } else {
+                ""
+            }
+        } else if is_enum_enc(et) {
+            enum_format_for_enc(0 - 8, et)
+        } else if str_len(et) > 4 && substr(et, 0, 4) == "tup:" {
+            x86gen_tuple_format_at(0 - 8, tup_elems(et), ff_h)
+        } else {
+            ""
+        }
     }
     let const_data_len = str_len(const_data)
     // find_field_in_enc 在编码中查找字段 / find_field_in_enc finds a field in an encoding
@@ -3246,8 +3350,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(pshadow_ps, plen)
                     shadow_pop(ptshadow_ps, plen)
                     push(pshadow_ps, "")
-                    if pelt == "str" {
-                        push(ptshadow_ps, "list-str")
+                    if plen > 0 {
+                        if pelt == "bool" {
+                            push(ptshadow_ps, "list-bool")
+                        } else if pelt == "unit" {
+                            push(ptshadow_ps, "list-unit")
+                        } else {
+                            push(ptshadow_ps, "list-" + pelt)
+                        }
                     } else {
                         push(ptshadow_ps, "list-int")
                     }
@@ -3260,7 +3370,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(pshadow_ps, 2)
                     shadow_pop(ptshadow_ps, 2)
                     push(pshadow_ps, "")
-                    if plt == "list-str" || plt == "str" {
+                    if is_list_type(plt) {
+                        let plel = list_elem_type(plt)
+                        if plel == "str" {
+                            push(ptshadow_ps, "str")
+                        } else {
+                            push(ptshadow_ps, plel)
+                        }
+                    } else if plt == "str" {
                         push(ptshadow_ps, "str")
                     } else if str_len(plt) > 4 && substr(plt, 0, 4) == "tup:" {
                         let mut pel_t = "int"
@@ -3864,10 +3981,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(type_shadow, "int")
             } else if op == lib::op_list {
                 let n = read_u16(code, ip + 1)
-                let ltag = if n > 0 && type_shadow[len(type_shadow) - 1] == "str" {
-                    "list-str"
-                } else if n > 0 && type_shadow[len(type_shadow) - 1] == "float" {
-                    "list-float"
+                let el_top = if n > 0 && len(type_shadow) >= 1 {
+                    type_shadow[len(type_shadow) - 1]
+                } else {
+                    ""
+                }
+                let ltag = if n > 0 {
+                    if el_top == "bool" {
+                        "list-bool"
+                    } else if el_top == "unit" {
+                        "list-unit"
+                    } else {
+                        "list-" + el_top
+                    }
                 } else {
                     "list-int"
                 }
@@ -3919,8 +4045,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     shadow_pop(shadow, 2)
                     shadow_pop(type_shadow, 2)
                     push(shadow, "")
-                    if st == "list-str" {
-                        push(type_shadow, "str")
+                    if is_list_type(st) {
+                        let st_el = list_elem_type(st)
+                        if st_el == "str" {
+                            push(type_shadow, "str")
+                        } else if st_el == "float" {
+                            push(type_shadow, "float")
+                        } else if st_el == "bool" {
+                            push(type_shadow, "bool")
+                        } else if st_el == "unit" {
+                            push(type_shadow, "unit")
+                        } else {
+                            push(type_shadow, st_el)
+                        }
                     } else {
                         push(type_shadow, "int")
                     }
@@ -4069,12 +4206,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_unit_convert_at(0 - 8 * (n - ci)))
                                 } else if atype == "float" {
                                     w(x86gen_float_to_str_at(0 - 8 * (n - ci)))
-                                } else if atype == "list-str" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - ci), true, false, f2s_h))
-                                } else if atype == "list-int" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - ci), false, false, f2s_h))
-                                } else if atype == "list-float" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - ci), false, true, f2s_h))
+                                } else if is_list_type(atype) {
+                                    let aelt = list_elem_type(atype)
+                                    w(x86gen_list_format_at(0 - 8 * (n - ci), aelt, list_elem_format_code(aelt, f2s_h), f2s_h))
                                 } else if str_len(atype) > 4 && substr(atype, 0, 4) == "tup:" {
                                     w(x86gen_tuple_format_at(0 - 8 * (n - ci), tup_elems(atype), f2s_h))
                                 } else if is_map_type(atype) {
@@ -4138,12 +4272,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
                                 } else if btype == "float" {
                                     w(x86gen_float_to_str_at(0 - 8 * (n - cj)))
-                                } else if btype == "list-str" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - cj), true, false, f2s_h))
-                                } else if btype == "list-int" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - cj), false, false, f2s_h))
-                                } else if btype == "list-float" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - cj), false, true, f2s_h))
+                                } else if is_list_type(btype) {
+                                    let belt = list_elem_type(btype)
+                                    w(x86gen_list_format_at(0 - 8 * (n - cj), belt, list_elem_format_code(belt, f2s_h), f2s_h))
                                 } else if str_len(btype) > 4 && substr(btype, 0, 4) == "tup:" {
                                     w(x86gen_tuple_format_at(0 - 8 * (n - cj), tup_elems(btype), f2s_h))
                                 } else if is_map_type(btype) {
@@ -4207,12 +4338,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
                                 } else if btype == "float" {
                                     w(x86gen_float_to_str_at(0 - 8 * (n - cj)))
-                                } else if btype == "list-str" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - cj), true, false, f2s_h))
-                                } else if btype == "list-int" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - cj), false, false, f2s_h))
-                                } else if btype == "list-float" {
-                                    w(x86gen_list_format_at(0 - 8 * (n - cj), false, true, f2s_h))
+                                } else if is_list_type(btype) {
+                                    let belt = list_elem_type(btype)
+                                    w(x86gen_list_format_at(0 - 8 * (n - cj), belt, list_elem_format_code(belt, f2s_h), f2s_h))
                                 } else if str_len(btype) > 4 && substr(btype, 0, 4) == "tup:" {
                                     w(x86gen_tuple_format_at(0 - 8 * (n - cj), tup_elems(btype), f2s_h))
                                 } else if is_map_type(btype) {
@@ -4276,12 +4404,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         w(x86gen_unit_convert_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     } else if str_arg_t == "float" {
                         w(x86gen_float_to_str_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                    } else if str_arg_t == "list-str" {
-                        w(x86gen_list_format_at(0 - 8, true, false, f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                    } else if str_arg_t == "list-int" {
-                        w(x86gen_list_format_at(0 - 8, false, false, f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                    } else if str_arg_t == "list-float" {
-                        w(x86gen_list_format_at(0 - 8, false, true, f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                    } else if is_list_type(str_arg_t) {
+                        let selt = list_elem_type(str_arg_t)
+                        w(x86gen_list_format_at(0 - 8, selt, list_elem_format_code(selt, f2s_h), f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     } else if str_len(str_arg_t) > 4 && substr(str_arg_t, 0, 4) == "tup:" {
                         w(x86gen_tuple_format_at(0 - 8, tup_elems(str_arg_t), f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                     } else if is_map_type(str_arg_t) {
@@ -4314,12 +4439,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             Some(slot) => {
                                 if slot < len(pos_types) {
                                     let elem_type = type_shadow[len(type_shadow) - 1]
-                                    if elem_type == "str" {
-                                        pos_types[slot] = "list-str"
-                                        type_shadow[slot] = "list-str"
-                                    } else if elem_type == "int" {
-                                        pos_types[slot] = "list-int"
-                                        type_shadow[slot] = "list-int"
+                                    let is_known_elt = elem_type == "str" || elem_type == "int" || elem_type == "float" || elem_type == "bool" || elem_type == "unit" || is_list_type(elem_type) || is_map_type(elem_type) || is_record_type(elem_type) || is_enum_enc(elem_type) || str_len(elem_type) > 4 && substr(elem_type, 0, 4) == "tup:"
+                                    if is_known_elt {
+                                        let ltag = "list-" + elem_type
+                                        pos_types[slot] = ltag
+                                        type_shadow[slot] = ltag
                                     }
                                 }
                             },
@@ -4330,7 +4454,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(x86gen_pop_native())
                 } else if callee == "range" {
                     w(x86gen_range_native())
-                    ret_type = "list"
+                    ret_type = "list-int"
                 } else if callee == "chr" {
                     w(x86gen_chr_native())
                     ret_type = "str"
@@ -4367,7 +4491,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         to_name = "bool"
                     } else if to_t == "unit" {
                         to_name = "unit"
-                    } else if to_t == "list-str" || to_t == "list-int" {
+                    } else if is_list_type(to_t) {
                         to_name = "list"
                     } else if is_map_type(to_t) {
                         to_name = "map"
