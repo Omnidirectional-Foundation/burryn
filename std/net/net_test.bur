@@ -1,0 +1,134 @@
+// net_test.bur — std/net 的 bur test 套件
+// bur test suite for std/net
+fn must_ok(result) {
+    match result {
+        Ok(v) => v,
+        Err(msg) => {
+            assert(false, "unexpected Err: " + msg)
+            -1
+        },
+    }
+}
+
+fn payload_server(lh, tag, payload) {
+    match tcp_accept(lh) {
+        Ok(conn) => {
+            let _ = net_write(conn, tag + ":" + payload)
+            net_close(conn)
+        },
+        Err(e) => eprintln("server accept: " + e),
+    }
+}
+
+fn echo_server(lh, tag) {
+    match tcp_accept(lh) {
+        Ok(conn) => {
+            match net_read(conn, 4096) {
+                Ok(data) => {
+                    let _ = net_write(conn, tag + ":" + data)
+                },
+                Err(e) => eprintln("server read: " + e),
+            }
+            net_close(conn)
+        },
+        Err(e) => eprintln("server accept: " + e),
+    }
+}
+
+fn silent_close_server(lh) {
+    match tcp_accept(lh) {
+        Ok(conn) => {
+            net_close(conn)
+        },
+        Err(e) => eprintln("server accept: " + e),
+    }
+}
+
+fn test_read_all_until_peer_close() {
+    let port = 19891
+    let lh = must_ok(tcp_listen("127.0.0.1", port))
+    spawn payload_server(lh, "ra", "payload")
+    let conn = must_ok(tcp_dial("127.0.0.1", port))
+    match read_all(conn) {
+        Ok(data) => assert(data == "ra:payload", "read_all got wrong payload: " + data),
+        Err(e) => assert(false, "read_all failed: " + e),
+    }
+    net_close(conn)
+    net_close(lh)
+}
+
+fn test_read_all_until_peer_close_empty() {
+    let port = 19892
+    let lh = must_ok(tcp_listen("127.0.0.1", port))
+    spawn silent_close_server(lh)
+    let conn = must_ok(tcp_dial("127.0.0.1", port))
+    match read_all(conn) {
+        Ok(data) => assert(str_len(data) == 0, "read_all on empty close got data: " + data),
+        Err(e) => assert(false, "read_all failed: " + e),
+    }
+    net_close(conn)
+    net_close(lh)
+}
+
+fn test_write_line_appends_newline() {
+    let port = 19893
+    let lh = must_ok(tcp_listen("127.0.0.1", port))
+    spawn echo_server(lh, "wl")
+    let conn = must_ok(tcp_dial("127.0.0.1", port))
+    match write_line(conn, "line1") {
+        Ok(_) => {},
+        Err(e) => assert(false, "write_line failed: " + e),
+    }
+    match net_read(conn, 4096) {
+        Ok(data) => assert(data == "wl:line1\n", "write_line did not append newline: " + data),
+        Err(e) => assert(false, "net_read failed: " + e),
+    }
+    net_close(conn)
+    net_close(lh)
+}
+
+fn test_multiple_lines_roundtrip() {
+    let port = 19894
+    let lh = must_ok(tcp_listen("127.0.0.1", port))
+    spawn echo_server(lh, "ml")
+    let conn = must_ok(tcp_dial("127.0.0.1", port))
+    let _ = write_line(conn, "one")
+    let _ = write_line(conn, "two")
+    let _ = write_line(conn, "three")
+    match net_read(conn, 4096) {
+        Ok(data) => assert(data == "ml:one\ntwo\nthree\n", "multi-line roundtrip mismatch: " + data),
+        Err(e) => assert(false, "net_read failed: " + e),
+    }
+    net_close(conn)
+    net_close(lh)
+}
+
+fn test_dial_refused_port_returns_err() {
+    match tcp_dial("127.0.0.1", 19899) {
+        Ok(_) => assert(false, "dial to closed port succeeded"),
+        Err(_) => {},
+    }
+}
+
+fn test_accept_after_close_returns_err() {
+    let lh = must_ok(tcp_listen("127.0.0.1", 19895))
+    net_close(lh)
+    match tcp_accept(lh) {
+        Ok(_) => assert(false, "accept on closed listener succeeded"),
+        Err(_) => {},
+    }
+}
+
+fn test_loopback_echo_roundtrip() {
+    let port = 19896
+    let lh = must_ok(tcp_listen("127.0.0.1", port))
+    spawn echo_server(lh, "rt")
+    let conn = must_ok(tcp_dial("127.0.0.1", port))
+    let _ = write_line(conn, "ping")
+    match net_read(conn, 4096) {
+        Ok(data) => assert(data == "rt:ping\n", "roundtrip mismatch: " + data),
+        Err(e) => assert(false, "net_read failed: " + e),
+    }
+    net_close(conn)
+    net_close(lh)
+}
