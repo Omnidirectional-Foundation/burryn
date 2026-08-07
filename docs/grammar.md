@@ -1,7 +1,6 @@
-# Burryn 语法（正式 grammar）
+# Burryn 语法
 
-> 语法冻结于 S8.2（v0.5 里程碑）。本文档是语言表层语法的唯一权威描述，与 `compiler/frontend/` 的实现逐条对应。
-> 冻结后语法变更须走修订流程：改本文档 → 改 parser/lexer → 全仓 `bur fmt` → 自举 fixpoint + parity 全绿 → 更新 SPEC 里程碑。
+> 本文档是 Burryn 表层语法的唯一权威描述，与 `compiler/frontend/` 的实现逐条对应。
 
 ## 记号约定
 
@@ -67,7 +66,7 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 - 插值 `{expr}` 内必须是 `str` 值（非 str 编译错，提示 `str()`）
 - `{{` 转义为字面 `{`
 - 插值串由 `t_interp_start` / `t_interp_mid` / `t_interp_end` 三个 token 表示，花括号是 token 边界
-- **多行字符串（冻结定案）**：`"""` 后必须换行；每行行首空白忽略后**第一个非空白字符必须是 `\`**（内容标记），`\` 后到行尾为该行内容；全空白行 = 空行；内容 = 各行以 `\n` 连接、最后一行无尾换行；行内转义与插值照常；`"""` 结束行前导空白忽略
+- **多行字符串**：`"""` 后必须换行；每行行首空白忽略后**第一个非空白字符必须是 `\`**（内容标记），`\` 后到行尾为该行内容；全空白行 = 空行；内容 = 各行以 `\n` 连接、最后一行无尾换行；行内转义与插值照常；`"""` 结束行前导空白忽略
 
 ### 1.5 符号（token 全表）
 
@@ -76,7 +75,7 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 ==  >  >=  <  <=  &&  ||  =>  <-  ->  |>  |  +=  -=  *=  /=  %=  "  \n(自动分号)
 ```
 
-**符号语义分工（冻结定案）：**
+**符号语义分工：**
 
 | 符号 | 语义 |
 |---|---|
@@ -84,7 +83,7 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 | `.` | 成员访问：record 字段（`r.x`）或方法调用（`p.area()`，checker 按类型解析）。不得用于路径限定 |
 | `..` | range 字面量 `1..10`（半开区间），脱糖为 `range(1, 10)` 调用 |
 | `=>` | match 臂、select 臂分隔 |
-| `->` | 函数签名返回类型标注（S7.8） |
+| `->` | 函数签名返回类型标注 |
 | `<-` | channel 接收（表达式前缀）与 send 语句分隔符（`ch <- v`） |
 | `\|>` | 管道 |
 | `\|` | or-pattern（match 臂 `A \| B =>`）、record 更新基底、行变量（类型层） |
@@ -92,7 +91,7 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 | `+= -= *= /= %=` | 复合赋值：`x += v` 脱糖为 `x = x + v`（目标须为变量或下标） |
 | `\n` | 语句结束（见 §1.6） |
 
-**`<-` 消歧规则（词法层 longest-match，冻结定案）**：`<` 后紧跟 `-`（无空格）无条件合成 `<-` token。因此「小于负值」必须加空格写成 `x < -5`；`x<-5` 解析为 `<-`（send/recv 语义）而非比较。`--` 不是 token：`5--5` 是 `5 - -5`。
+**`<-` 消歧规则（词法层 longest-match）**：`<` 后紧跟 `-`（无空格）无条件合成 `<-` token。因此「小于负值」必须加空格写成 `x < -5`；`x<-5` 解析为 `<-`（send/recv 语义）而非比较。`--` 不是 token：`5--5` 是 `5 - -5`。
 
 ### 1.6 自动分号插入
 
@@ -105,7 +104,7 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 ```
 program      ::= { top_level_decl }
 top_level_decl ::= import | fn_decl | method_decl | enum_decl | let_decl | const_decl
-                | type_decl | pub_decl
+                 | type_decl | pub_decl
 ```
 
 - 包：目录即包，`bur.mod` 声明 `module <path>`；`require` 声明依赖
@@ -127,7 +126,7 @@ type_decl    ::= ['pub'] 'type' ident '=' type_expr
 pub_decl     ::= 'pub' ( fn_decl | enum_decl | let_decl | const_decl | type_decl )
 ```
 
-- **零标注**：参数/返回类型可省略（S7.8）；`interface` 文件（S6.1）要求显式标注
+- **零标注**：参数/返回类型可省略；`interface` 文件要求显式标注
 - **`const` 初始化式**：编译期可折叠（字面量、const 引用、算术/比较/bool、str 拼接），折叠溢出 = 编译错；不可 `mut`
 - 顶层 `let` 可 `pub`；`pub` 导出标记，不用首字母大写
 
@@ -153,14 +152,14 @@ select_arm   ::= ( '<-' expression | ident '=' '<-' expression
                  | expression '<-' expression | 'default' ) '=>' expression,
 ```
 
-**select 细节（冻结定案）：**
+**select 细节：**
 - 臂形态：`<-ch => ...`（接收丢弃）、`v = <-ch => ...`（接收绑定，左侧必须是裸名）、`ch <- v => ...`（发送）、`default => ...`（非阻塞；至多一个）
 - `default` 是特判标识符，非关键字
 - 臂体是表达式（block 是表达式的一种），`=>` 之后可有逗号
 
 **for 迭代 channel**：`for x in ch` 排空 channel，关闭后结束；索引形式（`for i, x in ch`）报 E0599。
 
-**标签循环（冻结定案）**：`label: while/for` 起标签；`break label` / `continue label` 跳转到该标签循环（可跨嵌套层）；无标签 `break`/`continue` 作用于最近循环；标签不可跨函数；未定义标签 = E2018。
+**标签循环**：`label: while/for` 起标签；`break label` / `continue label` 跳转到该标签循环（可跨嵌套层）；无标签 `break`/`continue` 作用于最近循环；标签不可跨函数；未定义标签 = E2018。
 
 ## 5. 表达式（优先级从低到高）
 
@@ -188,7 +187,7 @@ match_arms   ::= { pattern ['if' expression] '=>' expression },
 record_literal ::= 'record' '{' [fields | update] '}'
 ```
 
-**postfix 语义分工（冻结定案）：**
+**postfix 语义分工：**
 
 | postfix | 语义 |
 |---|---|
@@ -231,11 +230,11 @@ record_type  ::= 'record' '{' { ident ':' type_expr } ',' [ '|' ident ] '}'
 ```
 
 - 类型参数：`[a]`（list）；`fn` 类型必须带 `fn` 关键字（`fn (T1, T2) -> T3`）；裸括号 `(T1, T2)` 是 tuple 类型
-- 约束变量（S7.8）：`fn f(a: addord)` 小写类型参数可带约束
-- **record 类型**：字段表 `{ x: int, y: str }`；行变量 `| r`（S8.3 row poly 预留，值层无行变量）
+- 约束变量：`fn f(a: addord)` 小写类型参数可带约束
+- **record 类型**：字段表 `{ x: int, y: str }`；行变量 `| r`（row poly 预留，值层无行变量）
 - enum 类型引用：`Shape`（本包）、`pkg::Shape`（跨包）
 
-## 8. record（冻结定稿）
+## 8. record
 
 ```
 record_literal  ::= 'record' '{' [ field {',' field} [','] ] '}'
@@ -246,13 +245,12 @@ type_field      ::= ident ':' type_expr
 access          ::= postfix '.' ident               // r.x
 ```
 
-**冻结定案（S8.2）：**
-- 字面量必须带 `record` 关键字（与 block 区分，SPEC §2 定案）
+- 字面量必须带 `record` 关键字（与 block 区分）
 - 更新 `record { r | x: 3 }`：以 `r` 为基底复制、覆写字段，生成新 record；**基底必须是裸 ident**（表达式先绑定到变量再更新）
 - 空 record `record {}` 合法（字面量与类型皆可）
-- 字段名重复（`record { x: 1, x: 2 }`）：语法层合法，行为由类型检查实现决定（冻结时记录为已知行为，无专门错误码）
+- 字段名重复（`record { x: 1, x: 2 }`）：语法层合法，行为由类型检查实现决定（无专门错误码）
 
-## 9. interface 文件语法（S6.1 工具链格式）
+## 9. interface 文件语法
 
 ```
 interface    ::= { import_decl | enum_decl | pub_interface_fn }
@@ -262,8 +260,8 @@ pub_interface_fn ::= 'pub' 'fn' ident '(' { ident ':' type_expr } ',' ')' '->' t
 - interface 文件是包导出签名（checker 缓存格式），**参数与返回类型必须显式标注**（E1101）
 - 无函数体；`pub` 标记导出
 
-## 10. 变更流程（冻结后）
+## 10. 变更流程
 
 1. 语法变更 = 改本文件 + parser/lexer + 全仓 `bur fmt` + 自举 fixpoint + parity 全绿
 2. 语义变更（不改表层语法）不触碰本文件，但须更新 SPEC
-3. LSP（S9）以本文件为语法契约，语法变更须同步 TextMate grammar 与 LSP 词法
+3. LSP 以本文件为语法契约，语法变更须同步 TextMate grammar 与 LSP 词法
