@@ -1,18 +1,8 @@
 # NUMBERING.md — 编号历史映射
 
-> version: n/a · status: 历史对照(只读) · updated: 2026-07-26
-> 相关文档：[`SPEC.md`](SPEC.md) 目标与里程碑 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
+> 相关文档：[`SPEC.md`](SPEC.md) · [`../tutorial.md`](../tutorial.md) · [`../README.md`](../README.md)
 
-> **注意：** 本文档只做历史对照。
-> 项目当前唯一有效编号体系是 [`SPEC.md`](SPEC.md) §5 的统一 `S<n>[.<m>]`。
-> 早期文档、commit message、讨论里出现的旧编号(`v1/v2/v3/v4`、`L1/L2/L3`、旧「S4 工具链」及其 `S4-1..S4-4`)一律作废，查此表回溯。
-
-## 为什么统一
-
-早期并存四套坐标：版本里程碑 `v1–v4`、自举分段 `S1–S3`、生态工具链 `S4`(内含 `S4-1..S4-4` 与依赖子层 `L1/L2/L3`)、语言特性评估表(部分标 `v4`)。
-语义交叉(如 `v4` 同时装「手写后端」与「row poly」；`S4` 语义从「自举分段」跳到「工具链」)，不利于 owner 与 LLM 交接推进。
-
-2026-07 owner 定：全线收敛为单一 `S<n>[.<m>]`，历史与未来同一坐标，已完成阶段标记为「已完成」，不再另立 `v`/`L` 体系。
+> 早期多套编号并存、语义交叉，已统一为 SPEC §5 的 `S<n>[.<m>]`；旧编号按映射表回溯。
 
 ## 旧 → 新 映射
 
@@ -37,9 +27,3 @@
 | §6.6 封闭 records | 改 unify，原标「独立 milestone」 | **S8.4**(移出 S7，与 row poly 同段) |
 | §6.7 Row Polymorphism(v4) | 重型类型系统首选项 | **S8.3** |
 | §6.7 Effects / Refinement / GADTs / Linear | 重型类型系统其余项 | 明确排除(见 §6.7) |
-
-## 当前状态速览
-
-- **S1-S7 已完成**：自举闭环、生态工具链、字符串插值、管道操作符、match guard、编译期常量、`defer` 与 TCP networking 均已落地。
-- **S8 进行中**：手写 x86-64 后端与重型类型推进中；x86-64 ELF 后端已开工。
-- **S9 部分实现**：LSP 核心、hover 与 VSCode 扩展已落地，剩余语言特性继续推进。
