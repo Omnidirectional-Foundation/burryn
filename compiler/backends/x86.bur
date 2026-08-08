@@ -2872,6 +2872,32 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         gf = gf + 1
     }
+    // 方法全名映射：CLOSURE + DEF_GLOBAL 配对记录「全局名 → fn handle」
+    // map from fully-qualified method names to fn handles (CLOSURE + DEF_GLOBAL pairs)
+    let mut method_full_map = map()
+    let mut mfi = 0
+    while mfi < nfn {
+        let mut mgip = 0
+        while mgip < len(f_code[mfi]) {
+            if f_code[mfi][mgip] == lib::op_def_global && mgip >= 3 && f_code[mfi][mgip - 3] == lib::op_closure {
+                let mgidx = read_u16(f_code[mfi], mgip + 1)
+                let mgname = const_str(mfi, mgidx)
+                let mcidx = read_u16(f_code[mfi], mgip - 2)
+                let mfh = fn_const(mfi, mcidx)
+                if mfh >= 0 {
+                    let exists = match get(method_full_map, mgname) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if !exists {
+                        put(method_full_map, mgname, mfh)
+                    }
+                }
+            }
+            mgip = mgip + inst_len(mfi, f_code[mfi], mgip)
+        }
+        mfi = mfi + 1
+    }
     let mut fn_ret_type = []
     let mut rhAlloc = 0
     while rhAlloc < nfn {
@@ -2954,6 +2980,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         lib::CVal::CCtor(peh, pvi) => {
                             push(pshadow_ps, "ctor:" + str(peh) + ":" + str(pvi))
                             push(ptshadow_ps, "enum")
+                        },
+                        lib::CVal::CFloat(_) => {
+                            push(pshadow_ps, "float")
+                            push(ptshadow_ps, "float")
                         },
                         _ => {
                             push(pshadow_ps, "")
@@ -3209,7 +3239,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         push(pshadow_ps, "")
                         push(ptshadow_ps, clt)
                     } else {
-                        let phandle = find_fn_by_name(pcallee)
+                        let mut phandle = find_fn_by_name(pcallee)
+                        if phandle < 0 {
+                            match get(method_full_map, pcallee) {
+                                Some(mh) => {
+                                    phandle = mh
+                                },
+                                None => {},
+                            }
+                        }
                         if phandle >= 0 {
                             let mut pff = 0
                             while pff < pn && pff < len(fn_param_types[phandle]) {
@@ -4180,7 +4218,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else if op == lib::op_call {
                 let n = code[ip + 1]
                 let callee = shadow[len(shadow) - n - 1]
-                let handle = find_fn_by_name(callee)
+                let mut handle = find_fn_by_name(callee)
+                if handle < 0 {
+                    match get(method_full_map, callee) {
+                        Some(mh) => {
+                            handle = mh
+                        },
+                        None => {},
+                    }
+                }
                 let mut ret_type = ""
                 if callee == "exit" {
                     w(mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(60) + syscall())
