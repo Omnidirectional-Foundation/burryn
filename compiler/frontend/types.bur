@@ -1,13 +1,16 @@
 // types.bur — HM 类型检查器：类型层（含类型标注）、ty_unify、泛化与实例化、全程序推导。
-// The HM type checker: type representation (annotations included), unification, generalization, instantiation, whole-program inference.
+// The HM type checker: type representation (annotations included), unification, generalization,
+// instantiation, whole-program inference.
 // 类型用 arena 句柄表示（并行 mut 列表 tk/tn/ta/tr/tl），避免 mut 不穿透枚举字段的限制；
 // 未决类型 = 带 level 的类型变量（generalize 时按 level 泛化）。
 // Types are arena handles over parallel mut lists (tk/tn/ta/tr/tl), sidestepping that mut does not
-// penetrate enum fields; unresolved types are level-carrying variables (generalization honors the level).
+// penetrate enum fields; unresolved types are level-carrying variables
+// (generalization honors the level).
 import "burryn.dev/compiler/lib"
 
 // LSP 悬停：类型检查时记录每个表达式区间与推断类型句柄，供按文件+偏移查询
-// Hover support: record each expression span and its inferred type handle during checking, queried by file + offset
+// Hover support: record each expression span and its inferred type handle during
+// checking, queried by file + offset
 let mut lsp_recording = false
 let mut lsp_ty_starts = []
 let mut lsp_ty_ends = []
@@ -19,7 +22,8 @@ let mut lsp_arena_ta = []
 let mut lsp_arena_tr = []
 
 // LSP go-to-definition：记录每个名字使用区间与其定义位置（跨文件），供按文件+偏移查询
-// Go-to-definition support: record each name use span and its definition location (cross-file), queried by file + offset
+// Go-to-definition support: record each name use span and its definition location
+// (cross-file), queried by file + offset
 let mut lsp_def_starts = []
 let mut lsp_def_ends = []
 let mut lsp_def_files = []
@@ -38,8 +42,7 @@ let mut imp_keys = []
 let mut imp_offs = []
 let mut imp_files = []
 
-// lsp_record_type 记录表达式的推断类型（供 hover 查询）/
-// lsp_record_type records an expression type (for hover)
+// lsp_record_type 记录表达式的推断类型（供 hover 查询） / lsp_record_type records an expression type (for hover)
 fn lsp_record_type(sp, h, file) {
     match sp {
         Sp(s, e) => {
@@ -110,7 +113,8 @@ pub fn lsp_def_at(file, offset) {
     }
 }
 
-// ty_new_con 构造命名类型（list/map/Option 等构造器）/ ty_new_con builds a fresh named type (list/map/Option constructors)
+// ty_new_con 构造命名类型（list/map/Option 等构造器）
+// ty_new_con builds a fresh named type (list/map/Option constructors)
 fn ty_new_con(mut tk, mut tn, mut ta, mut tr, mut tl, name, cargs) {
     push(tk, 0)
     push(tn, name)
@@ -130,7 +134,8 @@ fn ty_new_fn(mut tk, mut tn, mut ta, mut tr, mut tl, params, ret) {
     len(tk) - 1
 }
 
-// ty_new_var 构造带泛化级别（与可选约束）的类型变量 / ty_new_var builds a fresh type variable (with generalization level and optional constraint)
+// ty_new_var 构造带泛化级别（与可选约束）的类型变量
+// ty_new_var builds a fresh type variable (with generalization level and optional constraint)
 fn ty_new_var(mut tk, mut tn, mut ta, mut tr, mut tl, level, con) {
     push(tk, 2)
     push(tn, con)
@@ -168,7 +173,7 @@ fn ty_adjust_level(tk, tn, ta, tr, mut tl, h, level) {
     }
 }
 
-// ty_occurs 做 occurs 检查：变量是否出现在类型内（阻止递归类型）/
+// ty_occurs 做 occurs 检查：变量是否出现在类型内（阻止递归类型）
 // ty_occurs runs the occurs check: is the variable inside the type? (blocks recursive types)
 fn ty_occurs(tk, ta, tr, v, h) {
     let x = ty_resolve(tk, tr, h)
@@ -214,8 +219,7 @@ fn dm_heap_walk(tk, tn, ta, tr, h) {
     found
 }
 
-// fresh_name_copy 复制名字（fresh 语义）/
-// fresh_name_copy copies a name (fresh semantics)
+// fresh_name_copy 复制名字（fresh 语义） / fresh_name_copy copies a name (fresh semantics)
 fn fresh_name_copy(src) {
     let mut out = map()
     for name in keys(src) {
@@ -432,14 +436,13 @@ fn ty_pretty1(tk, tn, ta, tr, h) {
 // ty_unify 先解引用两侧，再按类型形态分派合并
 // ty_unify resolves both sides, then merges by type kind
 fn ty_unify(mut tk, mut tn, mut ta, mut tr, mut tl, ah, bh) {
-    // 先解析指针链（可能 a == b，同句柄直接成功）/
-    // Resolve pointer chains first (a == b short-circuits)
+    // 先解析指针链（可能 a == b，同句柄直接成功） / Resolve pointer chains first (a == b short-circuits)
     let a = ty_resolve(tk, tr, ah)
     let b = ty_resolve(tk, tr, bh)
     if a == b {
         return ""
     }
-    // 行变量侧：开放 record 尾巴绑定剩余字段的 record（或另一行变量）/
+    // 行变量侧：开放 record 尾巴绑定剩余字段的 record（或另一行变量）
     // Row variable side: an open-record tail binds to the leftover record (or another row var)
     if tk[a] == 2 && tn[a] == "row" {
         if tk[b] == 0 && str_len(tn[b]) > 4 && substr(tn[b], 0, 4) == "@rec" {
@@ -496,7 +499,7 @@ fn ty_unify(mut tk, mut tn, mut ta, mut tr, mut tl, ah, bh) {
                 if !a_open && b_open {
                     return ty_unify(tk, tn, ta, tr, tl, bh, ah)
                 }
-                // 已知字段按名配对（开放侧字段须是另一侧子集）/
+                // 已知字段按名配对（开放侧字段须是另一侧子集）
                 // Pair known fields by name (the open side's fields must be a subset)
                 let mut i = 0
                 while i < len(fa) {
@@ -520,8 +523,7 @@ fn ty_unify(mut tk, mut tn, mut ta, mut tr, mut tl, ah, bh) {
                     }
                     i = i + 1
                 }
-                // 开放侧行变量绑定另一侧的剩余字段 /
-                // The open side's row var binds the other side's leftover fields
+                // 开放侧行变量绑定另一侧的剩余字段 / The open side's row var binds the other side's leftover fields
                 let ra = ta[a][len(fa) - 1]
                 let mut rest_names = []
                 let mut rest_types = []
@@ -751,7 +753,8 @@ pub fn typecheck_script(stmts) {
 }
 
 // typecheck_program 做全程序类型检查：两遍包注册 + 依赖顺序
-// typecheck_program runs whole-program typecheck: two-pass package registration plus dependency order
+// typecheck_program runs whole-program typecheck: two-pass package registration
+// plus dependency order
 pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports) {
     let mut tk = []
     let mut tn = []
@@ -823,7 +826,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     imp_offs = []
     imp_files = []
 
-    // record_pkg_use 记录包名区间到 import 语句定义（pkg.name 的前半段）/
+    // record_pkg_use 记录包名区间到 import 语句定义（pkg.name 的前半段）
     // record_pkg_use records the package-name segment of a pkg.name use to its import statement
     fn record_pkg_use(sp, pkg, cfile) {
         let mut di = len(imp_keys) - 1
@@ -846,7 +849,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
     // rec_field_def_at 按字段名查 record 字段定义（最近字面量），未命中返回 -1
-    // rec_field_def_at looks up a record field definition by name (most recent literal), -1 when absent
+    // rec_field_def_at looks up a record field definition by name (most recent literal),
+    // -1 when absent
     fn rec_field_def_at(field) {
         let mut di = len(rec_field_keys) - 1
         while di >= 0 {
@@ -984,8 +988,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // new_binding 注册一个绑定（名字、可变性、种类）/
-    // new_binding registers a binding (name, mutability, kind)
+    // new_binding 注册一个绑定（名字、可变性、种类） / new_binding registers a binding (name, mutability, kind)
     fn new_binding(sch, is_mut, kind, sp) {
         push(b_scheme, sch)
         push(b_mut, is_mut)
@@ -1025,7 +1028,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     fn push_scope() {
         push(scopes, map())
     }
-    // starts_underscore 判断是否下划线前缀（未使用豁免）/
+    // starts_underscore 判断是否下划线前缀（未使用豁免）
     // starts_underscore tells whether a name is underscore-prefixed (unused exemption)
     fn starts_underscore(name) {
         str_len(name) > 0 && char_at(name, 0) == "_"
@@ -1224,7 +1227,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // register_enum 注册枚举（两遍：先名字，后字段）/
+    // register_enum 注册枚举（两遍：先名字，后字段）
     // register_enum registers an enum (two passes: names, then fields)
     fn register_enum(n) {
         match n {
@@ -1426,7 +1429,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // is_type_expr_node 判断节点是否为类型表达式 / is_type_expr_node tells whether the node is a type expression
+    // is_type_expr_node 判断节点是否为类型表达式
+    // is_type_expr_node tells whether the node is a type expression
     fn is_type_expr_node(n) {
         match n {
             TEName(_, _, _, _, _) => true,
@@ -1456,7 +1460,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // iface_collect_type 收集 interface 中的类型（本地枚举 + 外部包）/
+    // iface_collect_type 收集 interface 中的类型（本地枚举 + 外部包）
     // iface_collect_type collects interface types (local enums, external packages)
     fn iface_collect_type(h, mut local_enums, mut external_pkgs) {
         let x = ty_resolve(tk, tr, h)
@@ -1631,7 +1635,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // iface_type_context 取 interface 类型上下文（需要的名字）/ iface_type_context gathers the names a type needs
+    // iface_type_context 取 interface 类型上下文（需要的名字）
+    // iface_type_context gathers the names a type needs
     fn iface_type_context(sh) {
         let mut names = map()
         let mut i = 0
@@ -1701,7 +1706,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // render_package_interface 生成包的 interface 文件 / render_package_interface generates a package interface file
+    // render_package_interface 生成包的 interface 文件
+    // render_package_interface generates a package interface file
     fn render_package_interface(top) {
         let mut local_enums = map()
         let mut external_pkgs = map()
@@ -2150,7 +2156,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // infer_call 推断调用（实参、泛化、挂起诊断）/
+    // infer_call 推断调用（实参、泛化、挂起诊断）
     // infer_call infers a call (args, generalization, pending diagnostics)
     // infer_call 解析被调者（名字/包成员/方法），参数逐一推断后合一
     // infer_call resolves the callee (name/package member/method), infers args, then unifies
@@ -2422,10 +2428,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         dm_file = []
     }
 
-    // infer_match 推断 match（穷尽性 + 臂合一）/
+    // infer_match 推断 match（穷尽性 + 臂合一）
     // infer_match infers a match (exhaustiveness + arm unification)
     // infer_match 推断 scrutinee，逐臂模式绑定 + 体合一，末了检查穷尽性
-    // infer_match infers the scrutinee, binds patterns per arm, unifies bodies, then checks exhaustiveness
+    // infer_match infers the scrutinee, binds patterns per arm, unifies bodies,
+    // then checks exhaustiveness
     fn infer_match(scrut, arms, msp) {
         // 先推断 scrutinee，模式分析决定每臂绑定与覆盖集合
         // Infer the scrutinee first; pattern analysis decides per-arm bindings and coverage
@@ -2440,7 +2447,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             match arm {
                 MatchArm(pat, guard, body, _) => {
                     // 逐臂：模式绑定入作用域，guard 为 bool，体与整体合一
-                    // Per arm: pattern bindings enter scope, guard is bool, the body unifies with the match type
+                    // Per arm: pattern bindings enter scope, guard is bool, the body
+                    // unifies with the match type
                     push_scope()
                     let unguarded = match guard {
                         NoNode => true,
@@ -3326,7 +3334,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     fn te(name) {
         TEName("", name, "", [], Sp(0, 0))
     }
-    // builtin_enum 构造内建枚举（Option、Result 等）/ builtin_enum builds a builtin enum (Option, Result, ...)
+    // builtin_enum 构造内建枚举（Option、Result 等）
+    // builtin_enum builds a builtin enum (Option, Result, ...)
     fn builtin_enum(name, params, vnames, vfieldss) {
         let mut vhs = []
         let mut i = 0
@@ -3785,7 +3794,8 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
         push(interface_sources, render_package_interface(top))
         // 第二遍：逐组推断表达式类型（依赖顺序内），类型记录供 LSP
-        // Pass 2: infer expression types group by group (dependency order); type recording feeds the LSP
+        // Pass 2: infer expression types group by group (dependency order);
+        // type recording feeds the LSP
         put(pkg_seen, cur_pkg, true)
         let _ = pop(scopes)
         cur_aliases = map()
