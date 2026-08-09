@@ -379,12 +379,22 @@ fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
         } else if str_len(tn[x]) > 4 && substr(tn[x], 0, 4) == "@rec" {
             let fnames = rec_parse_names(tn[x])
             let mut fields = []
+            let mut row_name = ""
             let mut i = 0
             while i < len(fnames) {
-                push(fields, fnames[i] + ": " + ty_pretty(tk, tn, ta, tr, ta[x][i], names, cnt))
+                if str_len(fnames[i]) > 0 && substr(fnames[i], 0, 1) == "?" {
+                    row_name = substr(fnames[i], 1, str_len(fnames[i]) - 1)
+                } else {
+                    push(fields, fnames[i] + ": " + ty_pretty(tk, tn, ta, tr, ta[x][i], names, cnt))
+                }
                 i = i + 1
             }
-            "record " + chr(123) + " " + join(fields, ", ") + " " + chr(125)
+            let body = if row_name != "" {
+                join(fields, ", ") + " | " + row_name
+            } else {
+                join(fields, ", ")
+            }
+            "record " + chr(123) + " " + body + " " + chr(125)
         } else if tn[x] == "@tup" {
             let mut parts = []
             for a in ta[x] {
@@ -421,13 +431,29 @@ fn ty_pretty1(tk, tn, ta, tr, h) {
 // ty_unify merges two type handles, E0308 on mismatch; row vars and records pair field by field
 // ty_unify 先解引用两侧，再按类型形态分派合并
 // ty_unify resolves both sides, then merges by type kind
-fn ty_unify(tk, mut tn, ta, mut tr, mut tl, ah, bh) {
+fn ty_unify(mut tk, mut tn, mut ta, mut tr, mut tl, ah, bh) {
     // 先解析指针链（可能 a == b，同句柄直接成功）/
     // Resolve pointer chains first (a == b short-circuits)
     let a = ty_resolve(tk, tr, ah)
     let b = ty_resolve(tk, tr, bh)
     if a == b {
         return ""
+    }
+    // 行变量侧：开放 record 尾巴绑定剩余字段的 record（或另一行变量）/
+    // Row variable side: an open-record tail binds to the leftover record (or another row var)
+    if tk[a] == 2 && tn[a] == "row" {
+        if tk[b] == 0 && str_len(tn[b]) > 4 && substr(tn[b], 0, 4) == "@rec" {
+            tr[a] = b
+            return ""
+        }
+        if tk[b] == 2 && tn[b] == "row" {
+            tr[a] = b
+            return ""
+        }
+        return "expected a record, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
+    }
+    if tk[b] == 2 && tn[b] == "row" {
+        return ty_unify(tk, tn, ta, tr, tl, b, a)
     }
     // 变量侧合一：occurs 检查 + 约束允许性 + 直接绑定
     // Variable side: occurs check, constraint allowance, direct binding
@@ -461,6 +487,88 @@ fn ty_unify(tk, mut tn, ta, mut tr, mut tl, ah, bh) {
         return ty_unify(tk, tn, ta, tr, tl, b, a)
     }
     if tk[a] == 0 && tk[b] == 0 {
+        if str_len(tn[a]) > 4 && substr(tn[a], 0, 4) == "@rec" && str_len(tn[b]) > 4 && substr(tn[b], 0, 4) == "@rec" {
+            let fa = rec_parse_names(tn[a])
+            let fb = rec_parse_names(tn[b])
+            let a_open = len(fa) > 0 && substr(fa[len(fa) - 1], 0, 1) == "?"
+            let b_open = len(fb) > 0 && substr(fb[len(fb) - 1], 0, 1) == "?"
+            if a_open || b_open {
+                if !a_open && b_open {
+                    return ty_unify(tk, tn, ta, tr, tl, bh, ah)
+                }
+                // 已知字段按名配对（开放侧字段须是另一侧子集）/
+                // Pair known fields by name (the open side's fields must be a subset)
+                let mut i = 0
+                while i < len(fa) {
+                    if str_len(fa[i]) > 0 && substr(fa[i], 0, 1) != "?" {
+                        let f = fa[i]
+                        let mut j = 0
+                        let mut found = -1
+                        while j < len(fb) {
+                            if str_len(fb[j]) > 0 && substr(fb[j], 0, 1) != "?" && fb[j] == f {
+                                found = j
+                            }
+                            j = j + 1
+                        }
+                        if found < 0 {
+                            return "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, bh) + "`"
+                        }
+                        let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][found])
+                        if e != "" {
+                            return e
+                        }
+                    }
+                    i = i + 1
+                }
+                // 开放侧行变量绑定另一侧的剩余字段 /
+                // The open side's row var binds the other side's leftover fields
+                let ra = ta[a][len(fa) - 1]
+                let mut rest_names = []
+                let mut rest_types = []
+                let mut j = 0
+                while j < len(fb) {
+                    if str_len(fb[j]) > 0 && substr(fb[j], 0, 1) != "?" {
+                        let mut in_a = false
+                        let mut k = 0
+                        while k < len(fa) {
+                            if str_len(fa[k]) > 0 && substr(fa[k], 0, 1) != "?" && fa[k] == fb[j] {
+                                in_a = true
+                            }
+                            k = k + 1
+                        }
+                        if !in_a {
+                            push(rest_names, fb[j])
+                            push(rest_types, ta[b][j])
+                        }
+                    }
+                    j = j + 1
+                }
+                if b_open {
+                    let rb = ta[b][len(fb) - 1]
+                    let brow = substr(fb[len(fb) - 1], 1, str_len(fb[len(fb) - 1]) - 1)
+                    if len(rest_names) == 0 {
+                        tr[ra] = rb
+                    } else {
+                        let mut onames = []
+                        for rn in rest_names {
+                            push(onames, rn)
+                        }
+                        push(onames, "?" + brow)
+                        let mut orts = []
+                        for rt in rest_types {
+                            push(orts, rt)
+                        }
+                        push(orts, rb)
+                        tr[ra] = ty_new_con(tk, tn, ta, tr, tl, rec_type_name(onames), orts)
+                    }
+                } else if len(rest_names) == 0 {
+                    tr[ra] = ty_new_con(tk, tn, ta, tr, tl, "@rec", [])
+                } else {
+                    tr[ra] = ty_new_con(tk, tn, ta, tr, tl, rec_type_name(rest_names), rest_types)
+                }
+                return ""
+            }
+        }
         if tn[a] != tn[b] || len(ta[a]) != len(ta[b]) {
             return "expected `" + ty_pretty1(tk, tn, ta, tr, a) + "`, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
         }
@@ -1228,12 +1336,29 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 tfn(phs, convert_type_expr(ret, subst, prefix))
             },
-            TERecord(fnames, ftypes, _, _) => {
+            TERecord(fnames, ftypes, row, _) => {
                 let mut fhs = []
                 for ft in ftypes {
                     push(fhs, convert_type_expr(ft, subst, prefix))
                 }
-                ty_new_con(tk, tn, ta, tr, tl, rec_type_name(fnames), fhs)
+                let mut all_names = []
+                for n in fnames {
+                    push(all_names, n)
+                }
+                let row_name = match row {
+                    TEName(_, rn, _, _, _) => rn,
+                    _ => "",
+                }
+                if row_name != "" {
+                    let rv = match get(subst, row_name) {
+                        Some(t) => t,
+                        None => fresh(""),
+                    }
+                    tn[rv] = "row"
+                    push(fhs, rv)
+                    push(all_names, "?" + row_name)
+                }
+                ty_new_con(tk, tn, ta, tr, tl, rec_type_name(all_names), fhs)
             },
             TETuple(ets, _) => {
                 let mut ehs = []
@@ -2958,7 +3083,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 match ty {
                     NoNode => {},
                     _ => {
-                        let ah = convert_type_expr(ty, map(), "")
+                        let mut subst = map()
+                        collect_annotation_vars(ty, subst)
+                        let ah = convert_type_expr(ty, subst, "")
                         let e = ty_unify(tk, tn, ta, tr, tl, ah, t)
                         if e != "" {
                             cerr(nsp, "E0308", "", "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, t) + "` (annotation on `" + name + "`)")
@@ -3574,7 +3701,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         match ty {
                             NoNode => {},
                             _ => {
-                                let ah = convert_type_expr(ty, map(), "")
+                                let mut subst = map()
+                                collect_annotation_vars(ty, subst)
+                                let ah = convert_type_expr(ty, subst, "")
                                 let e = ty_unify(tk, tn, ta, tr, tl, ah, t)
                                 if e != "" {
                                     cerr(nsp, "E0308", "", "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, t) + "` (annotation on `" + name + "`)")

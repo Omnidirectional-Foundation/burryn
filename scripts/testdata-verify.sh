@@ -1,7 +1,8 @@
 #!/bin/bash
 # testdata-verify.sh — testdata 运行样例验证 + 构建自洽。
 # 跑主题目录（basics/types/regression）的 .bur vs .golden；
-# pkg/modules 多包样例与 rowvar 语法层特判；结尾跑 C 后端双级 fixpoint
+# pkg/modules 多包样例（pub/import/type）与 row poly（S8.3）随 golden-verify 覆盖；
+# 结尾跑 C 后端双级 fixpoint
 # （gen0 由 bur 编译自身，gen1 由 gen0 编译自身，cmp gen0 gen1）。
 # Usage: ./scripts/testdata-verify.sh
 set -u
@@ -10,7 +11,7 @@ cd "$(dirname "$0")/.."
 BUR=${BUR:-./bur}
 fails=0
 
-if ! SKIP=rowvar.bur ./scripts/golden-verify.sh testdata/basics testdata/types testdata/regression; then
+if ! ./scripts/golden-verify.sh testdata/basics testdata/types testdata/regression; then
     fails=$((fails + 1))
 fi
 
@@ -26,13 +27,7 @@ else
 fi
 rm -f "$tmp"
 
-# rowvar：行变量语法（S8.3 语义未实现，dev parse 应成功）
-if "$BUR" dev parse testdata/types/rowvar.bur >/dev/null 2>&1; then
-    echo "PASS rowvar.bur (syntax)"
-else
-    echo "FAIL rowvar.bur"
-    fails=$((fails + 1))
-fi
+# rowvar：行变量（S8.3）随 golden-verify 完整检查 + 运行
 
 echo "--- C 后端三代 fixpoint ---"
 # gen0 = bur 编译（继承旧代内置 std 数据）；gen1 = gen0 编译；gen2 = gen1 编译。
