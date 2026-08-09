@@ -1336,7 +1336,8 @@ fn x86gen_read_dir_native() {
     head
 }
 
-// proc 结构堆布局 / proc struct heap layout: pid, outfd, errfd, failfd, ob_len, eb_len, ob[8192], eb[8192], child_err, have_err, code, complete, consumed
+// proc 结构堆布局 / proc struct heap layout: pid, outfd, errfd, failfd, ob_len, eb_len, out_ptr/cap, err_ptr/cap, child_err, have_err, code, complete, consumed
+// stdout/stderr 缓冲为堆上动态增长缓冲（初始 8KB，满则倍增），不再固定 8KB 上限
 // 默认 PATH 常量（无 PATH 环境变量时）/"PATH" 缺席时回退的默认 PATH
 let proc_pid = 0
 let proc_outfd = 8
@@ -1344,14 +1345,16 @@ let proc_errfd = 16
 let proc_failfd = 24
 let proc_ob_len = 32
 let proc_eb_len = 40
-let proc_ob = 48
-let proc_eb = 8240
-let proc_child_err = 16432
-let proc_have_err = 16440
-let proc_code = 16448
-let proc_complete = 16456
-let proc_consumed = 16464
-let proc_size = 16472
+let proc_out_ptr = 48
+let proc_out_cap = 56
+let proc_err_ptr = 64
+let proc_err_cap = 72
+let proc_child_err = 80
+let proc_have_err = 88
+let proc_code = 96
+let proc_complete = 104
+let proc_consumed = 112
+let proc_size = 120
 let pipe2_nonblock_cloexec = 526336
 
 // x86gen_defer_loop 生成函数返回时的 defer 链执行（LIFO，闭包无参调用，链头在 [rsp]）/
@@ -1475,7 +1478,9 @@ fn x86gen_exec_spawn_native() {
     let child_closes = c1(0) + c1(4) + c1(8) + c1(12) + c1(16)
     let child_seq = dup1 + dup2 + child_closes + slash_head + slash_body + slash_back + direct + walk + fail_write
     // 父进程：关写端，建 proc 结构（失败关读端）/ parent: close write ends, build the proc struct (on failure close read ends)
-    let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
+    let init_out = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_out_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_out_cap, rax)
+    let init_err = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_err_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_err_cap, rax)
+    let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
     let fork_fail = c1(0) + c1(8) + c1(16) + mov_ri64(rax, 0 - 1)
     let parent_seq = mov_mr(rsp, 24, rax) + c1(4) + c1(12) + c1(20) + test_rr(rax, rax) + jl_rel32(str_len(parent_ok) + 5) + parent_ok + jmp_rel32(str_len(fork_fail)) + fork_fail
     let done_seq = add_ri32(rsp, 80)
@@ -1496,21 +1501,21 @@ fn x86gen_exec_spawn_native() {
 // x86gen_proc_pump inlines draining: non-blocking reads of failfd/outfd/errfd, wait4 once both pipes hit EOF
 // proc pump inline: r9 = proc 基址（全程保留）
 fn x86gen_proc_pump() {
-    // 单管排空：读到 EAGAIN 或 EOF；缓冲满则丢弃续读以推进 EOF
-    // drain one pipe: read until EAGAIN or EOF; when the buffer is full, keep draining to reach EOF
-    fn drain_fd(fd_off, len_off, buf_off) {
-        let cap = mov_ri64(r10, 8192) + mov_rm(rdx, r9, len_off) + sub_rr(r10, rdx)
-        let discard = mov_rr(rsi, rsp) + mov_ri64(rdx, 8192) + xor_rr(r10, r10)
-        let append = lea(rsi, r9, buf_off) + add_rr(rsi, rdx) + mov_rr(rdx, r10)
-        let cap_branch = test_rr(r10, r10) + jle_rel32(str_len(append) + 5) + append + jmp_rel32(str_len(discard)) + discard
+    // 单管排空：读到 EAGAIN 或 EOF；缓冲满则倍增缓冲继续收集，不丢弃
+    // drain one pipe: read until EAGAIN or EOF; on a full buffer, double it and keep collecting
+    fn drain_fd(fd_off, len_off, ptr_off, cap_off) {
+        let cap = mov_rm(r10, r9, cap_off) + mov_rm(rdx, r9, len_off) + sub_rr(r10, rdx)
+        let grow = mov_rm(r10, r9, cap_off) + add_rr(r10, r10) + mov_rr(r11, r12) + add_rr(r12, r10) + mov_rm(rsi, r9, ptr_off) + mov_rr(rdi, r11) + mov_rm(rcx, r9, len_off) + rep_movsb() + mov_mr(r9, ptr_off, r11) + mov_mr(r9, cap_off, r10) + sub_rr(r10, rdx)
+        let append = mov_rm(rsi, r9, ptr_off) + add_rr(rsi, rdx) + mov_rr(rdx, r10)
+        let cap_branch = test_rr(r10, r10) + jg_rel32(str_len(grow))
         let read = mov_rr(rdi, r8) + xor_rr(rax, rax) + syscall()
         let append_seq = mov_rm(rdx, r9, len_off) + add_rr(rdx, rax) + mov_mr(r9, len_off, rdx)
         let append_result = test_rr(r10, r10) + jle_rel32(str_len(append_seq)) + append_seq
         let eof = mov_rr(rdi, r8) + sys_mov_rax(3) + syscall() + mov_ri64(rax, 0 - 1) + mov_mr(r9, fd_off, rax)
         let dispatch = test_rr(rax, rax) + jg_rel32(6 + 5) + je_rel32(5 + str_len(append_result) + 5) + jmp_rel32(str_len(append_result) + 5 + str_len(eof))
-        let back = jmp_rel32(0 - (str_len(cap) + str_len(cap_branch) + str_len(read) + 20 + str_len(append_result) + 5))
-        let head = mov_rm(r8, r9, fd_off) + test_rr(r8, r8) + jl_rel32(str_len(cap) + str_len(cap_branch) + str_len(read) + 20 + str_len(append_result) + 5 + str_len(eof))
-        head + cap + cap_branch + read + dispatch + append_result + back + eof
+        let back = jmp_rel32(0 - (str_len(cap) + str_len(cap_branch) + str_len(grow) + str_len(append) + str_len(read) + 20 + str_len(append_result) + 5))
+        let head = mov_rm(r8, r9, fd_off) + test_rr(r8, r8) + jl_rel32(str_len(cap) + str_len(cap_branch) + str_len(grow) + str_len(append) + str_len(read) + 20 + str_len(append_result) + 5 + str_len(eof))
+        head + cap + cap_branch + grow + append + read + dispatch + append_result + back + eof
     }
     // wait4 状态换算：正常退出 code = (st>>8)&0xff，信号退出 code = 128 + termsig
     // wait4 status: normal exit code = (st>>8)&0xff, signaled code = 128 + termsig
@@ -1523,8 +1528,8 @@ fn x86gen_proc_pump() {
     // 双管 EOF 后：终读 failfd（exec 成功时 CLOEXEC 已关），wait4 收尸
     // after both pipes EOF: final failfd read (CLOEXEC closed it on exec success), then wait4
     let wait_block = mov_rm(rdi, r9, proc_failfd) + lea(rsi, r9, proc_child_err) + sys_mov_rdx(4) + xor_rr(rax, rax) + syscall() + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + jne_rel32(str_len(hav)) + hav + failfd_close + sub_ri32(rsp, 16) + mov_rm(rdi, r9, proc_pid) + mov_rr(rsi, rsp) + xor_rr(rdx, rdx) + mov_ri64(r10, 0) + sys_mov_rax(61) + syscall() + mov_rm(rdx, rsp, 0) + mov_rr(rcx, rdx) + mov_ri64(rax, 127) + and_rr(rdx, rax) + code_seq + add_ri32(rsp, 16)
-    let out_drain = drain_fd(proc_outfd, proc_ob_len, proc_ob)
-    let err_drain = drain_fd(proc_errfd, proc_eb_len, proc_eb)
+    let out_drain = drain_fd(proc_outfd, proc_ob_len, proc_out_ptr, proc_out_cap)
+    let err_drain = drain_fd(proc_errfd, proc_eb_len, proc_err_ptr, proc_err_cap)
     let err_check = mov_rm(r8, r9, proc_errfd) + test_rr(r8, r8) + jge_rel32(str_len(wait_block))
     let out_check = mov_rm(r8, r9, proc_outfd) + test_rr(r8, r8) + jge_rel32(str_len(err_check) + str_len(wait_block))
     let failfd_read = mov_rm(rdi, r9, proc_failfd) + lea(rsi, r9, proc_child_err) + sys_mov_rdx(4) + xor_rr(rax, rax) + syscall()
@@ -1536,8 +1541,8 @@ fn x86gen_proc_pump() {
 // x86gen_proc_result_inst 从 proc 构造 Result 实例（rax 返回，置 consumed）/
 // x86gen_proc_result_inst builds the Result instance from a proc (returned in rax, marks consumed)
 fn x86gen_proc_result_inst() {
-    let ob_str = mov_rm(r10, r9, proc_ob_len) + mov_rr(r11, r12) + mov_mr(r11, 0, r10) + lea(rsi, r9, proc_ob) + lea(rdi, r11, 8) + mov_rr(rcx, r10) + rep_movsb() + add_rr(r12, r10) + add_ri32(r12, 8)
-    let eb_str = mov_rm(r10, r9, proc_eb_len) + mov_rr(r8, r12) + mov_mr(r8, 0, r10) + lea(rsi, r9, proc_eb) + lea(rdi, r8, 8) + mov_rr(rcx, r10) + rep_movsb() + add_rr(r12, r10) + add_ri32(r12, 8)
+    let ob_str = mov_rm(r10, r9, proc_ob_len) + mov_rr(r11, r12) + mov_mr(r11, 0, r10) + mov_rm(rsi, r9, proc_out_ptr) + lea(rdi, r11, 8) + mov_rr(rcx, r10) + rep_movsb() + add_rr(r12, r10) + add_ri32(r12, 8)
+    let eb_str = mov_rm(r10, r9, proc_eb_len) + mov_rr(r8, r12) + mov_mr(r8, 0, r10) + mov_rm(rsi, r9, proc_err_ptr) + lea(rdi, r8, 8) + mov_rr(rcx, r10) + rep_movsb() + add_rr(r12, r10) + add_ri32(r12, 8)
     let out_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 2) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_rm(rax, r9, proc_code) + mov_mr(rcx, 16, rax) + mov_mr(rcx, 24, r11) + mov_mr(rcx, 32, r8) + add_ri32(r12, 40)
     let ok_inst = mov_rr(rax, r12) + mov_ri64(rdx, 1) + mov_mr(rax, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rax, 8, rdx) + mov_mr(rax, 16, rcx) + add_ri32(r12, 24)
     let ok_path = ob_str + eb_str + out_inst + ok_inst
