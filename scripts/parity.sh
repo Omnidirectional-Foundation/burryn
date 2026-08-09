@@ -34,8 +34,15 @@ run_parity() {
     # x86 build + run
     local bin="$TMPDIR/$name"
     if ! "$BUR" build --backend x86 "$file" -o "$bin" 2>/dev/null; then
-        echo "  SKIP $name (x86 build failed)"
-        SKIP=$((SKIP + 1))
+        # both backends rejecting the program (e.g. a static type error) is parity too
+        if [ "$vm_rc" -ne 0 ]; then
+            echo "  PASS $name (both backends reject)"
+            PASS=$((PASS + 1))
+        else
+            echo "  FAIL $name (x86 build failed, VM ran)"
+            FAIL=$((FAIL + 1))
+            FAILURES="$FAILURES $name"
+        fi
         return
     fi
 
