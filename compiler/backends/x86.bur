@@ -732,7 +732,7 @@ fn x86gen_unit_convert_at(off) {
 
 // is_unimpl_native 判断 native 是否未实现（发射 int3）/ is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "clock" || name == "close" || name == "net_nb" || name == "recv" || name == "chan"
+    name == "close" || name == "net_nb" || name == "recv" || name == "chan"
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）/
@@ -1582,6 +1582,20 @@ fn x86gen_exec_start_native() {
     spawn_seq + test_rr(rax, rax) + jl_rel32(str_len(ok_inst) + 5) + ok_tail + err_tail
 }
 
+// x86gen_clock_native 内联 clock：CLOCK_MONOTONIC 减去启动时刻，返回相对启动的秒（float 盒）
+// x86gen_clock_native inlines clock: CLOCK_MONOTONIC minus the startup instant, seconds since start (float box)
+// clock inline: monotonic since startup (startup timestamp lives at [rbx + 8*n_globals])
+fn x86gen_clock_native(n_globals) {
+    let ts = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall()
+    let diff_sec = mov_rm(rax, rsp, 0) + mov_rm(rdx, rcx, 0) + sub_rr(rax, rdx) + cvtsi2sd_xmm(0, rax)
+    let diff_nsec = mov_rm(rax, rsp, 8) + mov_rm(rdx, rcx, 8) + sub_rr(rax, rdx) + cvtsi2sd_xmm(1, rax)
+    let frac = mov_ri64(rax, 0x41CDCD6500000000) + movq_xmm_gpr(2, rax) + divsd_xmm(1, 2) + addsd_xmm(0, 1)
+    let fin = movq_gpr_xmm(rax, 0) + add_ri32(rsp, 16)
+    let box = mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8)
+    let ret = mov_mr(r15, 0 - 8, r11)
+    ts + lea(rcx, rbx, 8 * n_globals) + diff_sec + diff_nsec + frac + fin + box + ret
+}
+
 // x86gen_exec_poll_native 内联 exec_poll：单次排空，未完成 → None，完成 → Some(Result) /
 // x86gen_exec_poll_native inlines exec_poll: one drain, None when incomplete, Some(Result) when complete
 // exec_poll inline: single pump, None or Some(Result); invalid or consumed handle exits 4
@@ -1858,7 +1872,7 @@ fn x86gen_range_native() {
 // x86gen_start emits _start: mmap the heap, set the register conventions, call main
 // _start: mmap the heap, set register conventions, call main
 fn x86gen_start(nfn, n_globals) {
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + add_ri32(r12, 8 * n_globals + 4096) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + vs_push_zero() + mov_rm(rax, r13, 0) + call_r(rax) + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
 }
 
 // x86gen_program_to_buf 是 x86 后端入口：字节码表 → x86-64 ELF 二进制字节
@@ -4774,6 +4788,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let pf_res = mov_rm(rcx, r15, 0 - 8) + mov_rm(r11, rcx, 16) + mov_rm(rax, r11, 0) + mov_rm(rdx, r11, 8) + test_rr(rax, rax) + je_rel32(str_len(pf_box) + str_len(pf_some)) + pf_box + pf_some + pf_none
                     w(mov_rm(rax, r13, 8 * pf_h) + call_r(rax) + pf_res)
                     ret_type = enum_payload_enc("Option", [["float"]])
+                } else if callee == "clock" {
+                    w(x86gen_clock_native(n_globals))
+                    ret_type = "float"
                 } else if is_unimpl_native(callee) {
                     w(int3())
                 } else if callee == "contains" {
