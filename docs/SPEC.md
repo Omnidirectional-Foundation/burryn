@@ -223,6 +223,7 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 **类型系统扩展决策**(S8 工程评估):
 
 - **纳入**:row polymorphism(S8.3,首位) → 封闭 record(S8.4)。复用现有 var/generalize 加「行 var」,扁平 if-链撑得住;是结构化接口的公共地基,唯一值得投入的重型项
+- **S8.3 实现定案**:行变量复用类型变量句柄（`tn="row"` 标记），开放 record 编码为 `@rec|field|?rowvar`——`?` 前缀 = 行变量槽，置于字段名列表末尾，对应句柄置于 `ta` 末尾。`ty_unify` record 开放分支：开放侧已知字段按名与另一侧配对（须为子集），行变量绑定另一侧剩余字段的（开放/封闭）record；行变量独立出现时绑定整个 record 或另一行变量。generalize/occurs/adjust 经 `ta` 递归自动覆盖行变量。标注解析经 `collect_annotation_vars` 预建行变量句柄
 - **排除**:Effects——与现有 CSP(fiber/channel/select)竞争控制流转移,CSP 已覆盖 IO/并发大半实用场景,边际价值与代价不成比例
 - **排除**:Refinement Types——无 constraint solver 地基,须从零造子系统;与轻标注工程气质冲突(Rust 未上)
 - **排除**:GADTs——动 HM 最微妙处,通用工程价值最低
