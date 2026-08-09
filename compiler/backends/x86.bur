@@ -1961,6 +1961,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // find_fn_by_name 按名字查找函数 / find_fn_by_name finds a function by name
     fn find_fn_by_name(name) {
         let mut i = 0
+        if name == "" {
+            return 0 - 1
+        }
         while i < len(f_name) {
             if f_name[i] == name {
                 return i
@@ -2929,6 +2932,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             let mut ptshadow_ps = []
             let mut ppos_types = []
             let mut ppos_auth = []
+            let mut p_local_sub = []
+            let mut p_pending_sub = -1
             let mut pcur_variant = -1
             let pa_ps = f_arity[ptfh]
             let mut pseed = 0
@@ -2997,6 +3002,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         push(ptshadow_ps, "")
                     } else {
                         push(pshadow_ps, "slot:" + str(pslot))
+                        if p_pending_sub >= 0 {
+                            if len(p_local_sub) <= pslot {
+                                while len(p_local_sub) <= pslot {
+                                    push(p_local_sub, -1)
+                                }
+                            }
+                            p_local_sub[pslot] = p_pending_sub
+                        }
                         // 未初始化的 local（如 match 的 (match) 临时）采用当前栈顶类型并回写
                         // an uninitialized local (e.g. a match's (match) temp) takes the current stack-top type and writes it back
                         let mut pstype = "int"
@@ -3026,6 +3039,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             }
                         }
                         ppos_auth[pslot] = true
+                        if p_pending_sub >= 0 {
+                            if len(p_local_sub) <= pslot {
+                                while len(p_local_sub) <= pslot {
+                                    push(p_local_sub, -1)
+                                }
+                            }
+                            p_local_sub[pslot] = p_pending_sub
+                            p_pending_sub = -1
+                        }
                     }
                 } else if pop == lib::op_get_global {
                     let pidx = read_u16(pcode, pit + 1)
@@ -3073,6 +3095,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let pn = pcode[pit + 1]
                     let pcallee = if len(pshadow_ps) > pn {
                         pshadow_ps[len(pshadow_ps) - pn - 1]
+                    } else {
+                        ""
+                    }
+                    let pcallee_t = if len(ptshadow_ps) > pn {
+                        ptshadow_ps[len(ptshadow_ps) - pn - 1]
                     } else {
                         ""
                     }
@@ -3283,13 +3310,44 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 push(ptshadow_ps, "int")
                             }
                         } else {
-                            push(pshadow_ps, "")
-                            push(ptshadow_ps, "int")
+                            let mut anon_sub = -1
+                            if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "slot:" {
+                                match parse_int(substr(pcallee, 5, str_len(pcallee) - 5)) {
+                                    Some(psn) => {
+                                        if psn < len(p_local_sub) {
+                                            anon_sub = p_local_sub[psn]
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            } else if pcallee == "" {
+                                anon_sub = p_pending_sub
+                            }
+                            if anon_sub >= 0 && anon_sub < len(fn_param_types) {
+                                let mut paf = 0
+                                while paf < pn && paf < len(fn_param_types[anon_sub]) {
+                                    fn_param_types[anon_sub][paf] = merge_type(fn_param_types[anon_sub][paf], p_arg_t[paf])
+                                    paf = paf + 1
+                                }
+                            }
+                            if pcallee_t != "" {
+                                push(pshadow_ps, "")
+                                push(ptshadow_ps, pcallee_t)
+                            } else {
+                                push(pshadow_ps, "")
+                                push(ptshadow_ps, "int")
+                            }
                         }
                     }
                 } else if pop == lib::op_closure {
+                    let p_sub = fn_const(ptfh, read_u16(pcode, pit + 1))
+                    p_pending_sub = p_sub
                     push(pshadow_ps, "")
-                    push(ptshadow_ps, "")
+                    if p_sub < len(fn_ret_type) && fn_ret_type[p_sub] != "" {
+                        push(ptshadow_ps, fn_ret_type[p_sub])
+                    } else {
+                        push(ptshadow_ps, "")
+                    }
                 } else if pop == lib::op_get_upval {
                     push(pshadow_ps, "")
                     push(ptshadow_ps, "")
@@ -4769,6 +4827,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + mov_rr(r9, r12) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + mov_mr(r15, 0 - 8 * (n + 1), r9) + vs_pop_n(n)
                     let closure_path = mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
                     w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
+                    if len(type_shadow) >= n + 1 {
+                        let ct = type_shadow[len(type_shadow) - n - 1]
+                        if ct != "" {
+                            ret_type = ct
+                        } else if n > 0 {
+                            ret_type = type_shadow[len(type_shadow) - n]
+                        } else {
+                            ret_type = "int"
+                        }
+                    }
                 }
                 let mut ctor_arg_types = []
                 let mut cai = 0
@@ -4839,7 +4907,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 w(add_ri32(r12, 8 * (nup + 1)) + vs_push(r11))
                 push(shadow, "")
-                push(type_shadow, "")
+                if sub < len(fn_ret_type) && fn_ret_type[sub] != "" {
+                    push(type_shadow, fn_ret_type[sub])
+                } else {
+                    push(type_shadow, "")
+                }
             } else if op == lib::op_get_upval {
                 let idx = read_u16(code, ip + 1)
                 w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax))
