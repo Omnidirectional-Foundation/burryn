@@ -1,11 +1,14 @@
 // lexer.bur — Go 风格自动分号插入的词法分析器 / Lexer with Go-style automatic semicolon insertion.
 // 换行在前一个 token 可合法结束时终止语句；扫描越过错误继续，以便一次报告多个诊断。
-// Newlines terminate statements when the previous token could legally end one; scanning continues past errors so several can be reported at once.
+// Newlines terminate statements when the previous token could legally end one;
+// scanning continues past errors so several can be reported at once.
 // 状态 st 是 4 槽 int 列表：st[0] 当前 token 起点、st[1] 扫描位置、st[2] 上个 token 类型、st[3] 是否已发射过 token。
-// State st is a 4-slot int list: st[0] token start, st[1] scan offset, st[2] last token type, st[3] any token emitted yet.
+// State st is a 4-slot int list: st[0] token start, st[1] scan offset,
+// st[2] last token type, st[3] any token emitted yet.
 import "burryn.dev/compiler/lib"
 
-// lex 是词法入口：剥离 UTF-8 BOM 后逐 token 扫描，EOF 前补结尾分号 / lex is the entry: strips a UTF-8 BOM, scans tokens, appends a final semicolon before EOF
+// lex 是词法入口：剥离 UTF-8 BOM 后逐 token 扫描，EOF 前补结尾分号
+// lex is the entry: strips a UTF-8 BOM, scans tokens, appends a final semicolon before EOF
 pub fn lex(raw) {
     let src = if str_len(raw) >= 3 && substr(raw, 0, 3) == chr(65279) {
         substr(raw, 3, str_len(raw) - 3)
@@ -78,14 +81,17 @@ fn lex_emit(mut st, mut toks, t, lexeme) {
     st[3] = 1
 }
 
-// lex_maybe_semi 做自动分号插入：前一个 token 可结束语句且已发射过时补换行分号 / lex_maybe_semi appends a newline semicolon when the last token can end a statement
+// lex_maybe_semi 做自动分号插入：前一个 token 可结束语句且已发射过时补换行分号
+// lex_maybe_semi appends a newline semicolon when the last token can end a statement
 fn lex_maybe_semi(mut st, mut toks) {
     if st[3] == 1 && lex_can_end_stmt(st[2]) {
         lex_emit(st, toks, t_semi, "\n")
     }
 }
 
-// lex_scan 做单字符分派：注释（行/块，记为 trivia）、标点、复合操作符、字面量 / lex_scan dispatches on the first char: comments (as trivia), punctuation, compound operators, literals
+// lex_scan 做单字符分派：注释（行/块，记为 trivia）、标点、复合操作符、字面量
+// lex_scan dispatches on the first char: comments (as trivia), punctuation,
+// compound operators, literals
 fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     let c = lex_advance(src, st)
     if c == "#" && st[1] == 1 && lex_peek(src, st) == "!" {
@@ -228,13 +234,15 @@ fn lex_scan(src, mut st, mut toks, mut diags, mut comments) {
     }
 }
 
-// lex_string 是普通字符串扫描入口；first 区分开头片段与插值后恢复的片段（后者以 TInterpEnd 结束）/
-// lex_string scans an ordinary string; first distinguishes the opening segment from one resumed after an interpolation-closing `}`; the latter ends in TInterpEnd.
+// lex_string 是普通字符串扫描入口；first 区分开头片段与插值后恢复的片段（后者以 TInterpEnd 结束）
+// lex_string scans an ordinary string; first distinguishes the opening segment
+// from one resumed after an interpolation-closing `}`; the latter ends in TInterpEnd.
 fn lex_string(src, mut st, mut toks, mut diags, mut comments) {
     lex_string_part(src, st, toks, diags, comments, true)
 }
 
-// lex_string_part 扫描字符串片段（含转义与插值切换）/ lex_string_part scans a string segment (escapes and interpolation switching)
+// lex_string_part 扫描字符串片段（含转义与插值切换）
+// lex_string_part scans a string segment (escapes and interpolation switching)
 fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
     let mut parts = []
     let mut seg = st[1]
@@ -296,8 +304,10 @@ fn lex_string_part(src, mut st, mut toks, mut diags, mut comments, first) {
 
 // lex_ml_string 扫描三引号多行字符串：""" 后必须换行；每行行首空白忽略后必须是 \ 内容标记，
 // \ 后到行尾为该行内容；全空白行 = 空行；内容行行尾换行进入字面量，结束标记前去掉段尾一个换行；转义与插值照常。
-// lex_ml_string scans triple-quoted multiline strings: newline after """ ; leading whitespace ignored, then a \ content marker;
-// content runs to end of line; blank lines are empty rows; row-ending newlines are part of the literal,
+// lex_ml_string scans triple-quoted multiline strings: newline after """ ;
+// leading whitespace ignored, then a \ content marker;
+// content runs to end of line; blank lines are empty rows; row-ending newlines
+// are part of the literal,
 // the final one before """ is stripped; escapes and interpolation behave as usual.
 fn lex_ml_string(src, mut st, mut toks, mut diags, mut comments) {
     lex_bump(st)
@@ -341,8 +351,9 @@ fn lex_ml_string(src, mut st, mut toks, mut diags, mut comments) {
     lex_fail(diags, st[0], st[0] + 1, "E1002", "add a closing '\"'", "unterminated string")
 }
 
-// lex_ml_inline 扫描多行字符串的单个内容行：收集字面量到行尾（\n）或嵌套插值；插值恢复时继续本函数。/
-// lex_ml_inline scans one multiline row: collects literal bytes to end-of-line or a nested interpolation; resumes here after interpolation.
+// lex_ml_inline 扫描多行字符串的单个内容行：收集字面量到行尾（\n）或嵌套插值；插值恢复时继续本函数。
+// lex_ml_inline scans one multiline row: collects literal bytes to end-of-line
+// or a nested interpolation; resumes here after interpolation.
 fn lex_ml_inline(src, mut st, mut toks, mut diags, mut comments, mut seg, mut first, mut any_interp) {
     while st[1] < str_len(src) {
         let c = lex_peek(src, st)
@@ -409,8 +420,10 @@ fn lex_ml_inline(src, mut st, mut toks, mut diags, mut comments, mut seg, mut fi
 
 // lex_interpolation 扫描插值表达式直到匹配的 `}`；block、match 与嵌套插值里的花括号先各自配平，再恢复外层字符串模式。
 // resume 是恢复扫描的回调（普通串或三引号多行串各自的行内扫描）。
-// lex_interpolation scans the interpolation expression up to the matching `}`; braces inside blocks, match arms,
-// and nested interpolations balance before the outer string resumes. resume continues the outer scan.
+// lex_interpolation scans the interpolation expression up to the matching `}`;
+// braces inside blocks, match arms,
+// and nested interpolations balance before the outer string resumes.
+// resume continues the outer scan.
 fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open, resume) {
     let mut depth = 0
     while st[1] < str_len(src) {
@@ -443,8 +456,10 @@ fn lex_interpolation(src, mut st, mut toks, mut diags, mut comments, open, resum
 
 // lex_number 扫描数字字面量：hex/二进制前缀 0x 0b（lexeme 原样保留，parser 端转换）、
 // 下划线分隔符（_ 后必须跟数字）、浮点小数点与指数（前瞻判断，避免吞掉标识符如 1e、1ex）。
-// lex_number scans number literals: hex/binary prefixes 0x 0b (lexeme kept verbatim, converted by the parser),
-// underscore separators (a digit must follow '_'), float point and exponents (lookahead so 1e/1ex stays an identifier).
+// lex_number scans number literals: hex/binary prefixes 0x 0b (lexeme kept verbatim,
+// converted by the parser),
+// underscore separators (a digit must follow '_'), float point and exponents
+// (lookahead so 1e/1ex stays an identifier).
 fn lex_number(src, mut st, mut toks, mut diags) {
     let c0 = substr(src, st[1] - 1, 1)
     let c1 = lex_peek(src, st)
