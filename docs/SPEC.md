@@ -311,9 +311,9 @@ Callee prologue: `push rbp; mov rbp, r14; lea r14, [r15 - 8*(arity+1)]`。
 Callee epilogue: peek return value, collapse to r14, restore rbp, ret。
 op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
-### Phase 3: CSP opcode（未完成设计 spec）
+### Phase 3: CSP opcode（设计定案 2026-08-11）
 
-x86 后端无 fiber scheduler + 无 ucontext(`mmap MAP_JIT` 在自写后端不需,但调度器本身不存)。下列 CSP opcode **deferred**,需独立设计阻塞、park/wake、上下文切换机制:
+x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、上下文切换全部自写。值表示是 8B raw int64（无 tag），与 C runtime 的 16B tagged Value 不兼容，**不能链接 burrt.c 的 CSP**。以下为定案设计，全部子项照此实现：
 
 - **op_spawn (44)**: 2 bytes `[op][argc:1B]`。需 fiber struct + 独立栈 + 上下文切换。
 - **op_send (45)**: 2 bytes。需 channel struct + sendq/recvq + park/wake。
@@ -322,6 +322,55 @@ x86 后端无 fiber scheduler + 无 ucontext(`mmap MAP_JIT` 在自写后端不�
 - **op_select (48)**: variable。多路 select,最复杂 CSP opcode。
 - **op_defer (49)**: 1 byte。需 per-frame defer stack(可与 CSP 并发独立实现,但仍需 defer 栈管理)。
 - **close_upvalue**: 跳过——当前 copy-at-capture 语义不产生 open upvalues。
+
+#### 上下文切换：手写 8 槽 ctx（定案）
+
+唯一可行方案（无 ucontext、无 setjmp 可依赖）。关键洞察：**切换不需要保存指令指针**——切换子程序由生成代码用 `call` 调用，返回地址已在机器栈上，随 rsp 一起保存/恢复。
+
+- fiber ctx = 8 槽内存 `[rsp][rbx][rbp][r12][r13][r14][r15]`
+- 切换 = 保存 8 槽到当前 fiber ctx → 读下一个 fiber ctx → 恢复 → `ret` 继续执行
+- 正确性论证：生成代码无机器栈局部变量（全部在值栈，r14 相对寻址）；临时值要么在值栈（r15 以下）要么在 callee-saved（全保存）→ 任意指令点挂起都安全
+- spawn 首次 resume：trampoline 地址压新栈，ctx.rsp 指向它，trampoline 弹参数调入口函数
+- 切换子程序内**不允许分配**——GC 只在生成代码分配点触发，切换中间无 GC 窗口
+
+#### 栈布局：每 fiber 一套机器栈 + 值栈（定案）
+
+- 新 fiber mmap **1MiB**（对齐 C runtime `BUR_STACK_SIZE`），栈底加 **guard page**（不可读写，防机器栈/值栈越界静默损坏；越界 = SIGSEGV trap）
+- rsp 与 r15 一起换；`rt_stack_base` 从全局槽改为 **per-fiber 字段**，GC mark 遍历 fiber 表扫每 fiber 的 `[stack_base, top)`
+- 主 fiber 保持现状（OS 栈 + `rsp - 1MiB` 值栈）
+
+#### 时间片：callee 入口插桩（定案）
+
+- 插桩点 = **函数 prologue 后一处**（budget 减一 + 条件 call yield 子程序：schedule 自己到队尾 + 切换），比 C runtime 的调用点插桩省开销
+- **已知限制（写入限制清单）**：紧循环不可抢占——budget 只在函数边界递减，纯计算紧循环内无调度点，会独占 CPU 直至函数返回或阻塞；语义上仍是确定性协作式，不违反单线程承诺
+
+#### channel / send / recv / close（定案）
+
+- 堆对象布局照 C runtime `OChannel`：bounded FIFO buf + sendq/recvq/waiters + closed
+- send/recv/close 三路分支照 VM 语义（`vm.bur` op_send/op_recv）逐条翻译
+- **操作数留在值栈直到操作完成**——单 send 不用 fiber.sendVal 字段，park 期间值栈整体保留，比 C runtime 更简单
+
+#### select：重试循环 + 顺序选臂（定案）
+
+- 照 VM 语义：顺序扫臂找第一个 ready → 命中执行 + 跳臂目标；default → 跳 default；全不 ready → 注册到全部 chan 的 waiters + park(FBLOCKED_SELECT) + 醒来回循环头重试；send 臂的 val 在值栈上，park 期间自然保留
+- **公平性设计选择（刻意对齐 VM，非遗漏）**：多臂同时 ready 时确定性选**第一个**，不做随机化/round-robin——确定性优先于公平，与 VM 行为逐字节一致是验收前提
+
+#### GC 覆盖与 park 一致性（定案）
+
+- fiber 表 = 全局 root；chan 的 buf、sendq→fiber→sendVal、waiters 全链路可达
+- **测试硬性要求（第一批单测必含）**：fiber A park 在 send 上时触发 GC，断言待发送值仍存活——防 top 指针漂移导致漏扫
+- mark 时当前 fiber 扫值栈 `[stack_base, r15)`，其余 fiber 扫其 ctx 槽 + 值栈（保守扫，地址范围检查排除 raw int 误判）
+
+#### 死锁检测（定案）
+
+- 调度器主循环：ready 空 && 存在非 done fiber → fatal deadlock（exit 4，文本照 C runtime）
+- x86 无 timer/io 阻塞（net_nb 等仍未实现 int3），检测条件比 C runtime 简单
+
+#### defer（定案，独立于 CSP 先行实现）
+
+- per-fiber defer 栈（数组存 closure 指针）+ 帧进入记 watermark（照 C runtime `bur_run_defers` 的 dbase 语义）
+- op_defer 压入；函数 epilogue 前按 watermark LIFO 执行，返回值先 peek 保留在栈上再执行 defer（防 defer 内分配回收）
+- **实现顺序（从独立到耦合）**：defer → fiber 调度器（切换 + spawn + 死锁检测）→ channel（send/recv/close）→ chan_next → select
 
 ## 6.2 LSP 与编辑器生态(工程视角，对应 S9)
 
