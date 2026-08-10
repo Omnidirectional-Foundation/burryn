@@ -232,7 +232,7 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 
 ### x86-64 后端架构（S8.1，开发中）
 
-单文件 `compiler/backends/x86.bur`（5036 行）+ ELF64 发射 `compiler/backends/elf.bur`（75 行）。无 cc 依赖,手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义(cgen 的根栈纪律照搬到手写代码生成)。
+单文件 `compiler/backends/x86.bur` + ELF64 发射 `compiler/backends/elf.bur`。无 cc 依赖,手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义(cgen 的根栈纪律照搬到手写代码生成)。
 
 #### 寄存器约定
 
