@@ -777,6 +777,12 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut e_params = []
     let mut e_variants = []
     let mut enum_by_name = map()
+    let mut alias_qual = []
+    let mut alias_te = []
+    let mut alias_pub = []
+    let mut alias_pkg = []
+    let mut alias_by_name = map()
+    let mut alias_depth = 0
     let mut v_name = []
     let mut v_fields = []
     let mut v_span = []
@@ -1199,7 +1205,19 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                     cerr(sp, "E0107", "", "enum `" + name + "` takes " + str(len(e_params[eh])) + " type argument(s), " + str(len(targs)) + " given")
                                 }
                             },
-                            None => cerr(sp, "E0412", "", "cannot find type `" + name + "`"),
+                            None => {
+                                let is_alias = match get(alias_by_name, qual_name(name)) {
+                                    Some(_) => true,
+                                    None => false,
+                                }
+                                if is_alias {
+                                    if len(targs) > 0 {
+                                        cerr(sp, "E0107", "", "type alias `" + name + "` takes no type arguments")
+                                    }
+                                } else {
+                                    cerr(sp, "E0412", "", "cannot find type `" + name + "`")
+                                }
+                            },
                         }
                     }
                 }
@@ -1214,13 +1232,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
                 validate_type_expr(ret, pm)
             },
-            TERecord(_, ftypes, row, _) => {
+            TERecord(_, ftypes, _, _) => {
+                // 行变量槽按定义就是行变量（row poly），不做类型解析校验
+                // The row slot is a row variable by construction; no type resolution to validate
                 for ft in ftypes {
                     validate_type_expr(ft, pm)
-                }
-                match row {
-                    NoNode => {},
-                    _ => validate_type_expr(row, pm),
                 }
             },
             _ => {},
@@ -1290,87 +1306,46 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
-    // convert_type_expr 把类型表达式转类型句柄 / convert_type_expr turns a type expression into a type handle
-    fn convert_type_expr(te, subst, prefix) {
-        match te {
-            TEName(pkg, name, _, targs, _) => {
-                let hit = if pkg == "" {
-                    match get(subst, name) {
-                        Some(t) => t,
-                        None => -1,
-                    }
+    // register_alias 注册类型别名 / register_alias registers a type alias
+    fn register_alias(n) {
+        match n {
+            TypeAliasDecl(name, te, is_pub, sp) => {
+                let qual = qual_name(name)
+                let ehit = match get(enum_by_name, qual) {
+                    Some(_) => true,
+                    None => false,
+                }
+                let ahit = match get(alias_by_name, qual) {
+                    Some(_) => true,
+                    None => false,
+                }
+                if ehit {
+                    cerr(sp, "E0428", "", "type alias `" + name + "` conflicts with an enum of the same name")
+                    false
+                } else if ahit {
+                    cerr(sp, "E0428", "", "type alias `" + name + "` is declared more than once")
+                    false
                 } else {
-                    -1
-                }
-                if hit >= 0 {
-                    hit
-                } else {
-                    let mut cargs = []
-                    for a in targs {
-                        push(cargs, convert_type_expr(a, subst, prefix))
-                    }
-                    let full = if pkg != "" {
-                        let actual_pkg = match get(cur_aliases, pkg) {
-                            Some(path) => path,
-                            None => pkg,
-                        }
-                        actual_pkg + "." + name
-                    } else if name == "int" || name == "float" || name == "bool" || name == "str" || name == "unit" || name == "chan" || name == "map" {
-                        name
-                    } else {
-                        let local = match get(enum_by_name, prefix + "." + name) {
-                            Some(_) => prefix != "",
-                            None => false,
-                        }
-                        if local {
-                            prefix + "." + name
-                        } else {
-                            name
-                        }
-                    }
-                    ty_new_con(tk, tn, ta, tr, tl, full, cargs)
+                    push(alias_qual, qual)
+                    push(alias_te, te)
+                    push(alias_pub, is_pub)
+                    push(alias_pkg, cur_pkg)
+                    put(alias_by_name, qual, len(alias_qual) - 1)
+                    true
                 }
             },
-            TEList(elem, _) => con1("list", convert_type_expr(elem, subst, prefix)),
-            TEFn(ps, ret, _) => {
-                let mut phs = []
-                for p in ps {
-                    push(phs, convert_type_expr(p, subst, prefix))
-                }
-                tfn(phs, convert_type_expr(ret, subst, prefix))
+            _ => false,
+        }
+    }
+
+    // validate_alias_fields 校验别名 RHS 类型表达式 / validate_alias_fields validates the alias RHS type expression
+    fn validate_alias_fields(n) {
+        match n {
+            TypeAliasDecl(_, te, _, _) => {
+                let pm = map()
+                validate_type_expr(te, pm)
             },
-            TERecord(fnames, ftypes, row, _) => {
-                let mut fhs = []
-                for ft in ftypes {
-                    push(fhs, convert_type_expr(ft, subst, prefix))
-                }
-                let mut all_names = []
-                for n in fnames {
-                    push(all_names, n)
-                }
-                let row_name = match row {
-                    TEName(_, rn, _, _, _) => rn,
-                    _ => "",
-                }
-                if row_name != "" {
-                    let rv = match get(subst, row_name) {
-                        Some(t) => t,
-                        None => fresh(""),
-                    }
-                    tn[rv] = "row"
-                    push(fhs, rv)
-                    push(all_names, "?" + row_name)
-                }
-                ty_new_con(tk, tn, ta, tr, tl, rec_type_name(all_names), fhs)
-            },
-            TETuple(ets, _) => {
-                let mut ehs = []
-                for et in ets {
-                    push(ehs, convert_type_expr(et, subst, prefix))
-                }
-                ty_new_con(tk, tn, ta, tr, tl, "@tup", ehs)
-            },
-            _ => h_unit,
+            _ => {},
         }
     }
 
@@ -1429,6 +1404,116 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         }
     }
 
+    // convert_type_expr 把类型表达式转类型句柄 / convert_type_expr turns a type expression into a type handle
+    fn convert_type_expr(te, subst, prefix) {
+        match te {
+            TEName(pkg, name, _, targs, _) => {
+                let hit = if pkg == "" {
+                    match get(subst, name) {
+                        Some(t) => t,
+                        None => -1,
+                    }
+                } else {
+                    -1
+                }
+                if hit >= 0 {
+                    hit
+                } else {
+                    let mut cargs = []
+                    for a in targs {
+                        push(cargs, convert_type_expr(a, subst, prefix))
+                    }
+                    let full = if pkg != "" {
+                        let actual_pkg = match get(cur_aliases, pkg) {
+                            Some(path) => path,
+                            None => pkg,
+                        }
+                        actual_pkg + "." + name
+                    } else if name == "int" || name == "float" || name == "bool" || name == "str" || name == "unit" || name == "chan" || name == "map" {
+                        name
+                    } else {
+                        let local = match get(enum_by_name, prefix + "." + name) {
+                            Some(_) => prefix != "",
+                            None => match get(alias_by_name, prefix + "." + name) {
+                                Some(_) => prefix != "",
+                                None => false,
+                            },
+                        }
+                        if local {
+                            prefix + "." + name
+                        } else {
+                            name
+                        }
+                    }
+                    let alias_idx = match get(alias_by_name, full) {
+                        Some(i) => i,
+                        None => -1,
+                    }
+                    if alias_idx >= 0 {
+                        if len(targs) > 0 {
+                            cerr(span_of(te), "E0107", "", "type alias `" + name + "` takes no type arguments")
+                        }
+                        if alias_depth > 200 {
+                            cerr(span_of(te), "E0434", "", "cyclic type alias `" + name + "`")
+                            alias_depth = 0
+                            ty_new_var(tk, tn, ta, tr, tl, 0, "")
+                        } else {
+                            alias_depth = alias_depth + 1
+                            let mut asub = map()
+                            collect_annotation_vars(alias_te[alias_idx], asub)
+                            let r = convert_type_expr(alias_te[alias_idx], asub, alias_pkg[alias_idx])
+                            alias_depth = alias_depth - 1
+                            r
+                        }
+                    } else {
+                        ty_new_con(tk, tn, ta, tr, tl, full, cargs)
+                    }
+                }
+            },
+            TEList(elem, _) => con1("list", convert_type_expr(elem, subst, prefix)),
+            TEFn(ps, ret, _) => {
+                let mut phs = []
+                for p in ps {
+                    push(phs, convert_type_expr(p, subst, prefix))
+                }
+                tfn(phs, convert_type_expr(ret, subst, prefix))
+            },
+            TERecord(fnames, ftypes, row, _) => {
+                let mut fhs = []
+                for ft in ftypes {
+                    push(fhs, convert_type_expr(ft, subst, prefix))
+                }
+                let mut all_names = []
+                for n in fnames {
+                    push(all_names, n)
+                }
+                let row_name = match row {
+                    TEName(_, rn, _, _, _) => rn,
+                    _ => "",
+                }
+                if row_name != "" {
+                    let rv = match get(subst, row_name) {
+                        Some(t) => t,
+                        None => fresh(""),
+                    }
+                    tn[rv] = "row"
+                    push(fhs, rv)
+                    push(all_names, "?" + row_name)
+                }
+                ty_new_con(tk, tn, ta, tr, tl, rec_type_name(all_names), fhs)
+            },
+            TETuple(ets, _) => {
+                let mut ehs = []
+                for et in ets {
+                    push(ehs, convert_type_expr(et, subst, prefix))
+                }
+                ty_new_con(tk, tn, ta, tr, tl, "@tup", ehs)
+            },
+            _ => h_unit,
+        }
+    }
+
+    // collect_annotation_vars 收集标注中的行变量 / collect_annotation_vars collects row vars in annotations
     // is_type_expr_node 判断节点是否为类型表达式
     // is_type_expr_node tells whether the node is a type expression
     fn is_type_expr_node(n) {
@@ -3530,6 +3615,34 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             cur_aliases = aliases_of(file_imports[reg_files[ri]])
             validate_enum_fields(reg_decls[ri])
             ri = ri + 1
+        }
+        // 类型别名：所有枚举注册完后注册（冲突检测需要完整枚举表），随后校验 RHS
+        // Type aliases: register after all enums (collision checks need the full enum table), then validate RHS
+        let mut reg_adecls = []
+        let mut reg_afiles = []
+        let mut ai = 0
+        while ai < n_files {
+            cur_file = file_paths[ai]
+            cur_aliases = aliases_of(file_imports[ai])
+            for s in files_stmts[ai] {
+                match s {
+                    TypeAliasDecl(_, _, _, _) => {
+                        if register_alias(s) {
+                            push(reg_adecls, s)
+                            push(reg_afiles, ai)
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            ai = ai + 1
+        }
+        let mut ari = 0
+        while ari < len(reg_adecls) {
+            cur_file = file_paths[reg_afiles[ari]]
+            cur_aliases = aliases_of(file_imports[reg_afiles[ari]])
+            validate_alias_fields(reg_adecls[ari])
+            ari = ari + 1
         }
         // 预声明：函数与 let 先用占位类型注册，供相互引用
         // Pre-declare: functions and lets register with placeholder types for mutual references
