@@ -3132,6 +3132,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         push(fn_ret_type, "")
         rhAlloc = rhAlloc + 1
     }
+    // fn_ret_param: 函数直接返回第 k 个参数（返回类型 = 实参类型）；-1 = 非参数直返
+    // fn_ret_param: function returns param k directly (ret type = arg type); -1 = not a param passthrough
+    let mut fn_ret_param = []
+    let mut rpAlloc = 0
+    while rpAlloc < nfn {
+        push(fn_ret_param, 0 - 1)
+        rpAlloc = rpAlloc + 1
+    }
     let mut fn_param_types = []
     let mut phAlloc = 0
     while phAlloc < nfn {
@@ -3196,6 +3204,23 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     if len(ptshadow_ps) > 0 {
                         fn_ret_type[ptfh] = ptshadow_ps[len(ptshadow_ps) - 1]
                     }
+                    // 直接返回参数：返回类型跟随实参类型（多态函数异构调用修正）
+                    // Direct param return: ret type follows the arg type (fixes hetero polymorphic calls)
+                    let mut pret_param = 0 - 1
+                    if len(pshadow_ps) > 0 {
+                        let pt = pshadow_ps[len(pshadow_ps) - 1]
+                        if str_len(pt) > 5 && substr(pt, 0, 5) == "slot:" {
+                            match parse_int(substr(pt, 5, str_len(pt) - 5)) {
+                                Some(psn) => {
+                                    if psn >= 1 && psn <= pa_ps {
+                                        pret_param = psn - 1
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                    }
+                    fn_ret_param[ptfh] = pret_param
                 } else if pop == lib::op_const {
                     let pval = f_consts[ptfh][read_u16(pcode, pit + 1)]
                     match pval {
@@ -3578,8 +3603,20 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 pbb = pbb + 1
                             }
                             if fn_ret_type[phandle] != "" {
-                                push(pshadow_ps, "")
-                                push(ptshadow_ps, fn_ret_type[phandle])
+                                // param-tied：结果 shadow/type 跟随实参（嵌套透传 provenance）
+                                // param-tied: result shadow/type follows the arg (nested passthrough provenance)
+                                let rp2 = if phandle < len(fn_ret_param) {
+                                    fn_ret_param[phandle]
+                                } else {
+                                    0 - 1
+                                }
+                                if rp2 >= 0 && rp2 < pn {
+                                    push(pshadow_ps, p_arg_s[rp2])
+                                    push(ptshadow_ps, p_arg_t[rp2])
+                                } else {
+                                    push(pshadow_ps, "")
+                                    push(ptshadow_ps, fn_ret_type[phandle])
+                                }
                             } else {
                                 push(pshadow_ps, "")
                                 push(ptshadow_ps, "int")
@@ -5104,7 +5141,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if handle >= 0 {
                     w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
                     if handle < len(fn_ret_type) {
-                        ret_type = fn_ret_type[handle]
+                        let rp = if handle < len(fn_ret_param) {
+                            fn_ret_param[handle]
+                        } else {
+                            0 - 1
+                        }
+                        if rp >= 0 && rp < n {
+                            ret_type = type_shadow[len(type_shadow) - n + rp]
+                        } else {
+                            ret_type = fn_ret_type[handle]
+                        }
                     }
                     let mut bmi = 0
                     while bmi < n && bmi < len(fn_param_types[handle]) {
