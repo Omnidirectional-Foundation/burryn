@@ -180,7 +180,7 @@ func dumpNode(b *strings.Builder, n any, pre string) {
 	deeper := pre + "  "
 	line := func(format string, args ...any) { fmt.Fprintf(b, "%s"+format+"\n", append([]any{pre}, args...)...) }
 	if n == nil {
-		line("NoNode")
+		line("frontend.Node.NoNode")
 		return
 	}
 	switch x := n.(type) {
@@ -215,6 +215,9 @@ func dumpNode(b *strings.Builder, n any, pre string) {
 		line("Index %s", spanStr(x.Span))
 		dumpNode(b, x.Target, deeper)
 		dumpNode(b, x.Idx, deeper)
+	case *FieldAccess:
+		line("FieldAccess %s %s", dumpEscape(x.Field), spanStr(x.Span))
+		dumpNode(b, x.Base, deeper)
 	case *ListLit:
 		line("ListLit %s", spanStr(x.Span))
 		for _, e := range x.Elems {
@@ -223,6 +226,12 @@ func dumpNode(b *strings.Builder, n any, pre string) {
 	case *FnLit:
 		line("FnLit %s params=%s muts=%s pspans=%s %s", dumpEscape(x.Name),
 			strsAtom(x.Params), boolsAtom(x.ParamMuts), spansAtom(x.ParamSpans), spanStr(x.Span))
+		for i, pty := range x.ParamTys {
+			fmt.Fprintf(b, "%sParamType %d\n", deeper, i)
+			dumpNode(b, pty, deeper+"  ")
+		}
+		fmt.Fprintf(b, "%sReturnType\n", deeper)
+		dumpNode(b, x.RetTy, deeper+"  ")
 		dumpNode(b, x.Body, deeper)
 	case *Block:
 		line("Block %s", spanStr(x.Span))
@@ -244,6 +253,7 @@ func dumpNode(b *strings.Builder, n any, pre string) {
 		for _, a := range x.Arms {
 			fmt.Fprintf(b, "%sMatchArm %s\n", deeper, spanStr(a.Span))
 			dumpNode(b, a.Pat, deeper+"  ")
+			dumpNode(b, a.Guard, deeper+"  ")
 			dumpNode(b, a.Body, deeper+"  ")
 		}
 	case *VariantAccess:
@@ -335,11 +345,11 @@ func dumpNode(b *strings.Builder, n any, pre string) {
 		dumpNode(b, x.Chan, deeper)
 		dumpNode(b, x.Val, deeper)
 	case *BreakStmt:
-		line("BreakStmt %s", spanStr(x.Span))
+		line("BreakStmt %s %s", dumpEscape(x.Label), spanStr(x.Span))
 	case *ContinueStmt:
-		line("ContinueStmt %s", spanStr(x.Span))
+		line("ContinueStmt %s %s", dumpEscape(x.Label), spanStr(x.Span))
 	case *TEName:
-		line("TEName %s %s %s", dumpEscape(x.Pkg), dumpEscape(x.Name), spanStr(x.Span))
+		line("TEName %s %s %s %s", dumpEscape(x.Pkg), dumpEscape(x.Name), dumpEscape(x.Constraint), spanStr(x.Span))
 		for _, a := range x.Args {
 			dumpNode(b, a, deeper)
 		}
@@ -484,7 +494,7 @@ func TestBurcCheckParity(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := dumpGoCheck(string(srcBytes))
-			got := prog.run(t, "check", file)
+			got := prog.run(t, "dev", "check", file)
 			if got != want {
 				t.Errorf("check dump mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
 			}
@@ -556,7 +566,7 @@ func TestBurcDisParity(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := dumpGoDis(t, string(srcBytes))
-			got := prog.run(t, "dis", file)
+			got := prog.run(t, "dev", "dis", file)
 			if got != want {
 				t.Errorf("disasm mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
 			}
@@ -694,7 +704,7 @@ func TestBurcEmitCParity(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := dumpGoEmitC(string(srcBytes))
-			got := prog.run(t, "emit-c", file)
+			got := prog.run(t, "dev", "emit-c", file)
 			if got != want {
 				t.Errorf("emitted C mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
 			}
@@ -711,7 +721,7 @@ func TestBurcLexParity(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := dumpGoLex(string(srcBytes))
-			got := prog.run(t, "lex", file)
+			got := prog.run(t, "dev", "lex", file)
 			if got != want {
 				t.Errorf("token dump mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
 			}
@@ -728,7 +738,7 @@ func TestBurcParseParity(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := dumpGoParse(string(srcBytes))
-			got := prog.run(t, "parse", file)
+			got := prog.run(t, "dev", "parse", file)
 			if got != want {
 				t.Errorf("AST dump mismatch (%d vs %d bytes)\n%s", len(got), len(want), firstDiff(got, want))
 			}
