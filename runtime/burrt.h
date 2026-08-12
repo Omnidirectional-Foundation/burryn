@@ -31,6 +31,8 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #include <ucontext.h>
 
 // ---- Value ------------------------------------------------------------
@@ -60,7 +62,7 @@ static inline Value bur_obj(Obj *o)     { Value v; v.t = VOBJ; v.u.o = o; return
 typedef enum {
     OBJ_STRING, OBJ_LIST, OBJ_MAP, OBJ_FUNC, OBJ_CLOSURE,
     OBJ_UPVALUE, OBJ_ENUMTYPE, OBJ_VARIANTCTOR, OBJ_ENUMINST, OBJ_NATIVE,
-    OBJ_CHANNEL, OBJ_TUPLE
+    OBJ_CHANNEL, OBJ_RECORD, OBJ_TUPLE
 } ObjType;
 
 struct Obj {
@@ -80,12 +82,6 @@ typedef struct {
     Value *elems;
     int64_t len, cap;
 } OList;
-
-typedef struct {
-    Obj obj;
-    int64_t n;
-    Value *elems;
-} OTuple;
 
 typedef struct {
     bool is_str;
@@ -161,6 +157,19 @@ typedef struct {
     int nfields;
 } OEnumInst;
 
+typedef struct {
+    Obj obj;
+    OString **names;
+    Value *fields;
+    int nfields;
+} ORecord;
+
+typedef struct {
+    Obj obj;
+    Value *elems;
+    int64_t n;
+} OTuple;
+
 typedef Value (*NativeFn)(Value *args, int argc);
 
 typedef struct {
@@ -192,17 +201,23 @@ struct Fiber {
     OUpvalue **openUpvals;
     int nopen, opencap;
 
-    Value *defers;          // registered defer closures; frames delimit their
-    int ndefers, defercap;  // slice by watermark and pop it LIFO on exit
-
     int id;
     FiberStatus status;
     Value sendVal;          // pending value while blocked on send
     OClosure *entry;        // closure the fiber runs on first resume
     int call_depth;         // per-fiber call depth, for stack-overflow trapping
+    OFunc **trace_fn;       // per-depth function, for trap stack traces
+    int *trace_ln;          // per-depth live source line (BUR_LN stores)
+    int trace_cap;
     int budget;             // instructions remaining before a forced yield
     int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
     int64_t io_proc;        // process handle awaited while FBLOCKED_IO
+    int io_fd;              // descriptor awaited while FBLOCKED_IO
+    short io_events;        // poll events requested for io_fd
+    bool io_ready;          // scheduler observed readiness for io_fd
+
+    Value *defers;          // registered defer closures; frames delimit their
+    int ndefers, defercap;  // slice by watermark and pop it LIFO on exit
 
     ucontext_t ctx;
     char *cstack;           // heap-allocated native stack backing ctx
@@ -258,6 +273,10 @@ static char **bur_argv;
 
 // ---- traps ------------------------------------------------------------
 
+// BUR_LN: generated code records the live source line of the running
+// frame before each instruction; bur_trap walks these for the trace.
+#define BUR_LN(n) (bur_cur->trace_ln[bur_cur->call_depth] = (n))
+
 static void bur_trap(const char *fmt, ...) {
     fflush(stdout);
     va_list ap;
@@ -266,6 +285,16 @@ static void bur_trap(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
+    if (bur_cur && bur_cur->trace_fn) {
+        for (int d = bur_cur->call_depth; d >= 0; d--) {
+            if (d >= bur_cur->trace_cap) continue;
+            OFunc *fn = bur_cur->trace_fn[d];
+            if (!fn || !fn->file) continue; // synthetic glue has no source
+            fprintf(stderr, "  at %s (%s:%d)\n",
+                    fn->name && fn->name[0] ? fn->name : "<fn>",
+                    fn->file, bur_cur->trace_ln[d]);
+        }
+    }
     exit(4);
 }
 
@@ -354,9 +383,17 @@ static OEnumInst *bur_new_inst(OEnumType *e, int variant, Value *fields, int nfi
     return o;
 }
 
-// stack roots (declared here, used by the collector)
-static void bur_push(Value v);
-static Value bur_pop(void);
+static ORecord *bur_new_record(OString **names, Value *fields, int nfields) {
+    ORecord *o = (ORecord *)bur_alloc(sizeof(ORecord), OBJ_RECORD);
+    o->nfields = nfields;
+    if (nfields > 0) {
+        o->names = (OString **)malloc(sizeof(OString *) * (size_t)nfields);
+        memcpy(o->names, names, sizeof(OString *) * (size_t)nfields);
+        o->fields = (Value *)malloc(sizeof(Value) * (size_t)nfields);
+        memcpy(o->fields, fields, sizeof(Value) * (size_t)nfields);
+    }
+    return o;
+}
 
 static OTuple *bur_new_tuple(Value *elems, int64_t n) {
     OTuple *o = (OTuple *)bur_alloc(sizeof(OTuple), OBJ_TUPLE);
@@ -368,7 +405,27 @@ static OTuple *bur_new_tuple(Value *elems, int64_t n) {
     return o;
 }
 
-// bur_tuple_make pops n values into a fresh tuple (op_tuple)
+static void bur_push(Value v);
+static Value bur_pop(void);
+static void bur_trap(const char *fmt, ...);
+
+static void bur_record_make(int n, const char *names_enc) {
+    OString **names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    Value *fields = (Value *)malloc(sizeof(Value) * (size_t)n);
+    const char *p = names_enc;
+    for (int i = 0; i < n; i++) {
+        const char *end = strchr(p, '\n');
+        int64_t len = end ? (int64_t)(end - p) : (int64_t)strlen(p);
+        names[i] = bur_new_string_n(p, len);
+        fields[i] = bur_cur->stack[bur_cur->top - n + i];
+        p = end ? end + 1 : p + len;
+    }
+    bur_cur->top -= n;
+    ORecord *r = bur_new_record(names, fields, n);
+    free(names); free(fields);
+    bur_push(bur_obj((Obj *)r));
+}
+
 static void bur_tuple_make(int n) {
     Value *elems = (Value *)malloc(sizeof(Value) * (size_t)n);
     for (int i = 0; i < n; i++) elems[i] = bur_cur->stack[bur_cur->top - n + i];
@@ -377,6 +434,60 @@ static void bur_tuple_make(int n) {
     free(elems);
     bur_push(bur_obj((Obj *)t));
 }
+
+static void bur_record_get(const char *fname) {
+    Value rv = bur_pop();
+    if (rv.t != VOBJ || rv.u.o->type != OBJ_RECORD)
+        bur_trap("field access needs a record");
+    ORecord *r = (ORecord *)rv.u.o;
+    int64_t flen = (int64_t)strlen(fname);
+    for (int i = 0; i < r->nfields; i++) {
+        if (r->names[i]->len == flen && memcmp(r->names[i]->data, fname, (size_t)flen) == 0) {
+            bur_push(r->fields[i]);
+            return;
+        }
+    }
+    bur_trap("record has no field \"%s\"", fname);
+}
+
+static void bur_record_update(int n, const char *names_enc) {
+    Value *new_vals = (Value *)malloc(sizeof(Value) * (size_t)n);
+    for (int i = 0; i < n; i++)
+        new_vals[i] = bur_cur->stack[bur_cur->top - n + i];
+    bur_cur->top -= n;
+    Value base_v = bur_pop();
+    if (base_v.t != VOBJ || base_v.u.o->type != OBJ_RECORD)
+        bur_trap("record update needs a record");
+    ORecord *base = (ORecord *)base_v.u.o;
+    OString **upd_names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    const char *p = names_enc;
+    for (int i = 0; i < n; i++) {
+        const char *end = strchr(p, '\n');
+        int64_t len = end ? (int64_t)(end - p) : (int64_t)strlen(p);
+        upd_names[i] = bur_new_string_n(p, len);
+        p = end ? end + 1 : p + len;
+    }
+    OString **rnames = (OString **)malloc(sizeof(OString *) * (size_t)base->nfields);
+    Value *rvals = (Value *)malloc(sizeof(Value) * (size_t)base->nfields);
+    for (int i = 0; i < base->nfields; i++) {
+        rnames[i] = base->names[i];
+        rvals[i] = base->fields[i];
+        for (int j = 0; j < n; j++) {
+            if (upd_names[j]->len == base->names[i]->len &&
+                memcmp(upd_names[j]->data, base->names[i]->data, (size_t)base->names[i]->len) == 0) {
+                rvals[i] = new_vals[j];
+                break;
+            }
+        }
+    }
+    ORecord *r = bur_new_record(rnames, rvals, base->nfields);
+    free(new_vals); free(upd_names); free(rnames); free(rvals);
+    bur_push(bur_obj((Obj *)r));
+}
+
+// stack roots (declared here, used by the collector)
+static void bur_push(Value v);
+static Value bur_pop(void);
 
 static void bur_mark_value(Value v);
 
@@ -402,11 +513,6 @@ static void bur_gc_trace(Obj *o) {
     case OBJ_LIST: {
         OList *l = (OList *)o;
         for (int64_t i = 0; i < l->len; i++) bur_mark_value(l->elems[i]);
-        break;
-    }
-    case OBJ_TUPLE: {
-        OTuple *t = (OTuple *)o;
-        for (int64_t i = 0; i < t->n; i++) bur_mark_value(t->elems[i]);
         break;
     }
     case OBJ_MAP: {
@@ -448,6 +554,19 @@ static void bur_gc_trace(Obj *o) {
         OChannel *ch = (OChannel *)o;
         for (int i = 0; i < ch->buflen; i++) bur_mark_value(ch->buf[i]);
         // blocked senders' pending values are marked via fiber roots
+        break;
+    }
+    case OBJ_RECORD: {
+        ORecord *r = (ORecord *)o;
+        for (int i = 0; i < r->nfields; i++) {
+            bur_gray_push((Obj *)r->names[i]);
+            bur_mark_value(r->fields[i]);
+        }
+        break;
+    }
+    case OBJ_TUPLE: {
+        OTuple *t = (OTuple *)o;
+        for (int i = 0; i < t->n; i++) bur_mark_value(t->elems[i]);
         break;
     }
     }
@@ -503,7 +622,6 @@ static void bur_gc_collect(void) {
             switch (o->type) {
             case OBJ_STRING: free(((OString *)o)->data); break;
             case OBJ_LIST: free(((OList *)o)->elems); break;
-            case OBJ_TUPLE: free(((OTuple *)o)->elems); break;
             case OBJ_MAP: {
                 OMap *m = (OMap *)o;
                 for (int64_t i = 0; i < m->len; i++) if (m->entries[i].k.is_str) free(m->entries[i].k.s);
@@ -515,6 +633,12 @@ static void bur_gc_collect(void) {
             case OBJ_CHANNEL: {
                 OChannel *ch = (OChannel *)o;
                 free(ch->buf); free(ch->sendq); free(ch->recvq); free(ch->waiters);
+                break;
+            }
+            case OBJ_TUPLE: free(((OTuple *)o)->elems); break;
+            case OBJ_RECORD: {
+                ORecord *r = (ORecord *)o;
+                free(r->names); free(r->fields);
                 break;
             }
             default: break;
@@ -560,6 +684,7 @@ static const char *bur_typename(Value v) {
         case OBJ_NATIVE: return "native function";
         case OBJ_CHANNEL: return "channel";
         case OBJ_TUPLE: return "tuple";
+        case OBJ_RECORD: return "record";
         }
     }
     return "?";
@@ -600,13 +725,6 @@ static bool bur_obj_eq(Obj *a, Obj *b) {
             if (!bur_eq(x->elems[i], y->elems[i])) return false;
         return true;
     }
-    case OBJ_TUPLE: {
-        OTuple *x = (OTuple *)a, *y = (OTuple *)b;
-        if (x->n != y->n) return false;
-        for (int64_t i = 0; i < x->n; i++)
-            if (!bur_eq(x->elems[i], y->elems[i])) return false;
-        return true;
-    }
     case OBJ_MAP: {
         OMap *x = (OMap *)a, *y = (OMap *)b;
         if (x->len != y->len) return false;
@@ -622,6 +740,23 @@ static bool bur_obj_eq(Obj *a, Obj *b) {
         if (x->enm != y->enm || x->variant != y->variant) return false;
         for (int i = 0; i < x->nfields; i++)
             if (!bur_eq(x->fields[i], y->fields[i])) return false;
+        return true;
+    }
+    case OBJ_RECORD: {
+        ORecord *x = (ORecord *)a, *y = (ORecord *)b;
+        if (x->nfields != y->nfields) return false;
+        for (int i = 0; i < x->nfields; i++) {
+            OString *nx = x->names[i], *ny = y->names[i];
+            if (nx->len != ny->len || memcmp(nx->data, ny->data, (size_t)nx->len) != 0) return false;
+            if (!bur_eq(x->fields[i], y->fields[i])) return false;
+        }
+        return true;
+    }
+    case OBJ_TUPLE: {
+        OTuple *x = (OTuple *)a, *y = (OTuple *)b;
+        if (x->n != y->n) return false;
+        for (int64_t i = 0; i < x->n; i++)
+            if (!bur_eq(x->elems[i], y->elems[i])) return false;
         return true;
     }
     default: return a == b;
@@ -763,6 +898,28 @@ static void bur_format(Buf *b, Value v, bool quote) {
         char t[64];
         snprintf(t, sizeof t, "<chan cap=%d len=%d>", ch->cap, ch->buflen);
         buf_str(b, t);
+        return;
+    }
+    case OBJ_TUPLE: {
+        OTuple *t = (OTuple *)o;
+        buf_char(b, '(');
+        for (int64_t i = 0; i < t->n; i++) {
+            if (i > 0) buf_str(b, ", ");
+            bur_format(b, t->elems[i], true);
+        }
+        buf_char(b, ')');
+        return;
+    }
+    case OBJ_RECORD: {
+        ORecord *r = (ORecord *)o;
+        buf_str(b, "record { ");
+        for (int i = 0; i < r->nfields; i++) {
+            if (i > 0) buf_str(b, ", ");
+            buf_bytes(b, r->names[i]->data, r->names[i]->len);
+            buf_str(b, ": ");
+            bur_format(b, r->fields[i], true);
+        }
+        buf_str(b, " }");
         return;
     }
     default: return;
@@ -972,6 +1129,14 @@ static Value bur_compare(Value a, Value b, int kind) {
         default: return bur_bool(c <= 0);
         }
     }
+    if (a.t == VINT && b.t == VINT) {
+        switch (kind) {
+        case 0: return bur_bool(a.u.i > b.u.i);
+        case 1: return bur_bool(a.u.i >= b.u.i);
+        case 2: return bur_bool(a.u.i < b.u.i);
+        default: return bur_bool(a.u.i <= b.u.i);
+        }
+    }
     if ((a.t == VINT || a.t == VFLOAT) && (b.t == VINT || b.t == VFLOAT)) {
         double af = a.t == VINT ? (double)a.u.i : a.u.f;
         double bf = b.t == VINT ? (double)b.u.i : b.u.f;
@@ -994,19 +1159,19 @@ static Value bur_index_get(Value target, Value idx) {
             bur_trap("list index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, l->len);
         return l->elems[idx.u.i];
     }
-    if (target.t == VOBJ && target.u.o->type == OBJ_TUPLE) {
-        OTuple *t = (OTuple *)target.u.o;
-        if (idx.t != VINT) bur_trap("tuple index must be an int, got %s", bur_typename(idx));
-        if (idx.u.i < 0 || idx.u.i >= t->n)
-            bur_trap("tuple index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, t->n);
-        return t->elems[idx.u.i];
-    }
     if (target.t == VOBJ && target.u.o->type == OBJ_STRING) {
         OString *s = (OString *)target.u.o;
         if (idx.t != VINT) bur_trap("string index must be an int, got %s", bur_typename(idx));
         if (idx.u.i < 0 || idx.u.i >= s->len)
             bur_trap("string index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, s->len);
         return bur_obj((Obj *)bur_new_string_n(s->data + idx.u.i, 1));
+    }
+    if (target.t == VOBJ && target.u.o->type == OBJ_TUPLE) {
+        OTuple *t = (OTuple *)target.u.o;
+        if (idx.t != VINT) bur_trap("tuple index must be an int, got %s", bur_typename(idx));
+        if (idx.u.i < 0 || idx.u.i >= t->n)
+            bur_trap("tuple index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, t->n);
+        return t->elems[idx.u.i];
     }
     bur_trap("cannot index %s", bur_typename(target));
     return bur_unit();
@@ -1099,6 +1264,16 @@ static void bur_call(int argc) {
         if (argc != cl->fn->arity)
             bur_trap("%s expects %d argument(s), got %d", cl->fn->name, cl->fn->arity, argc);
         if (++bur_cur->call_depth > 2048) bur_trap("stack overflow (call depth > 2048)");
+        int d = bur_cur->call_depth;
+        if (d >= bur_cur->trace_cap) {
+            int nc = bur_cur->trace_cap ? bur_cur->trace_cap : 8;
+            while (nc <= d) nc *= 2;
+            bur_cur->trace_fn = (OFunc **)realloc(bur_cur->trace_fn, sizeof(OFunc *) * nc);
+            bur_cur->trace_ln = (int *)realloc(bur_cur->trace_ln, sizeof(int) * nc);
+            bur_cur->trace_cap = nc;
+        }
+        bur_cur->trace_fn[d] = cl->fn;
+        bur_cur->trace_ln[d] = 0;
         OClosure *prev = bur_cur_closure;
         bur_cur_closure = cl;
         cl->fn->code();
@@ -1342,6 +1517,14 @@ static void bur_park(FiberStatus st) {
     swapcontext(&bur_cur->ctx, &bur_sched_ctx);
     bur_cur->budget = BUR_TIMESLICE;
 }
+static void bur_wait_current_fd(int fd, short events) {
+    bur_cur->io_proc = -1;
+    bur_cur->io_fd = fd;
+    bur_cur->io_events = events;
+    bur_cur->io_ready = false;
+    bur_nio++;
+    bur_park(FBLOCKED_IO);
+}
 static void bur_switch_to_sched(void) {
     swapcontext(&bur_cur->ctx, &bur_sched_ctx);
     bur_cur->budget = BUR_TIMESLICE;
@@ -1366,7 +1549,13 @@ static Fiber *bur_new_fiber(OClosure *cl, Value *args, int argc, size_t stacksiz
     f->status = FREADY;
     f->sendVal = bur_unit();
     f->budget = BUR_TIMESLICE;
+    f->io_proc = -1;
+    f->io_fd = -1;
     f->entry = cl;
+    f->trace_cap = 8;
+    f->trace_fn = (OFunc **)calloc(8, sizeof(OFunc *));
+    f->trace_ln = (int *)calloc(8, sizeof(int));
+    f->trace_fn[0] = cl->fn; // the entry body runs at depth 0, outside bur_call
     f->stack[f->top++] = bur_obj((Obj *)cl); // closure + args, like vm.newFiber
     for (int i = 0; i < argc; i++) f->stack[f->top++] = args[i];
     f->cstack = (char *)malloc(stacksize);
@@ -1415,6 +1604,44 @@ typedef struct {
 static BurProc *bur_procs;
 static int64_t bur_nprocs, bur_procscap;
 
+typedef void (*BurWaitReadyFn)(int64_t owner, short revents);
+
+typedef struct {
+    struct pollfd *fds;
+    int64_t *owners;
+    BurWaitReadyFn *ready;
+    int n, cap;
+    int64_t deadline_ns;
+} BurWaitSet;
+
+static BurWaitSet bur_waitset;
+
+static void bur_wait_reset(void) {
+    bur_waitset.n = 0;
+    bur_waitset.deadline_ns = INT64_MAX;
+}
+
+static void bur_wait_fd(int fd, short events, int64_t owner, BurWaitReadyFn ready) {
+    if (fd < 0) return;
+    if (bur_waitset.n == bur_waitset.cap) {
+        bur_waitset.cap = bur_waitset.cap * 2 + 16;
+        size_t size = (size_t)bur_waitset.cap;
+        bur_waitset.fds = (struct pollfd *)realloc(bur_waitset.fds, sizeof(struct pollfd) * size);
+        bur_waitset.owners = (int64_t *)realloc(bur_waitset.owners, sizeof(int64_t) * size);
+        bur_waitset.ready = (BurWaitReadyFn *)realloc(bur_waitset.ready, sizeof(BurWaitReadyFn) * size);
+    }
+    int i = bur_waitset.n++;
+    bur_waitset.fds[i].fd = fd;
+    bur_waitset.fds[i].events = events;
+    bur_waitset.fds[i].revents = 0;
+    bur_waitset.owners[i] = owner;
+    bur_waitset.ready[i] = ready;
+}
+
+static void bur_wait_timer(int64_t deadline_ns) {
+    if (deadline_ns < bur_waitset.deadline_ns) bur_waitset.deadline_ns = deadline_ns;
+}
+
 static bool bur_proc_valid(int64_t h) {
     return h >= 0 && h < bur_nprocs && bur_procs[h].used && !bur_procs[h].consumed;
 }
@@ -1449,33 +1676,58 @@ static void bur_proc_pump(BurProc *p) {
     }
 }
 
-// poll every live proc fd (waiting timeout_ms, -1 = forever), pump what is
-// ready, and wake fibers whose awaited proc completed, in fiber id order
-static void bur_poll_io(int timeout_ms) {
-    struct pollfd *pfds = NULL;
-    int64_t *owner = NULL;
-    int n = 0;
+static void bur_proc_ready(int64_t owner, short revents) {
+    (void)revents;
+    bur_proc_pump(&bur_procs[owner]);
+}
+
+static void bur_fiber_fd_ready(int64_t owner, short revents) {
+    (void)revents;
+    Fiber *f = bur_fibers[owner];
+    if (f->status == FBLOCKED_IO && f->io_fd >= 0) f->io_ready = true;
+}
+
+// Register every idle source through one wait set, then poll once. The
+// timer entry supplies poll's timeout; fd callbacks handle ready sources.
+static void bur_wait_poll(bool block) {
+    bur_wait_reset();
     for (int64_t i = 0; i < bur_nprocs; i++) {
         BurProc *p = &bur_procs[i];
         if (!p->used || p->complete) continue;
-        int fds[3] = { p->outfd, p->errfd, p->failfd };
-        for (int k = 0; k < 3; k++) {
-            if (fds[k] < 0) continue;
-            pfds = (struct pollfd *)realloc(pfds, sizeof(struct pollfd) * (size_t)(n + 1));
-            owner = (int64_t *)realloc(owner, sizeof(int64_t) * (size_t)(n + 1));
-            pfds[n].fd = fds[k]; pfds[n].events = POLLIN; pfds[n].revents = 0;
-            owner[n] = i; n++;
+        bur_wait_fd(p->outfd, POLLIN, i, bur_proc_ready);
+        bur_wait_fd(p->errfd, POLLIN, i, bur_proc_ready);
+        bur_wait_fd(p->failfd, POLLIN, i, bur_proc_ready);
+    }
+    for (int64_t i = 0; i < bur_nfibers; i++) {
+        Fiber *f = bur_fibers[i];
+        if (f->status == FBLOCKED_TIMER) bur_wait_timer(f->wake_ns);
+        else if (f->status == FBLOCKED_IO && f->io_fd >= 0)
+            bur_wait_fd(f->io_fd, f->io_events, i, bur_fiber_fd_ready);
+    }
+    int timeout_ms = 0;
+    if (block) {
+        timeout_ms = -1;
+        if (bur_waitset.deadline_ns != INT64_MAX) {
+            int64_t d = bur_waitset.deadline_ns - bur_now_ns();
+            timeout_ms = d <= 0 ? 0 : (int)(d / 1000000) + 1;
         }
     }
-    poll(pfds, (nfds_t)n, timeout_ms); // n == 0 degenerates to a plain sleep
-    for (int i = 0; i < n; i++)
-        if (pfds[i].revents) bur_proc_pump(&bur_procs[owner[i]]);
-    free(pfds); free(owner);
+    poll(bur_waitset.fds, (nfds_t)bur_waitset.n, timeout_ms);
+    for (int i = 0; i < bur_waitset.n; i++)
+        if (bur_waitset.fds[i].revents)
+            bur_waitset.ready[i](bur_waitset.owners[i], bur_waitset.fds[i].revents);
     if (bur_nio == 0) return;
     for (int64_t i = 0; i < bur_nfibers; i++) { // wake in fiber id order
         Fiber *f = bur_fibers[i];
-        if (f->status == FBLOCKED_IO && bur_procs[f->io_proc].complete) {
+        bool ready = f->io_ready;
+        if (!ready && f->status == FBLOCKED_IO && f->io_proc >= 0)
+            ready = bur_procs[f->io_proc].complete;
+        if (f->status == FBLOCKED_IO && ready) {
             bur_nio--;
+            f->io_proc = -1;
+            f->io_fd = -1;
+            f->io_events = 0;
+            f->io_ready = false;
             bur_schedule(f);
         }
     }
@@ -1506,20 +1758,11 @@ static void bur_scheduler(void) {
     for (;;) {
         if (bur_main_fiber->status == FDONE) return;
         if (bur_ntimers > 0) bur_wake_due_timers();
-        if (bur_nio > 0) bur_poll_io(0); // keep child pipes drained
+        if (bur_nio > 0) bur_wait_poll(false); // keep child pipes drained
         Fiber *f = bur_ready_pop();
         if (!f) {
             if (bur_ntimers > 0 || bur_nio > 0) {
-                int tmo = -1; // sleep on the io fds until the nearest timer
-                if (bur_ntimers > 0) {
-                    int64_t nearest = INT64_MAX;
-                    for (int64_t i = 0; i < bur_nfibers; i++)
-                        if (bur_fibers[i]->status == FBLOCKED_TIMER && bur_fibers[i]->wake_ns < nearest)
-                            nearest = bur_fibers[i]->wake_ns;
-                    int64_t d = nearest - bur_now_ns();
-                    tmo = d <= 0 ? 0 : (int)(d / 1000000) + 1;
-                }
-                bur_poll_io(tmo);
+                bur_wait_poll(true);
                 continue;
             }
             int blocked = 0;
