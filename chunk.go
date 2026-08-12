@@ -37,7 +37,7 @@ const (
 	OpJumpIfFalsePop // u16 fwd, pops cond
 	OpLoop           // u16 back
 	OpCall           // u8 argc
-	OpClosure        // u16 fn const, then per-upval: u8 isLocal, u16 idx
+	OpClosure        // u16 fn const, then per-upval: u8 flags (bit0 isLocal, bit1 ref), u16 idx
 	OpReturn
 	OpList        // u16 count
 	OpIndexGet    // pops idx, target; push elem
@@ -52,6 +52,11 @@ const (
 	OpRecv        // pops chan, push received (may park fiber); traps on closed
 	OpChanNext    // u16 fwd: pops chan; push next value, or jump when closed+drained
 	OpSelect      // u8 nArms, u8 flags, per-arm{u8 kind,u16 bodyJump}, [u16 defaultJump]
+	OpDefer       // pops a closure, pushes it on the frame defer stack
+	OpRecord      // u8 n, u16 const name list: pops n vals, pushes a record
+	OpGetFieldName // u16 const name: pops record, pushes its field
+	OpRecordUpdate // u8 n, u16 const name list: pops n vals + base, pushes a record
+	OpTuple       // u8 n: pops n vals, pushes a tuple
 )
 
 type Chunk struct {

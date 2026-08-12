@@ -267,6 +267,9 @@ func (g *cgen) emitBody(fn *OFunc) {
 
 	fmt.Fprintf(&g.b, "static void bur_fn_%d(void) { // %s\n", id, fn.Name)
 	fmt.Fprintf(&g.b, "\tint base = bur_cur->top - %d - 1; (void)base;\n", fn.Arity)
+	if fnHasDefer(fn) {
+		g.b.WriteString("\tint dbase = bur_cur->ndefers;\n")
+	}
 	g.b.WriteString("\tOClosure *self = bur_cur_closure; (void)self;\n")
 	g.b.WriteString("\tif (--bur_cur->budget <= 0) bur_preempt();\n") // preemption hook on entry
 
@@ -285,6 +288,18 @@ func (g *cgen) emitBody(fn *OFunc) {
 		fmt.Fprintf(&g.b, "L%d:;\n", len(code))
 	}
 	g.b.WriteString("}\n\n")
+}
+
+// fnHasDefer tells whether a function registers any deferred closures.
+func fnHasDefer(fn *OFunc) bool {
+	code := fn.Chunk.Code
+	for ip := 0; ip < len(code); {
+		if code[ip] == OpDefer {
+			return true
+		}
+		ip += instLen(code[ip], code, ip, fn)
+	}
+	return false
 }
 
 // jumpTargets scans a function's code once and returns the set of instruction
@@ -338,6 +353,12 @@ func instLen(op byte, code []byte, ip int, fn *OFunc) int {
 		return 3
 	case OpPopN, OpCall, OpSpawn, OpEndBlock, OpTestVariant, OpGetField:
 		return 2
+	case OpTuple, OpDefer:
+		return 2
+	case OpGetFieldName:
+		return 3
+	case OpRecord, OpRecordUpdate:
+		return 4
 	case OpClosure:
 		target := fn.Chunk.Consts[readU16(code, ip+1)].O.(*OFunc)
 		return 3 + target.NumUpvals*3
@@ -460,8 +481,19 @@ func (g *cgen) emitInst(id int, code []byte, ip int) int {
 	case OpClosure:
 		return g.emitClosure(id, code, ip)
 	case OpReturn:
-		w("{ Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }")
+		if fnHasDefer(g.objs[id].(*OFunc)) {
+			w("{ bur_run_defers(dbase); Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }")
+		} else {
+			w("{ Value r = bur_pop(); bur_close_upvalues(base); bur_cur->top = base; bur_push(r); return; }")
+		}
 		return ip + 1
+	case OpDefer:
+		w("{ Value cl = bur_pop(); bur_defer_push(cl); }")
+		return ip + 2
+	case OpTuple:
+		n := int(code[ip+1])
+		w("bur_tuple_make(%d);", n)
+		return ip + 2
 	case OpList:
 		n := u16(0)
 		w("{ OList *l = bur_new_list(&bur_cur->stack[bur_cur->top - %d], %d); bur_cur->top -= %d; bur_push(bur_obj((Obj *)l)); }", n, n, n)
@@ -564,14 +596,20 @@ func (g *cgen) emitClosure(id int, code []byte, ip int) int {
 	p := ip + 3
 	fmt.Fprintf(&g.b, "\t{ OClosure *cl = bur_new_closure((OFunc *)bur_consts_%d[%d].u.o); bur_push(bur_obj((Obj *)cl));\n", id, fnConst)
 	for i := 0; i < fn.NumUpvals; i++ {
-		isLocal := code[p] == 1
+		// descriptor flags: bit0=islocal, bit1=ref (capture(ref name))
+		flags := code[p]
 		p++
 		uidx := int(readU16(code, p))
 		p += 2
-		if isLocal {
-			fmt.Fprintf(&g.b, "\t  cl->upvals[%d] = bur_capture_upvalue(base + %d);\n", i, uidx)
+		if flags&1 == 1 {
+			if flags >= 2 {
+				fmt.Fprintf(&g.b, "\t  cl->upvals[%d] = bur_capture_upvalue(base + %d);\n", i, uidx)
+			} else {
+				// default value capture: an independent closed-cell snapshot
+				fmt.Fprintf(&g.b, "\t  cl->upvals[%d] = bur_capture_value(base + %d);\n", i, uidx)
+			}
 		} else {
-			fmt.Fprintf(&g.b, "\t  cl->upvals[%d] = self->upvals[%d];\n", i, uidx)
+			fmt.Fprintf(&g.b, "\t  cl->upvals[%d] = self->upvals[%d]->open ? self->upvals[%d] : bur_new_closed_cell(upvalue_get(self->upvals[%d]));\n", i, uidx, uidx, uidx)
 		}
 	}
 	g.b.WriteString("\t}\n")

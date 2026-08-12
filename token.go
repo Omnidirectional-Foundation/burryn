@@ -64,6 +64,28 @@ const (
 	TSelect
 
 	TEOF
+
+	// trivia and string segments (mirrors frontend/token.bur)
+	TComment // comments recorded as trivia, never parsed
+	TInterpStart
+	TInterpMid
+	TInterpEnd
+	TPipe    // |>
+	TConst
+	TDefer
+	TRecord
+	TType
+	TBar // |
+
+	// frozen-syntax additions
+	TColonColon // ::
+	TDotDot     // ..
+	TPlusEq
+	TMinusEq
+	TStarEq
+	TSlashEq
+	TPercentEq
+	TCapture
 )
 
 // Span is a half-open byte range [Start, End) into the source.
@@ -108,4 +130,9 @@ var keywords = map[string]TokType{
 	"pub":      TPub,
 	"import":   TImport,
 	"select":   TSelect,
+	"const":    TConst,
+	"defer":    TDefer,
+	"record":   TRecord,
+	"type":     TType,
+	"capture":  TCapture,
 }

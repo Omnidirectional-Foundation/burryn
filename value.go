@@ -53,6 +53,13 @@ type OList struct {
 	Elems []Value
 }
 
+// OTuple is a fixed-size heterogeneous tuple (op_tuple); element access goes
+// through OpIndexGet.
+type OTuple struct {
+	GCHeader
+	Elems []Value
+}
+
 // OMap is a hash map with int|str keys that iterates in insertion order.
 type OMap struct {
 	GCHeader
@@ -199,6 +206,7 @@ type ONative struct {
 
 func (o *OString) hdr() *GCHeader      { return &o.GCHeader }
 func (o *OList) hdr() *GCHeader        { return &o.GCHeader }
+func (o *OTuple) hdr() *GCHeader       { return &o.GCHeader }
 func (o *OMap) hdr() *GCHeader         { return &o.GCHeader }
 func (o *OFunc) hdr() *GCHeader        { return &o.GCHeader }
 func (o *OClosure) hdr() *GCHeader     { return &o.GCHeader }
@@ -211,6 +219,7 @@ func (o *ONative) hdr() *GCHeader      { return &o.GCHeader }
 
 func (o *OString) typeName() string      { return "string" }
 func (o *OList) typeName() string        { return "list" }
+func (o *OTuple) typeName() string       { return "tuple" }
 func (o *OMap) typeName() string         { return "map" }
 func (o *OFunc) typeName() string        { return "function" }
 func (o *OClosure) typeName() string     { return "function" }
@@ -271,6 +280,17 @@ func objEqual(a, b Obj) bool {
 		return ok && x.S == y.S
 	case *OList:
 		y, ok := b.(*OList)
+		if !ok || len(x.Elems) != len(y.Elems) {
+			return false
+		}
+		for i := range x.Elems {
+			if !valuesEqual(x.Elems[i], y.Elems[i]) {
+				return false
+			}
+		}
+		return true
+	case *OTuple:
+		y, ok := b.(*OTuple)
 		if !ok || len(x.Elems) != len(y.Elems) {
 			return false
 		}
@@ -346,6 +366,17 @@ func format(v Value, quote bool) string {
 				b.WriteString(repr(e))
 			}
 			b.WriteByte(']')
+			return b.String()
+		case *OTuple:
+			var b strings.Builder
+			b.WriteByte('(')
+			for i, e := range o.Elems {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(repr(e))
+			}
+			b.WriteByte(')')
 			return b.String()
 		case *OMap:
 			var b strings.Builder

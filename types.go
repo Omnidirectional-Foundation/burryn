@@ -993,6 +993,12 @@ func (c *Checker) convertTypeExpr(te TypeExpr, subst map[string]Ty, prefix strin
 		}
 	case *TEList:
 		return &TCon{Name: "list", Args: []Ty{c.convertTypeExpr(x.Elem, subst, prefix)}}
+	case *TETuple:
+		ts := make([]Ty, len(x.Types))
+		for i, t := range x.Types {
+			ts[i] = c.convertTypeExpr(t, subst, prefix)
+		}
+		return &TCon{Name: "@tup", Args: ts}
 	case *TEFn:
 		ps := make([]Ty, len(x.Params))
 		for i, p := range x.Params {
@@ -1084,6 +1090,48 @@ func (c *Checker) inferStmt(s Stmt) {
 			sch = &Scheme{t: t}
 		}
 		c.declare(st.Name, sch, st.Mut, "local", st.NameSpan)
+	case *DestructLet:
+		tt := c.inferExpr(st.Init)
+		elTys := make([]Ty, len(st.Names))
+		for i := range elTys {
+			elTys[i] = c.fresh("")
+		}
+		c.unifyAt(tt, &TCon{Name: "@tup", Args: elTys}, st.Init.span(), "in this destructuring `let` (need a tuple)")
+		for i, name := range st.Names {
+			c.declare(name, &Scheme{t: elTys[i]}, st.Mut, "local", st.NameSpans[i])
+		}
+	case *ConstDecl:
+		t := c.inferExpr(st.Init)
+		c.declare(st.Name, &Scheme{t: t}, false, "local", st.NameSpan)
+	case *MethodDecl:
+		tv := c.fresh("")
+		c.declare(st.RecvTy+"."+st.Name, &Scheme{t: tv}, false, "local", st.NameSpan)
+		b := c.lookup(st.RecvTy + "." + st.Name)
+		b.isFn = true
+		b.used = true
+		c.level++
+		ft := c.inferExpr(st.Fn)
+		c.level--
+		b.scheme = c.generalize(ft)
+		c.unifyAt(tv, ft, st.NameSpan, "in this method")
+	case *DeferStmt:
+		c.pushScope()
+		push := len(c.retTys)
+		c.retTys = append(c.retTys, tUnit)
+		c.inferBlockStmts(st.Body.(*Block))
+		c.retTys = c.retTys[:push]
+		c.popScope()
+	case *LabelStmt:
+		c.loop++
+		c.inferStmt(st.Inner)
+		c.loop--
+	case *TypeAliasDecl:
+		// aliases resolve on demand via lookup; record the target
+		if st.Pub {
+			c.errPubScript(st.Span)
+		}
+		t := c.convertTypeExpr(st.Ty, nil, c.pkgPrefix)
+		c.declare(st.Name, &Scheme{t: t}, false, "alias", st.Span)
 	case *FnDecl:
 		if st.Pub {
 			c.errPubScript(st.Span)
@@ -1401,6 +1449,12 @@ func (c *Checker) inferExpr(e Expr) Ty {
 		ct := c.inferExpr(ex.Chan)
 		c.unifyAt(ct, &TCon{Name: "chan", Args: []Ty{el}}, ex.Span, "with `<-` (need a channel)")
 		return el
+	case *TupleLit:
+		ts := make([]Ty, len(ex.Elems))
+		for i, el := range ex.Elems {
+			ts[i] = c.inferExpr(el)
+		}
+		return &TCon{Name: "@tup", Args: ts}
 	}
 	return c.fresh("")
 }
@@ -1533,6 +1587,10 @@ func (c *Checker) inferTry(ex *TryExpr) Ty {
 	}
 	ret := c.retTys[len(c.retTys)-1]
 	switch r := resolve(t).(type) {
+	case *TV:
+		// the operand type is not settled yet (mutually recursive fns): defer
+		// the Option/Result decision instead of failing at the use site
+		return c.fresh("")
 	case *TCon:
 		switch r.Name {
 		case "Result":
@@ -1852,6 +1910,12 @@ func prettyWith(t Ty, names map[*TV]string) string {
 			return "[" + prettyWith(x.Args[0], names) + "]"
 		case "chan":
 			return "chan(" + prettyWith(x.Args[0], names) + ")"
+		case "@tup":
+			parts := make([]string, len(x.Args))
+			for i, a := range x.Args {
+				parts[i] = prettyWith(a, names)
+			}
+			return "(" + strings.Join(parts, ", ") + ")"
 		}
 		if len(x.Args) == 0 {
 			return x.Name

@@ -60,7 +60,7 @@ static inline Value bur_obj(Obj *o)     { Value v; v.t = VOBJ; v.u.o = o; return
 typedef enum {
     OBJ_STRING, OBJ_LIST, OBJ_MAP, OBJ_FUNC, OBJ_CLOSURE,
     OBJ_UPVALUE, OBJ_ENUMTYPE, OBJ_VARIANTCTOR, OBJ_ENUMINST, OBJ_NATIVE,
-    OBJ_CHANNEL
+    OBJ_CHANNEL, OBJ_TUPLE
 } ObjType;
 
 struct Obj {
@@ -80,6 +80,12 @@ typedef struct {
     Value *elems;
     int64_t len, cap;
 } OList;
+
+typedef struct {
+    Obj obj;
+    int64_t n;
+    Value *elems;
+} OTuple;
 
 typedef struct {
     bool is_str;
@@ -185,6 +191,9 @@ struct Fiber {
     int top, cap;
     OUpvalue **openUpvals;
     int nopen, opencap;
+
+    Value *defers;          // registered defer closures; frames delimit their
+    int ndefers, defercap;  // slice by watermark and pop it LIFO on exit
 
     int id;
     FiberStatus status;
@@ -349,6 +358,26 @@ static OEnumInst *bur_new_inst(OEnumType *e, int variant, Value *fields, int nfi
 static void bur_push(Value v);
 static Value bur_pop(void);
 
+static OTuple *bur_new_tuple(Value *elems, int64_t n) {
+    OTuple *o = (OTuple *)bur_alloc(sizeof(OTuple), OBJ_TUPLE);
+    o->n = n;
+    if (n > 0) {
+        o->elems = (Value *)malloc(sizeof(Value) * (size_t)n);
+        memcpy(o->elems, elems, sizeof(Value) * (size_t)n);
+    }
+    return o;
+}
+
+// bur_tuple_make pops n values into a fresh tuple (op_tuple)
+static void bur_tuple_make(int n) {
+    Value *elems = (Value *)malloc(sizeof(Value) * (size_t)n);
+    for (int i = 0; i < n; i++) elems[i] = bur_cur->stack[bur_cur->top - n + i];
+    bur_cur->top -= n;
+    OTuple *t = bur_new_tuple(elems, n);
+    free(elems);
+    bur_push(bur_obj((Obj *)t));
+}
+
 static void bur_mark_value(Value v);
 
 static Obj **bur_gray;
@@ -373,6 +402,11 @@ static void bur_gc_trace(Obj *o) {
     case OBJ_LIST: {
         OList *l = (OList *)o;
         for (int64_t i = 0; i < l->len; i++) bur_mark_value(l->elems[i]);
+        break;
+    }
+    case OBJ_TUPLE: {
+        OTuple *t = (OTuple *)o;
+        for (int64_t i = 0; i < t->n; i++) bur_mark_value(t->elems[i]);
         break;
     }
     case OBJ_MAP: {
@@ -450,6 +484,7 @@ static void bur_gc_collect(void) {
         Fiber *f = bur_fibers[fi];
         for (int i = 0; i < f->top; i++) bur_mark_value(f->stack[i]);
         for (int i = 0; i < f->nopen; i++) bur_gray_push((Obj *)f->openUpvals[i]);
+        for (int i = 0; i < f->ndefers; i++) bur_mark_value(f->defers[i]);
         bur_mark_value(f->sendVal);
     }
 
@@ -468,6 +503,7 @@ static void bur_gc_collect(void) {
             switch (o->type) {
             case OBJ_STRING: free(((OString *)o)->data); break;
             case OBJ_LIST: free(((OList *)o)->elems); break;
+            case OBJ_TUPLE: free(((OTuple *)o)->elems); break;
             case OBJ_MAP: {
                 OMap *m = (OMap *)o;
                 for (int64_t i = 0; i < m->len; i++) if (m->entries[i].k.is_str) free(m->entries[i].k.s);
@@ -523,6 +559,7 @@ static const char *bur_typename(Value v) {
         case OBJ_ENUMINST: return ((OEnumInst *)v.u.o)->enm->name;
         case OBJ_NATIVE: return "native function";
         case OBJ_CHANNEL: return "channel";
+        case OBJ_TUPLE: return "tuple";
         }
     }
     return "?";
@@ -560,6 +597,13 @@ static bool bur_obj_eq(Obj *a, Obj *b) {
         OList *x = (OList *)a, *y = (OList *)b;
         if (x->len != y->len) return false;
         for (int64_t i = 0; i < x->len; i++)
+            if (!bur_eq(x->elems[i], y->elems[i])) return false;
+        return true;
+    }
+    case OBJ_TUPLE: {
+        OTuple *x = (OTuple *)a, *y = (OTuple *)b;
+        if (x->n != y->n) return false;
+        for (int64_t i = 0; i < x->n; i++)
             if (!bur_eq(x->elems[i], y->elems[i])) return false;
         return true;
     }
@@ -950,6 +994,13 @@ static Value bur_index_get(Value target, Value idx) {
             bur_trap("list index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, l->len);
         return l->elems[idx.u.i];
     }
+    if (target.t == VOBJ && target.u.o->type == OBJ_TUPLE) {
+        OTuple *t = (OTuple *)target.u.o;
+        if (idx.t != VINT) bur_trap("tuple index must be an int, got %s", bur_typename(idx));
+        if (idx.u.i < 0 || idx.u.i >= t->n)
+            bur_trap("tuple index %" PRId64 " out of bounds (len %" PRId64 ")", idx.u.i, t->n);
+        return t->elems[idx.u.i];
+    }
     if (target.t == VOBJ && target.u.o->type == OBJ_STRING) {
         OString *s = (OString *)target.u.o;
         if (idx.t != VINT) bur_trap("string index must be an int, got %s", bur_typename(idx));
@@ -1001,6 +1052,22 @@ static OUpvalue *bur_capture_upvalue(int slot) {
     }
     bur_cur->openUpvals[bur_cur->nopen++] = u;
     return u;
+}
+
+// bur_new_closed_cell wraps a value in an independent closed cell
+// (value-capture snapshots: never open, never shared)
+static OUpvalue *bur_new_closed_cell(Value v) {
+    OUpvalue *u = (OUpvalue *)bur_alloc(sizeof(OUpvalue), OBJ_UPVALUE);
+    u->fiber = NULL;
+    u->slot = 0;
+    u->open = false;
+    u->closed = v;
+    return u;
+}
+
+// bur_capture_value captures a value-capture snapshot from a stack slot
+static OUpvalue *bur_capture_value(int slot) {
+    return bur_new_closed_cell(bur_cur->stack[slot]);
 }
 
 static void bur_close_upvalues(int from) {
@@ -1060,6 +1127,30 @@ static void bur_call(int argc) {
     }
     default:
         bur_trap("cannot call %s", bur_typename(callee));
+    }
+}
+
+// ---- defers -----------------------------------------------------------
+
+// bur_defer_push registers a closure on the current fiber's defer stack;
+// the registering frame runs its slice LIFO on every function exit
+static void bur_defer_push(Value cl) {
+    if (bur_cur->ndefers == bur_cur->defercap) {
+        bur_cur->defercap = bur_cur->defercap * 2 + 8;
+        bur_cur->defers = (Value *)realloc(bur_cur->defers, sizeof(Value) * (size_t)bur_cur->defercap);
+    }
+    bur_cur->defers[bur_cur->ndefers++] = cl;
+}
+
+// bur_run_defers pops and calls the frame's defers (those above dbase)
+// LIFO; callers run it before popping the exit value so that value stays
+// rooted on the stack across the deferred calls
+static void bur_run_defers(int dbase) {
+    while (bur_cur->ndefers > dbase) {
+        Value cl = bur_cur->defers[--bur_cur->ndefers];
+        bur_push(cl);
+        bur_call(0);
+        bur_pop();
     }
 }
 
