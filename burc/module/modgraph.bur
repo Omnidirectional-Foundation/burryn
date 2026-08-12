@@ -1,0 +1,700 @@
+// modgraph.bur — 模块图：依赖解析（MVS）、bur.sum 校验、import 驱动加载。
+// Module graph: dependency resolution (MVS), bur.sum verification, import-driven loading.
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// 模块信息
+// Module info
+pub enum ModInfo {
+    MI(str, [str], [str]),
+}
+
+// 版本选择结果
+// Version pick result
+pub enum ModPick {
+    MP([str], [str]),
+}
+
+// modgraph_parse 解析 go.mod 风格 require 块 / modgraph_parse parses a go.mod-style require block
+pub fn modgraph_parse(text) {
+    let mut mpath = ""
+    let mut rpaths = []
+    let mut rvers = []
+    for line in split(text, "\n") {
+        let mut t = line
+        match str_index_of(t, "//") {
+            Some(ix) => {
+                t = substr(t, 0, ix)
+            },
+            None => {},
+        }
+        let fields = str_fields(t)
+        if len(fields) > 0 {
+            if fields[0] == "module" {
+                if len(fields) != 2 || !valid_import_path(fields[1]) {
+                    return Err("malformed module directive")
+                }
+                if mpath != "" {
+                    return Err("duplicate module directive")
+                }
+                mpath = fields[1]
+            } else if fields[0] == "require" {
+                if len(fields) != 3 || !valid_import_path(fields[1]) || !lib::str_has_prefix(fields[2], "v") {
+                    return Err("malformed require directive")
+                }
+                push(rpaths, fields[1])
+                push(rvers, fields[2])
+            } else {
+                return Err("unknown directive \"" + fields[0] + "\"")
+            }
+        }
+    }
+    if mpath == "" {
+        return Err("missing module directive")
+    }
+    Ok(MI(mpath, rpaths, rvers))
+}
+
+// ver_cmp 语义版本比较 / ver_cmp compares semantic versions
+pub fn ver_cmp(a, b) {
+    let pa = ver_parts(a)
+    let pb = ver_parts(b)
+    let mut i = 0
+    while i < 3 {
+        if pa[i] < pb[i] {
+            return -1
+        }
+        if pa[i] > pb[i] {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ver_parts 拆分版本号 / ver_parts splits a version into parts
+fn ver_parts(v) {
+    let s = if lib::str_has_prefix(v, "v") {
+        substr(v, 1, str_len(v) - 1)
+    } else {
+        v
+    }
+    let bits = split(s, ".")
+    let mut out = []
+    let mut i = 0
+    while i < 3 {
+        if i < len(bits) {
+            match parse_int(bits[i]) {
+                Some(n) => push(out, n),
+                None => push(out, 0),
+            }
+        } else {
+            push(out, 0)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// env_lookup 带默认值的环境变量查找 / env_lookup looks up an env var with a default
+fn env_lookup(name) {
+    match exec("printenv", [name]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    Some(trim(so))
+                } else {
+                    None
+                }
+            },
+        },
+        Err(_) => None,
+    }
+}
+
+// cache_root 取模块缓存根（BURCACHE）/ cache_root returns the module cache root (BURCACHE)
+pub fn cache_root() {
+    match env_lookup("BURCACHE") {
+        Some(p) => p,
+        None => match env_lookup("HOME") {
+            Some(h) => h + "/.burryn/pkg",
+            None => "/tmp/burryn-pkg",
+        },
+    }
+}
+
+// mod_git_base 取 git 基址（BURGITBASE 或 ~/.burryn）
+// mod_git_base returns the git base (BURGITBASE or ~/.burryn)
+fn mod_git_base() {
+    match env_lookup("BURGITBASE") {
+        Some(b) => b,
+        None => "https://",
+    }
+}
+
+// exec_ok 判断命令是否成功 / exec_ok tells whether the command succeeded
+fn exec_ok(cmd, cargs, what) {
+    match exec(cmd, cargs) {
+        Ok(o) => match o {
+            Output(code, _, se) => {
+                if code == 0 {
+                    Ok(0)
+                } else {
+                    Err(what + ": " + trim(se))
+                }
+            },
+        },
+        Err(m) => Err(what + ": " + m),
+    }
+}
+
+// parent_dir 取父目录 / parent_dir returns the parent directory
+fn parent_dir(p) {
+    let mut last = -1
+    let mut i = 0
+    while i < str_len(p) {
+        if char_at(p, i) == "/" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last <= 0 {
+        "."
+    } else {
+        substr(p, 0, last)
+    }
+}
+
+// mod_fetch 把模块 clone 进缓存（vX 标签） / mod_fetch git-clones a module into the cache (tagged vX)
+pub fn mod_fetch(path, version) {
+    let dest = cache_root() + "/" + path + "@" + version
+    if file_exists(dest + "/bur.mod") {
+        return Ok(dest)
+    }
+    let tmp = dest + ".tmp"
+    let _ = exec("rm", ["-rf", tmp])
+    exec_ok("mkdir", ["-p", parent_dir(dest)], "mkdir " + parent_dir(dest))?
+    match exec("git", ["-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1", "--branch", version, mod_git_base() + path, tmp]) {
+        Ok(o) => match o {
+            Output(code, _, se) => {
+                if code != 0 {
+                    let _ = exec("rm", ["-rf", tmp])
+                    return Err("cannot fetch " + path + "@" + version + " (is tag " + version + " published? from `require " + path + " " + version + "`): " + trim(se))
+                }
+            },
+        },
+        Err(m) => {
+            return Err("git clone: " + m)
+        },
+    }
+    exec_ok("rm", ["-rf", tmp + "/.git"], "strip .git")?
+    if !file_exists(tmp + "/bur.mod") {
+        let _ = exec("rm", ["-rf", tmp])
+        return Err("fetched " + path + "@" + version + " has no bur.mod at its root")
+    }
+    exec_ok("mv", [tmp, dest], "mv into cache")?
+    Ok(dest)
+}
+
+// mvs_walk 做 MVS 遍历：自底向上最大版本选择
+// mvs_walk runs the MVS walk: bottom-up maximal version selection
+// mvs_walk 自底向上遍历依赖树，每个模块取最大需求版本
+// mvs_walk walks the dependency tree bottom-up, picking the maximal required version per module
+// mvs_walk 自底向上遍历依赖树，每个模块取最大需求版本
+// mvs_walk walks the dependency tree bottom-up, picking the maximal required version per module
+fn mvs_walk(dir, fetch) {
+    // 自底向上遍历依赖树，每个模块取最大需求版本
+    // Walk the dependency tree bottom-up, picking the maximal required version per module
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod not found in " + dir + ": " + m)
+            ""
+        },
+    }
+    let mut qp = match modgraph_parse(text) {
+        Ok(mi) => {
+            match mi {
+                MI(_, rp, _) => rp,
+            }
+        },
+        Err(m) => {
+            return Err(dir + "/bur.mod: " + m)
+            []
+        },
+    }
+    let mut qv = match modgraph_parse(text) {
+        Ok(mi) => {
+            match mi {
+                MI(_, _, rv) => rv,
+            }
+        },
+        Err(m) => {
+            return Err(dir + "/bur.mod: " + m)
+            []
+        },
+    }
+    let root = cache_root()
+    let mut sel = map()
+    let mut seen = map()
+    let mut qi = 0
+    while qi < len(qp) {
+        let p = qp[qi]
+        let v = qv[qi]
+        qi = qi + 1
+        if p == "std" || lib::str_has_prefix(p, "std/") {
+            return Err("std ships with the toolchain; drop `require " + p + "`")
+        }
+        let key = p + "@" + v
+        match get(seen, key) {
+            Some(_) => {},
+            None => {
+                put(seen, key, 1)
+                let take = match get(sel, p) {
+                    Some(cur) => ver_cmp(v, cur) > 0,
+                    None => true,
+                }
+                if take {
+                    put(sel, p, v)
+                }
+                let mdir = root + "/" + key
+                if fetch && !file_exists(mdir + "/bur.mod") {
+                    match mod_fetch(p, v) {
+                        Ok(_) => {},
+                        Err(m) => {
+                            return Err(m)
+                        },
+                    }
+                }
+                let mtext = match read_file(mdir + "/bur.mod") {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err("module " + key + " not in cache (" + mdir + "); fetch it with `bur mod download`")
+                        ""
+                    },
+                }
+                match modgraph_parse(mtext) {
+                    Ok(sub) => match sub {
+                        MI(subpath, srp, srv) => {
+                            if subpath != p {
+                                return Err("cache corruption: " + mdir + " declares module " + subpath)
+                            }
+                            let mut k = 0
+                            while k < len(srp) {
+                                push(qp, srp[k])
+                                push(qv, srv[k])
+                                k = k + 1
+                            }
+                        },
+                    },
+                    Err(m) => {
+                        return Err("bad bur.mod in " + mdir + ": " + m)
+                    },
+                }
+            },
+        }
+    }
+    let spaths = sorted_strs(keys(sel))
+    let mut svers = []
+    for p in spaths {
+        match get(sel, p) {
+            Some(v) => push(svers, v),
+            None => push(svers, ""),
+        }
+    }
+    Ok(MP(spaths, svers))
+}
+
+// mvs_resolve 是依赖解析入口 / mvs_resolve is the dependency resolution entry
+pub fn mvs_resolve(dir) {
+    mvs_walk(dir, false)
+}
+
+// mvs_resolve_fetch 解析并拉取 / mvs_resolve_fetch resolves and fetches
+pub fn mvs_resolve_fetch(dir) {
+    mvs_walk(dir, true)
+}
+
+// sorted_strs 字符串列表排序 / sorted_strs sorts a string list
+fn sorted_strs(xs) {
+    let mut out = []
+    for x in xs {
+        let mut i = 0
+        while i < len(out) && out[i] < x {
+            i = i + 1
+        }
+        out = concat(concat(slice(out, 0, i), [x]), slice(out, i, len(out)))
+    }
+    out
+}
+
+// tree_hash 目录树内容哈希（缓存失效用） / tree_hash hashes a directory tree (cache invalidation)
+pub fn tree_hash(dir) {
+    let mut files = []
+    collect_files(dir, "", files)
+    let mut manifest = []
+    for rel in sorted_strs(files) {
+        match exec("sha256sum", [dir + "/" + rel]) {
+            Ok(o) => match o {
+                Output(code, so, se) => {
+                    if code != 0 {
+                        return Err("sha256sum " + rel + ": " + trim(se))
+                    }
+                    push(manifest, substr(so, 0, 64) + "  " + rel + "\n")
+                },
+            },
+            Err(m) => {
+                return Err("sha256sum: " + m)
+            },
+        }
+    }
+    match exec("sh", ["-c", "printf %s \"$0\" | sha256sum | cut -c1-64 | tr a-f A-F | basenc --base16 -d | base64", join(manifest, "")]) {
+        Ok(o) => match o {
+            Output(code, so, se) => {
+                if code != 0 {
+                    return Err("sha256sum: " + trim(se))
+                }
+                Ok("h1:" + trim(so))
+            },
+        },
+        Err(m) => Err("sh: " + m),
+    }
+}
+
+// collect_files 递归收集文件 / collect_files recursively collects files
+fn collect_files(root, rel, mut acc) {
+    let dir = if rel == "" {
+        root
+    } else {
+        root + "/" + rel
+    }
+    match read_dir(dir) {
+        Ok(names) => {
+            for n in names {
+                if !lib::str_has_prefix(n, ".") {
+                    let r = if rel == "" {
+                        n
+                    } else {
+                        rel + "/" + n
+                    }
+                    match read_dir(dir + "/" + n) {
+                        Ok(_) => collect_files(root, r, acc),
+                        Err(_) => push(acc, r),
+                    }
+                }
+            }
+        },
+        Err(_) => {},
+    }
+}
+
+// sum_render 渲染 bur.sum / sum_render renders bur.sum
+pub fn sum_render(pick, hashes) {
+    match pick {
+        MP(paths, vers) => {
+            let mut lines = []
+            let mut i = 0
+            while i < len(paths) {
+                push(lines, paths[i] + " " + vers[i] + " " + hashes[i] + "\n")
+                i = i + 1
+            }
+            join(lines, "")
+        },
+    }
+}
+
+// sum_check 校验 bur.sum / sum_check verifies bur.sum
+pub fn sum_check(sum_text, pick, root) {
+    let mut want = map()
+    for line in split(sum_text, "\n") {
+        let f = str_fields(line)
+        if len(f) == 3 {
+            put(want, f[0], f[1] + " " + f[2])
+        } else if len(f) != 0 {
+            return Err("malformed bur.sum line: " + line)
+        }
+    }
+    match pick {
+        MP(paths, vers) => {
+            let mut i = 0
+            while i < len(paths) {
+                match get(want, paths[i]) {
+                    Some(e) => {
+                        let got = tree_hash(root + "/" + paths[i] + "@" + vers[i])?
+                        if e != vers[i] + " " + got {
+                            return Err("bur.sum mismatch for " + paths[i] + ": have " + e + ", computed " + vers[i] + " " + got)
+                        }
+                    },
+                    None => {
+                        return Err("bur.sum: missing entry for " + paths[i])
+                    },
+                }
+                i = i + 1
+            }
+            Ok(len(paths))
+        },
+    }
+}
+
+// mod_hashes 模块文件哈希 / mod_hashes hashes module files
+fn mod_hashes(pick, root) {
+    match pick {
+        MP(paths, vers) => {
+            let mut hs = []
+            let mut i = 0
+            while i < len(paths) {
+                let h = tree_hash(root + "/" + paths[i] + "@" + vers[i])?
+                push(hs, h)
+                i = i + 1
+            }
+            Ok(hs)
+        },
+    }
+}
+
+// mod_init_text 生成 bur.mod 初始化文本 / mod_init_text builds the bur.mod init text
+pub fn mod_init_text(mpath) {
+    if !valid_import_path(mpath) {
+        Err("invalid module path \"" + mpath + "\"")
+    } else {
+        Ok("module " + mpath + "\n")
+    }
+}
+
+// tidy_scan_imports 扫描 import（tidy 用）/ tidy_scan_imports scans imports (tidy)
+fn tidy_scan_imports(dir) {
+    let mut out = []
+    let mut seen = map()
+    for rel in test_walk(dir) {
+        let pdir = if rel == "." {
+            dir
+        } else {
+            dir + "/" + rel
+        }
+        let entries = match read_dir(pdir) {
+            Ok(es) => es,
+            Err(m) => {
+                return Err("cannot read " + pdir + ": " + m)
+                []
+            },
+        }
+        for name in entries {
+            if str_ends_with(name, ".bur") {
+                let disp = pdir + "/" + name
+                let src = match read_file(disp) {
+                    Ok(s) => s,
+                    Err(m) => {
+                        return Err("cannot read " + disp + ": " + m)
+                        ""
+                    },
+                }
+                match frontend::lex(src) {
+                    lib::LexOut::Lexed(toks, ldiags, _) => {
+                        if len(ldiags) > 0 {
+                            return Err(disp + " has lex errors; run `bur check " + dir + "`")
+                        }
+                        match frontend::parse(toks) {
+                            frontend::ParseOut::Parsed(stmts, pdiags) => {
+                                if len(pdiags) > 0 {
+                                    return Err(disp + " has parse errors; run `bur check " + dir + "`")
+                                }
+                                for s in stmts {
+                                    match s {
+                                        frontend::Node::ImportDecl(_, _, ipath, _, _) => {
+                                            match get(seen, ipath) {
+                                                Some(_) => {},
+                                                None => {
+                                                    put(seen, ipath, true)
+                                                    push(out, ipath)
+                                                },
+                                            }
+                                        },
+                                        _ => {},
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// mod_tidy 裁剪未用依赖（tidy）/ mod_tidy prunes unused deps (tidy)
+pub fn mod_tidy(dir) {
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod: " + m)
+            ""
+        },
+    }
+    let mi = modgraph_parse(text)?
+    let mod_path = match mi {
+        MI(p, _, _) => p,
+    }
+    let imports = tidy_scan_imports(dir)?
+    let pick0 = mvs_resolve(dir)?
+    let gpaths = match pick0 {
+        MP(ps, _) => ps,
+    }
+    let gvers = match pick0 {
+        MP(_, vs) => vs,
+    }
+    let mut needed = map()
+    for ip in imports {
+        let local = ip == "std" || lib::str_has_prefix(ip, "std/") || ip == mod_path || lib::str_has_prefix(ip, mod_path + "/")
+        if !local {
+            let mut best = -1
+            let mut blen = -1
+            let mut gi = 0
+            while gi < len(gpaths) {
+                if (ip == gpaths[gi] || lib::str_has_prefix(ip, gpaths[gi] + "/")) && str_len(gpaths[gi]) > blen {
+                    best = gi
+                    blen = str_len(gpaths[gi])
+                }
+                gi = gi + 1
+            }
+            if best < 0 {
+                return Err("cannot resolve import \"" + ip + "\": no required module provides it; add its module with `bur get <path>@<version>`")
+            }
+            put(needed, gpaths[best], gvers[best])
+        }
+    }
+    let mut kept = []
+    for line in split(text, "\n") {
+        let f = str_fields(line)
+        let drop = if len(f) >= 2 && f[0] == "require" {
+            match get(needed, f[1]) {
+                Some(_) => false,
+                None => true,
+            }
+        } else {
+            false
+        }
+        if !drop {
+            push(kept, line)
+        }
+    }
+    let mut out = join(kept, "\n")
+    for p in sorted_strs(keys(needed)) {
+        match get(needed, p) {
+            Some(v) => {
+                out = mod_edit_require(out, p, v)
+            },
+            None => {},
+        }
+    }
+    if out != text {
+        write_file(dir + "/bur.mod", out)?
+    }
+    mod_sum_sync(dir)
+}
+
+// mod_sum_sync 同步 bur.sum / mod_sum_sync syncs bur.sum
+fn mod_sum_sync(dir) {
+    let pick = mvs_resolve(dir)?
+    let hs = mod_hashes(pick, cache_root())?
+    write_file(dir + "/bur.sum", sum_render(pick, hs))?
+    match pick {
+        MP(paths, _) => Ok(str(len(paths)) + " module(s) in bur.sum"),
+    }
+}
+
+// mod_download 下载模块 / mod_download downloads a module
+pub fn mod_download(dir) {
+    let pick = mvs_resolve_fetch(dir)?
+    let root = cache_root()
+    match read_file(dir + "/bur.sum") {
+        Ok(sum) => {
+            let n = sum_check(sum, pick, root)?
+            Ok(str(n) + " module(s) verified against bur.sum")
+        },
+        Err(_) => {
+            let hs = mod_hashes(pick, root)?
+            write_file(dir + "/bur.sum", sum_render(pick, hs))?
+            match pick {
+                MP(paths, _) => Ok(str(len(paths)) + " module(s) downloaded; bur.sum written"),
+            }
+        },
+    }
+}
+
+// mod_verify 校验模块 / mod_verify verifies a module
+pub fn mod_verify(dir) {
+    let pick = mvs_resolve(dir)?
+    let sum = match read_file(dir + "/bur.sum") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.sum: " + m)
+            ""
+        },
+    }
+    let n = sum_check(sum, pick, cache_root())?
+    Ok(str(n) + " module(s) verified")
+}
+
+// mod_edit_require 编辑 require 行 / mod_edit_require edits a require line
+pub fn mod_edit_require(text, path, version) {
+    let mut out = []
+    let mut hit = false
+    for line in split(text, "\n") {
+        let f = str_fields(line)
+        if len(f) >= 2 && f[0] == "require" && f[1] == path {
+            if !hit {
+                push(out, "require " + path + " " + version)
+                hit = true
+            }
+        } else {
+            push(out, line)
+        }
+    }
+    if !hit {
+        while len(out) > 0 && out[len(out) - 1] == "" {
+            let _ = pop(out)
+        }
+        push(out, "require " + path + " " + version)
+        push(out, "")
+    }
+    join(out, "\n")
+}
+
+// mod_get 添加依赖 / mod_get adds a dependency
+pub fn mod_get(dir, spec) {
+    let at = match str_index_of(spec, "@") {
+        Some(ix) => ix,
+        None => {
+            return Err("usage: bur get <path>@<version> (an explicit version is required)")
+            0
+        },
+    }
+    let path = substr(spec, 0, at)
+    let version = substr(spec, at + 1, str_len(spec) - at - 1)
+    if !valid_import_path(path) {
+        return Err("invalid module path \"" + path + "\"")
+    }
+    if !lib::str_has_prefix(version, "v") {
+        return Err("version must look like v1.2.3, got \"" + version + "\"")
+    }
+    if path == "std" || lib::str_has_prefix(path, "std/") {
+        return Err("std ships with the toolchain; it is never fetched")
+    }
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod: " + m)
+            ""
+        },
+    }
+    write_file(dir + "/bur.mod", mod_edit_require(text, path, version))?
+    match mvs_resolve_fetch(dir) {
+        Ok(_) => {},
+        Err(m) => {
+            let _ = write_file(dir + "/bur.mod", text)
+            return Err(m)
+        },
+    }
+    mod_sum_sync(dir)
+}

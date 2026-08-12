@@ -1,24 +1,35 @@
-// bur — the Burryn CLI driver. Parses argv and dispatches to run/check/dis/
-// build/version, defaulting a bare `bur <file|dir>` to run. The compiler
-// itself lives in the burryn.dev/burc/lib package; this file only wires the
-// command surface, mirroring the Go host's main.go + build.go.
+// main.bur — bur CLI 驱动：解析 argv 分派到 run/check/dis/build/fmt/test/mod/get/version，
+// 裸 `bur <file|dir>` 等价 run。编译器主体在子包，这里只接线命令面。
+// The bur CLI driver: parses argv and dispatches to run/check/dis/build/fmt/test/mod/get/version,
+// defaulting a bare `bur <file|dir>` to run. The compiler itself lives in subpackages;
+// this file wires the command surface.
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/backends"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/bytecode"
+import "burryn.dev/compiler/module"
 
-import "burryn.dev/burc/lib"
+// 作者标记，无功能作用，请勿删除。/ Author's mark; no behavior. Do not remove.
+let _author_mark = "OFMeteoriteH ☄"
 
-let version = "0.2.0"
+// 对外版本号 / Public version string
+let version = "0.5.0"
 
-// exit codes mirror the Go host: static (compile) errors, CLI misuse,
-// unreadable input, and runtime traps each get a distinct status.
+// 退出码镜像 Go host：静态错/用法错/读文件失败/运行时 trap 各占一档
+// Exit codes mirror the Go host: static errors, CLI misuse, unreadable input,
+// and runtime traps each get a distinct status
 let exit_static = 1
 let exit_usage = 2
 let exit_no_input = 3
 let _exit_runtime = 4
 
-// pipeline modes shared by run_file/run_module.
+// run_file/run_module 共享的管线模式 / Pipeline modes shared by run_file/run_module
 let mode_run = 0
 let mode_check = 1
 let mode_dis = 2
 
+// main 是 CLI 入口：解析 argv 并分派 / main is the CLI entry: parse argv and dispatch
 fn main() {
     let a = args()
     if len(a) == 0 {
@@ -46,6 +57,16 @@ fn main() {
         dispatch(a[1], mode_dis, [])
     } else if cmd == "build" {
         build_cmd(slice(a, 1, len(a)))
+    } else if cmd == "fmt" {
+        fmt_cmd(slice(a, 1, len(a)))
+    } else if cmd == "mod" {
+        mod_cmd(slice(a, 1, len(a)))
+    } else if cmd == "get" {
+        get_cmd(slice(a, 1, len(a)))
+    } else if cmd == "test" {
+        test_cmd(slice(a, 1, len(a)))
+    } else if cmd == "lsp" {
+        tooling::lsp_serve()
     } else if cmd == "version" || cmd == "-v" || cmd == "--version" {
         println("Burryn " + version + " — the ring beneath Meyrin")
     } else if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -57,6 +78,7 @@ fn main() {
     }
 }
 
+// usage 打印用法并退出 / usage prints usage and exits
 fn usage() {
     println("Burryn " + version + " — a small language forged from Go and Rust")
     println("")
@@ -66,16 +88,162 @@ fn usage() {
     println("  bur <file.bur|dir>     same as run")
     println("  bur check <file|dir>   typecheck only (rustc-style diagnostics)")
     println("  bur build <file|dir>   compile to a native binary via C")
+    println("  bur fmt <file|dir|->   rewrite source in the official format")
     println("  bur dis <file|dir>     disassemble compiled bytecode")
+    println("  bur mod init <path>    write a fresh bur.mod")
+    println("  bur mod tidy [dir]     recompute MVS offline and rewrite bur.sum")
+    println("  bur mod download [dir] fetch the require closure into the cache")
+    println("  bur mod verify [dir]   check cached trees against bur.sum")
+    println("  bur get <path>@<ver>   add or upgrade a require, then download")
+    println("  bur test [dir]         run the test_* fns of *_test.bur files")
     println("  bur version")
     println("")
     println("bur build flags:")
     println("  -o <path>              output path (binary, or C file with --emit c)")
     println("  --emit c               emit generated C instead of a binary")
+    println("  --backend <name>       code backend: c (default), x86, llvm, cranelift, wasm")
+    println("")
+    println("bur fmt flags:")
+    println("  --check                list files that would change; exit 1 if any")
+    println("  -                      read stdin, write the result to stdout")
+    println("")
+    println("bur test flags:")
+    println("  --run <substr>         only run tests whose name contains substr")
+    println("  -v                     print each passing test's output too")
 }
 
-// dispatch routes a path to the file or module pipeline based on whether it
-// names a directory (a bur.mod alongside it marks a module package).
+// fmt_cmd 处理 fmt 子命令：文件/目录/stdin 与 --check
+// fmt_cmd handles the fmt subcommand: file/dir/stdin and --check
+fn fmt_cmd(rest) {
+    let mut check_only = false
+    let mut targets = []
+    for a in rest {
+        if a == "--check" {
+            check_only = true
+        } else {
+            push(targets, a)
+        }
+    }
+    if len(targets) == 0 {
+        usage()
+        exit(exit_usage)
+    }
+    let mut state = [0, 0]
+    for t in targets {
+        if t == "-" {
+            fmt_stdin(state)
+        } else if ends_with(t, ".bur") {
+            fmt_one(t, check_only, state)
+        } else {
+            fmt_dir(strip_trailing_slash(t), check_only, state)
+        }
+    }
+    if state[1] > 0 || check_only && state[0] > 0 {
+        exit(exit_static)
+    }
+}
+
+// fmt_source 格式化单个源码 / fmt_source formats one source
+fn fmt_source(path, src, mut state) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
+            if len(ldiags) > 0 {
+                let _ = emit_errors(ldiags, path, false)
+                state[1] = 1
+                return None
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if len(pdiags) > 0 {
+                        let _ = emit_errors(pdiags, path, false)
+                        state[1] = 1
+                        return None
+                    }
+                    match tooling::format_verified(stmts, src, comments) {
+                        Ok(out) => Some(out),
+                        Err(msg) => {
+                            eprintln("internal error: " + msg)
+                            exit(4)
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// fmt_one 格式化单个文件 / fmt_one formats one file
+fn fmt_one(path, check_only, mut state) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match fmt_source(path, src, state) {
+        Some(out) => {
+            if out != src {
+                if check_only {
+                    println(path)
+                    state[0] = 1
+                } else {
+                    match write_file(path, out) {
+                        Ok(_) => {},
+                        Err(msg) => {
+                            eprintln("error: " + msg)
+                            exit(exit_no_input)
+                        },
+                    }
+                }
+            }
+        },
+        None => {},
+    }
+}
+
+// fmt_stdin 格式化 stdin / fmt_stdin formats stdin
+fn fmt_stdin(mut state) {
+    let src = match read_file("/dev/stdin") {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match fmt_source("<stdin>", src, state) {
+        Some(out) => print(out),
+        None => {},
+    }
+}
+
+// fmt_dir 格式化目录 / fmt_dir formats a directory
+fn fmt_dir(dir, check_only, mut state) {
+    match read_dir(dir) {
+        Ok(names) => {
+            for n in names {
+                if !starts_with(n, ".") {
+                    let p = dir + "/" + n
+                    if ends_with(n, ".bur") {
+                        fmt_one(p, check_only, state)
+                    } else {
+                        match read_dir(p) {
+                            Ok(_) => fmt_dir(p, check_only, state),
+                            Err(_) => {},
+                        }
+                    }
+                }
+            }
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+}
+
+// dispatch 把文件或目录分派到 run/check/dis
+// dispatch sends a file or dir to run/check/dis
 fn dispatch(path, mode, argv) {
     if is_dir(path) {
         run_module(path, mode, argv)
@@ -84,11 +252,12 @@ fn dispatch(path, mode, argv) {
     }
 }
 
-// is_dir treats an existing path with a bur.mod as a module directory.
+// is_dir 判断路径是否为目录 / is_dir tells whether the path is a directory
 fn is_dir(path) {
     file_exists(strip_trailing_slash(path) + "/bur.mod")
 }
 
+// strip_trailing_slash 去尾部斜杠 / strip_trailing_slash removes a trailing slash
 fn strip_trailing_slash(p) {
     if ends_with(p, "/") {
         substr(p, 0, str_len(p) - 1)
@@ -97,28 +266,31 @@ fn strip_trailing_slash(p) {
     }
 }
 
+// ends_with 后缀判断 / ends_with checks a suffix
 fn ends_with(s, suffix) {
     let n = str_len(s)
     let m = str_len(suffix)
     n >= m && substr(s, n - m, m) == suffix
 }
 
+// starts_with 前缀判断 / starts_with checks a prefix
 fn starts_with(s, prefix) {
     let n = str_len(s)
     let m = str_len(prefix)
     n >= m && substr(s, 0, m) == prefix
 }
 
-// diag_is_error reports whether a diagnostic carries the error flag.
+// diag_is_error 判断诊断是否为错误（非警告）
+// diag_is_error tells whether the diagnostic is an error (not a warning)
 fn diag_is_error(d) {
     match d {
-        lib.DiagT.Diag(ie, _, _, _, _, _) => ie,
+        lib::DiagT::Diag(ie, _, _, _, _, _) => ie,
+        lib::DiagT::DiagX(ie, _, _, _, _, _, _, _) => ie,
     }
 }
 
-// run_file executes the script pipeline: lex, parse, typecheck, compile, then
-// run/check/dis per mode. Static diagnostics go to stderr; unreadable input
-// exits 3; static errors exit 1.
+// run_file 单文件管线：lex→parse→check→compile→run
+// run_file runs the single-file pipeline: lex, parse, check, compile, run
 fn run_file(path, mode, argv) {
     let src = match read_file(path) {
         Ok(s) => s,
@@ -127,37 +299,38 @@ fn run_file(path, mode, argv) {
             exit(exit_no_input)
         },
     }
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags) => {
-            if emit_errors(ldiags, false) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
-            match lib.parse(toks) {
-                lib.ParseOut.Parsed(stmts, pdiags) => {
-                    if emit_errors(pdiags, false) {
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
-                    match lib.typecheck_script(stmts) {
-                        lib.CheckOut.Checked(cdiags, _, binds, chan_fors) => {
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, binds, chan_fors, _) => {
                             if mode == mode_check {
-                                run_check(cdiags, binds)
+                                if run_check(cdiags, path, binds) {
+                                    exit(exit_static)
+                                }
                                 return
                             }
-                            if emit_errors(cdiags, true) {
+                            if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
-                            match lib.compile_script(stmts, chan_fors) {
-                                lib.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(lib.dump_diag(d))
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
                                     if mode == mode_dis {
-                                        lib.dump_disasm(0, fnames, fa, fu, fc, fspans, fk,
-                                            eq, ev, ea, lib.line_starts(src))
+                                        tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, lib::line_starts(src))
                                     } else {
-                                        lib.run_program(fnames, ffile, fa, fu, fc, fspans, fk,
-                                            eq, ev, ea, argv)
+                                        bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, [""], [path], [lib::line_starts(src)])
                                     }
                                 },
                             }
@@ -169,41 +342,46 @@ fn run_file(path, mode, argv) {
     }
 }
 
-// run_module mirrors run_file for a module directory: a missing bur.mod exits
-// 3, load/type/compile errors exit 1.
+// run_module 模块管线（目录入口） / run_module runs the module pipeline (directory entry)
 fn run_module(dir0, mode, argv) {
     let dir = strip_trailing_slash(dir0)
     if !file_exists(dir + "/bur.mod") {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
     }
-    match lib.load_module(dir) {
-        lib.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
-            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, binds, chan_fors) => {
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, binds, chan_fors, _) => {
                     if mode == mode_check {
-                        run_check_f(cdiags, cfiles, binds)
+                        if run_check_f(cdiags, cfiles, binds) {
+                            exit(exit_static)
+                        }
                         return
                     }
                     if emit_errors_f(cdiags, cfiles, true) {
                         exit(exit_static)
                     }
-                    match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                        lib.CompileOut.CompileFailed(d, f) => {
-                            eprintln(lib.dump_diag_f(d, f))
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
                             exit(exit_static)
                         },
-                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
                             if mode == mode_dis {
-                                lib.dump_disasm(0, fnames, fa, fu, fc, fspans, fk,
-                                    eq, ev, ea, [])
+                                tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, [])
                             } else {
-                                lib.run_program(fnames, ffile, fa, fu, fc, fspans, fk,
-                                    eq, ev, ea, argv)
+                                bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, ls_files, ls_files, ls_tables)
                             }
                         },
                     }
@@ -213,9 +391,19 @@ fn run_module(dir0, mode, argv) {
     }
 }
 
-// emit_errors renders diagnostics to stderr; with errors_only it skips
-// warnings. Returns whether any error-level diagnostic was seen.
-fn emit_errors(diags, errors_only) {
+// concat_lists 拼接列表 / concat_lists concatenates lists
+fn concat_lists(xss) {
+    let mut acc = []
+    for xs in xss {
+        for x in xs {
+            push(acc, x)
+        }
+    }
+    acc
+}
+
+// emit_errors 输出诊断并返回是否失败 / emit_errors prints diagnostics and returns the failure flag
+fn emit_errors(diags, path, errors_only) {
     let mut errs = false
     for d in diags {
         let is_err = diag_is_error(d)
@@ -223,12 +411,13 @@ fn emit_errors(diags, errors_only) {
             errs = true
         }
         if is_err || !errors_only {
-            eprintln(lib.dump_diag(d))
+            eprintln(tooling::render_diag(d, path))
         }
     }
     errs
 }
 
+// emit_errors_f 按文件输出诊断 / emit_errors_f prints diagnostics per file
 fn emit_errors_f(diags, files, errors_only) {
     let mut errs = false
     let mut i = 0
@@ -238,40 +427,115 @@ fn emit_errors_f(diags, files, errors_only) {
             errs = true
         }
         if is_err || !errors_only {
-            eprintln(lib.dump_diag_f(diags[i], files[i]))
+            eprintln(tooling::render_diag(diags[i], files[i]))
         }
         i = i + 1
     }
     errs
 }
 
-// run_check prints top-level binding types then diagnostics, mirroring the
-// Go host's check output for scripts.
-fn run_check(cdiags, binds) {
+// fold_script_or_exit 折叠脚本（失败即退出）/ fold_script_or_exit folds a script or exits on failure
+fn fold_script_or_exit(stmts, path) {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
+            if emit_errors(diags, path, false) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+// fold_packages_or_exit 折叠包（失败即退出） / fold_packages_or_exit folds packages or exits on failure
+fn fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        frontend::FoldOut::FoldedPkgs(out, diags, files) => {
+            if emit_errors_f(diags, files, false) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+// fold_script_for_dev dev 子命令的脚本折叠 / fold_script_for_dev folds a script for dev subcommands
+fn fold_script_for_dev(stmts) {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
+            for d in diags {
+                println(tooling::dump_diag(d))
+            }
+            if len(diags) > 0 {
+                None
+            } else {
+                Some(out)
+            }
+        },
+        _ => None,
+    }
+}
+
+// fold_packages_for_dev dev 子命令的包折叠
+// fold_packages_for_dev folds packages for dev subcommands
+fn fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        frontend::FoldOut::FoldedPkgs(out, diags, files) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(tooling::dump_diag_f(diags[i], files[i]))
+                i = i + 1
+            }
+            if len(diags) > 0 {
+                None
+            } else {
+                Some(out)
+            }
+        },
+        _ => None,
+    }
+}
+
+// run_check check 模式：类型检查 / run_check runs the typecheck mode
+fn run_check(cdiags, path, binds) {
+    let mut has_err = false
     for line in binds {
         println(line)
     }
     for d in cdiags {
-        println(lib.dump_diag(d))
+        if diag_is_error(d) {
+            has_err = true
+        }
+        println(tooling::render_diag(d, path))
     }
+    has_err
 }
 
+// run_check_f 按文件 check / run_check_f checks per file
 fn run_check_f(cdiags, cfiles, binds) {
+    let mut has_err = false
     for line in binds {
         println(line)
     }
     let mut i = 0
     while i < len(cdiags) {
-        println(lib.dump_diag_f(cdiags[i], cfiles[i]))
+        if diag_is_error(cdiags[i]) {
+            has_err = true
+        }
+        println(tooling::render_diag(cdiags[i], cfiles[i]))
         i = i + 1
     }
+    has_err
 }
 
-// build_cmd parses build flags (-o <path>, --emit c) then compiles the input
-// to C or a native binary. CLI misuse exits 2.
+// build_cmd build 子命令 / build_cmd handles the build subcommand
+// build_cmd 解析 build 参数（backend/输出），分派 C 或 x86 后端
+// build_cmd parses build flags (backend/output), dispatching to the C or x86 backend
 fn build_cmd(rest) {
     let mut out = ""
     let mut emit_c = false
+    let mut backend = "c"
     let mut input = ""
     let mut i = 0
     while i < len(rest) {
@@ -290,6 +554,13 @@ fn build_cmd(rest) {
             }
             emit_c = true
             i = i + 2
+        } else if arg == "--backend" {
+            if i + 1 >= len(rest) {
+                usage()
+                exit(exit_usage)
+            }
+            backend = rest[i + 1]
+            i = i + 2
         } else if starts_with(arg, "-") {
             usage()
             exit(exit_usage)
@@ -306,37 +577,73 @@ fn build_cmd(rest) {
         usage()
         exit(exit_usage)
     }
-    build_input(input, emit_c, out)
+    build_input(input, emit_c, out, backend)
 }
 
-// build_input compiles a file or module to a C translation unit, then either
-// prints/writes the C (emit_c) or hands it to the native C toolchain.
-fn build_input(input, emit_c, out) {
-    let csrc = compile_to_c(input)
-    if emit_c {
-        if out == "" || out == "-" {
-            print(csrc)
-        } else {
-            match write_file(out, csrc) {
-                Ok(_) => {},
-                Err(msg) => {
-                    eprintln("error: " + msg)
-                    exit(exit_no_input)
-                },
+// build_input 解析 build 输入（文件/目录/backend） / build_input resolves the build input (file/dir/backend)
+fn build_input(input, emit_c, out, backend) {
+    if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
+        eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
+        exit(exit_usage)
+    }
+    if backend == "c" {
+        let csrc = compile_to_c(input)
+        if emit_c {
+            if out == "" || out == "-" {
+                print(csrc)
+            } else {
+                match write_file(out, csrc) {
+                    Ok(_) => {},
+                    Err(msg) => {
+                        eprintln("error: " + msg)
+                        exit(exit_no_input)
+                    },
+                }
             }
+        } else {
+            let dst = if out == "" {
+                default_out_name(input)
+            } else {
+                out
+            }
+            build_native(csrc, dst)
         }
-    } else {
+    } else if backend == "x86" {
+        let bytes = compile_to_x86(input)
         let dst = if out == "" {
             default_out_name(input)
         } else {
             out
         }
-        build_native(csrc, dst)
+        match write_file(dst, bytes) {
+            Ok(_) => {
+                match exec("chmod", ["+x", dst]) {
+                    Ok(o) => match o {
+                        Output(code, _, _) => {
+                            if code != 0 {
+                                eprintln("error: chmod +x failed for " + dst)
+                                exit(exit_static)
+                            }
+                        },
+                    },
+                    Err(msg) => {
+                        eprintln("error: chmod failed: " + msg)
+                        exit(exit_static)
+                    },
+                }
+            },
+            Err(msg) => {
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+    } else {
+        eprintln("error: backend '" + backend + "' is not yet implemented")
+        exit(exit_static)
     }
 }
 
-// compile_to_c runs the front end for a file or module and returns the C
-// source, exiting 1 on static errors and 3 on unreadable input.
+// compile_to_c 编译为 C（--emit c 或默认路径） / compile_to_c compiles to C (--emit c or the default path)
 fn compile_to_c(input) {
     if is_dir(input) {
         compile_module_to_c(strip_trailing_slash(input))
@@ -345,6 +652,64 @@ fn compile_to_c(input) {
     }
 }
 
+// compile_to_x86 编译为 x86 ELF / compile_to_x86 compiles to an x86 ELF
+fn compile_to_x86(input) {
+    if is_dir(input) {
+        eprintln("error: x86 backend does not support modules yet")
+        exit(exit_static)
+    } else {
+        compile_file_to_x86(input)
+    }
+}
+
+// compile_file_to_x86 单文件转 x86 二进制
+// compile_file_to_x86 compiles a single file to an x86 binary
+fn compile_file_to_x86(path) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    // 注入 float 运行时（dtoa/strtod 大整数核心），供 parse_float / float 格式化使用
+    // inject the float runtime (bigint dtoa/strtod core) for parse_float / float formatting
+    let injected = match read_file("compiler/lib/float_rt.bur") {
+        Ok(s) => s,
+        Err(_) => "",
+    }
+    match frontend::lex(injected + src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends::x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// compile_file_to_c 单文件转 C 源码 / compile_file_to_c compiles a single file to C
 fn compile_file_to_c(path) {
     let src = match read_file(path) {
         Ok(s) => s,
@@ -353,28 +718,28 @@ fn compile_file_to_c(path) {
             exit(exit_no_input)
         },
     }
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags) => {
-            if emit_errors(ldiags, false) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
                 exit(exit_static)
             }
-            match lib.parse(toks) {
-                lib.ParseOut.Parsed(stmts, pdiags) => {
-                    if emit_errors(pdiags, false) {
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
                         exit(exit_static)
                     }
-                    match lib.typecheck_script(stmts) {
-                        lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
-                            if emit_errors(cdiags, true) {
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
                                 exit(exit_static)
                             }
-                            match lib.compile_script(stmts, chan_fors) {
-                                lib.CompileOut.CompileFailed(d, _) => {
-                                    eprintln(lib.dump_diag(d))
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
-                                    lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)]),
                             }
                         },
                     }
@@ -384,29 +749,35 @@ fn compile_file_to_c(path) {
     }
 }
 
+// compile_module_to_c 模块转 C 源码 / compile_module_to_c compiles a module to C
 fn compile_module_to_c(dir) {
     if !file_exists(dir + "/bur.mod") {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
     }
-    match lib.load_module(dir) {
-        lib.ModOut.ModFailed(diags, dfiles) => {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
             emit_errors_f(diags, dfiles, false)
             exit(exit_static)
         },
-        lib.ModOut.ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
-            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
                     if emit_errors_f(cdiags, cfiles, true) {
                         exit(exit_static)
                     }
-                    match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                        lib.CompileOut.CompileFailed(d, f) => {
-                            eprintln(lib.dump_diag_f(d, f))
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
                             exit(exit_static)
                         },
-                        lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
-                            lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea),
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
                     }
                 },
             }
@@ -414,8 +785,8 @@ fn compile_module_to_c(dir) {
     }
 }
 
-// default_out_name strips any directory and a trailing .bur to name the
-// binary, mirroring the Go host's defaultOutName.
+// default_out_name 默认输出名（去 .bur 后缀）
+// default_out_name derives the default output name (drop the .bur suffix)
 fn default_out_name(path) {
     let p = strip_trailing_slash(path)
     let base = base_name(p)
@@ -426,6 +797,7 @@ fn default_out_name(path) {
     }
 }
 
+// base_name 取路径末段 / base_name returns the last path segment
 fn base_name(p) {
     let mut start = 0
     let mut i = 0
@@ -438,12 +810,7 @@ fn base_name(p) {
     substr(p, start, str_len(p) - start)
 }
 
-// build_native writes the C translation unit to program.c in the current
-// directory and invokes a C compiler, resolving the runtime headers from the
-// fixed relative runtime/ include path (via -Iruntime). With no getenv/mkdir/
-// exe-path natives, $CC is not honored, no temp dir is created, and the
-// runtime headers are located relative to the current working directory —
-// which the bootstrap loop runs from the repo root.
+// build_native 调 cc 产出原生二进制 / build_native invokes cc to produce a native binary
 fn build_native(csrc, out) {
     let cfile = "program.c"
     match write_file(cfile, csrc) {
@@ -459,13 +826,17 @@ fn build_native(csrc, out) {
         eprintln("hint: run without a toolchain using `bur run`")
         exit(exit_static)
     }
-    match exec(cc, ["-O2", "-o", out, cfile, "-Iruntime", "-lm"]) {
+    match exec(cc, ["-O1", "-g1", "-o", out, cfile, "-Iruntime", "-lm"]) {
         Ok(o) => match o {
             Output(code, _, err) => {
                 if code != 0 {
                     eprint_raw(err)
                     eprintln("error: C compiler failed")
                     exit(exit_static)
+                }
+                match exec("rm", [cfile]) {
+                    Ok(_) => {},
+                    Err(_) => {},
                 }
             },
         },
@@ -476,16 +847,14 @@ fn build_native(csrc, out) {
     }
 }
 
-// eprint_raw writes captured compiler stderr without an added newline when it
-// is empty, mirroring inherited stderr as closely as exec() allows.
+// eprint_raw 原样打印到 stderr / eprint_raw prints verbatim to stderr
 fn eprint_raw(s) {
     if str_len(s) > 0 {
         eprintln(s)
     }
 }
 
-// find_cc probes for a working C compiler by name, since exec() cannot honor
-// $CC (no getenv native). Order mirrors the Go host: cc, gcc, clang.
+// find_cc 探测 cc/gcc/clang / find_cc probes for cc/gcc/clang
 fn find_cc() {
     let candidates = ["cc", "gcc", "clang"]
     let mut found = ""
@@ -497,6 +866,7 @@ fn find_cc() {
     found
 }
 
+// cc_works 判断 cc 是否可用 / cc_works tells whether cc is usable
 fn cc_works(name) {
     match exec(name, ["--version"]) {
         Ok(o) => match o {
@@ -506,9 +876,12 @@ fn cc_works(name) {
     }
 }
 
-// dev_cmd exposes the per-stage pipeline dumps used for parity testing. It is
-// intentionally undocumented in usage(); each subcommand mirrors one stage.
+// dev_cmd 隐藏 dev 子命令分派 / dev_cmd dispatches hidden dev subcommands
+// dev_cmd 隐藏调试子命令：分段转储与内部入口
+// dev_cmd hidden debug subcommands: staged dumps and internal entries
 fn dev_cmd(rest) {
+    // dev 隐藏子命令：lex/parse/check/dis 等分段转储
+    // dev hidden subcommands: staged dumps (lex/parse/check/dis, ...)
     if len(rest) < 2 {
         eprintln("usage: bur dev <lex|parse|check|dis|emit-c> <file.bur>")
         eprintln("       bur dev <build-dir|run-dir> <dir>")
@@ -527,6 +900,48 @@ fn dev_cmd(rest) {
         run_file(rest[1], mode_run, slice(rest, 2, len(rest)))
         return
     }
+    if sub == "mod-graph" {
+        dev_mod_graph(strip_trailing_slash(rest[1]))
+        return
+    }
+    if sub == "interface" {
+        dev_interface(strip_trailing_slash(rest[1]))
+        return
+    }
+    if sub == "interface-parse" {
+        dev_interface_parse(rest[1])
+        return
+    }
+    if sub == "embed-std" {
+        if len(rest) < 2 {
+            eprintln("usage: bur dev embed-std <repo-root>")
+            exit(exit_usage)
+        }
+        match lib::embed_std(strip_trailing_slash(rest[1])) {
+            Ok(_) => {},
+            Err(msg) => {
+                eprintln("embed-std:", msg)
+                exit(exit_static)
+            },
+        }
+        return
+    }
+    if sub == "run-test" {
+        if len(rest) < 3 {
+            eprintln("usage: bur dev run-test <dir> <fn>")
+            exit(exit_usage)
+        }
+        run_test_target(strip_trailing_slash(rest[1]), rest[2])
+        return
+    }
+    if sub == "hover" {
+        if len(rest) < 4 {
+            eprintln("usage: bur dev hover <dir> <file> <offset>")
+            exit(exit_usage)
+        }
+        dev_hover(strip_trailing_slash(rest[1]), rest[2], rest[3])
+        return
+    }
     let src = match read_file(rest[1]) {
         Ok(s) => s,
         Err(msg) => {
@@ -543,44 +958,32 @@ fn dev_cmd(rest) {
     } else if sub == "dis" {
         dev_dis(src)
     } else if sub == "emit-c" {
-        dev_emit_c(src)
+        dev_emit_c(src, rest[1])
+    } else if sub == "fmt" {
+        dev_fmt(src)
     } else {
         println("unknown dev command:", sub)
         exit(exit_usage)
     }
 }
 
-fn dev_build_dir(dir) {
-    match lib.load_module(dir) {
-        lib.ModOut.ModFailed(diags, dfiles) => {
-            let mut i = 0
-            while i < len(diags) {
-                println(lib.dump_diag_f(diags[i], dfiles[i]))
-                i = i + 1
-            }
+// dev_interface 处理 dev interface / dev_interface handles dev interface
+// dev_interface 处理 dev interface / dev_interface handles dev interface
+fn dev_interface(dir) {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
         },
-        lib.ModOut.ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports) => {
-            let mut i = 0
-            while i < len(ldiags) {
-                println(lib.dump_diag_f(ldiags[i], lfiles[i]))
-                i = i + 1
-            }
-            match lib.typecheck_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
-                lib.CheckOut.Checked(cdiags, cfiles, _, chan_fors) => {
-                    let mut errs = false
-                    i = 0
-                    while i < len(cdiags) {
-                        println(lib.dump_diag_f(cdiags[i], cfiles[i]))
-                        if diag_is_error(cdiags[i]) {
-                            errs = true
-                        }
-                        i = i + 1
-                    }
-                    if !errs {
-                        match lib.compile_program(pkgs_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
-                            lib.CompileOut.CompileFailed(d, f) => println(lib.dump_diag_f(d, f)),
-                            lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
-                                print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea)),
+        module::ModOut::ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, _, _) => {
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match frontend::typecheck_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib::CheckOut::Checked(diags, dfiles, _, _, interfaces) => {
+                    if !emit_errors_f(diags, dfiles, true) {
+                        let mut i = 0
+                        while i < len(interfaces) {
+                            println("// package " + pkg_paths[i])
+                            print(interfaces[i])
+                            i = i + 1
                         }
                     }
                 },
@@ -589,34 +992,466 @@ fn dev_build_dir(dir) {
     }
 }
 
+// dev_hover 处理 dev hover / dev_hover handles dev hover
+// dev_hover 处理 dev hover / dev_hover handles dev hover
+fn dev_hover(dir, file, offset_str) {
+    let offset = match parse_int(offset_str) {
+        Some(n) => n,
+        None => {
+            eprintln("error: offset must be an integer")
+            exit(exit_usage)
+        },
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, _pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            frontend::lsp_set_recording(true)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(_, _, _, _, _) => {},
+            }
+            frontend::lsp_set_recording(false)
+            println(frontend::lsp_type_at(file, offset))
+        },
+    }
+}
+
+// dev_interface_parse 处理 dev interface-parse
+// dev_interface_parse handles dev interface-parse
+// dev_interface_parse 处理 dev interface-parse
+// dev_interface_parse handles dev interface-parse
+fn dev_interface_parse(path) {
+    match read_file(path) {
+        Ok(src) => match frontend::lex(src) {
+            lib::LexOut::Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    for d in ldiags {
+                        println(tooling::dump_diag(d))
+                    }
+                } else {
+                    match frontend::parse_interface(toks) {
+                        frontend::ParseOut::Parsed(stmts, pdiags) => {
+                            for s in stmts {
+                                tooling::dump_node(s, "")
+                            }
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        },
+                    }
+                }
+            },
+        },
+        Err(msg) => {
+            println("error:", msg)
+            exit(exit_no_input)
+        },
+    }
+}
+
+// dev_mod_graph 处理 dev mod-graph / dev_mod_graph handles dev mod-graph
+// dev_mod_graph 处理 dev mod-graph / dev_mod_graph handles dev mod-graph
+fn dev_mod_graph(dir) {
+    match module::mvs_resolve(dir) {
+        Ok(pick) => {
+            let root = module::cache_root()
+            match pick {
+                module::ModPick::MP(paths, vers) => {
+                    let mut hashes = []
+                    let mut i = 0
+                    while i < len(paths) {
+                        match module::tree_hash(root + "/" + paths[i] + "@" + vers[i]) {
+                            Ok(h) => push(hashes, h),
+                            Err(m) => {
+                                eprintln("error: " + m)
+                                exit(exit_static)
+                            },
+                        }
+                        i = i + 1
+                    }
+                    print(module::sum_render(pick, hashes))
+                },
+            }
+        },
+        Err(m) => {
+            eprintln("error: " + m)
+            exit(exit_static)
+        },
+    }
+}
+
+// mod_report 打印模块报告 / mod_report prints a module report
+fn mod_report(r) {
+    match r {
+        Ok(msg) => println(msg),
+        Err(m) => {
+            eprintln("error: " + m)
+            exit(exit_static)
+        },
+    }
+}
+
+// mod_cmd mod 子命令 / mod_cmd handles the mod subcommand
+fn mod_cmd(rest) {
+    if len(rest) == 0 {
+        eprintln("usage: bur mod <init|tidy|download|verify> [args]")
+        exit(exit_usage)
+    }
+    let sub = rest[0]
+    let dir = if len(rest) >= 2 {
+        strip_trailing_slash(rest[1])
+    } else {
+        "."
+    }
+    if sub == "init" {
+        if len(rest) != 2 {
+            eprintln("usage: bur mod init <module-path>")
+            exit(exit_usage)
+        }
+        if file_exists("bur.mod") {
+            eprintln("error: bur.mod already exists")
+            exit(exit_static)
+        }
+        match module::mod_init_text(rest[1]) {
+            Ok(text) => match write_file("bur.mod", text) {
+                Ok(_) => {},
+                Err(m) => {
+                    eprintln("error: " + m)
+                    exit(exit_no_input)
+                },
+            },
+            Err(m) => {
+                eprintln("error: " + m)
+                exit(exit_usage)
+            },
+        }
+    } else if sub == "tidy" {
+        mod_report(module::mod_tidy(dir))
+    } else if sub == "download" {
+        mod_report(module::mod_download(dir))
+    } else if sub == "verify" {
+        mod_report(module::mod_verify(dir))
+    } else {
+        eprintln("unknown mod command: " + sub)
+        exit(exit_usage)
+    }
+}
+
+// get_cmd get 子命令 / get_cmd handles the get subcommand
+fn get_cmd(rest) {
+    if len(rest) != 1 {
+        eprintln("usage: bur get <path>@<version>")
+        exit(exit_usage)
+    }
+    mod_report(module::mod_get(".", rest[0]))
+}
+
+// self_exe 取自身可执行路径 / self_exe returns the own executable path
+fn self_exe() {
+    match exec("sh", ["-c", "readlink /proc/$PPID/exe"]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    trim(so)
+                } else {
+                    ""
+                }
+            },
+        },
+        Err(_) => "",
+    }
+}
+
+// test_cmd test 子命令 / test_cmd handles the test subcommand
+// test_cmd 测试子命令：发现/运行目标，汇总结果
+// test_cmd runs tests: discovery, targets, summary
+fn test_cmd(rest) {
+    // 测试子命令：解析 --run/-v，发现并运行目标
+    // Test subcommand: parse --run/-v, discover and run targets
+    let mut dir = "."
+    let mut run_filter = ""
+    let mut verbose = false
+    let mut i = 0
+    while i < len(rest) {
+        let a = rest[i]
+        if a == "--run" {
+            if i + 1 >= len(rest) {
+                eprintln("usage: bur test [dir] [--run <substr>] [-v]")
+                exit(exit_usage)
+            }
+            run_filter = rest[i + 1]
+            i = i + 1
+        } else if a == "-v" {
+            verbose = true
+        } else {
+            dir = strip_trailing_slash(a)
+        }
+        i = i + 1
+    }
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    let mut all = []
+    let mut all_dirs = []
+    let mut all_fns = []
+    for rel in module::test_walk(dir) {
+        let pdir = if rel == "." {
+            dir
+        } else {
+            dir + "/" + rel
+        }
+        match module::test_discover(pdir) {
+            Ok(ns) => {
+                for n in ns {
+                    if rel == "." {
+                        push(all, n)
+                    } else {
+                        push(all, rel + "/" + n)
+                    }
+                    push(all_dirs, pdir)
+                    push(all_fns, n)
+                }
+            },
+            Err(m) => {
+                eprintln("error: " + m)
+                exit(exit_no_input)
+            },
+        }
+    }
+    let mut selected = []
+    let mut sel_dirs = []
+    let mut sel_fns = []
+    let mut ai = 0
+    while ai < len(all) {
+        if run_filter == "" || str_contains(all[ai], run_filter) {
+            push(selected, all[ai])
+            push(sel_dirs, all_dirs[ai])
+            push(sel_fns, all_fns[ai])
+        }
+        ai = ai + 1
+    }
+    if len(selected) == 0 {
+        println("no tests to run")
+        return
+    }
+    let self_path = self_exe()
+    if self_path == "" {
+        eprintln("error: cannot resolve own binary via readlink /proc/self/exe")
+        exit(exit_no_input)
+    }
+    let mut failed = 0
+    let mut si = 0
+    while si < len(selected) {
+        let name = selected[si]
+        match exec("env", ["BUR_DETERMINISTIC=1", self_path, "dev", "run-test", sel_dirs[si], sel_fns[si]]) {
+            Ok(o) => match o {
+                Output(code, so, se) => {
+                    if code == 0 {
+                        println("ok   " + name)
+                        if verbose && so != "" {
+                            print(so)
+                        }
+                    } else {
+                        failed = failed + 1
+                        println("FAIL " + name + " (exit " + str(code) + ")")
+                        if so != "" {
+                            print(so)
+                        }
+                        if trim(se) != "" {
+                            println(trim(se))
+                        }
+                    }
+                },
+            },
+            Err(m) => {
+                failed = failed + 1
+                println("FAIL " + name + ": " + m)
+            },
+        }
+        si = si + 1
+    }
+    if failed == 0 {
+        println("PASS  " + str(len(selected)) + " test(s)")
+    } else {
+        println("FAIL  " + str(failed) + " of " + str(len(selected)) + " test(s)")
+        exit(exit_static)
+    }
+}
+
+// parent_dir 取父目录 / parent_dir returns the parent directory
+fn parent_dir(p) {
+    let mut cut = -1
+    let mut i = 0
+    while i < str_len(p) {
+        if char_at(p, i) == "/" {
+            cut = i
+        }
+        i = i + 1
+    }
+    if cut < 0 {
+        if p == "." {
+            ""
+        } else {
+            "."
+        }
+    } else if cut == 0 {
+        if p == "/" {
+            ""
+        } else {
+            "/"
+        }
+    } else {
+        substr(p, 0, cut)
+    }
+}
+
+// module_root_of 查找模块根（bur.mod 所在处） / module_root_of finds the module root (where bur.mod lives)
+fn module_root_of(p0) {
+    let mut p = strip_trailing_slash(p0)
+    let mut root = ""
+    let mut going = true
+    while going {
+        if file_exists(p + "/bur.mod") {
+            root = p
+            going = false
+        } else {
+            let d = parent_dir(p)
+            if d == "" {
+                going = false
+            } else {
+                p = d
+            }
+        }
+    }
+    root
+}
+
+// run_test_target 运行测试目标 / run_test_target runs a test target
+fn run_test_target(dir0, fnname) {
+    let dir = strip_trailing_slash(dir0)
+    let root = module_root_of(dir)
+    if root == "" {
+        eprintln("error: bur.mod not found in " + dir + " or any parent directory")
+        exit(exit_no_input)
+    }
+    let rel = if root == dir {
+        "."
+    } else {
+        substr(dir, str_len(root) + 1, str_len(dir) - str_len(root) - 1)
+    }
+    match module::load_module_test(root, rel, fnname) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
+                            exit(exit_static)
+                        },
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                            bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [], ls_files, ls_files, ls_tables)
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// dev_build_dir 处理 dev build-dir / dev_build_dir handles dev build-dir
+// dev_build_dir 处理 dev build-dir / dev_build_dir handles dev build-dir
+fn dev_build_dir(dir) {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(tooling::dump_diag_f(diags[i], dfiles[i]))
+                i = i + 1
+            }
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let mut i = 0
+            while i < len(ldiags) {
+                println(tooling::dump_diag_f(ldiags[i], lfiles[i]))
+                i = i + 1
+            }
+            match fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                Some(checked_stmts) => match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                    lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                        let mut errs = false
+                        i = 0
+                        while i < len(cdiags) {
+                            println(tooling::dump_diag_f(cdiags[i], cfiles[i]))
+                            if diag_is_error(cdiags[i]) {
+                                errs = true
+                            }
+                            i = i + 1
+                        }
+                        if !errs {
+                            let ls_files = concat_lists(pkgs_fpaths)
+                            let ls_tables = concat_lists(pkgs_lstarts)
+                            match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, f) => println(tooling::dump_diag_f(d, f)),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
+                            }
+                        }
+                    },
+                },
+                None => {},
+            }
+        },
+    }
+}
+
+// dev_lex 处理 dev lex / dev_lex handles dev lex
+// dev_lex 处理 dev lex / dev_lex handles dev lex
 fn dev_lex(src) {
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, diags) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, diags, _) => {
             for t in toks {
-                println(lib.dump_token(t))
+                println(tooling::dump_token(t))
             }
             for d in diags {
-                println(lib.dump_diag(d))
+                println(tooling::dump_diag(d))
             }
         },
     }
 }
 
+// dev_parse 处理 dev parse / dev_parse handles dev parse
+// dev_parse 处理 dev parse / dev_parse handles dev parse
 fn dev_parse(src) {
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(lib.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match lib.parse(toks) {
-                    lib.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         for s in stmts {
-                            lib.dump_node(s, "")
+                            tooling::dump_node(s, "")
                         }
                         for d in pdiags {
-                            println(lib.dump_diag(d))
+                            println(tooling::dump_diag(d))
                         }
                     },
                 }
@@ -625,29 +1460,66 @@ fn dev_parse(src) {
     }
 }
 
+// dev_check 处理 dev check / dev_check handles dev check
+// dev_check 处理 dev check / dev_check handles dev check
 fn dev_check(src) {
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(lib.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match lib.parse(toks) {
-                    lib.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(lib.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
-                            match lib.typecheck_script(stmts) {
-                                lib.CheckOut.Checked(cdiags, _, binds, _) => {
-                                    for line in binds {
-                                        println(line)
-                                    }
-                                    for d in cdiags {
-                                        println(lib.dump_diag(d))
-                                    }
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, binds, _, _) => {
+                                        for line in binds {
+                                            println(line)
+                                        }
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                        }
+                                    },
+                                },
+                                None => {},
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// dev_fmt 处理 dev fmt / dev_fmt handles dev fmt
+// dev_fmt 处理 dev fmt / dev_fmt handles dev fmt
+fn dev_fmt(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match tooling::format_verified(stmts, src, comments) {
+                                Ok(out) => print(out),
+                                Err(msg) => {
+                                    eprintln("internal error: " + msg)
+                                    exit(4)
                                 },
                             }
                         }
@@ -658,39 +1530,42 @@ fn dev_check(src) {
     }
 }
 
+// dev_dis 处理 dev dis / dev_dis handles dev dis
+// dev_dis 处理 dev dis / dev_dis handles dev dis
 fn dev_dis(src) {
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags) => {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(lib.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match lib.parse(toks) {
-                    lib.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(lib.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
-                            match lib.typecheck_script(stmts) {
-                                lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
-                                    let mut errs = false
-                                    for d in cdiags {
-                                        println(lib.dump_diag(d))
-                                        if diag_is_error(d) {
-                                            errs = true
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
                                         }
-                                    }
-                                    if !errs {
-                                        match lib.compile_script(stmts, chan_fors) {
-                                            lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
-                                            lib.CompileOut.Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) =>
-                                                lib.dump_disasm(0, fnames, fa, fu, fc, fs, fk,
-                                                    eq, ev, ea, lib.line_starts(src)),
+                                        if !errs {
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => tooling::dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib::line_starts(src)),
+                                            }
                                         }
-                                    }
+                                    },
                                 },
+                                None => {},
                             }
                         }
                     },
@@ -700,38 +1575,42 @@ fn dev_dis(src) {
     }
 }
 
-fn dev_emit_c(src) {
-    match lib.lex(src) {
-        lib.LexOut.Lexed(toks, ldiags) => {
+// dev_emit_c 处理 dev emit-c / dev_emit_c handles dev emit-c
+// dev_emit_c 处理 dev emit-c / dev_emit_c handles dev emit-c
+fn dev_emit_c(src, path) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
             if len(ldiags) > 0 {
                 for d in ldiags {
-                    println(lib.dump_diag(d))
+                    println(tooling::dump_diag(d))
                 }
             } else {
-                match lib.parse(toks) {
-                    lib.ParseOut.Parsed(stmts, pdiags) => {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
                         if len(pdiags) > 0 {
                             for d in pdiags {
-                                println(lib.dump_diag(d))
+                                println(tooling::dump_diag(d))
                             }
                         } else {
-                            match lib.typecheck_script(stmts) {
-                                lib.CheckOut.Checked(cdiags, _, _, chan_fors) => {
-                                    let mut errs = false
-                                    for d in cdiags {
-                                        println(lib.dump_diag(d))
-                                        if diag_is_error(d) {
-                                            errs = true
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
                                         }
-                                    }
-                                    if !errs {
-                                        match lib.compile_script(stmts, chan_fors) {
-                                            lib.CompileOut.CompileFailed(d, _) => println(lib.dump_diag(d)),
-                                            lib.CompileOut.Compiled(fnames, ffile, fa, fu, fc, _, fk, eq, ev, ea) =>
-                                                print(lib.cgen_program_to_buf(fnames, ffile, fa, fu, fc, fk, eq, ev, ea)),
+                                        if !errs {
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(backends::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)])),
+                                            }
                                         }
-                                    }
+                                    },
                                 },
+                                None => {},
                             }
                         }
                     },

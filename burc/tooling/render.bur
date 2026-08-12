@@ -1,0 +1,131 @@
+// render.bur — rustc 风格诊断渲染：多 span 标注 + 结构化修复建议。
+// rustc-style diagnostic rendering: multi-span annotations and structured fix suggestions.
+
+import "burryn.dev/compiler/lib"
+
+// pad_num 数字零填充（行号对齐用）/ pad_num zero-pads a number (line-number alignment)
+fn pad_num(n, w) {
+    let s = str(n)
+    let mut out = s
+    while str_len(out) < w {
+        out = " " + out
+    }
+    out
+}
+
+// spaces 生成 n 个空格 / spaces produces n spaces
+fn spaces(n) {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    out
+}
+
+// carets 生成 n 个脱字符 / carets produces n carets
+fn carets(n) {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + "^"
+        i = i + 1
+    }
+    out
+}
+
+// line_text 取行文本 / line_text returns a line's text
+fn line_text(src, starts, ln) {
+    let s0 = starts[ln - 1]
+    let e0 = if ln < len(starts) {
+        starts[ln] - 1
+    } else {
+        str_len(src)
+    }
+    if e0 > s0 {
+        substr(src, s0, e0 - s0)
+    } else {
+        ""
+    }
+}
+
+// snippet 生成带标注的代码片段 / snippet builds a code snippet with annotations
+fn snippet(mut parts, src, starts, file, s, e, label) {
+    let ln = lib::line_of(starts, s)
+    let col = s - starts[ln - 1] + 1
+    push(parts, "  --> " + file + ":" + str(ln) + ":" + str(col) + "\n")
+    let text = line_text(src, starts, ln)
+    let line_end = starts[ln - 1] + str_len(text)
+    let stop = if e < line_end {
+        e
+    } else {
+        line_end
+    }
+    let width = if stop > s {
+        stop - s
+    } else {
+        1
+    }
+    let nw = str_len(str(ln))
+    push(parts, spaces(nw + 1) + "|\n")
+    push(parts, pad_num(ln, nw) + " | " + text + "\n")
+    let mark = spaces(nw + 1) + "| " + spaces(col - 1) + carets(width)
+    if label != "" {
+        push(parts, mark + " " + label + "\n")
+    } else {
+        push(parts, mark + "\n")
+    }
+}
+
+// render_parts 渲染诊断各部分 / render_parts renders diagnostic parts
+fn render_parts(is_err, code, msg, help, s, e, file, labs, fixes) {
+    let mut parts = []
+    let kind = if is_err {
+        "error"
+    } else {
+        "warning"
+    }
+    push(parts, kind + "[" + code + "]: " + msg + "\n")
+    match read_file(file) {
+        Ok(src) => {
+            let starts = lib::line_starts(src)
+            snippet(parts, src, starts, file, s, e, "")
+            for lab in labs {
+                match lab {
+                    lib::LabelT::Lab(ls, le, ltext) => {
+                        push(parts, "note:\n")
+                        snippet(parts, src, starts, file, ls, le, ltext)
+                    },
+                }
+            }
+        },
+        Err(_) => {
+            push(parts, "  --> " + file + ":" + str(s) + ".." + str(e) + " (source unavailable)\n")
+        },
+    }
+    if help != "" {
+        push(parts, "  = help: " + help + "\n")
+    }
+    for fx in fixes {
+        match fx {
+            lib::FixT::Fix(_, _, rep, desc) => {
+                if rep == "" {
+                    push(parts, "  = fix: " + desc + "\n")
+                } else {
+                    push(parts, "  = fix: " + desc + ": `" + rep + "`\n")
+                }
+            },
+        }
+    }
+    join(parts, "")
+}
+
+// render_diag 是诊断渲染入口 / render_diag is the diagnostic render entry
+pub fn render_diag(d, file) {
+    let out = match d {
+        lib::DiagT::Diag(ie, code, msg, help, s, e) => render_parts(ie, code, msg, help, s, e, file, [], []),
+        lib::DiagT::DiagX(ie, code, msg, help, s, e, labs, fixes) => render_parts(ie, code, msg, help, s, e, file, labs, fixes),
+    }
+    substr(out, 0, str_len(out) - 1)
+}

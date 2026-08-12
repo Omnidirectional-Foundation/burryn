@@ -25,7 +25,10 @@ var tokDumpNames = []string{"TLParen", "TRParen", "TLBrace", "TRBrace",
 	"TArrow", "TLArrow", "TThinArrow", "TIdent", "TString", "TInt", "TFloat",
 	"TLet", "TMut", "TFn", "TIf", "TElse", "TWhile", "TFor", "TIn", "TReturn",
 	"TTrue", "TFalse", "TEnum", "TMatch", "TSpawn", "TBreak", "TContinue",
-	"TPub", "TImport", "TSelect", "TEOF"}
+	"TPub", "TImport", "TSelect", "TEOF", "TComment", "TInterpStart",
+	"TInterpMid", "TInterpEnd", "TPipe", "TConst", "TDefer", "TRecord",
+	"TType", "TBar", "TColonColon", "TDotDot", "TPlusEq", "TMinusEq",
+	"TStarEq", "TSlashEq", "TPercentEq", "TCapture"}
 
 // dumpEscape mirrors burc/dump.bur's dump_escape: quote the string, escape
 // backslash/newline/tab/quote, pass every other byte through raw.

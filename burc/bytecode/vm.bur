@@ -1,0 +1,2977 @@
+// vm.bur — 字节码解释器 + 运行时。
+// Bytecode interpreter and runtime.
+// 值即 Val：标量与字符串内联；可变的或带身份的对象（list/map/closure/upvalue/枚举实例/channel/native/枚举类型/变体构造器）
+// 活在由 int 句柄索引的平行 mut 列表 arena 里——mut 不穿透枚举字段，因此用 arena 绕过。
+// Values are Val: scalars and strings inline; mutable or identity-bearing objects
+// live in a tagged arena
+// of parallel mut lists reached through int handles, because mut does not penetrate enum fields.
+// 解释堆自带从 GC 移植的 mark-sweep 回收器：句柄是宿主 GC 无法追踪的 int，槽位存活由 VM 自己判定；
+// 释放的槽丢弃负载（让宿主 GC 回收内存）并进入空闲链表复用。
+// The interpreted heap has its own mark-sweep collector ported from the GC:
+// handles are ints the host
+// GC cannot trace, so slot liveness is the VM's own job; freed slots drop
+// payloads and go on a free list.
+// fiber 是平行 mut 列表中的普通数据——调度器与宿主同线程的 FIFO 就绪队列；
+// 运行时 trap 直接打印到 stderr 并 exit(4)：trap 总是结束程序，无需展开。
+// Fibers are plain data in parallel mut lists; the scheduler is the same FIFO
+// ready queue on one host
+// thread. Runtime traps print to stderr and exit(4) directly: a trap always ends the program.
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// 解释值 / Interpreted value
+enum Val {
+    VUnit,
+    VBool(bool),
+    VInt(int),
+    VFloat(float),
+    VStr(str),
+    VObj(int),
+}
+
+// channel 尝试接收的结果（语言无 tuple）/ chan_try_recv result (the language has no tuples)
+enum RecvRes {
+    RecvGot(Val),
+    RecvNone,
+}
+
+// 堆对象类型 / Heap object kinds
+let ot_free = 0
+let ot_list = 1
+let ot_map = 2
+let ot_closure = 3
+let ot_upval = 4
+let ot_enuminst = 5
+let ot_channel = 6
+let ot_native = 7
+let ot_enumtype = 8
+let ot_ctor = 9
+let ot_record = 10
+let ot_tuple = 11
+
+// fiber 状态机 / Fiber states
+let fs_ready = 0
+let fs_blocked_send = 1
+let fs_blocked_recv = 2
+let fs_blocked_select = 3
+let fs_done = 4
+let fs_blocked_timer = 5
+let fs_blocked_io = 6
+let fs_blocked_net = 7
+let fs_blocked_stdin = 8
+
+// 调度等待原因 / Scheduler wait reasons
+let wait_timer = 1
+let wait_exec = 2
+let wait_net = 3
+
+// 协作调度时间片：旋转 fiber 每 10000 条指令让出一次
+// Cooperative time slice: a spinning fiber yields every 10000 instructions
+let vm_time_slice = 10000
+
+// run_program 是运行入口：装载平行表（代码/常量/枚举元数据），创建主 fiber，进入调度器
+// run_program is the entry: load the parallel tables (code/constants/enum metadata),
+// create the main fiber, enter the scheduler
+pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args, ls_files, ls_names, ls_tables) {
+    let max_int = 9223372036854775807
+    let min_int = -9223372036854775807 - 1
+
+    let mut o_tag = []
+    let mut o_mark = []
+    let mut o_vals = []
+    let mut o_keys = []
+    let mut o_idxi = []
+    let mut o_idxs = []
+    let mut o_i1 = []
+    let mut o_i2 = []
+    let mut o_b1 = []
+    let mut o_v1 = []
+    let mut o_h1 = []
+    let mut o_h2 = []
+    let mut o_h3 = []
+    // 闭包 upvalue 槽（[Value]）：值捕获存快照值，ref 捕获存 VObj(cell)
+    // closure upvalue slots ([Value]): value capture stores a snapshot, ref capture stores VObj(cell)
+    let mut o_cu = []
+    let mut free_slots = []
+    let mut pinned = []
+    let mut obj_count = 0
+    let mut gc_threshold = 256
+    let mut gc_total_alloc = 0
+    let mut gc_cycles_n = 0
+    let mut vm_on = false
+    let mut gray = []
+
+    let mut globals = map()
+    let mut fb_stack = []
+    let mut fb_status = []
+    let mut fb_sendval = []
+    let mut fb_selectch = []
+    let mut fb_openuv = []
+    let mut fb_fr_cl = []
+    let mut fb_fr_ip = []
+    let mut fb_fr_base = []
+    let mut fb_fr_callip = []
+    let mut fb_fr_defers = []
+    let mut fb_fr_dstash = []
+    let mut fb_fr_dact = []
+    let mut fb_wakeat = []
+    let mut fb_ioproc = []
+    let mut fb_iohas = []
+    let mut fb_iores = []
+    let mut fb_netop = []
+    let mut fb_nethandle = []
+    let mut fb_netdata = []
+    let mut fb_netmax = []
+    let mut fb_stdinmax = []
+    let mut ready = []
+    let mut main_fiber = 0
+    let mut park_recv = -1
+    let mut park_sleep = -1.0
+    let mut park_io = -1
+    let mut park_netop = -1
+    let mut park_nethandle = -1
+    let mut park_netdata = ""
+    let mut park_netmax = 0
+    let mut park_stdinmax = -1
+    let mut ntimers = 0
+    let mut nio = 0
+    let mut nio_net = 0
+    let mut nio_stdin = 0
+    let mut wait_fiber = []
+    let mut wait_kind = []
+    let mut wait_deadline = []
+    let mut wait_handle = []
+    let mut yield_flag = false
+    let mut opt_enum = -1
+    let mut res_enum = -1
+    let mut out_enum = -1
+    let mut k_vals = []
+
+    let mut cur_f = -1
+    let mut cur_ip = 0
+
+    // trap 打印运行时错误并 exit(4) / trap prints a runtime error and exits with code 4
+    fn trap(msg) {
+        eprintln("runtime error: " + msg)
+        if cur_f >= 0 {
+            let mut d = len(fb_fr_cl[cur_f]) - 1
+            while d >= 0 {
+                let fnh = o_i1[fb_fr_cl[cur_f][d]]
+                let ip = if d == len(fb_fr_cl[cur_f]) - 1 {
+                    cur_ip
+                } else {
+                    fb_fr_callip[cur_f][d + 1]
+                }
+                let name = if f_name[fnh] != "" {
+                    f_name[fnh]
+                } else {
+                    "<fn>"
+                }
+                let mut li = -1
+                let mut i = 0
+                while i < len(ls_files) {
+                    if ls_files[i] == f_file[fnh] {
+                        li = i
+                        i = len(ls_files)
+                    } else {
+                        i = i + 1
+                    }
+                }
+                let file = if li >= 0 {
+                    ls_names[li]
+                } else {
+                    f_file[fnh]
+                }
+                if file != "" {
+                    let ln = if li >= 0 && ip < len(f_spans[fnh]) {
+                        match f_spans[fnh][ip] {
+                            frontend::SpanT::Sp(s0, _) => lib::line_of(ls_tables[li], s0),
+                        }
+                    } else {
+                        0
+                    }
+                    eprintln("  at " + name + " (" + file + ":" + str(ln) + ")")
+                }
+                d = d - 1
+            }
+        }
+        exit(4)
+    }
+
+    // rd_u16 读 u16 操作数 / rd_u16 reads a u16 operand
+    fn rd_u16(code, ip) {
+        code[ip] * 256 + code[ip + 1]
+    }
+
+    // is_str 判断值是否为字符串 / is_str tells whether v is a string
+    fn is_str(v) {
+        match v {
+            VStr(_) => true,
+            _ => false,
+        }
+    }
+    // str_of 取字符串负载 / str_of extracts the string payload
+    fn str_of(v) {
+        match v {
+            VStr(s) => s,
+            _ => "",
+        }
+    }
+    // is_int 判断值是否为 int / is_int tells whether v is an int
+    fn is_int(v) {
+        match v {
+            VInt(_) => true,
+            _ => false,
+        }
+    }
+    // int_of 取 int 负载 / int_of extracts the int payload
+    fn int_of(v) {
+        match v {
+            VInt(n) => n,
+            _ => 0,
+        }
+    }
+    // is_bool 判断值是否为 bool / is_bool tells whether v is a bool
+    fn is_bool(v) {
+        match v {
+            VBool(_) => true,
+            _ => false,
+        }
+    }
+    // bool_of 取 bool 负载 / bool_of extracts the bool payload
+    fn bool_of(v) {
+        match v {
+            VBool(b) => b,
+            _ => false,
+        }
+    }
+    // is_num 判断值是否为数字（int/float）/ is_num tells whether v is numeric (int/float)
+    fn is_num(v) {
+        match v {
+            VInt(_) => true,
+            VFloat(_) => true,
+            _ => false,
+        }
+    }
+    // num_f 把数字值转为 float / num_f converts a numeric value to float
+    fn num_f(v) {
+        match v {
+            VInt(n) => to_float(n),
+            VFloat(x) => x,
+            _ => 0.0,
+        }
+    }
+    // obj_h 取堆对象句柄 / obj_h extracts the heap-object handle
+    fn obj_h(v) {
+        match v {
+            VObj(h) => h,
+            _ => -1,
+        }
+    }
+    // tagged_h 取带 tag 的句柄 / tagged_h extracts the tag and handle
+    fn tagged_h(v, t) {
+        match v {
+            VObj(h) => if o_tag[h] == t {
+                h
+            } else {
+                -1
+            },
+            _ => -1,
+        }
+    }
+
+    // type_name 取值类型名（错误消息用）/ type_name names a value's type (error messages)
+    fn type_name(v) {
+        match v {
+            VUnit => "unit",
+            VBool(_) => "bool",
+            VInt(_) => "int",
+            VFloat(_) => "float",
+            VStr(_) => "string",
+            VObj(h) => {
+                let t = o_tag[h]
+                if t == ot_list {
+                    "list"
+                } else if t == ot_map {
+                    "map"
+                } else if t == ot_closure {
+                    "function"
+                } else if t == ot_upval {
+                    "upvalue"
+                } else if t == ot_enuminst {
+                    en_qual[o_i1[h]]
+                } else if t == ot_channel {
+                    "channel"
+                } else if t == ot_native {
+                    "native function"
+                } else if t == ot_enumtype {
+                    "enum"
+                } else if t == ot_record {
+                    "record"
+                } else if t == ot_tuple {
+                    "tuple"
+                } else {
+                    "variant constructor"
+                }
+            },
+        }
+    }
+
+    // format_val 把值转文本（可选加引号）/ format_val renders a value as text (optionally quoted)
+    fn format_val(v, quote) {
+        match v {
+            VUnit => "()",
+            VBool(b) => str(b),
+            VInt(n) => str(n),
+            VFloat(x) => str(x),
+            VStr(s) => if quote {
+                lib::go_quote(s)
+            } else {
+                s
+            },
+            VObj(h) => {
+                let t = o_tag[h]
+                if t == ot_list {
+                    let mut parts = []
+                    for e in o_vals[h] {
+                        push(parts, format_val(e, true))
+                    }
+                    "[" + join(parts, ", ") + "]"
+                } else if t == ot_map {
+                    let mut parts = []
+                    let mut i = 0
+                    while i < len(o_keys[h]) {
+                        push(parts, format_val(o_keys[h][i], true) + ": " + format_val(o_vals[h][i], true))
+                        i = i + 1
+                    }
+                    "" + chr(123) + "" + join(parts, ", ") + "}"
+                } else if t == ot_tuple {
+                    let mut parts = []
+                    for e in o_vals[h] {
+                        push(parts, format_val(e, true))
+                    }
+                    "(" + join(parts, ", ") + ")"
+                } else if t == ot_closure {
+                    let name = f_name[o_i1[h]]
+                    if name == "" {
+                        "<fn anonymous>"
+                    } else {
+                        "<fn " + name + ">"
+                    }
+                } else if t == ot_native {
+                    "<native " + lib::native_names[o_i1[h]] + ">"
+                } else if t == ot_enumtype {
+                    "<enum " + en_qual[o_i1[h]] + ">"
+                } else if t == ot_ctor {
+                    "<variant " + en_qual[o_i1[h]] + "." + en_vnames[o_i1[h]][o_i2[h]] + ">"
+                } else if t == ot_enuminst {
+                    let name = en_vnames[o_i1[h]][o_i2[h]]
+                    if len(o_vals[h]) == 0 {
+                        name
+                    } else {
+                        let mut parts = []
+                        for e in o_vals[h] {
+                            push(parts, format_val(e, true))
+                        }
+                        name + "(" + join(parts, ", ") + ")"
+                    }
+                } else if t == ot_channel {
+                    "<chan cap=" + str(o_i1[h]) + " len=" + str(len(o_vals[h])) + ">"
+                } else if t == ot_record {
+                    let mut parts = []
+                    let mut i = 0
+                    while i < len(o_keys[h]) {
+                        let kname = match o_keys[h][i] {
+                            VStr(s) => s,
+                            _ => "?",
+                        }
+                        push(parts, kname + ": " + format_val(o_vals[h][i], true))
+                        i = i + 1
+                    }
+                    "record " + chr(123) + " " + join(parts, ", ") + " " + chr(125)
+                } else {
+                    "?"
+                }
+            },
+        }
+    }
+
+    // eq_val 比较值相等（结构化）/ eq_val compares values structurally
+    fn eq_val(a, b) {
+        match a {
+            VUnit => match b {
+                VUnit => true,
+                _ => false,
+            },
+            VBool(x) => match b {
+                VBool(y) => x == y,
+                _ => false,
+            },
+            VInt(x) => match b {
+                VInt(y) => x == y,
+                VFloat(y) => to_float(x) == y,
+                _ => false,
+            },
+            VFloat(x) => match b {
+                VFloat(y) => x == y,
+                VInt(y) => x == to_float(y),
+                _ => false,
+            },
+            VStr(x) => match b {
+                VStr(y) => x == y,
+                _ => false,
+            },
+            VObj(x) => match b {
+                VObj(y) => {
+                    let tx = o_tag[x]
+                    let ty = o_tag[y]
+                    // 列表相等：同长 + 逐元素递归
+                    // List equality: same length plus element-wise recursion
+                    if tx == ot_list && ty == ot_list {
+                        if len(o_vals[x]) != len(o_vals[y]) {
+                            false
+                        } else {
+                            let mut same = true
+                            let mut i = 0
+                            while i < len(o_vals[x]) {
+                                if !eq_val(o_vals[x][i], o_vals[y][i]) {
+                                    same = false
+                                    break
+                                }
+                                i = i + 1
+                            }
+                            same
+                        }
+                        // map 相等：同键数 + 按键逐值比较（保插入序）
+                        // Map equality: same key count, compare by key (insertion order kept)
+                    } else if tx == ot_map && ty == ot_map {
+                        if len(o_keys[x]) != len(o_keys[y]) {
+                            false
+                        } else {
+                            let mut same = true
+                            let mut i = 0
+                            while i < len(o_keys[x]) {
+                                let pos = match o_keys[x][i] {
+                                    VInt(n) => match get(o_idxi[y], n) {
+                                        Some(p) => p,
+                                        None => -1,
+                                    },
+                                    VStr(s) => match get(o_idxs[y], s) {
+                                        Some(p) => p,
+                                        None => -1,
+                                    },
+                                    _ => -1,
+                                }
+                                if pos < 0 {
+                                    same = false
+                                    break
+                                }
+                                if !eq_val(o_vals[x][i], o_vals[y][pos]) {
+                                    same = false
+                                    break
+                                }
+                                i = i + 1
+                            }
+                            same
+                        }
+                        // 枚举实例相等：枚举身份 + 变体 tag + 字段逐值
+                        // Enum instances: same enum, same variant tag, field-wise values
+                    } else if tx == ot_enuminst && ty == ot_enuminst {
+                        if o_i1[x] != o_i1[y] || o_i2[x] != o_i2[y] {
+                            false
+                        } else {
+                            let mut same = true
+                            let mut i = 0
+                            while i < len(o_vals[x]) {
+                                if !eq_val(o_vals[x][i], o_vals[y][i]) {
+                                    same = false
+                                    break
+                                }
+                                i = i + 1
+                            }
+                            same
+                        }
+                        // record 相等：字段集一致 + 同名逐值
+                        // Records: same field set, compare by name
+                    } else if tx == ot_record && ty == ot_record {
+                        if len(o_keys[x]) != len(o_keys[y]) {
+                            false
+                        } else {
+                            let mut same = true
+                            let mut i = 0
+                            while i < len(o_keys[x]) {
+                                if o_keys[x][i] != o_keys[y][i] || !eq_val(o_vals[x][i], o_vals[y][i]) {
+                                    same = false
+                                    i = len(o_keys[x])
+                                }
+                                i = i + 1
+                            }
+                            same
+                        }
+                    } else {
+                        x == y
+                    }
+                },
+                _ => false,
+            },
+        }
+    }
+
+    // mark_val 标记一个值（GC）/ mark_val marks one value (GC)
+    fn mark_val(v) {
+        match v {
+            VObj(h) => {
+                if !o_mark[h] {
+                    o_mark[h] = true
+                    push(gray, h)
+                }
+            },
+            _ => {},
+        }
+    }
+    // mark_obj 标记一个对象（GC）/ mark_obj marks one object (GC)
+    fn mark_obj(h) {
+        if !o_mark[h] {
+            o_mark[h] = true
+            push(gray, h)
+        }
+    }
+
+    // collect 触发一次 mark-sweep 回收 / collect triggers a mark-sweep collection
+    // collect 标记存活对象（根：值栈、调用帧、channel、defer 栈）后清扫
+    // collect marks live objects (roots: value stacks, frames, channels, defers) then sweeps
+    fn collect() {
+        // 根集：pinned 对象、全局表、所有 fiber 的栈与调用帧
+        // Roots: pinned objects, the global table, every fiber's stacks and frames
+        gc_cycles_n = gc_cycles_n + 1
+        gray = []
+
+        for h in pinned {
+            mark_obj(h)
+        }
+        for k in keys(globals) {
+            match get(globals, k) {
+                Some(v) => mark_val(v),
+                None => {},
+            }
+        }
+        // 逐 fiber 标记值栈、闭包、defer 栈与暂存
+        // Per fiber: mark the value stack, closures, defer stacks, and stashes
+        let mut fi = 0
+        while fi < len(fb_stack) {
+            for v in fb_stack[fi] {
+                mark_val(v)
+            }
+            for ch in fb_fr_cl[fi] {
+                mark_obj(ch)
+            }
+            for dl in fb_fr_defers[fi] {
+                for dh in dl {
+                    mark_obj(dh)
+                }
+            }
+            for dv in fb_fr_dstash[fi] {
+                mark_val(dv)
+            }
+            for uh in fb_openuv[fi] {
+                mark_obj(uh)
+            }
+            mark_val(fb_sendval[fi])
+            fi = fi + 1
+        }
+        for pr in fb_iores {
+            mark_val(pr)
+        }
+
+        while len(gray) > 0 {
+            let h = pop(gray)
+            let t = o_tag[h]
+            if t == ot_list || t == ot_enuminst || t == ot_channel {
+                for e in o_vals[h] {
+                    mark_val(e)
+                }
+            } else if t == ot_record {
+                for e in o_vals[h] {
+                    mark_val(e)
+                }
+                for e in o_keys[h] {
+                    mark_val(e)
+                }
+            } else if t == ot_map {
+                for e in o_keys[h] {
+                    mark_val(e)
+                }
+                for e in o_vals[h] {
+                    mark_val(e)
+                }
+            } else if t == ot_closure {
+                // upvalue 槽：ref 捕获是 cell（VObj ot_upval），值捕获是普通值
+                // upvalue slots: ref captures hold a cell (VObj ot_upval), value captures a plain value
+                for uv in o_cu[h] {
+                    match uv {
+                        VObj(uh) if o_tag[uh] == ot_upval => mark_obj(uh),
+                        v => mark_val(v),
+                    }
+                }
+            } else if t == ot_upval {
+                if !o_b1[h] {
+                    mark_val(o_v1[h])
+                }
+            }
+        }
+
+        let mut freed = 0
+        // 清扫：未标记的槽丢弃负载并进空闲链表
+        // Sweep: unmarked slots drop payloads and join the free list
+        let mut h = 0
+        while h < len(o_tag) {
+            if o_tag[h] != ot_free {
+                if o_mark[h] {
+                    o_mark[h] = false
+                } else {
+                    o_tag[h] = ot_free
+                    o_vals[h] = []
+                    o_keys[h] = []
+                    o_idxi[h] = map()
+                    o_idxs[h] = map()
+                    o_i1[h] = 0
+                    o_i2[h] = 0
+                    o_b1[h] = false
+                    o_v1[h] = VUnit
+                    o_h1[h] = []
+                    o_h2[h] = []
+                    o_h3[h] = []
+                    o_cu[h] = []
+                    push(free_slots, h)
+                    freed = freed + 1
+                }
+            }
+            h = h + 1
+        }
+        obj_count = obj_count - freed
+        freed
+    }
+
+    // alloc_obj 分配对象槽位（空闲链表复用）/ alloc_obj allocates an object slot (free-list reuse)
+    fn alloc_obj(tag) {
+        if vm_on && obj_count + 1 > gc_threshold {
+            let _ = collect()
+            gc_threshold = obj_count * 2 + 64
+        }
+        obj_count = obj_count + 1
+        gc_total_alloc = gc_total_alloc + 1
+        if len(free_slots) > 0 {
+            let h = pop(free_slots)
+            o_tag[h] = tag
+            h
+        } else {
+            push(o_tag, tag)
+            push(o_mark, false)
+            push(o_vals, [])
+            push(o_keys, [])
+            push(o_idxi, map())
+            push(o_idxs, map())
+            push(o_i1, 0)
+            push(o_i2, 0)
+            push(o_b1, false)
+            push(o_v1, VUnit)
+            push(o_h1, [])
+            push(o_h2, [])
+            push(o_h3, [])
+            push(o_cu, [])
+            len(o_tag) - 1
+        }
+    }
+
+    // fpush 压栈 / fpush pushes onto the fiber stack
+    fn fpush(f, v) {
+        push(fb_stack[f], v)
+    }
+    // fpop 弹栈 / fpop pops the fiber stack
+    fn fpop(f) {
+        pop(fb_stack[f])
+    }
+    // fpeek 取栈内元素 / fpeek peeks the fiber stack
+    fn fpeek(f, n) {
+        fb_stack[f][len(fb_stack[f]) - 1 - n]
+    }
+    // ftop 取栈顶 / ftop returns the stack top
+    fn ftop(f) {
+        len(fb_stack[f])
+    }
+    // fsettop 设置栈顶 / fsettop sets the stack top
+    fn fsettop(f, n) {
+        while len(fb_stack[f]) > n {
+            let _ = pop(fb_stack[f])
+        }
+    }
+
+    // make_inst 构造枚举实例 / make_inst builds an enum instance
+    fn make_inst(eh, variant, fields) {
+        let h = alloc_obj(ot_enuminst)
+        o_i1[h] = eh
+        o_i2[h] = variant
+        o_vals[h] = fields
+        VObj(h)
+    }
+    // make_some 构造 Some / make_some builds Some(v)
+    fn make_some(f, v) {
+        fpush(f, v)
+        let r = make_inst(opt_enum, 0, [fpeek(f, 0)])
+        let _ = fpop(f)
+        r
+    }
+    // make_none 构造 None / make_none builds None
+    fn make_none() {
+        make_inst(opt_enum, 1, [])
+    }
+    // make_ok 构造 Ok / make_ok builds Ok(v)
+    fn make_ok(f, v) {
+        fpush(f, v)
+        let r = make_inst(res_enum, 0, [fpeek(f, 0)])
+        let _ = fpop(f)
+        r
+    }
+    // make_err 构造 Err / make_err builds Err(v)
+    fn make_err(f, v) {
+        fpush(f, v)
+        let r = make_inst(res_enum, 1, [fpeek(f, 0)])
+        let _ = fpop(f)
+        r
+    }
+
+    // schedule 入队一个 fiber / schedule enqueues a fiber
+    fn schedule(f) {
+        fb_status[f] = fs_ready
+        push(ready, f)
+    }
+
+    // conv_exec_result 转换 exec 结果 / conv_exec_result converts an exec result
+    fn conv_exec_result(f, r) {
+        match r {
+            Ok(o) => match o {
+                Output(code, so, se) => {
+                    let oi = make_inst(out_enum, 0, [VInt(code), VStr(so), VStr(se)])
+                    make_ok(f, oi)
+                },
+            },
+            Err(m) => make_err(f, VStr(m)),
+        }
+    }
+
+    // wait_reset 清空等待注册 / wait_reset clears wait registrations
+    fn wait_reset() {
+        wait_fiber = []
+        wait_kind = []
+        wait_deadline = []
+        wait_handle = []
+    }
+
+    // wait_add_timer 注册定时器等待 / wait_add_timer registers a timer wait
+    fn wait_add_timer(f, deadline) {
+        push(wait_fiber, f)
+        push(wait_kind, wait_timer)
+        push(wait_deadline, deadline)
+        push(wait_handle, -1)
+    }
+
+    // wait_add_exec 注册子进程等待 / wait_add_exec registers a process wait
+    fn wait_add_exec(f, h) {
+        push(wait_fiber, f)
+        push(wait_kind, wait_exec)
+        push(wait_deadline, -1.0)
+        push(wait_handle, h)
+    }
+
+    // wait_register_all 注册所有阻塞 fiber 的 fd / wait_register_all registers all blocked fibers' fds
+    fn wait_register_all() {
+        wait_reset()
+        let mut i = 0
+        while i < len(fb_status) {
+            if fb_status[i] == fs_blocked_timer {
+                wait_add_timer(i, fb_wakeat[i])
+            } else if fb_status[i] == fs_blocked_io {
+                wait_add_exec(i, fb_ioproc[i])
+            } else if fb_status[i] == fs_blocked_net {
+                push(wait_fiber, i)
+                push(wait_kind, wait_net)
+                push(wait_deadline, -1.0)
+                push(wait_handle, -1)
+            }
+            i = i + 1
+        }
+    }
+
+    // wait_poll_io 轮询 IO 就绪 / wait_poll_io polls for IO readiness
+    fn wait_poll_io() {
+        let mut i = 0
+        while i < len(wait_fiber) {
+            if wait_kind[i] == wait_exec {
+                let f = wait_fiber[i]
+                match exec_poll(wait_handle[i]) {
+                    Some(r) => {
+                        fb_iores[f] = conv_exec_result(f, r)
+                        fb_iohas[f] = true
+                        fb_ioproc[f] = -1
+                        nio = nio - 1
+                        schedule(f)
+                    },
+                    None => {},
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // wait_poll_net 轮询网络就绪 / wait_poll_net polls for network readiness
+    fn wait_poll_net() {
+        let mut i = 0
+        while i < len(fb_status) {
+            if fb_status[i] != fs_blocked_net {
+                i = i + 1
+                continue
+            }
+            let f = i
+            let op = fb_netop[f]
+            let h = fb_nethandle[f]
+            match net_nb(op, h, fb_netdata[f], fb_netmax[f]) {
+                Ok(s) => {
+                    if op == 2 {
+                        let n = match parse_int(s) {
+                            Some(x) => x,
+                            None => 0,
+                        }
+                        let rem = str_len(fb_netdata[f]) - n
+                        if rem > 0 {
+                            fb_netdata[f] = substr(fb_netdata[f], n, rem)
+                        } else {
+                            fb_iores[f] = make_ok(f, VUnit)
+                            fb_iohas[f] = true
+                            fb_netop[f] = -1
+                            nio_net = nio_net - 1
+                            schedule(f)
+                        }
+                    } else if op == 0 {
+                        let ch = match parse_int(s) {
+                            Some(x) => x,
+                            None => {
+                                trap("net_nb accept returned bad handle")
+                                0
+                            },
+                        }
+                        fb_iores[f] = make_ok(f, VInt(ch))
+                        fb_iohas[f] = true
+                        fb_netop[f] = -1
+                        nio_net = nio_net - 1
+                        schedule(f)
+                    } else {
+                        fb_iores[f] = make_ok(f, VStr(s))
+                        fb_iohas[f] = true
+                        fb_netop[f] = -1
+                        nio_net = nio_net - 1
+                        schedule(f)
+                    }
+                },
+                Err(m) => {
+                    if m == "__eagain" {} else {
+                        fb_iores[f] = make_err(f, VStr(m))
+                        fb_iohas[f] = true
+                        fb_netop[f] = -1
+                        nio_net = nio_net - 1
+                        schedule(f)
+                    }
+                },
+            }
+            i = i + 1
+        }
+    }
+
+    // wait_poll_stdin 轮询 stdin 就绪 / wait_poll_stdin polls for stdin readiness
+    fn wait_poll_stdin() {
+        let mut i = 0
+        while i < len(fb_status) {
+            if fb_status[i] != fs_blocked_stdin {
+                i = i + 1
+                continue
+            }
+            let f = i
+            match stdin_nb(fb_stdinmax[f]) {
+                Ok(s) => {
+                    fb_iores[f] = VStr(s)
+                    fb_iohas[f] = true
+                    nio_stdin = nio_stdin - 1
+                    schedule(f)
+                },
+                Err(m) => {
+                    if m == "__eagain" {} else {
+                        trap("read_stdin: " + m)
+                    }
+                },
+            }
+            i = i + 1
+        }
+    }
+
+    // wait_nearest_timer 取最近的定时器截止 / wait_nearest_timer returns the nearest timer deadline
+    fn wait_nearest_timer() {
+        let mut nearest = -1.0
+        let mut i = 0
+        while i < len(wait_fiber) {
+            if wait_kind[i] == wait_timer {
+                if nearest < 0.0 || wait_deadline[i] < nearest {
+                    nearest = wait_deadline[i]
+                }
+            }
+            i = i + 1
+        }
+        nearest
+    }
+
+    // wake_due_timers 唤醒到期的定时器 / wake_due_timers wakes due timers
+    fn wake_due_timers() {
+        let now = clock()
+        let mut going = true
+        while going {
+            going = false
+            let mut best = -1
+            let mut i = 0
+            while i < len(fb_status) {
+                if fb_status[i] == fs_blocked_timer && fb_wakeat[i] <= now {
+                    if best < 0 || fb_wakeat[i] < fb_wakeat[best] {
+                        best = i
+                    }
+                }
+                i = i + 1
+            }
+            if best >= 0 {
+                ntimers = ntimers - 1
+                schedule(best)
+                going = true
+            }
+        }
+    }
+
+    // wait_idle 空转等待（无就绪） / wait_idle idles when nothing is ready
+    fn wait_idle() {
+        while len(ready) == 0 {
+            wait_register_all()
+            if nio > 0 || nio_net > 0 || nio_stdin > 0 {
+                sleep(1)
+            } else {
+                let nearest = wait_nearest_timer()
+                let waitms = trunc((nearest - clock()) * 1000.0) + 1
+                if waitms > 0 {
+                    sleep(waitms)
+                }
+            }
+            wait_poll_io()
+            if nio_net > 0 {
+                wait_poll_net()
+            }
+            if nio_stdin > 0 {
+                wait_poll_stdin()
+            }
+            if ntimers > 0 {
+                wake_due_timers()
+            }
+        }
+    }
+
+    // new_fiber 创建 fiber / new_fiber creates a fiber
+    fn new_fiber(cl, args) {
+        push(fb_stack, [VObj(cl)])
+        push(fb_status, fs_ready)
+        push(fb_sendval, VUnit)
+        push(fb_selectch, [])
+        push(fb_openuv, [])
+        push(fb_fr_cl, [cl])
+        push(fb_fr_ip, [0])
+        push(fb_fr_base, [0])
+        push(fb_fr_callip, [0])
+        push(fb_fr_defers, [[]])
+        push(fb_fr_dstash, [VUnit])
+        push(fb_fr_dact, [false])
+        push(fb_wakeat, -1.0)
+        push(fb_ioproc, -1)
+        push(fb_iohas, false)
+        push(fb_iores, VUnit)
+        push(fb_netop, -1)
+        push(fb_nethandle, -1)
+        push(fb_netdata, "")
+        push(fb_netmax, 0)
+        push(fb_stdinmax, 0)
+        let f = len(fb_stack) - 1
+        for a in args {
+            push(fb_stack[f], a)
+        }
+        f
+    }
+
+    // wake_waiters 唤醒等待者 / wake_waiters wakes waiters
+    fn wake_waiters(ch) {
+        if len(o_h3[ch]) > 0 {
+            for w in o_h3[ch] {
+                if fb_status[w] == fs_blocked_select {
+                    schedule(w)
+                }
+            }
+            o_h3[ch] = []
+        }
+    }
+    // remove_waiter 移除等待者 / remove_waiter removes a waiter
+    fn remove_waiter(ch, f) {
+        let mut kept = []
+        for w in o_h3[ch] {
+            if w != f {
+                push(kept, w)
+            }
+        }
+        o_h3[ch] = kept
+    }
+    // chan_recv_ready 判断接收是否就绪 / chan_recv_ready tells whether a receive is ready
+    fn chan_recv_ready(ch) {
+        len(o_vals[ch]) > 0 || len(o_h1[ch]) > 0 || o_b1[ch]
+    }
+    // chan_send_ready 判断发送是否就绪 / chan_send_ready tells whether a send is ready
+    fn chan_send_ready(ch) {
+        o_b1[ch] || len(o_h2[ch]) > 0 || len(o_vals[ch]) < o_i1[ch]
+    }
+    // chan_try_recv 尝试接收 / chan_try_recv tries a receive
+    fn chan_try_recv(ch) {
+        if len(o_vals[ch]) > 0 {
+            let v = o_vals[ch][0]
+            o_vals[ch] = slice(o_vals[ch], 1, len(o_vals[ch]))
+            if len(o_h1[ch]) > 0 {
+                let s = o_h1[ch][0]
+                o_h1[ch] = slice(o_h1[ch], 1, len(o_h1[ch]))
+                push(o_vals[ch], fb_sendval[s])
+                fb_sendval[s] = VUnit
+                schedule(s)
+            }
+            RecvGot(v)
+        } else if len(o_h1[ch]) > 0 {
+            let s = o_h1[ch][0]
+            o_h1[ch] = slice(o_h1[ch], 1, len(o_h1[ch]))
+            let v = fb_sendval[s]
+            fb_sendval[s] = VUnit
+            schedule(s)
+            RecvGot(v)
+        } else {
+            RecvNone
+        }
+    }
+
+    // uv_get 读 upvalue / uv_get reads an upvalue
+    fn uv_get(h) {
+        if o_b1[h] {
+            fb_stack[o_i1[h]][o_i2[h]]
+        } else {
+            o_v1[h]
+        }
+    }
+    // uv_set 写 upvalue / uv_set writes an upvalue
+    fn uv_set(h, v) {
+        if o_b1[h] {
+            fb_stack[o_i1[h]][o_i2[h]] = v
+        } else {
+            o_v1[h] = v
+        }
+    }
+    // capture_upvalue 捕获 upvalue（开启时记 (fiber, slot)）
+    // capture_upvalue captures an upvalue ((fiber, slot) while open)
+    fn capture_upvalue(f, slot) {
+        let mut found = -1
+        for uh in fb_openuv[f] {
+            if o_i2[uh] == slot {
+                found = uh
+            }
+        }
+        if found >= 0 {
+            found
+        } else {
+            let h = alloc_obj(ot_upval)
+            o_i1[h] = f
+            o_i2[h] = slot
+            o_b1[h] = true
+            o_v1[h] = VUnit
+            push(fb_openuv[f], h)
+            h
+        }
+    }
+    // close_upvalues 在作用域退出时关闭 upvalue / close_upvalues closes upvalues at scope exit
+    fn close_upvalues(f, from) {
+        let mut kept = []
+        for uh in fb_openuv[f] {
+            if o_i2[uh] >= from {
+                o_v1[uh] = fb_stack[f][o_i2[uh]]
+                o_b1[uh] = false
+            } else {
+                push(kept, uh)
+            }
+        }
+        fb_openuv[f] = kept
+    }
+
+    // map_find 查找 map 键 / map_find looks up a map key
+    fn map_find(mh, k) {
+        match k {
+            VInt(n) => match get(o_idxi[mh], n) {
+                Some(p) => p,
+                None => -1,
+            },
+            VStr(s) => match get(o_idxs[mh], s) {
+                Some(p) => p,
+                None => -1,
+            },
+            _ => -2,
+        }
+    }
+    // map_index_put 插入 map（保持插入序）/ map_index_put inserts into a map (preserves insertion order)
+    fn map_index_put(mh, k, pos) {
+        match k {
+            VInt(n) => put(o_idxi[mh], n, pos),
+            VStr(s) => put(o_idxs[mh], s, pos),
+            _ => {},
+        }
+    }
+
+    // do_native 按 id 分派 native（与 C runtime 的 bur_register_native 对齐）
+    // do_native dispatches natives by id (aligned with bur_register_native in the C runtime)
+    fn do_native(f, id, argc) {
+        let nm = lib::native_names[id]
+        // 打印族：格式化多参并用空格连接
+        // Print family: format the args and join with spaces
+        if nm == "print" || nm == "println" || nm == "eprintln" {
+            let mut parts = []
+            let mut i = 0
+            while i < argc {
+                push(parts, format_val(fpeek(f, argc - 1 - i), false))
+                i = i + 1
+            }
+            let s = join(parts, " ")
+            if nm == "print" {
+                print(s)
+            } else if nm == "println" {
+                println(s)
+            } else {
+                eprintln(s)
+            }
+            VUnit
+            // 集合：len/map/get/put/delete/keys/push/pop
+            // Collections: len/map/get/put/delete/keys/push/pop
+        } else if nm == "len" {
+            let v = fpeek(f, 0)
+            let lh = tagged_h(v, ot_list)
+            if lh >= 0 {
+                VInt(len(o_vals[lh]))
+            } else if is_str(v) {
+                VInt(str_len(str_of(v)))
+            } else {
+                trap("len() needs a list, string, or map, got " + type_name(v))
+                VUnit
+            }
+        } else if nm == "map" {
+            VObj(alloc_obj(ot_map))
+        } else if nm == "get" {
+            let mh = tagged_h(fpeek(f, 1), ot_map)
+            if mh < 0 {
+                trap("get() needs a map, got " + type_name(fpeek(f, 1)))
+            }
+            let pos = map_find(mh, fpeek(f, 0))
+            if pos == -2 {
+                trap("map keys must be int or str, got " + type_name(fpeek(f, 0)))
+            }
+            if pos >= 0 {
+                make_some(f, o_vals[mh][pos])
+            } else {
+                make_none()
+            }
+        } else if nm == "put" {
+            let mh = tagged_h(fpeek(f, 2), ot_map)
+            if mh < 0 {
+                trap("put() needs a map, got " + type_name(fpeek(f, 2)))
+            }
+            let k = fpeek(f, 1)
+            let v = fpeek(f, 0)
+            let pos = map_find(mh, k)
+            if pos == -2 {
+                trap("map keys must be int or str, got " + type_name(k))
+            }
+            if pos >= 0 {
+                o_vals[mh][pos] = v
+            } else {
+                let p = len(o_keys[mh])
+                push(o_keys[mh], k)
+                push(o_vals[mh], v)
+                map_index_put(mh, k, p)
+            }
+            VUnit
+        } else if nm == "delete" {
+            let mh = tagged_h(fpeek(f, 1), ot_map)
+            if mh < 0 {
+                trap("delete() needs a map, got " + type_name(fpeek(f, 1)))
+            }
+            let k = fpeek(f, 0)
+            let pos = map_find(mh, k)
+            if pos == -2 {
+                trap("map keys must be int or str, got " + type_name(k))
+            }
+            if pos >= 0 {
+                o_keys[mh] = concat(slice(o_keys[mh], 0, pos), slice(o_keys[mh], pos + 1, len(o_keys[mh])))
+                o_vals[mh] = concat(slice(o_vals[mh], 0, pos), slice(o_vals[mh], pos + 1, len(o_vals[mh])))
+                match k {
+                    VInt(n) => delete(o_idxi[mh], n),
+                    VStr(s) => delete(o_idxs[mh], s),
+                    _ => {},
+                }
+                let mut i = pos
+                while i < len(o_keys[mh]) {
+                    map_index_put(mh, o_keys[mh][i], i)
+                    i = i + 1
+                }
+            }
+            VUnit
+        } else if nm == "keys" {
+            let mh = tagged_h(fpeek(f, 0), ot_map)
+            if mh < 0 {
+                trap("keys() needs a map, got " + type_name(fpeek(f, 0)))
+            }
+            let lh = alloc_obj(ot_list)
+            o_vals[lh] = slice(o_keys[mh], 0, len(o_keys[mh]))
+            VObj(lh)
+        } else if nm == "push" {
+            let lh = tagged_h(fpeek(f, 1), ot_list)
+            if lh < 0 {
+                trap("push() needs a list, got " + type_name(fpeek(f, 1)))
+            }
+            push(o_vals[lh], fpeek(f, 0))
+            VUnit
+        } else if nm == "pop" {
+            let lh = tagged_h(fpeek(f, 0), ot_list)
+            if lh < 0 {
+                trap("pop() needs a list, got " + type_name(fpeek(f, 0)))
+            }
+            if len(o_vals[lh]) == 0 {
+                trap("pop() on empty list")
+            }
+            pop(o_vals[lh])
+            // 类型转换：str/trunc/to_float/float_bits/parse_int/parse_float
+            // Conversions: str/trunc/to_float/float_bits/parse_int/parse_float
+        } else if nm == "str" {
+            VStr(format_val(fpeek(f, 0), false))
+        } else if nm == "trunc" {
+            match fpeek(f, 0) {
+                VFloat(x) => VInt(trunc(x)),
+                _ => {
+                    trap("trunc() needs a float, got " + type_name(fpeek(f, 0)))
+                    VUnit
+                },
+            }
+        } else if nm == "to_float" {
+            match fpeek(f, 0) {
+                VInt(n) => VFloat(to_float(n)),
+                _ => {
+                    trap("to_float() needs an int, got " + type_name(fpeek(f, 0)))
+                    VUnit
+                },
+            }
+        } else if nm == "float_bits" {
+            match fpeek(f, 0) {
+                VFloat(x) => VInt(float_bits(x)),
+                _ => {
+                    trap("float_bits() needs a float, got " + type_name(fpeek(f, 0)))
+                    VUnit
+                },
+            }
+        } else if nm == "parse_int" {
+            if !is_str(fpeek(f, 0)) {
+                trap("parse_int() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            match parse_int(str_of(fpeek(f, 0))) {
+                Some(n) => make_some(f, VInt(n)),
+                None => make_none(),
+            }
+        } else if nm == "parse_float" {
+            if !is_str(fpeek(f, 0)) {
+                trap("parse_float() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            match parse_float(str_of(fpeek(f, 0))) {
+                Some(x) => make_some(f, VFloat(x)),
+                None => make_none(),
+            }
+            // 字符串：长度/索引/查找/切片/拆分拼接
+            // Strings: length, indexing, search, slicing, split and join
+        } else if nm == "str_len" {
+            if !is_str(fpeek(f, 0)) {
+                trap("str_len() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            VInt(str_len(str_of(fpeek(f, 0))))
+        } else if nm == "char_at" {
+            if !is_str(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("char_at() needs (str, int)")
+            }
+            let s = str_of(fpeek(f, 1))
+            let i = int_of(fpeek(f, 0))
+            if i < 0 || i >= str_len(s) {
+                trap("char_at index " + str(i) + " out of bounds (len " + str(str_len(s)) + ")")
+            }
+            VStr(char_at(s, i))
+        } else if nm == "range" {
+            if !is_int(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("range() needs two ints")
+            }
+            let a = int_of(fpeek(f, 1))
+            let b = int_of(fpeek(f, 0))
+            let lh = alloc_obj(ot_list)
+            let mut i = a
+            while i < b {
+                push(o_vals[lh], VInt(i))
+                i = i + 1
+            }
+            VObj(lh)
+        } else if nm == "split" {
+            if !is_str(fpeek(f, 1)) || !is_str(fpeek(f, 0)) {
+                trap("split() needs (str, str)")
+            }
+            let parts = split(str_of(fpeek(f, 1)), str_of(fpeek(f, 0)))
+            let lh = alloc_obj(ot_list)
+            for p in parts {
+                push(o_vals[lh], VStr(p))
+            }
+            VObj(lh)
+        } else if nm == "join" {
+            let lh = tagged_h(fpeek(f, 1), ot_list)
+            if lh < 0 || !is_str(fpeek(f, 0)) {
+                trap("join() needs ([str], str)")
+            }
+            let mut parts = []
+            for e in o_vals[lh] {
+                if !is_str(e) {
+                    trap("join() needs a list of str, got " + type_name(e) + " element")
+                }
+                push(parts, str_of(e))
+            }
+            VStr(join(parts, str_of(fpeek(f, 0))))
+        } else if nm == "substr" {
+            if !is_str(fpeek(f, 2)) || !is_int(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("substr() needs (str, int, int)")
+            }
+            let s = str_of(fpeek(f, 2))
+            let start = int_of(fpeek(f, 1))
+            let n = int_of(fpeek(f, 0))
+            if start < 0 || n < 0 || start + n > str_len(s) {
+                trap("substr(" + str(start) + ", " + str(n) + ") out of bounds (len " + str(str_len(s)) + ")")
+            }
+            VStr(substr(s, start, n))
+        } else if nm == "byte_at" {
+            if !is_str(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("byte_at() needs (str, int)")
+            }
+            let s = str_of(fpeek(f, 1))
+            let i = int_of(fpeek(f, 0))
+            if i < 0 || i >= str_len(s) {
+                trap("byte_at index " + str(i) + " out of bounds (len " + str(str_len(s)) + ")")
+            }
+            VInt(byte_at(s, i))
+        } else if nm == "str_contains" {
+            if !is_str(fpeek(f, 1)) || !is_str(fpeek(f, 0)) {
+                trap("str_contains() needs (str, str)")
+            }
+            VBool(str_contains(str_of(fpeek(f, 1)), str_of(fpeek(f, 0))))
+        } else if nm == "str_index_of" {
+            if !is_str(fpeek(f, 1)) || !is_str(fpeek(f, 0)) {
+                trap("str_index_of() needs (str, str)")
+            }
+            match str_index_of(str_of(fpeek(f, 1)), str_of(fpeek(f, 0))) {
+                Some(i) => make_some(f, VInt(i)),
+                None => make_none(),
+            }
+        } else if nm == "trim" {
+            if !is_str(fpeek(f, 0)) {
+                trap("trim() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            VStr(trim(str_of(fpeek(f, 0))))
+        } else if nm == "slice" {
+            let src = tagged_h(fpeek(f, 2), ot_list)
+            if src < 0 || !is_int(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("slice() needs ([a], int, int)")
+            }
+            let start = int_of(fpeek(f, 1))
+            let end = int_of(fpeek(f, 0))
+            if start < 0 || end < start || end > len(o_vals[src]) {
+                trap("slice(" + str(start) + ", " + str(end) + ") out of bounds (len " + str(len(o_vals[src])) + ")")
+            }
+            let lh = alloc_obj(ot_list)
+            o_vals[lh] = slice(o_vals[src], start, end)
+            VObj(lh)
+            // 列表操作：拼接与包含
+            // Lists: concat and contains
+        } else if nm == "concat" {
+            let xs = tagged_h(fpeek(f, 1), ot_list)
+            let ys = tagged_h(fpeek(f, 0), ot_list)
+            if xs < 0 || ys < 0 {
+                trap("concat() needs ([a], [a])")
+            }
+            let lh = alloc_obj(ot_list)
+            o_vals[lh] = concat(o_vals[xs], o_vals[ys])
+            VObj(lh)
+        } else if nm == "contains" {
+            let lh = tagged_h(fpeek(f, 1), ot_list)
+            if lh < 0 {
+                trap("contains() needs a list, got " + type_name(fpeek(f, 1)))
+            }
+            let mut found = false
+            for e in o_vals[lh] {
+                if eq_val(e, fpeek(f, 0)) {
+                    found = true
+                    break
+                }
+            }
+            VBool(found)
+            // 文件系统：读/写/存在/目录列表
+            // Filesystem: read, write, existence, directory listing
+        } else if nm == "read_file" {
+            if !is_str(fpeek(f, 0)) {
+                trap("read_file() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            match read_file(str_of(fpeek(f, 0))) {
+                Ok(s) => make_ok(f, VStr(s)),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else if nm == "write_file" {
+            if !is_str(fpeek(f, 1)) || !is_str(fpeek(f, 0)) {
+                trap("write_file() needs (str, str)")
+            }
+            match write_file(str_of(fpeek(f, 1)), str_of(fpeek(f, 0))) {
+                Ok(_) => make_ok(f, VUnit),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else if nm == "file_exists" {
+            if !is_str(fpeek(f, 0)) {
+                trap("file_exists() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            VBool(file_exists(str_of(fpeek(f, 0))))
+        } else if nm == "read_dir" {
+            if !is_str(fpeek(f, 0)) {
+                trap("read_dir() needs a str, got " + type_name(fpeek(f, 0)))
+            }
+            match read_dir(str_of(fpeek(f, 0))) {
+                Ok(names) => {
+                    let lh = alloc_obj(ot_list)
+                    for n in names {
+                        push(o_vals[lh], VStr(n))
+                    }
+                    make_ok(f, VObj(lh))
+                },
+                Err(m) => make_err(f, VStr(m)),
+            }
+            // 子进程与运行时：exec、args、exit
+            // Subprocess and runtime: exec, args, exit
+        } else if nm == "exec" {
+            if fb_iohas[f] {
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                let ah = tagged_h(fpeek(f, 0), ot_list)
+                if !is_str(fpeek(f, 1)) || ah < 0 {
+                    trap("exec() needs (str, [str])")
+                }
+                let mut hargs = []
+                for e in o_vals[ah] {
+                    if !is_str(e) {
+                        trap("exec() args must be str, got " + type_name(e))
+                    }
+                    push(hargs, str_of(e))
+                }
+                match exec_start(str_of(fpeek(f, 1)), hargs) {
+                    Ok(h) => match exec_poll(h) {
+                        Some(r) => conv_exec_result(f, r),
+                        None => {
+                            park_io = h
+                            VUnit
+                        },
+                    },
+                    Err(m) => make_err(f, VStr(m)),
+                }
+            }
+            // 异步子进程与网络：exec_start/exec_poll、tcp、net_*、stdin
+            // Async subprocess and networking: exec_start/exec_poll, tcp, net_*, stdin
+        } else if nm == "exec_start" {
+            let ah = tagged_h(fpeek(f, 0), ot_list)
+            if !is_str(fpeek(f, 1)) || ah < 0 {
+                trap("exec_start() needs (str, [str])")
+            }
+            let mut hargs = []
+            for e in o_vals[ah] {
+                if !is_str(e) {
+                    trap("exec_start() args must be str, got " + type_name(e))
+                }
+                push(hargs, str_of(e))
+            }
+            match exec_start(str_of(fpeek(f, 1)), hargs) {
+                Ok(h) => make_ok(f, VInt(h)),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else if nm == "exec_poll" {
+            match exec_poll(int_of(fpeek(f, 0))) {
+                Some(r) => make_some(f, conv_exec_result(f, r)),
+                None => make_none(),
+            }
+        } else if nm == "args" {
+            let lh = alloc_obj(ot_list)
+            for a in vm_args {
+                push(o_vals[lh], VStr(a))
+            }
+            VObj(lh)
+        } else if nm == "exit" {
+            match fpeek(f, 0) {
+                VInt(n) => exit(n),
+                _ => {
+                    trap("exit() needs an int, got " + type_name(fpeek(f, 0)))
+                    VUnit
+                },
+            }
+            // 通道与字符：chan/close/recv、chr/byte_chr/ord
+            // Channels and characters: chan/close/recv, chr/byte_chr/ord
+        } else if nm == "chan" {
+            if argc > 1 {
+                trap("chan() takes at most one argument")
+            }
+            let mut capacity = 0
+            if argc == 1 {
+                if !is_int(fpeek(f, 0)) || int_of(fpeek(f, 0)) < 0 {
+                    trap("chan() capacity must be a non-negative int")
+                }
+                capacity = int_of(fpeek(f, 0))
+            }
+            let h = alloc_obj(ot_channel)
+            o_i1[h] = capacity
+            VObj(h)
+        } else if nm == "close" {
+            let ch = tagged_h(fpeek(f, 0), ot_channel)
+            if ch < 0 {
+                trap("close() needs a channel, got " + type_name(fpeek(f, 0)))
+            }
+            if o_b1[ch] {
+                trap("close of closed channel")
+            }
+            o_b1[ch] = true
+            for r in o_h2[ch] {
+                schedule(r)
+            }
+            o_h2[ch] = []
+            wake_waiters(ch)
+            VUnit
+        } else if nm == "recv" {
+            let ch = tagged_h(fpeek(f, 0), ot_channel)
+            if ch < 0 {
+                trap("recv() needs a channel, got " + type_name(fpeek(f, 0)))
+            }
+            match chan_try_recv(ch) {
+                RecvGot(v) => {
+                    let opt = make_some(f, v)
+                    wake_waiters(ch)
+                    opt
+                },
+                RecvNone => {
+                    if o_b1[ch] {
+                        make_none()
+                    } else {
+                        park_recv = ch
+                        VUnit
+                    }
+                },
+            }
+        } else if nm == "chr" {
+            if !is_int(fpeek(f, 0)) || int_of(fpeek(f, 0)) < 0 || int_of(fpeek(f, 0)) > 1114111 {
+                trap("chr() needs an int code point")
+            }
+            VStr(chr(int_of(fpeek(f, 0))))
+        } else if nm == "byte_chr" {
+            if !is_int(fpeek(f, 0)) || int_of(fpeek(f, 0)) < 0 || int_of(fpeek(f, 0)) > 255 {
+                trap("byte_chr() needs an int in 0..255")
+            }
+            VStr(byte_chr(int_of(fpeek(f, 0))))
+        } else if nm == "ord" {
+            if !is_str(fpeek(f, 0)) || str_len(str_of(fpeek(f, 0))) == 0 {
+                trap("ord() needs a non-empty string")
+            }
+            VInt(ord(str_of(fpeek(f, 0))))
+            // 运行时杂项：clock/type_of/assert/gc/yield/sleep
+            // Runtime misc: clock/type_of/assert/gc/yield/sleep
+        } else if nm == "clock" {
+            VFloat(clock())
+        } else if nm == "type_of" {
+            VStr(type_name(fpeek(f, 0)))
+        } else if nm == "assert" {
+            if !is_bool(fpeek(f, 1)) {
+                trap("assert() needs a bool, got " + type_name(fpeek(f, 1)))
+            }
+            if !bool_of(fpeek(f, 1)) {
+                trap("assertion failed: " + format_val(fpeek(f, 0), false))
+            }
+            VUnit
+        } else if nm == "gc" {
+            VInt(collect())
+        } else if nm == "heap_objects" {
+            VInt(obj_count)
+        } else if nm == "gc_cycles" {
+            VInt(gc_cycles_n)
+        } else if nm == "yield" {
+            yield_flag = true
+            VUnit
+        } else if nm == "sleep" {
+            if int_of(fpeek(f, 0)) > 0 {
+                park_sleep = clock() + to_float(int_of(fpeek(f, 0))) / 1000.0
+            } else {
+                yield_flag = true
+            }
+            VUnit
+        } else if nm == "tcp_listen" {
+            if !is_str(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("tcp_listen() needs (str, int)")
+            }
+            match tcp_listen(str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
+                Ok(h) => make_ok(f, VInt(h)),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else if nm == "tcp_accept" {
+            if fb_iohas[f] {
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                if !is_int(fpeek(f, 0)) {
+                    trap("tcp_accept() needs an int")
+                }
+                let lh = int_of(fpeek(f, 0))
+                match net_nb(0, lh, "", 0) {
+                    Ok(s) => {
+                        let ch = match parse_int(s) {
+                            Some(x) => x,
+                            None => {
+                                trap("tcp_accept: bad handle from net_nb")
+                                0
+                            },
+                        }
+                        make_ok(f, VInt(ch))
+                    },
+                    Err(m) => {
+                        if m == "__eagain" {
+                            park_netop = 0
+                            park_nethandle = lh
+                            park_netdata = ""
+                            park_netmax = 0
+                            VUnit
+                        } else {
+                            make_err(f, VStr(m))
+                        }
+                    },
+                }
+            }
+        } else if nm == "tcp_dial" {
+            if !is_str(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("tcp_dial() needs (str, int)")
+            }
+            match tcp_dial(str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
+                Ok(h) => make_ok(f, VInt(h)),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else if nm == "net_read" {
+            if fb_iohas[f] {
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                if !is_int(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                    trap("net_read() needs (int, int)")
+                }
+                let h = int_of(fpeek(f, 1))
+                let max = int_of(fpeek(f, 0))
+                match net_nb(1, h, "", max) {
+                    Ok(s) => make_ok(f, VStr(s)),
+                    Err(m) => {
+                        if m == "__eagain" {
+                            park_netop = 1
+                            park_nethandle = h
+                            park_netdata = ""
+                            park_netmax = max
+                            VUnit
+                        } else {
+                            make_err(f, VStr(m))
+                        }
+                    },
+                }
+            }
+        } else if nm == "net_write" {
+            if fb_iohas[f] {
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                if !is_int(fpeek(f, 1)) || !is_str(fpeek(f, 0)) {
+                    trap("net_write() needs (int, str)")
+                }
+                let h = int_of(fpeek(f, 1))
+                let mut data = str_of(fpeek(f, 0))
+                let mut going = true
+                let mut had_err = false
+                let mut err_val = VUnit
+                while going && str_len(data) > 0 {
+                    match net_nb(2, h, data, 0) {
+                        Ok(s) => {
+                            let n = match parse_int(s) {
+                                Some(x) => x,
+                                None => 0,
+                            }
+                            if n <= 0 {
+                                going = false
+                            } else {
+                                data = substr(data, n, str_len(data) - n)
+                            }
+                        },
+                        Err(m) => {
+                            if m == "__eagain" {
+                                park_netop = 2
+                                park_nethandle = h
+                                park_netdata = data
+                                park_netmax = 0
+                                going = false
+                            } else {
+                                had_err = true
+                                err_val = make_err(f, VStr(m))
+                                going = false
+                            }
+                        },
+                    }
+                }
+                if park_netop >= 0 {
+                    VUnit
+                } else if had_err {
+                    err_val
+                } else {
+                    make_ok(f, VUnit)
+                }
+            }
+        } else if nm == "net_close" {
+            if !is_int(fpeek(f, 0)) {
+                trap("net_close() needs an int")
+            }
+            let _ = net_close(int_of(fpeek(f, 0)))
+            VUnit
+        } else if nm == "net_nb" {
+            if !is_int(fpeek(f, 3)) || !is_int(fpeek(f, 2)) || !is_str(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
+                trap("net_nb() needs (int, int, str, int)")
+            }
+            match net_nb(int_of(fpeek(f, 3)), int_of(fpeek(f, 2)), str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
+                Ok(s) => make_ok(f, VStr(s)),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else if nm == "read_stdin" {
+            if fb_iohas[f] {
+                fb_iohas[f] = false
+                let r = fb_iores[f]
+                fb_iores[f] = VUnit
+                r
+            } else {
+                if !is_int(fpeek(f, 0)) {
+                    trap("read_stdin() needs an int")
+                }
+                let max = int_of(fpeek(f, 0))
+                match stdin_nb(max) {
+                    Ok(s) => VStr(s),
+                    Err(m) => {
+                        if m == "__eagain" {
+                            park_stdinmax = max
+                            VUnit
+                        } else {
+                            trap("read_stdin: " + m)
+                            VUnit
+                        }
+                    },
+                }
+            }
+        } else if nm == "stdin_nb" {
+            if !is_int(fpeek(f, 0)) {
+                trap("stdin_nb() needs an int")
+            }
+            match stdin_nb(int_of(fpeek(f, 0))) {
+                Ok(s) => make_ok(f, VStr(s)),
+                Err(m) => make_err(f, VStr(m)),
+            }
+        } else {
+            trap("unknown native " + nm + " (VM bug)")
+            VUnit
+        }
+    }
+
+    // call_value 调用一个值（closure/native/构造器分派）
+    // call_value calls a value (closure/native/ctor dispatch)
+    fn call_value(f, argc) {
+        let callee = fpeek(f, argc)
+        let h = obj_h(callee)
+        if h < 0 {
+            trap("cannot call " + type_name(callee))
+        }
+        let t = o_tag[h]
+        // 闭包调用：压调用帧（深度上限 2048） / Closure call: push a call frame (depth cap 2048)
+        if t == ot_closure {
+            let fnh = o_i1[h]
+            if argc != f_arity[fnh] {
+                trap(format_val(callee, false) + " expects " + str(f_arity[fnh]) + " argument(s), got " + str(argc))
+            }
+            if len(fb_fr_cl[f]) >= 2048 {
+                trap("stack overflow (call depth > 2048)")
+            }
+            push(fb_fr_cl[f], h)
+            push(fb_fr_ip[f], 0)
+            push(fb_fr_base[f], ftop(f) - argc - 1)
+            push(fb_fr_callip[f], cur_ip)
+            push(fb_fr_defers[f], [])
+            push(fb_fr_dstash[f], VUnit)
+            push(fb_fr_dact[f], false)
+            // native 调用：结果回填；park_* < 0 表示未挂起则弹参压结果
+            // Native call: stash the result; if no park (park_* < 0) pop args and push the result
+        } else if t == ot_native {
+            let res = do_native(f, o_i1[h], argc)
+            if park_recv < 0 && park_io < 0 && park_netop < 0 && park_stdinmax < 0 {
+                let mut i = 0
+                while i <= argc {
+                    let _ = fpop(f)
+                    i = i + 1
+                }
+                fpush(f, res)
+            }
+            // 变体构造器：校验字段数，字段反序取（栈顶是末参）
+            // Variant ctor: check field count, collect fields in reverse
+            // (top of stack is the last arg)
+        } else if t == ot_ctor {
+            let eh = o_i1[h]
+            let vi = o_i2[h]
+            if argc != en_varities[eh][vi] {
+                trap(en_qual[eh] + "." + en_vnames[eh][vi] + " expects " + str(en_varities[eh][vi]) + " field(s), got " + str(argc))
+            }
+            let mut fields = []
+            let mut i = 0
+            while i < argc {
+                push(fields, fpeek(f, argc - 1 - i))
+                i = i + 1
+            }
+            let inst = make_inst(eh, vi, fields)
+            i = 0
+            while i <= argc {
+                let _ = fpop(f)
+                i = i + 1
+            }
+            fpush(f, inst)
+        } else {
+            trap("cannot call " + type_name(callee))
+        }
+    }
+
+    // arith_name 取算术操作符名（错误消息用）/ arith_name names an arithmetic operator (error messages)
+    fn arith_name(op) {
+        if op == lib::op_add {
+            "+"
+        } else if op == lib::op_sub {
+            "-"
+        } else if op == lib::op_mul {
+            "*"
+        } else if op == lib::op_div {
+            "/"
+        } else {
+            "%"
+        }
+    }
+    // do_arith 执行算术运算 / do_arith executes arithmetic
+    fn do_arith(f, op) {
+        // 按操作数类型分派：str 仅拼接，int 溢出检查，float 直算，混合 trap
+        // Dispatch on operand types: str concats only, int checks overflow,
+        // float computes, mixed traps
+        let b = fpeek(f, 0)
+        let a = fpeek(f, 1)
+        if is_str(a) && is_str(b) {
+            if op != lib::op_add {
+                trap("cannot apply " + lib::go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
+            }
+            let s = str_of(a) + str_of(b)
+            let _ = fpop(f)
+            let _ = fpop(f)
+            fpush(f, VStr(s))
+            // int 分支：逐操作符溢出检查后压结果
+            // Int branch: per-operator overflow checks, then push the result
+        } else if is_int(a) && is_int(b) {
+            let x = int_of(a)
+            let y = int_of(b)
+            let _ = fpop(f)
+            let _ = fpop(f)
+            if op == lib::op_add {
+                if y > 0 && x > max_int - y {
+                    trap("integer overflow: " + str(x) + " + " + str(y))
+                }
+                if y < 0 && x < min_int - y {
+                    trap("integer overflow: " + str(x) + " + " + str(y))
+                }
+                fpush(f, VInt(x + y))
+            } else if op == lib::op_sub {
+                if y > 0 && x < min_int + y {
+                    trap("integer overflow: " + str(x) + " - " + str(y))
+                }
+                if y < 0 && x > max_int + y {
+                    trap("integer overflow: " + str(x) + " - " + str(y))
+                }
+                fpush(f, VInt(x - y))
+            } else if op == lib::op_mul {
+                let mut over = false
+                if x > 0 && y > 0 && x > max_int / y {
+                    over = true
+                }
+                if x > 0 && y < 0 && y < min_int / x {
+                    over = true
+                }
+                if x < 0 && y > 0 && x < min_int / y {
+                    over = true
+                }
+                if x < 0 && y < 0 && x < max_int / y {
+                    over = true
+                }
+                if over {
+                    trap("integer overflow: " + str(x) + " * " + str(y))
+                }
+                fpush(f, VInt(x * y))
+            } else if op == lib::op_div {
+                if y == 0 {
+                    trap("integer division by zero")
+                }
+                if x == min_int && y == -1 {
+                    trap("integer overflow: " + str(x) + " / " + str(y))
+                }
+                fpush(f, VInt(x / y))
+            } else {
+                if y == 0 {
+                    trap("integer modulo by zero")
+                }
+                fpush(f, VInt(x % y))
+            }
+            // float 分支：无溢出检查（IEEE 754 语义）；混合数字转 float
+            // Float branch: no overflow checks (IEEE 754); mixed numerics widen to float
+        } else if is_num(a) && is_num(b) && op != lib::op_mod {
+            let x = num_f(a)
+            let y = num_f(b)
+            let _ = fpop(f)
+            let _ = fpop(f)
+            if op == lib::op_add {
+                fpush(f, VFloat(x + y))
+            } else if op == lib::op_sub {
+                fpush(f, VFloat(x - y))
+            } else if op == lib::op_mul {
+                fpush(f, VFloat(x * y))
+            } else {
+                fpush(f, VFloat(x / y))
+            }
+        } else {
+            trap("cannot apply " + lib::go_quote(arith_name(op)) + " to " + type_name(a) + " and " + type_name(b))
+        }
+    }
+    // do_compare 执行比较运算 / do_compare executes comparisons
+    fn do_compare(f, op) {
+        let b = fpop(f)
+        let a = fpop(f)
+        if is_str(a) && is_str(b) {
+            let x = str_of(a)
+            let y = str_of(b)
+            let r = if op == lib::op_gt {
+                x > y
+            } else if op == lib::op_gt_eq {
+                x >= y
+            } else if op == lib::op_lt {
+                x < y
+            } else {
+                x <= y
+            }
+            fpush(f, VBool(r))
+        } else if is_int(a) && is_int(b) {
+            let x = int_of(a)
+            let y = int_of(b)
+            let r = if op == lib::op_gt {
+                x > y
+            } else if op == lib::op_gt_eq {
+                x >= y
+            } else if op == lib::op_lt {
+                x < y
+            } else {
+                x <= y
+            }
+            fpush(f, VBool(r))
+        } else if is_num(a) && is_num(b) {
+            let x = num_f(a)
+            let y = num_f(b)
+            let r = if op == lib::op_gt {
+                x > y
+            } else if op == lib::op_gt_eq {
+                x >= y
+            } else if op == lib::op_lt {
+                x < y
+            } else {
+                x <= y
+            }
+            fpush(f, VBool(r))
+        } else {
+            trap("cannot compare " + type_name(a) + " and " + type_name(b))
+        }
+    }
+
+    // exec_fiber 是主解释循环（opcode 分派）/ exec_fiber is the main interpreter loop (opcode dispatch)
+    fn exec_fiber(f) {
+        // 协作时间片：预算耗尽即让出，防旋转饿死
+        // Cooperative slice: yield when the budget runs out (no starvation)
+        let mut budget = vm_time_slice
+        cur_f = f
+        while true {
+            if budget <= 0 {
+                schedule(f)
+                return false
+            }
+            budget = budget - 1
+            let fi = len(fb_fr_ip[f]) - 1
+            let clh = fb_fr_cl[f][fi]
+            let fnh = o_i1[clh]
+            let code = f_code[fnh]
+            let start_ip = fb_fr_ip[f][fi]
+            cur_ip = start_ip
+            // 取操作码；操作数按指令形态从 start_ip+1 读
+            // Fetch the opcode; operands read from start_ip+1 per instruction shape
+            let op = code[start_ip]
+            fb_fr_ip[f][fi] = start_ip + 1
+
+            if op == lib::op_const {
+                let idx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                fpush(f, k_vals[fnh][idx])
+            } else if op == lib::op_unit {
+                fpush(f, VUnit)
+            } else if op == lib::op_true {
+                fpush(f, VBool(true))
+            } else if op == lib::op_false {
+                fpush(f, VBool(false))
+            } else if op == lib::op_pop {
+                let _ = fpop(f)
+            } else if op == lib::op_pop_n {
+                let n = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                fsettop(f, ftop(f) - n)
+            } else if op == lib::op_close_upvalue {
+                close_upvalues(f, ftop(f) - 1)
+                let _ = fpop(f)
+            } else if op == lib::op_end_block {
+                let n = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                let v = fpop(f)
+                close_upvalues(f, ftop(f) - n)
+                fsettop(f, ftop(f) - n)
+                fpush(f, v)
+                // 局部变量读写
+                // Locals: read and write slots
+            } else if op == lib::op_get_local {
+                let slot = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                fpush(f, fb_stack[f][fb_fr_base[f][fi] + slot])
+            } else if op == lib::op_set_local {
+                let slot = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                fb_stack[f][fb_fr_base[f][fi] + slot] = fpeek(f, 0)
+                // 全局变量读写
+                // Globals: read and write the global table
+            } else if op == lib::op_get_global {
+                let idx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                let name = match k_vals[fnh][idx] {
+                    VStr(s) => s,
+                    _ => {
+                        trap("bad global name const (VM bug)")
+                        ""
+                    },
+                }
+                match get(globals, name) {
+                    Some(v) => fpush(f, v),
+                    None => trap("undefined variable " + lib::go_quote(name)),
+                }
+            } else if op == lib::op_def_global {
+                let idx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                let name = match k_vals[fnh][idx] {
+                    VStr(s) => s,
+                    _ => {
+                        trap("bad global name const (VM bug)")
+                        ""
+                    },
+                }
+                put(globals, name, fpop(f))
+            } else if op == lib::op_set_global {
+                let idx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                let name = match k_vals[fnh][idx] {
+                    VStr(s) => s,
+                    _ => {
+                        trap("bad global name const (VM bug)")
+                        ""
+                    },
+                }
+                match get(globals, name) {
+                    Some(_) => put(globals, name, fpeek(f, 0)),
+                    None => trap("undefined variable " + lib::go_quote(name)),
+                }
+                // upvalue 读写（闭包捕获的 cell）
+                // Upvalues: read and write captured cells
+            } else if op == lib::op_get_upval {
+                let idx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                // ref 捕获（cell）解引用；值捕获取快照
+                // dereference a ref-captured cell; value captures yield the snapshot
+                match o_cu[clh][idx] {
+                    VObj(uh) if o_tag[uh] == ot_upval => fpush(f, uv_get(uh)),
+                    v => fpush(f, v),
+                }
+            } else if op == lib::op_set_upval {
+                let idx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                // ref 捕获写 cell（外部可见）；值捕获只改闭包本地副本
+                // ref captures write the cell (visible outside); value captures only
+                // update the closure-local copy
+                match o_cu[clh][idx] {
+                    VObj(uh) if o_tag[uh] == ot_upval => uv_set(uh, fpeek(f, 0)),
+                    _ => {
+                        o_cu[clh][idx] = fpeek(f, 0)
+                    },
+                }
+                // 比较：值相等与排序
+                // Comparison: equality and ordering
+            } else if op == lib::op_eq {
+                let b = fpop(f)
+                let a = fpop(f)
+                fpush(f, VBool(eq_val(a, b)))
+            } else if op == lib::op_neq {
+                let b = fpop(f)
+                let a = fpop(f)
+                fpush(f, VBool(!eq_val(a, b)))
+            } else if op == lib::op_gt || op == lib::op_gt_eq || op == lib::op_lt || op == lib::op_lt_eq {
+                do_compare(f, op)
+                // 算术与一元运算（int 溢出 trap，str + 走拼接）
+                // Arithmetic and unary ops (int overflow traps; str + concatenates)
+            } else if op == lib::op_add || op == lib::op_sub || op == lib::op_mul || op == lib::op_div || op == lib::op_mod {
+                do_arith(f, op)
+            } else if op == lib::op_neg {
+                let v = fpop(f)
+                match v {
+                    VInt(n) => {
+                        if n == min_int {
+                            trap("integer overflow: -(" + str(n) + ")")
+                        }
+                        fpush(f, VInt(0 - n))
+                    },
+                    VFloat(x) => fpush(f, VFloat(0.0 - x)),
+                    _ => trap("operand of '-' must be a number, got " + type_name(v)),
+                }
+            } else if op == lib::op_not {
+                let v = fpop(f)
+                if !is_bool(v) {
+                    trap("operand of '!' must be a bool, got " + type_name(v))
+                }
+                fpush(f, VBool(!bool_of(v)))
+                // 控制流：跳转、条件跳转、循环回边
+                // Control flow: jumps, conditional branches, loop back-edges
+            } else if op == lib::op_jump {
+                fb_fr_ip[f][fi] = start_ip + 3 + rd_u16(code, start_ip + 1)
+            } else if op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop {
+                let cond = fpeek(f, 0)
+                if !is_bool(cond) {
+                    trap("condition must be a bool, got " + type_name(cond))
+                }
+                let dist = rd_u16(code, start_ip + 1)
+                let mut nip = start_ip + 3
+                if op == lib::op_jump_if_false_pop {
+                    let _ = fpop(f)
+                }
+                if op == lib::op_jump_if_true {
+                    if bool_of(cond) {
+                        nip = nip + dist
+                    }
+                } else {
+                    if !bool_of(cond) {
+                        nip = nip + dist
+                    }
+                }
+                fb_fr_ip[f][fi] = nip
+            } else if op == lib::op_loop {
+                fb_fr_ip[f][fi] = start_ip + 3 - rd_u16(code, start_ip + 1)
+                // 调用：call_value 按值形态分派（闭包/native/构造器）
+                // Calls: call_value dispatches on the value kind (closure/native/ctor)
+            } else if op == lib::op_call {
+                let argc = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                call_value(f, argc)
+                if park_recv >= 0 {
+                    let ch = park_recv
+                    park_recv = -1
+                    fb_status[f] = fs_blocked_recv
+                    push(o_h2[ch], f)
+                    wake_waiters(ch)
+                    fb_fr_ip[f][fi] = start_ip
+                    return false
+                }
+                if park_sleep >= 0.0 {
+                    fb_status[f] = fs_blocked_timer
+                    fb_wakeat[f] = park_sleep
+                    park_sleep = -1.0
+                    ntimers = ntimers + 1
+                    return false
+                }
+                if park_io >= 0 {
+                    fb_status[f] = fs_blocked_io
+                    fb_ioproc[f] = park_io
+                    park_io = -1
+                    nio = nio + 1
+                    fb_fr_ip[f][fi] = start_ip
+                    return false
+                }
+                if park_netop >= 0 {
+                    fb_status[f] = fs_blocked_net
+                    fb_netop[f] = park_netop
+                    fb_nethandle[f] = park_nethandle
+                    fb_netdata[f] = park_netdata
+                    fb_netmax[f] = park_netmax
+                    park_netop = -1
+                    park_nethandle = -1
+                    park_netdata = ""
+                    park_netmax = 0
+                    nio_net = nio_net + 1
+                    fb_fr_ip[f][fi] = start_ip
+                    return false
+                }
+                if park_stdinmax >= 0 {
+                    fb_status[f] = fs_blocked_stdin
+                    fb_stdinmax[f] = park_stdinmax
+                    park_stdinmax = -1
+                    nio_stdin = nio_stdin + 1
+                    fb_fr_ip[f][fi] = start_ip
+                    return false
+                }
+                if yield_flag {
+                    yield_flag = false
+                    schedule(f)
+                    return false
+                }
+                // 闭包构造：复制函数表项并捕获 upvalue
+                // Closures: copy the function entry and capture upvalues
+            } else if op == lib::op_closure {
+                let idx = rd_u16(code, start_ip + 1)
+                let mut ip = start_ip + 3
+                let sub = match f_consts[fnh][idx] {
+                    lib::CVal::CFn(x) => x,
+                    _ => {
+                        trap("bad closure const (VM bug)")
+                        0
+                    },
+                }
+                let nclh = alloc_obj(ot_closure)
+                o_i1[nclh] = sub
+                fpush(f, VObj(nclh))
+                let mut i = 0
+                while i < f_nupvals[sub] {
+                    // 描述符：bit0=islocal，bit1=ref（capture(ref name) 声明）
+                    // descriptor: bit0=islocal, bit1=ref (capture(ref name) declaration)
+                    let is_local = code[ip] % 2 == 1
+                    let is_ref = code[ip] >= 2
+                    let uidx = rd_u16(code, ip + 1)
+                    ip = ip + 3
+                    if is_local {
+                        if is_ref {
+                            push(o_cu[nclh], VObj(capture_upvalue(f, fb_fr_base[f][fi] + uidx)))
+                        } else {
+                            // 默认值捕获：拷贝当前栈值（快照）
+                            // default value capture: copy the current stack value (snapshot)
+                            push(o_cu[nclh], fb_stack[f][fb_fr_base[f][fi] + uidx])
+                        }
+                    } else {
+                        // 透传父 upvalue：原样继承槽内容（值或 cell 句柄）
+                        // inherit the parent upvalue slot as-is (value or cell handle)
+                        push(o_cu[nclh], o_cu[clh][uidx])
+                    }
+                    i = i + 1
+                }
+                fb_fr_ip[f][fi] = ip
+            } else if op == lib::op_return {
+                if len(fb_fr_defers[f][fi]) > 0 || fb_fr_dact[f][fi] {
+                    let v = fpop(f)
+                    if !fb_fr_dact[f][fi] {
+                        fb_fr_dstash[f][fi] = v
+                        fb_fr_dact[f][fi] = true
+                    }
+                    if len(fb_fr_defers[f][fi]) > 0 {
+                        let dh = pop(fb_fr_defers[f][fi])
+                        fb_fr_ip[f][fi] = start_ip
+                        fpush(f, VObj(dh))
+                        call_value(f, 0)
+                    } else {
+                        fpush(f, fb_fr_dstash[f][fi])
+                        fb_fr_dact[f][fi] = false
+                        fb_fr_ip[f][fi] = start_ip
+                    }
+                } else {
+                    let result = fpop(f)
+                    let base = fb_fr_base[f][fi]
+                    close_upvalues(f, base)
+                    let _ = pop(fb_fr_cl[f])
+                    let _ = pop(fb_fr_ip[f])
+                    let _ = pop(fb_fr_base[f])
+                    let _ = pop(fb_fr_callip[f])
+                    let _ = pop(fb_fr_defers[f])
+                    let _ = pop(fb_fr_dstash[f])
+                    let _ = pop(fb_fr_dact[f])
+                    if len(fb_fr_cl[f]) == 0 {
+                        fb_status[f] = fs_done
+                        return true
+                    }
+                    fsettop(f, base)
+                    fpush(f, result)
+                }
+                // 列表构造与索引读写（越界 trap）
+                // Lists: construction, indexed reads and writes (out-of-bounds traps)
+            } else if op == lib::op_list {
+                let n = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                let lh = alloc_obj(ot_list)
+                let top = ftop(f)
+                let mut i = top - n
+                while i < top {
+                    push(o_vals[lh], fb_stack[f][i])
+                    i = i + 1
+                }
+                fsettop(f, top - n)
+                fpush(f, VObj(lh))
+            } else if op == lib::op_index_get {
+                let idx = fpop(f)
+                let target = fpop(f)
+                let lh = tagged_h(target, ot_list)
+                if lh >= 0 {
+                    if !is_int(idx) {
+                        trap("list index must be an int, got " + type_name(idx))
+                    }
+                    let i = int_of(idx)
+                    if i < 0 || i >= len(o_vals[lh]) {
+                        trap("list index " + str(i) + " out of bounds (len " + str(len(o_vals[lh])) + ")")
+                    }
+                    fpush(f, o_vals[lh][i])
+                } else if is_str(target) {
+                    if !is_int(idx) {
+                        trap("string index must be an int, got " + type_name(idx))
+                    }
+                    let s = str_of(target)
+                    let i = int_of(idx)
+                    if i < 0 || i >= str_len(s) {
+                        trap("string index " + str(i) + " out of bounds (len " + str(str_len(s)) + ")")
+                    }
+                    fpush(f, VStr(char_at(s, i)))
+                } else {
+                    let th = tagged_h(target, ot_tuple)
+                    if th >= 0 {
+                        if !is_int(idx) {
+                            trap("tuple index must be an int, got " + type_name(idx))
+                        }
+                        let i = int_of(idx)
+                        if i < 0 || i >= len(o_vals[th]) {
+                            trap("tuple index " + str(i) + " out of bounds (len " + str(len(o_vals[th])) + ")")
+                        }
+                        fpush(f, o_vals[th][i])
+                    } else {
+                        trap("cannot index " + type_name(target))
+                    }
+                }
+            } else if op == lib::op_index_set {
+                let v = fpop(f)
+                let idx = fpop(f)
+                let target = fpop(f)
+                let lh = tagged_h(target, ot_list)
+                if lh < 0 {
+                    trap("cannot index-assign into " + type_name(target))
+                }
+                if !is_int(idx) {
+                    trap("list index must be an int, got " + type_name(idx))
+                }
+                let i = int_of(idx)
+                if i < 0 || i >= len(o_vals[lh]) {
+                    trap("list index " + str(i) + " out of bounds (len " + str(len(o_vals[lh])) + ")")
+                }
+                o_vals[lh][i] = v
+            } else if op == lib::op_len {
+                let v = fpop(f)
+                let lh = tagged_h(v, ot_list)
+                if lh >= 0 {
+                    fpush(f, VInt(len(o_vals[lh])))
+                } else if is_str(v) {
+                    fpush(f, VInt(str_len(str_of(v))))
+                } else {
+                    trap("len() needs a list or string, got " + type_name(v))
+                }
+                // 枚举匹配：tag 测试、字段提取、未命中回退
+                // Enum matching: tag tests, field extraction, no-match fallback
+            } else if op == lib::op_test_variant {
+                let vidx = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                let etv = fpop(f)
+                let cand = fpop(f)
+                let eth = obj_h(etv)
+                if eth < 0 {
+                    trap("bad TestVariant operand (VM bug)")
+                }
+                let m = match cand {
+                    VObj(ih) => o_tag[ih] == ot_enuminst && o_i1[ih] == o_i1[eth] && o_i2[ih] == vidx,
+                    _ => false,
+                }
+                fpush(f, VBool(m))
+            } else if op == lib::op_get_field {
+                let fidx = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                let inst = fpop(f)
+                let ih = obj_h(inst)
+                if ih < 0 {
+                    trap("bad GetField operand (VM bug)")
+                }
+                fpush(f, o_vals[ih][fidx])
+            } else if op == lib::op_no_match {
+                trap("no pattern matched value " + format_val(fpeek(f, 0), true))
+            } else if op == lib::op_try {
+                if fb_fr_dact[f][fi] {
+                    let _ = fpop(f)
+                    if len(fb_fr_defers[f][fi]) > 0 {
+                        let dh = pop(fb_fr_defers[f][fi])
+                        fb_fr_ip[f][fi] = start_ip
+                        fpush(f, VObj(dh))
+                        call_value(f, 0)
+                    } else {
+                        let result = fb_fr_dstash[f][fi]
+                        let base = fb_fr_base[f][fi]
+                        close_upvalues(f, base)
+                        let _ = pop(fb_fr_cl[f])
+                        let _ = pop(fb_fr_ip[f])
+                        let _ = pop(fb_fr_base[f])
+                        let _ = pop(fb_fr_callip[f])
+                        let _ = pop(fb_fr_defers[f])
+                        let _ = pop(fb_fr_dstash[f])
+                        let _ = pop(fb_fr_dact[f])
+                        if len(fb_fr_cl[f]) == 0 {
+                            fb_status[f] = fs_done
+                            return true
+                        }
+                        fsettop(f, base)
+                        fpush(f, result)
+                    }
+                } else {
+                    let v = fpeek(f, 0)
+                    let ih = tagged_h(v, ot_enuminst)
+                    let is_opt_res = if ih >= 0 {
+                        o_i1[ih] == opt_enum || o_i1[ih] == res_enum
+                    } else {
+                        false
+                    }
+                    if !is_opt_res {
+                        trap("'?' needs an Option or Result, got " + type_name(v))
+                    }
+                    if o_i2[ih] == 0 {
+                        let _ = fpop(f)
+                        fpush(f, o_vals[ih][0])
+                    } else if len(fb_fr_defers[f][fi]) > 0 {
+                        let _ = fpop(f)
+                        fb_fr_dstash[f][fi] = v
+                        fb_fr_dact[f][fi] = true
+                        let dh = pop(fb_fr_defers[f][fi])
+                        fb_fr_ip[f][fi] = start_ip
+                        fpush(f, VObj(dh))
+                        call_value(f, 0)
+                    } else {
+                        let _ = fpop(f)
+                        let base = fb_fr_base[f][fi]
+                        close_upvalues(f, base)
+                        let _ = pop(fb_fr_cl[f])
+                        let _ = pop(fb_fr_ip[f])
+                        let _ = pop(fb_fr_base[f])
+                        let _ = pop(fb_fr_callip[f])
+                        let _ = pop(fb_fr_defers[f])
+                        let _ = pop(fb_fr_dstash[f])
+                        let _ = pop(fb_fr_dact[f])
+                        if len(fb_fr_cl[f]) == 0 {
+                            fb_status[f] = fs_done
+                            return true
+                        }
+                        fsettop(f, base)
+                        fpush(f, v)
+                    }
+                }
+                // defer：挂到当前帧的延迟栈，返回前倒序执行
+                // Defer: push onto the frame's defer stack, run in reverse before return
+            } else if op == lib::op_defer {
+                let v = fpop(f)
+                let dh = tagged_h(v, ot_closure)
+                if dh < 0 {
+                    trap("defer needs a function, got " + type_name(v) + " (VM bug)")
+                }
+                push(fb_fr_defers[f][fi], dh)
+                // 并发：spawn 新 fiber、channel 收发、select 多路等待
+                // Concurrency: spawn, channel send/recv, select multiplexing
+            } else if op == lib::op_spawn {
+                let argc = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                let callee = fpeek(f, argc)
+                let ch2 = tagged_h(callee, ot_closure)
+                if ch2 < 0 {
+                    trap("spawn needs a function, got " + type_name(callee))
+                }
+                if f_arity[o_i1[ch2]] != argc {
+                    trap(format_val(callee, false) + " expects " + str(f_arity[o_i1[ch2]]) + " argument(s), got " + str(argc))
+                }
+                let mut sargs = []
+                let mut i = 0
+                while i < argc {
+                    push(sargs, fpeek(f, argc - 1 - i))
+                    i = i + 1
+                }
+                let nf = new_fiber(ch2, sargs)
+                schedule(nf)
+                fsettop(f, ftop(f) - argc - 1)
+            } else if op == lib::op_send {
+                let v = fpop(f)
+                let chv = fpop(f)
+                let ch = tagged_h(chv, ot_channel)
+                if ch < 0 {
+                    trap("cannot send to " + type_name(chv) + " (need a channel)")
+                }
+                if o_b1[ch] {
+                    trap("send on closed channel")
+                }
+                if len(o_h2[ch]) > 0 {
+                    push(o_vals[ch], v)
+                    let r = o_h2[ch][0]
+                    o_h2[ch] = slice(o_h2[ch], 1, len(o_h2[ch]))
+                    schedule(r)
+                    wake_waiters(ch)
+                } else if len(o_vals[ch]) < o_i1[ch] {
+                    push(o_vals[ch], v)
+                    wake_waiters(ch)
+                } else {
+                    fb_sendval[f] = v
+                    fb_status[f] = fs_blocked_send
+                    push(o_h1[ch], f)
+                    wake_waiters(ch)
+                    return false
+                }
+            } else if op == lib::op_recv {
+                let chv = fpeek(f, 0)
+                let ch = tagged_h(chv, ot_channel)
+                if ch < 0 {
+                    let _ = fpop(f)
+                    trap("cannot receive from " + type_name(chv) + " (need a channel)")
+                }
+                match chan_try_recv(ch) {
+                    RecvGot(v) => {
+                        let _ = fpop(f)
+                        fpush(f, v)
+                        wake_waiters(ch)
+                    },
+                    RecvNone => {
+                        if o_b1[ch] {
+                            let _ = fpop(f)
+                            trap("receive on closed channel")
+                        }
+                        fb_status[f] = fs_blocked_recv
+                        push(o_h2[ch], f)
+                        wake_waiters(ch)
+                        fb_fr_ip[f][fi] = start_ip
+                        return false
+                    },
+                }
+            } else if op == lib::op_chan_next {
+                let chv = fpeek(f, 0)
+                let ch = tagged_h(chv, ot_channel)
+                if ch < 0 {
+                    let _ = fpop(f)
+                    trap("cannot iterate " + type_name(chv) + " (need a channel)")
+                }
+                match chan_try_recv(ch) {
+                    RecvGot(v) => {
+                        let _ = fpop(f)
+                        fpush(f, v)
+                        wake_waiters(ch)
+                        fb_fr_ip[f][fi] = start_ip + 3
+                    },
+                    RecvNone => {
+                        if o_b1[ch] {
+                            let _ = fpop(f)
+                            fb_fr_ip[f][fi] = start_ip + 3 + rd_u16(code, start_ip + 1)
+                        } else {
+                            fb_status[f] = fs_blocked_recv
+                            push(o_h2[ch], f)
+                            wake_waiters(ch)
+                            fb_fr_ip[f][fi] = start_ip
+                            return false
+                        }
+                    },
+                }
+            } else if op == lib::op_select {
+                if len(fb_selectch[f]) > 0 {
+                    for pch in fb_selectch[f] {
+                        remove_waiter(pch, f)
+                    }
+                    fb_selectch[f] = []
+                }
+                let mut p = start_ip + 1
+                let n_arms = code[p]
+                let has_default = code[p + 1] != 0
+                p = p + 2
+                let mut arm_send = []
+                let mut arm_target = []
+                let mut slots = 0
+                let mut i = 0
+                while i < n_arms {
+                    let kind = code[p]
+                    let dist = rd_u16(code, p + 1)
+                    p = p + 3
+                    push(arm_send, kind == 1)
+                    push(arm_target, p + dist)
+                    slots = slots + (if kind == 1 {
+                        2
+                    } else {
+                        1
+                    })
+                    i = i + 1
+                }
+                let mut default_target = -1
+                if has_default {
+                    let dist = rd_u16(code, p)
+                    p = p + 2
+                    default_target = p + dist
+                }
+                let base = ftop(f) - slots
+                let mut chan_pos = []
+                let mut val_pos = []
+                let mut off = base
+                i = 0
+                while i < n_arms {
+                    push(chan_pos, off)
+                    if arm_send[i] {
+                        push(val_pos, off + 1)
+                        off = off + 2
+                    } else {
+                        push(val_pos, -1)
+                        off = off + 1
+                    }
+                    i = i + 1
+                }
+                let mut chosen = -1
+                i = 0
+                while i < n_arms {
+                    let ch = tagged_h(fb_stack[f][chan_pos[i]], ot_channel)
+                    if ch < 0 {
+                        trap("select arm needs a channel, got " + type_name(fb_stack[f][chan_pos[i]]))
+                    }
+                    if arm_send[i] {
+                        if chan_send_ready(ch) {
+                            chosen = i
+                            break
+                        }
+                    } else if chan_recv_ready(ch) {
+                        chosen = i
+                        break
+                    }
+                    i = i + 1
+                }
+                if chosen >= 0 {
+                    let ch = tagged_h(fb_stack[f][chan_pos[chosen]], ot_channel)
+                    if arm_send[chosen] {
+                        if o_b1[ch] {
+                            trap("send on closed channel")
+                        }
+                        let v = fb_stack[f][val_pos[chosen]]
+                        if len(o_h2[ch]) > 0 {
+                            push(o_vals[ch], v)
+                            let r = o_h2[ch][0]
+                            o_h2[ch] = slice(o_h2[ch], 1, len(o_h2[ch]))
+                            schedule(r)
+                        } else {
+                            push(o_vals[ch], v)
+                        }
+                        wake_waiters(ch)
+                        fsettop(f, base)
+                    } else {
+                        match chan_try_recv(ch) {
+                            RecvGot(v) => {
+                                wake_waiters(ch)
+                                fsettop(f, base)
+                                fpush(f, v)
+                            },
+                            RecvNone => {
+                                fsettop(f, base)
+                                trap("receive on closed channel")
+                            },
+                        }
+                    }
+                    fb_fr_ip[f][fi] = arm_target[chosen]
+                } else if has_default {
+                    fsettop(f, base)
+                    fb_fr_ip[f][fi] = default_target
+                } else {
+                    i = 0
+                    while i < n_arms {
+                        let ch = tagged_h(fb_stack[f][chan_pos[i]], ot_channel)
+                        push(o_h3[ch], f)
+                        push(fb_selectch[f], ch)
+                        i = i + 1
+                    }
+                    fb_status[f] = fs_blocked_select
+                    fb_fr_ip[f][fi] = start_ip
+                    return false
+                }
+                // tuple 与 record：构造、字段访问、record 更新
+                // Tuples and records: construction, field access, record updates
+            } else if op == lib::op_tuple {
+                let n = code[start_ip + 1]
+                fb_fr_ip[f][fi] = start_ip + 2
+                let h = alloc_obj(ot_tuple)
+                let mut vals = []
+                let mut i = 0
+                while i < n {
+                    push(vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
+                fsettop(f, ftop(f) - n)
+                o_vals[h] = vals
+                fpush(f, VObj(h))
+            } else if op == lib::op_record {
+                let n = code[start_ip + 1]
+                let cidx = rd_u16(code, start_ip + 2)
+                fb_fr_ip[f][fi] = start_ip + 4
+                let names_str = match k_vals[fnh][cidx] {
+                    VStr(s) => s,
+                    _ => "",
+                }
+                let fnames = split(names_str, "\n")
+                let h = alloc_obj(ot_record)
+                let mut vals = []
+                let mut i = 0
+                while i < n {
+                    push(vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
+                fsettop(f, ftop(f) - n)
+                let mut keys = []
+                let mut j = 0
+                while j < len(fnames) {
+                    if fnames[j] != "" {
+                        push(keys, VStr(fnames[j]))
+                    }
+                    j = j + 1
+                }
+                o_vals[h] = vals
+                o_keys[h] = keys
+                fpush(f, VObj(h))
+            } else if op == lib::op_get_field_name {
+                let cidx = rd_u16(code, start_ip + 1)
+                fb_fr_ip[f][fi] = start_ip + 3
+                let fname = match k_vals[fnh][cidx] {
+                    VStr(s) => s,
+                    _ => "",
+                }
+                let rv = fpop(f)
+                let rh = tagged_h(rv, ot_record)
+                if rh < 0 {
+                    trap("field access needs a record, got " + type_name(rv))
+                }
+                let mut found = false
+                let mut i = 0
+                while i < len(o_keys[rh]) {
+                    if o_keys[rh][i] == VStr(fname) {
+                        fpush(f, o_vals[rh][i])
+                        found = true
+                        i = len(o_keys[rh])
+                    }
+                    i = i + 1
+                }
+                if !found {
+                    trap("record has no field \"" + fname + "\"")
+                }
+            } else if op == lib::op_record_update {
+                let n = code[start_ip + 1]
+                let cidx = rd_u16(code, start_ip + 2)
+                fb_fr_ip[f][fi] = start_ip + 4
+                let names_str = match k_vals[fnh][cidx] {
+                    VStr(s) => s,
+                    _ => "",
+                }
+                let fnames = split(names_str, "\n")
+                let mut update_names = []
+                let mut j = 0
+                while j < len(fnames) {
+                    if fnames[j] != "" {
+                        push(update_names, fnames[j])
+                    }
+                    j = j + 1
+                }
+                let mut new_vals = []
+                let mut i = 0
+                while i < n {
+                    push(new_vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
+                fsettop(f, ftop(f) - n)
+                let base_v = fpop(f)
+                let bh = tagged_h(base_v, ot_record)
+                if bh < 0 {
+                    trap("record update needs a record, got " + type_name(base_v))
+                }
+                let h = alloc_obj(ot_record)
+                let mut rkeys = []
+                let mut rvals = []
+                let mut k = 0
+                while k < len(o_keys[bh]) {
+                    push(rkeys, o_keys[bh][k])
+                    let mut overwritten = false
+                    let mut m = 0
+                    while m < len(update_names) {
+                        if VStr(update_names[m]) == o_keys[bh][k] {
+                            push(rvals, new_vals[m])
+                            overwritten = true
+                            m = len(update_names)
+                        }
+                        m = m + 1
+                    }
+                    if !overwritten {
+                        push(rvals, o_vals[bh][k])
+                    }
+                    k = k + 1
+                }
+                o_vals[h] = rvals
+                o_keys[h] = rkeys
+                fpush(f, VObj(h))
+            } else {
+                trap("bad opcode " + str(op) + " (VM bug)")
+            }
+        }
+        false
+    }
+
+    let mut et_obj = []
+    let mut e = 0
+    while e < len(en_qual) {
+        let h = alloc_obj(ot_enumtype)
+        o_i1[h] = e
+        push(et_obj, h)
+        push(pinned, h)
+        if en_qual[e] == "Option" {
+            opt_enum = e
+        }
+        if en_qual[e] == "Result" {
+            res_enum = e
+        }
+        if en_qual[e] == "Output" {
+            out_enum = e
+        }
+        e = e + 1
+    }
+    // 装载函数表：代码/跨度/常量池逐函数复制
+    // Load function tables: per-function code, spans, and constant pools
+    let mut fh = 0
+    while fh < len(f_name) {
+        let mut kv = []
+        for cv in f_consts[fh] {
+            push(kv, match cv {
+                lib::CVal::CInt(n) => VInt(n),
+                lib::CVal::CFloat(x) => VFloat(x),
+                lib::CVal::CStr(s) => VStr(s),
+                lib::CVal::CFn(_) => VUnit,
+                lib::CVal::CEnumType(eh) => VObj(et_obj[eh]),
+                lib::CVal::CSingleton(eh, vi) => {
+                    let h = alloc_obj(ot_enuminst)
+                    o_i1[h] = eh
+                    o_i2[h] = vi
+                    push(pinned, h)
+                    VObj(h)
+                },
+                lib::CVal::CCtor(eh, vi) => {
+                    let h = alloc_obj(ot_ctor)
+                    o_i1[h] = eh
+                    o_i2[h] = vi
+                    push(pinned, h)
+                    VObj(h)
+                },
+            })
+        }
+        push(k_vals, kv)
+        fh = fh + 1
+    }
+    let mut ni = 0
+    while ni < len(lib::native_names) {
+        let h = alloc_obj(ot_native)
+        o_i1[h] = ni
+        push(pinned, h)
+        put(globals, lib::native_names[ni], VObj(h))
+        ni = ni + 1
+    }
+    put(globals, "Option", VObj(et_obj[opt_enum]))
+    put(globals, "Result", VObj(et_obj[res_enum]))
+    put(globals, "Output", VObj(et_obj[out_enum]))
+
+    let mcl = alloc_obj(ot_closure)
+    o_i1[mcl] = 0
+    main_fiber = new_fiber(mcl, [])
+    push(ready, main_fiber)
+    vm_on = true
+    // 调度循环：跑就绪 fiber；全阻塞时按等待类型轮询 IO/网络/timer
+    // Scheduler loop: run ready fibers; when all block, poll IO/network/timers by wait kind
+    while true {
+        if ntimers > 0 {
+            wake_due_timers()
+        }
+        if nio > 0 {
+            wait_register_all()
+            wait_poll_io()
+        }
+        if nio_net > 0 {
+            wait_poll_net()
+        }
+        if nio_stdin > 0 {
+            wait_poll_stdin()
+        }
+        if len(ready) == 0 {
+            if nio > 0 || nio_net > 0 || nio_stdin > 0 || ntimers > 0 {
+                wait_idle()
+            } else {
+                let mut blocked = 0
+                let mut bi = 0
+                while bi < len(fb_status) {
+                    let st = fb_status[bi]
+                    if st == fs_blocked_send || st == fs_blocked_recv || st == fs_blocked_select {
+                        blocked = blocked + 1
+                    }
+                    bi = bi + 1
+                }
+                if blocked > 0 {
+                    eprintln("fatal: deadlock — all " + str(blocked) + " remaining fiber(s) are blocked on channels")
+                    exit(4)
+                }
+                return
+            }
+        }
+        let fx = ready[0]
+        ready = slice(ready, 1, len(ready))
+        if fb_status[fx] == fs_ready {
+            let done = exec_fiber(fx)
+            if done && fx == main_fiber {
+                return
+            }
+        }
+    }
+}

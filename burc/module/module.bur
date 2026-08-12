@@ -1,0 +1,1181 @@
+// module.bur — 模块加载器：解析 import、缓存命中、子包发现、std 嵌入表回退。
+// Module loader: import resolution, cache hits, subpackage discovery, embedded-std fallback.
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// 模块加载输出
+// Module load output
+pub enum ModOut {
+    ModLoaded([lib::DiagT], [str], [str], [[[frontend::Node]]], [[str]], [[[frontend::Node]]], [str], [[[int]]]),
+    ModFailed([lib::DiagT], [str]),
+}
+
+// str_ends_with 后缀检查 / str_ends_with checks a suffix
+fn str_ends_with(s, suffix) {
+    let n = str_len(s)
+    let m = str_len(suffix)
+    n >= m && substr(s, n - m, m) == suffix
+}
+
+// str_fields 按空白分词（bur.mod 用）/ str_fields splits on whitespace (for bur.mod)
+fn str_fields(s) {
+    let mut out = []
+    let mut start = -1
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        if c == " " || c == "\t" {
+            if start >= 0 {
+                push(out, substr(s, start, i - start))
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+        i = i + 1
+    }
+    if start >= 0 {
+        push(out, substr(s, start, str_len(s) - start))
+    }
+    out
+}
+
+// iface_id_of 生成接口缓存 id / iface_id_of derives the interface cache id
+fn iface_id_of(hash) {
+    let mut out = ""
+    let mut i = 0
+    while i < str_len(hash) {
+        let c = char_at(hash, i)
+        if c == "+" {
+            out = out + "-"
+        } else if c == "/" {
+            out = out + "_"
+        } else if c == "=" || c == ":" {} else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    lib::toolchain_version + "-" + out
+}
+
+// valid_import_path 校验 import 路径 / valid_import_path validates an import path
+fn valid_import_path(p) {
+    if p == "" || lib::str_has_prefix(p, "/") || str_ends_with(p, "/") {
+        false
+    } else {
+        let mut ok = true
+        for el in split(p, "/") {
+            if el == "" || el == "." || el == ".." {
+                ok = false
+            }
+        }
+        if str_contains(p, "\\") || str_contains(p, " ") || str_contains(p, "\t") || str_contains(p, "\"") || str_contains(p, "'") || str_contains(p, "`") {
+            ok = false
+        }
+        ok
+    }
+}
+
+// is_const_expr 判断是否为常量表达式 / is_const_expr tells whether an expression is constant
+fn is_const_expr(e) {
+    match e {
+        frontend::Node::IntLit(_, _) => true,
+        frontend::Node::FloatLit(_, _) => true,
+        frontend::Node::StrLit(_, _) => true,
+        frontend::Node::BoolLit(_, _) => true,
+        frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => true,
+        frontend::Node::Unary(_, rhs, _) => is_const_expr(rhs),
+        frontend::Node::Binary(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
+        frontend::Node::Logical(_, lhs, rhs, _) => is_const_expr(lhs) && is_const_expr(rhs),
+        frontend::Node::ListLit(elems, _) => {
+            let mut ok = true
+            for el in elems {
+                if !is_const_expr(el) {
+                    ok = false
+                }
+            }
+            ok
+        },
+        frontend::Node::TupleLit(elems, _) => {
+            let mut ok = true
+            for el in elems {
+                if !is_const_expr(el) {
+                    ok = false
+                }
+            }
+            ok
+        },
+        _ => false,
+    }
+}
+
+// parse_bur_mod 解析 bur.mod 清单（模块路径 + 依赖）
+// parse_bur_mod parses a bur.mod manifest (module path + deps)
+fn parse_bur_mod(file, src, mut diags, mut dfiles) {
+    let mut path = ""
+    let mut off = 0
+    for line0 in split(src, "\n") {
+        let line_off = off
+        off = off + str_len(line0) + 1
+        let text = match str_index_of(line0, "//") {
+            Some(i) => substr(line0, 0, i),
+            None => line0,
+        }
+        let fields = str_fields(text)
+        if len(fields) > 0 {
+            let sp_start = line_off
+            let sp_end = line_off + str_len(text)
+            if fields[0] == "module" {
+                if len(fields) != 2 {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "malformed module directive", "write `module <path>`, e.g. `module example.com/you/hello`", sp_start, sp_end))
+                    push(dfiles, file)
+                } else if path != "" {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "duplicate module directive", "", sp_start, sp_end))
+                    push(dfiles, file)
+                } else if !valid_import_path(fields[1]) {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "invalid module path \"" + fields[1] + "\"", "", sp_start, sp_end))
+                    push(dfiles, file)
+                } else {
+                    path = fields[1]
+                }
+            } else if fields[0] == "require" {
+                if len(fields) != 3 || !valid_import_path(fields[1]) || !lib::str_has_prefix(fields[2], "v") {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "malformed require directive", "write `require <path> <version>`", sp_start, sp_end))
+                    push(dfiles, file)
+                }
+            } else {
+                push(diags, lib::DiagT::Diag(true, "E0432", "unknown directive \"" + fields[0] + "\"", "bur.mod knows the directives `module` and `require`", sp_start, sp_end))
+                push(dfiles, file)
+            }
+        }
+    }
+    if path == "" && len(diags) == 0 {
+        push(diags, lib::DiagT::Diag(true, "E0432", "missing module directive in " + file, "add a module directive, e.g. `module example.com/you/hello`", 0, 0))
+        push(dfiles, file)
+    }
+    path
+}
+
+// mark_pattern 标记模式中的名字使用 / mark_pattern marks usage in a pattern
+fn mark_pattern(p, aliases, mut used) {
+    match p {
+        frontend::Node::PatVariant(ppkg, _, _, binds, _) => {
+            if ppkg != "" {
+                match get(aliases, ppkg) {
+                    Some(_) => put(used, ppkg, true),
+                    None => {},
+                }
+            }
+            for sub in binds {
+                mark_pattern(sub, aliases, used)
+            }
+        },
+        _ => {},
+    }
+}
+
+// mark_te 标记类型表达式中的名字使用 / mark_te marks usage in a type expression
+fn mark_te(te, aliases, mut used) {
+    match te {
+        frontend::Node::TEName(pkg, _, _, targs, _) => {
+            if pkg != "" {
+                match get(aliases, pkg) {
+                    Some(_) => put(used, pkg, true),
+                    None => {},
+                }
+            }
+            for a in targs {
+                mark_te(a, aliases, used)
+            }
+        },
+        frontend::Node::TEList(elem, _) => mark_te(elem, aliases, used),
+        frontend::Node::TEFn(ps, ret, _) => {
+            for p2 in ps {
+                mark_te(p2, aliases, used)
+            }
+            mark_te(ret, aliases, used)
+        },
+        _ => {},
+    }
+}
+
+// mark_expr 标记表达式中的名字使用（未用 import 检查）
+// mark_expr marks names used in an expression (unused-import check)
+fn mark_expr(e, aliases, mut used) {
+    // 标记表达式中的名字使用（未用 import 检查）
+    // Mark name usage in expressions (unused-import check)
+    match e {
+        frontend::Node::VariantAccess(en, _, _) => {
+            match get(aliases, en) {
+                Some(_) => put(used, en, true),
+                None => {},
+            }
+        },
+        frontend::Node::QualVariantAccess(pkg, _, _, _) => {
+            match get(aliases, pkg) {
+                Some(_) => put(used, pkg, true),
+                None => {},
+            }
+        },
+        frontend::Node::Unary(_, rhs, _) => mark_expr(rhs, aliases, used),
+        frontend::Node::Binary(_, lhs, rhs, _) => {
+            mark_expr(lhs, aliases, used)
+            mark_expr(rhs, aliases, used)
+        },
+        frontend::Node::Logical(_, lhs, rhs, _) => {
+            mark_expr(lhs, aliases, used)
+            mark_expr(rhs, aliases, used)
+        },
+        frontend::Node::Call(callee, cargs, _) => {
+            mark_expr(callee, aliases, used)
+            for a in cargs {
+                mark_expr(a, aliases, used)
+            }
+        },
+        frontend::Node::Pipe(lhs, target, args, _) => {
+            mark_expr(lhs, aliases, used)
+            mark_expr(target, aliases, used)
+            for a in args {
+                mark_expr(a, aliases, used)
+            }
+        },
+        frontend::Node::Index(target, idx, _) => {
+            mark_expr(target, aliases, used)
+            mark_expr(idx, aliases, used)
+        },
+        frontend::Node::ListLit(elems, _) => {
+            for el in elems {
+                mark_expr(el, aliases, used)
+            }
+        },
+        frontend::Node::FnLit(_, _, _, param_tys, ret_ty, body, _, _, _) => {
+            for te in param_tys {
+                mark_te(te, aliases, used)
+            }
+            mark_te(ret_ty, aliases, used)
+            mark_expr(body, aliases, used)
+        },
+        frontend::Node::Block(stmts, _) => {
+            for s in stmts {
+                mark_stmt(s, aliases, used)
+            }
+        },
+        frontend::Node::IfExpr(cond, then, els, _) => {
+            mark_expr(cond, aliases, used)
+            mark_expr(then, aliases, used)
+            mark_expr(els, aliases, used)
+        },
+        frontend::Node::MatchExpr(scrut, arms, _) => {
+            mark_expr(scrut, aliases, used)
+            for arm in arms {
+                match arm {
+                    frontend::Node::MatchArm(pat, guard, body, _) => {
+                        mark_pattern(pat, aliases, used)
+                        mark_expr(guard, aliases, used)
+                        mark_expr(body, aliases, used)
+                    },
+                    _ => {},
+                }
+            }
+        },
+        frontend::Node::TryExpr(inner, _) => mark_expr(inner, aliases, used),
+        frontend::Node::RecvExpr(chexpr, _) => mark_expr(chexpr, aliases, used),
+        _ => {},
+    }
+}
+
+// mark_stmt 标记语句中的名字使用 / mark_stmt marks usage in a statement
+fn mark_stmt(s, aliases, mut used) {
+    match s {
+        frontend::Node::LetStmt(_, _, _, _, _, init, _) => mark_expr(init, aliases, used),
+        frontend::Node::ConstDecl(_, _, _, _, init, _) => mark_expr(init, aliases, used),
+        frontend::Node::AssignStmt(target, val, _) => {
+            mark_expr(target, aliases, used)
+            mark_expr(val, aliases, used)
+        },
+        frontend::Node::ExprStmt(e, _) => mark_expr(e, aliases, used),
+        frontend::Node::WhileStmt(cond, body, _) => {
+            mark_expr(cond, aliases, used)
+            mark_expr(body, aliases, used)
+        },
+        frontend::Node::ForStmt(_, _, _, _, iter, _, body, _) => {
+            mark_expr(iter, aliases, used)
+            mark_expr(body, aliases, used)
+        },
+        frontend::Node::ReturnStmt(v, _) => mark_expr(v, aliases, used),
+        frontend::Node::FnDecl(_, _, _, lit, _) => mark_expr(lit, aliases, used),
+        frontend::Node::EnumDecl(_, _, variants, _, _) => {
+            for vd in variants {
+                match vd {
+                    frontend::Node::EnumVariantDecl(_, _, vtypes, _) => {
+                        for te in vtypes {
+                            mark_te(te, aliases, used)
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        },
+        frontend::Node::SpawnStmt(call, _) => mark_expr(call, aliases, used),
+        frontend::Node::DeferStmt(body, _, _) => mark_expr(body, aliases, used),
+        frontend::Node::SendStmt(chexpr, val, _) => {
+            mark_expr(chexpr, aliases, used)
+            mark_expr(val, aliases, used)
+        },
+        _ => {},
+    }
+}
+
+// resolve_te 把类型表达式中的名字解析为限定名
+// resolve_te resolves names in a type expression to qualified names
+fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
+    match te {
+        frontend::Node::TEName(pkg, name, constraint, targs, sp) => {
+            let mut rargs = []
+            for a in targs {
+                push(rargs, resolve_te(a, aliases, mod_path, disp, diags, dfiles))
+            }
+            let rpkg = if pkg == "" {
+                ""
+            } else {
+                match get(aliases, pkg) {
+                    Some(path) => path,
+                    None => {
+                        match sp {
+                            frontend::SpanT::Sp(s0, e0) => {
+                                push(diags, lib::DiagT::Diag(true, "E0433", "cannot find package `" + pkg + "`", "import it first: `import \"" + mod_path + "/" + pkg + "\"`", s0, e0))
+                                push(dfiles, disp)
+                            },
+                        }
+                        pkg
+                    },
+                }
+            }
+            frontend::Node::TEName(rpkg, name, constraint, rargs, sp)
+        },
+        frontend::Node::TEList(elem, sp) => frontend::Node::TEList(resolve_te(elem, aliases, mod_path, disp, diags, dfiles), sp),
+        frontend::Node::TEFn(ps, ret, sp) => {
+            let mut rps = []
+            for p2 in ps {
+                push(rps, resolve_te(p2, aliases, mod_path, disp, diags, dfiles))
+            }
+            frontend::Node::TEFn(rps, resolve_te(ret, aliases, mod_path, disp, diags, dfiles), sp)
+        },
+        _ => te,
+    }
+}
+
+// resolve_file_tes 解析文件中的类型表达式 / resolve_file_tes resolves type expressions in a file
+fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
+    let mut out = []
+    for s in stmts {
+        match s {
+            frontend::Node::EnumDecl(name, params, variants, is_pub, sp) => {
+                let mut rvars = []
+                for vd in variants {
+                    match vd {
+                        frontend::Node::EnumVariantDecl(vn, ar, vtypes, vsp) => {
+                            let mut rts = []
+                            for te in vtypes {
+                                push(rts, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                            }
+                            push(rvars, frontend::Node::EnumVariantDecl(vn, ar, rts, vsp))
+                        },
+                        _ => push(rvars, vd),
+                    }
+                }
+                push(out, frontend::Node::EnumDecl(name, params, rvars, is_pub, sp))
+            },
+            frontend::Node::FnDecl(name, nsp, is_pub, lit, sp) => {
+                match lit {
+                    frontend::Node::FnLit(params, muts, pspans, param_tys, ret_ty, body, fname, crefs, lsp) => {
+                        let mut rparam_tys = []
+                        for te in param_tys {
+                            push(rparam_tys, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                        }
+                        let rret_ty = match ret_ty {
+                            frontend::Node::NoNode => frontend::Node::NoNode,
+                            te => resolve_te(te, aliases, mod_path, disp, diags, dfiles),
+                        }
+                        push(out, frontend::Node::FnDecl(name, nsp, is_pub, frontend::Node::FnLit(params, muts, pspans, rparam_tys, rret_ty, body, fname, crefs, lsp), sp))
+                    },
+                    _ => push(out, s),
+                }
+            },
+            frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, init, sp) => {
+                match init {
+                    frontend::Node::TEName(_, _, _, _, _) => push(out, frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend::Node::TEList(_, _) => push(out, frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend::Node::TEFn(_, _, _) => push(out, frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    _ => push(out, s),
+                }
+            },
+            _ => push(out, s),
+        }
+    }
+    out
+}
+
+// check_pkg_shape 包形状检查：pub 导出与 import 匹配
+// check_pkg_shape checks the package shape: pub exports match imports
+// check_pkg_shape 校验包形状：pub 导出与 import 使用一致
+// check_pkg_shape verifies the package shape: pub exports match imports
+fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
+    // 收集 pub 声明后与 import 引用对账
+    // Collect pub declarations, then reconcile against import references
+    let mut declared = map()
+    let mut declared_s = map()
+    let mut declared_e = map()
+    let mut fi = 0
+    while fi < len(files_stmts) {
+        let disp = file_paths[fi]
+        for s in files_stmts[fi] {
+            let mut name = ""
+            let mut name_sp = frontend::SpanT::Sp(0, 0)
+            match s {
+                frontend::Node::FnDecl(n, nsp, _, _, _) => {
+                    name = n
+                    name_sp = nsp
+                },
+                frontend::Node::EnumDecl(n, _, _, _, esp) => {
+                    name = n
+                    name_sp = esp
+                },
+                frontend::Node::ConstDecl(n, nsp, _, _, _, _) => {
+                    name = n
+                    name_sp = nsp
+                },
+                frontend::Node::LetStmt(n, nsp, _, _, _, init, _) => {
+                    name = n
+                    name_sp = nsp
+                    if !is_const_expr(init) {
+                        match frontend::span_of(init) {
+                            frontend::SpanT::Sp(is0, ie0) => {
+                                push(diags, lib::DiagT::Diag(true, "E0802", "package-level `let` must be initialized with a constant expression", "package-level `let` allows literals, arithmetic on literals, list literals, and `fn` literals; compute anything else inside a function", is0, ie0))
+                                push(dfiles, disp)
+                            },
+                        }
+                    }
+                },
+                _ => {
+                    match frontend::span_of(s) {
+                        frontend::SpanT::Sp(ss0, se0) => {
+                            push(diags, lib::DiagT::Diag(true, "E0801", "only declarations are allowed at the top level of a package file", "executable code lives inside functions; the program starts at `fn main`", ss0, se0))
+                            push(dfiles, disp)
+                        },
+                    }
+                },
+            }
+            if name != "" {
+                match get(declared, name) {
+                    Some(prev) => {
+                        let where_part = if prev != disp {
+                            " (first declared in " + prev + ")"
+                        } else {
+                            ""
+                        }
+                        let ps = match get(declared_s, name) {
+                            Some(x) => x,
+                            None => 0,
+                        }
+                        let pe = match get(declared_e, name) {
+                            Some(x) => x,
+                            None => 0,
+                        }
+                        match name_sp {
+                            frontend::SpanT::Sp(ns0, ne0) => {
+                                if prev == disp {
+                                    push(diags, lib::DiagT::DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [lib::LabelT::Lab(ps, pe, "first declared here")], []))
+                                } else {
+                                    push(diags, lib::DiagT::Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
+                                }
+                                push(dfiles, disp)
+                            },
+                        }
+                    },
+                    None => {
+                        put(declared, name, disp)
+                        match name_sp {
+                            frontend::SpanT::Sp(ns0, ne0) => {
+                                put(declared_s, name, ns0)
+                                put(declared_e, name, ne0)
+                            },
+                        }
+                    },
+                }
+            }
+        }
+        fi = fi + 1
+    }
+}
+
+// load_module 是模块加载入口：定位 bur.mod、解析依赖、加载子包
+// load_module is the module load entry: locate bur.mod, resolve deps, load subpackages
+pub fn load_module(dir0) {
+    load_module_opts(dir0, "")
+}
+
+// load_module_opts 带选项的模块加载 / load_module_opts loads a module with options
+fn load_module_opts(dir0, test_rel) {
+    let dir = if str_ends_with(dir0, "/") {
+        substr(dir0, 0, str_len(dir0) - 1)
+    } else {
+        dir0
+    }
+    let mut diags = []
+    let mut dfiles = []
+    let mod_file = dir + "/bur.mod"
+    let mod_src = match read_file(mod_file) {
+        Ok(s) => s,
+        Err(msg) => {
+            push(diags, lib::DiagT::Diag(true, "E0432", "cannot read " + mod_file + ": " + msg, "create one with a module directive, e.g. `module example.com/you/hello`", 0, 0))
+            push(dfiles, "")
+            return ModFailed(diags, dfiles)
+            ""
+        },
+    }
+    let mod_path = parse_bur_mod(mod_file, mod_src, diags, dfiles)
+    if len(diags) > 0 {
+        return ModFailed(diags, dfiles)
+    }
+    let test_pkg = if test_rel == "" {
+        ""
+    } else if test_rel == "." {
+        mod_path
+    } else {
+        mod_path + "/" + test_rel
+    }
+
+    let mut sum_ids = map()
+    match read_file(dir + "/bur.sum") {
+        Ok(sum) => {
+            for line in split(sum, "\n") {
+                let f = str_fields(line)
+                if len(f) == 3 {
+                    put(sum_ids, f[0] + "@" + f[1], iface_id_of(f[2]))
+                }
+            }
+        },
+        Err(_) => {},
+    }
+
+    let mut dep_paths = []
+    let mut dep_vers = []
+    match mvs_resolve(dir) {
+        Ok(pick) => match pick {
+            MP(paths, vers) => {
+                let mut i = 0
+                while i < len(paths) {
+                    push(dep_paths, paths[i])
+                    push(dep_vers, vers[i])
+                    i = i + 1
+                }
+            },
+        },
+        Err(msg) => {
+            push(diags, lib::DiagT::Diag(true, "E0432", "cannot resolve module dependencies: " + msg, "fetch the required modules with `bur mod download`", 0, 0))
+            push(dfiles, mod_file)
+            return ModFailed(diags, dfiles)
+        },
+    }
+
+    let mut state = map()
+    let mut out_paths = []
+    let mut out_files = []
+    let mut out_fpaths = []
+    let mut out_imports = []
+    let mut out_ids = []
+    let mut out_lstarts = []
+    // load_pkg 加载单个包（环检测）/ load_pkg loads one package (cycle-checked)
+    // load_pkg 加载单个包：环检测 → 接口缓存 → 全量解析
+    // load_pkg loads one package: cycle check, interface cache, full parse
+    // load_pkg 逐包加载：环检测、接口缓存、全量解析与形状校验
+    // load_pkg loads one package: cycle check, interface cache, full parse, shape check
+    fn load_pkg(path, from_file, from_sp, stack) {
+        let st = match get(state, path) {
+            Some(x) => x,
+            None => 0,
+        }
+        if st == 2 {
+            return
+        }
+        if st == 1 {
+            let mut start = 0
+            let mut found = false
+            let mut i = 0
+            while i < len(stack) {
+                if stack[i] == path && !found {
+                    start = i
+                    found = true
+                }
+                i = i + 1
+            }
+            let mut cyc = []
+            i = start
+            while i < len(stack) {
+                push(cyc, stack[i])
+                i = i + 1
+            }
+            push(cyc, path)
+            match from_sp {
+                frontend::SpanT::Sp(s0, e0) => {
+                    push(diags, lib::DiagT::Diag(true, "E0391", "import cycle: " + join(cyc, " -> "), "", s0, e0))
+                    push(dfiles, from_file)
+                },
+            }
+            return
+        }
+        put(state, path, 1)
+        let stack2 = concat(stack, [path])
+        let is_std = path != mod_path && (path == "std" || lib::str_has_prefix(path, "std/"))
+
+        let is_local = path == mod_path || lib::str_has_prefix(path, mod_path + "/")
+        let mut dep_ix = -1
+        let mut dep_len = -1
+        let mut xi = 0
+        while xi < len(dep_paths) {
+            let prefix = dep_paths[xi]
+            if (path == prefix || lib::str_has_prefix(path, prefix + "/")) && str_len(prefix) > dep_len {
+                dep_ix = xi
+                dep_len = str_len(prefix)
+            }
+            xi = xi + 1
+        }
+        let is_external = !is_std && !is_local && dep_ix >= 0
+        if !is_std && !is_local && !is_external {
+            match from_sp {
+                frontend::SpanT::Sp(s0, e0) => {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "cannot resolve import \"" + path + "\"", "add its module with `bur get <module>@<version>` or a `require` directive", s0, e0))
+                    push(dfiles, from_file)
+                },
+            }
+            put(state, path, 2)
+            return
+        }
+        let std_rels = if is_std {
+            match get(lib::std_embed_files(), path) {
+                Some(rels) => rels,
+                None => {
+                    match from_sp {
+                        frontend::SpanT::Sp(s0, e0) => {
+                            push(diags, lib::DiagT::Diag(true, "E0433", "cannot find bundled standard package \"" + path + "\"", "check the `std/` import path shipped with this Burryn version", s0, e0))
+                            push(dfiles, from_file)
+                        },
+                    }
+                    put(state, path, 2)
+                    return
+                    ""
+                },
+            }
+        } else {
+            ""
+        }
+        let pdir = if is_std {
+            "<std:" + path + ">"
+        } else if is_external {
+            let root = cache_root() + "/" + dep_paths[dep_ix] + "@" + dep_vers[dep_ix]
+            if path == dep_paths[dep_ix] {
+                root
+            } else {
+                root + "/" + substr(path, dep_len + 1, str_len(path) - dep_len - 1)
+            }
+        } else if path == mod_path {
+            dir
+        } else {
+            dir + "/" + substr(path, str_len(mod_path) + 1, str_len(path) - str_len(mod_path) - 1)
+        }
+        let entries = if is_std {
+            split(std_rels, chr(31))
+        } else {
+            match read_dir(pdir) {
+                Ok(es) => es,
+                Err(msg) => {
+                    match from_sp {
+                        frontend::SpanT::Sp(s0, e0) => {
+                            push(diags, lib::DiagT::Diag(true, "E0433", "cannot find package \"" + path + "\": " + msg, "", s0, e0))
+                            push(dfiles, from_file)
+                        },
+                    }
+                    put(state, path, 2)
+                    return
+                    []
+                },
+            }
+        }
+
+        let mut files_stmts = []
+        let mut file_paths = []
+        let mut file_imports = []
+        let mut file_lstarts = []
+        let mut bur_files = 0
+        let want_tests = test_pkg != "" && path == test_pkg
+        for name in entries {
+            if str_ends_with(name, ".bur") && (want_tests || !str_ends_with(name, "_test.bur")) {
+                bur_files = bur_files + 1
+                let disp = pdir + "/" + name
+                let src = if is_std {
+                    match lib::std_embed_get(path, name) {
+                        Some(s) => s,
+                        None => {
+                            push(diags, lib::DiagT::Diag(true, "E0433", "missing embedded source " + path + "/" + name, "rebuild Burryn so its bundled standard library is complete", 0, 0))
+                            push(dfiles, "")
+                            ""
+                        },
+                    }
+                } else {
+                    match lsp_overlay_read(disp) {
+                        Ok(s) => s,
+                        Err(msg) => {
+                            push(diags, lib::DiagT::Diag(true, "E0433", "cannot read " + disp + ": " + msg, "", 0, 0))
+                            push(dfiles, "")
+                            ""
+                        },
+                    }
+                }
+                if src != "" {
+                    match frontend::lex(src) {
+                        lib::LexOut::Lexed(toks, ldiags, _) => {
+                            if len(ldiags) > 0 {
+                                for d in ldiags {
+                                    push(diags, d)
+                                    push(dfiles, disp)
+                                }
+                            } else {
+                                match frontend::parse(toks) {
+                                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                                        if len(pdiags) > 0 {
+                                            for d in pdiags {
+                                                push(diags, d)
+                                                push(dfiles, disp)
+                                            }
+                                        } else {
+                                            let mut kept = []
+                                            let mut imps = []
+                                            let mut imports_done = false
+                                            for s in stmts {
+                                                match s {
+                                                    frontend::Node::ImportDecl(_, _, _, _, isp) => {
+                                                        if imports_done {
+                                                            match isp {
+                                                                frontend::SpanT::Sp(is0, ie0) => {
+                                                                    push(diags, lib::DiagT::Diag(true, "E0432", "`import` must come before any declarations", "move it to the top of the file, above the declarations", is0, ie0))
+                                                                    push(dfiles, disp)
+                                                                },
+                                                            }
+                                                        } else {
+                                                            push(imps, s)
+                                                        }
+                                                    },
+                                                    _ => {
+                                                        imports_done = true
+                                                        push(kept, s)
+                                                    },
+                                                }
+                                            }
+                                            push(files_stmts, kept)
+                                            push(file_paths, disp)
+                                            push(file_imports, imps)
+                                            push(file_lstarts, lib::line_starts(src))
+                                        }
+                                    },
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        if bur_files == 0 {
+            match from_sp {
+                frontend::SpanT::Sp(s0, e0) => {
+                    push(diags, lib::DiagT::Diag(true, "E0433", "no .bur files in package \"" + path + "\" (" + pdir + ")", "", s0, e0))
+                    push(dfiles, from_file)
+                },
+            }
+            put(state, path, 2)
+            return
+        }
+
+        check_pkg_shape(path, files_stmts, file_paths, diags, dfiles)
+
+        let mut decl_names = map()
+        let mut di = 0
+        while di < len(files_stmts) {
+            for s in files_stmts[di] {
+                match s {
+                    frontend::Node::FnDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    frontend::Node::EnumDecl(n, _, _, _, _) => put(decl_names, n, true),
+                    frontend::Node::LetStmt(n, _, _, _, _, _, _) => put(decl_names, n, true),
+                    frontend::Node::ConstDecl(n, _, _, _, _, _) => put(decl_names, n, true),
+                    _ => {},
+                }
+            }
+            di = di + 1
+        }
+
+        let mut fi = 0
+        while fi < len(files_stmts) {
+            let disp = file_paths[fi]
+            let mut kept_imps = []
+            let mut seen = map()
+            for imp in file_imports[fi] {
+                match imp {
+                    frontend::Node::ImportDecl(alias0, asp, ipath, psp, isp) => {
+                        let alias = frontend::import_alias(alias0, ipath)
+                        let asp2 = if alias0 == "" {
+                            psp
+                        } else {
+                            asp
+                        }
+                        if !valid_import_path(ipath) {
+                            match psp {
+                                frontend::SpanT::Sp(s0, e0) => {
+                                    push(diags, lib::DiagT::Diag(true, "E0432", "invalid import path \"" + ipath + "\"", "", s0, e0))
+                                    push(dfiles, disp)
+                                },
+                            }
+                        } else if alias == "_" || alias == "Option" || alias == "Result" {
+                            match asp2 {
+                                frontend::SpanT::Sp(s0, e0) => {
+                                    push(diags, lib::DiagT::Diag(true, "E0252", "cannot use `" + alias + "` as an import name", "rename the import: `import other \"" + ipath + "\"`", s0, e0))
+                                    push(dfiles, disp)
+                                },
+                            }
+                        } else {
+                            let dup = match get(seen, alias) {
+                                Some(_) => true,
+                                None => false,
+                            }
+                            let clash = match get(decl_names, alias) {
+                                Some(_) => true,
+                                None => false,
+                            }
+                            if dup {
+                                match asp2 {
+                                    frontend::SpanT::Sp(s0, e0) => {
+                                        push(diags, lib::DiagT::Diag(true, "E0252", "`" + alias + "` is imported more than once in this file", "rename one of them: `import other \"" + ipath + "\"`", s0, e0))
+                                        push(dfiles, disp)
+                                    },
+                                }
+                            } else if clash {
+                                match isp {
+                                    frontend::SpanT::Sp(s0, e0) => {
+                                        push(diags, lib::DiagT::Diag(true, "E0252", "import `" + alias + "` conflicts with a declaration in this package", "rename the import with an alias: `import other \"...\"`", s0, e0))
+                                        push(dfiles, disp)
+                                    },
+                                }
+                            } else {
+                                put(seen, alias, true)
+                                push(kept_imps, imp)
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            file_imports[fi] = kept_imps
+            let aliases = frontend::aliases_of(kept_imps)
+            let mut used = map()
+            for s in files_stmts[fi] {
+                mark_stmt(s, aliases, used)
+            }
+            files_stmts[fi] = resolve_file_tes(files_stmts[fi], aliases, mod_path, disp, diags, dfiles)
+            for imp in kept_imps {
+                match imp {
+                    frontend::Node::ImportDecl(alias0, _, ipath, _, isp) => {
+                        let alias = frontend::import_alias(alias0, ipath)
+                        let is_used = match get(used, alias) {
+                            Some(_) => true,
+                            None => false,
+                        }
+                        if !is_used {
+                            match isp {
+                                frontend::SpanT::Sp(s0, e0) => {
+                                    push(diags, lib::DiagT::Diag(false, "unused_import", "unused import: `" + alias + "`", "remove the import", s0, e0))
+                                    push(dfiles, disp)
+                                },
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+
+        fi = 0
+        while fi < len(file_imports) {
+            for imp in file_imports[fi] {
+                match imp {
+                    frontend::Node::ImportDecl(_, _, ipath, psp, _) => load_pkg(ipath, file_paths[fi], psp, stack2),
+                    _ => {},
+                }
+            }
+            fi = fi + 1
+        }
+
+        put(state, path, 2)
+        push(out_paths, path)
+        push(out_files, files_stmts)
+        push(out_fpaths, file_paths)
+        push(out_imports, file_imports)
+        push(out_lstarts, file_lstarts)
+        let pkg_id = if is_external {
+            match get(sum_ids, dep_paths[dep_ix] + "@" + dep_vers[dep_ix]) {
+                Some(x) => x,
+                None => "",
+            }
+        } else {
+            ""
+        }
+        push(out_ids, pkg_id)
+    }
+
+    if test_pkg == "" {
+        load_pkg(mod_path, "", frontend::SpanT::Sp(0, 0), [])
+    } else {
+        load_pkg(test_pkg, "", frontend::SpanT::Sp(0, 0), [])
+    }
+
+    let mut has_err = false
+    for d in diags {
+        match d {
+            lib::DiagT::Diag(ie, _, _, _, _, _) => {
+                if ie {
+                    has_err = true
+                }
+            },
+            lib::DiagT::DiagX(ie, _, _, _, _, _, _, _) => {
+                if ie {
+                    has_err = true
+                }
+            },
+        }
+    }
+    if has_err {
+        ModFailed(diags, dfiles)
+    } else {
+        ModLoaded(diags, dfiles, out_paths, out_files, out_fpaths, out_imports, out_ids, out_lstarts)
+    }
+}
+
+// load_module_test 是测试加载入口 / load_module_test is the test load entry
+pub fn load_module_test(dir0, rel, test_fn) {
+    match load_module_opts(dir0, rel) {
+        ModFailed(d, f) => ModFailed(d, f),
+        ModLoaded(ld, lf, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let ei = len(pkgs_stmts) - 1
+            let mut np_stmts = []
+            let mut np_fpaths = []
+            let mut np_imports = []
+            let mut np_lstarts = []
+            let mut pi = 0
+            while pi < len(pkgs_stmts) {
+                if pi == ei {
+                    let mut fstmts = []
+                    let mut fpaths = []
+                    let mut fimps = []
+                    let mut flstarts = []
+                    let mut fi = 0
+                    while fi < len(pkgs_stmts[pi]) {
+                        let mut kept = []
+                        for s in pkgs_stmts[pi][fi] {
+                            match s {
+                                frontend::Node::FnDecl(n, _, _, _, _) => {
+                                    if n != "main" {
+                                        push(kept, s)
+                                    }
+                                },
+                                _ => push(kept, s),
+                            }
+                        }
+                        push(fstmts, kept)
+                        push(fpaths, pkgs_fpaths[pi][fi])
+                        push(fimps, pkgs_imports[pi][fi])
+                        push(flstarts, pkgs_lstarts[pi][fi])
+                        fi = fi + 1
+                    }
+                    let z = frontend::SpanT::Sp(0, 0)
+                    let call = frontend::Node::ExprStmt(frontend::Node::Call(frontend::Node::Ident(test_fn, z), [], z), z)
+                    let lit = frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, frontend::Node::Block([call], z), "main", [], z)
+                    push(fstmts, [frontend::Node::FnDecl("main", z, false, lit, z)])
+                    push(fpaths, "<test:" + test_fn + ">")
+                    push(fimps, [])
+                    push(flstarts, [0])
+                    push(np_stmts, fstmts)
+                    push(np_fpaths, fpaths)
+                    push(np_imports, fimps)
+                    push(np_lstarts, flstarts)
+                } else {
+                    push(np_stmts, pkgs_stmts[pi])
+                    push(np_fpaths, pkgs_fpaths[pi])
+                    push(np_imports, pkgs_imports[pi])
+                    push(np_lstarts, pkgs_lstarts[pi])
+                }
+                pi = pi + 1
+            }
+            ModLoaded(ld, lf, pkg_paths, np_stmts, np_fpaths, np_imports, pkg_ids, np_lstarts)
+        },
+    }
+}
+
+// test_walk 遍历测试目录 / test_walk walks the test directory
+pub fn test_walk(root) {
+    let mut acc = ["."]
+    // walk 递归遍历 / walk recurses
+    fn walk(rel) {
+        let dir = if rel == "" {
+            root
+        } else {
+            root + "/" + rel
+        }
+        match read_dir(dir) {
+            Ok(names) => {
+                for n in sorted_strs(names) {
+                    if !lib::str_has_prefix(n, ".") {
+                        let sub = if rel == "" {
+                            n
+                        } else {
+                            rel + "/" + n
+                        }
+                        match read_dir(root + "/" + sub) {
+                            Ok(_) => {
+                                if !file_exists(root + "/" + sub + "/bur.mod") {
+                                    push(acc, sub)
+                                    walk(sub)
+                                }
+                            },
+                            Err(_) => {},
+                        }
+                    }
+                }
+            },
+            Err(_) => {},
+        }
+    }
+    walk("")
+    acc
+}
+
+// test_discover 发现测试 / test_discover discovers tests
+pub fn test_discover(dir) {
+    let entries = match read_dir(dir) {
+        Ok(es) => es,
+        Err(m) => {
+            return Err("cannot read " + dir + ": " + m)
+            []
+        },
+    }
+    let mut tfiles = []
+    for n in entries {
+        if str_ends_with(n, "_test.bur") {
+            push(tfiles, n)
+        }
+    }
+    let mut names = []
+    for fname in sorted_strs(tfiles) {
+        let disp = dir + "/" + fname
+        let src = match lsp_overlay_read(disp) {
+            Ok(s) => s,
+            Err(m) => {
+                return Err("cannot read " + disp + ": " + m)
+                ""
+            },
+        }
+        match frontend::lex(src) {
+            lib::LexOut::Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    return Err(disp + " has lex errors; run `bur check " + dir + "`")
+                }
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            return Err(disp + " has parse errors; run `bur check " + dir + "`")
+                        }
+                        for s in stmts {
+                            match s {
+                                frontend::Node::FnDecl(n, _, _, flit, _) => {
+                                    if lib::str_has_prefix(n, "test_") {
+                                        match flit {
+                                            frontend::Node::FnLit(ps, _, _, _, _, _, _, _, _) => {
+                                                if len(ps) == 0 {
+                                                    push(names, n)
+                                                }
+                                            },
+                                            _ => {},
+                                        }
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+    Ok(names)
+}
+
+let mut lsp_docs_keys = []
+let mut lsp_docs_vals = []
+
+let mut lsp_root_path_box = [""]
+
+// lsp_doc_get 取 LSP 文档 / lsp_doc_get gets an LSP document
+pub fn lsp_doc_get(uri) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            return Some(lsp_docs_vals[i])
+        }
+        i = i + 1
+    }
+    None
+}
+
+// lsp_doc_set 设置 LSP 文档 / lsp_doc_set sets an LSP document
+pub fn lsp_doc_set(uri, text) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            lsp_docs_vals[i] = text
+            return
+        }
+        i = i + 1
+    }
+    push(lsp_docs_keys, uri)
+    push(lsp_docs_vals, text)
+}
+
+// lsp_doc_remove 移除 LSP 文档 / lsp_doc_remove removes an LSP document
+pub fn lsp_doc_remove(uri) {
+    let mut i = 0
+    while i < len(lsp_docs_keys) {
+        if lsp_docs_keys[i] == uri {
+            lsp_docs_keys = concat(slice(lsp_docs_keys, 0, i), slice(lsp_docs_keys, i + 1, len(lsp_docs_keys)))
+            lsp_docs_vals = concat(slice(lsp_docs_vals, 0, i), slice(lsp_docs_vals, i + 1, len(lsp_docs_vals)))
+            return
+        }
+        i = i + 1
+    }
+}
+
+// lsp_overlay_read 读 LSP overlay / lsp_overlay_read reads an LSP overlay
+pub fn lsp_overlay_read(path) {
+    let uri = "file://" + path
+    match lsp_doc_get(uri) {
+        Some(text) => Ok(text),
+        None => read_file(path),
+    }
+}
+
+// lsp_get_root_path 取 LSP 根路径 / lsp_get_root_path gets the LSP root path
+pub fn lsp_get_root_path() {
+    lsp_root_path_box[0]
+}
+
+// lsp_set_root_path 设置 LSP 根路径 / lsp_set_root_path sets the LSP root path
+pub fn lsp_set_root_path(p) {
+    lsp_root_path_box[0] = p
+}
