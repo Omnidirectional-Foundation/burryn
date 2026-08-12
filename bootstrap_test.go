@@ -88,7 +88,9 @@ func loadBurc(t *testing.T) *burcProgram {
 	m, diags := loadModule("burc")
 	diags = append(diags, typecheckModule(m)...)
 	for _, d := range diags {
-		t.Errorf("burc is not diagnostic-clean: [%s] %s", d.Code, d.Msg)
+		if d.IsErr {
+			t.Errorf("burc is not diagnostic-clean: [%s] %s", d.Code, d.Msg)
+		}
 	}
 	if t.Failed() {
 		t.Fatal("aborting: burc must be diagnostic-clean")

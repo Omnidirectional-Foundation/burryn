@@ -683,6 +683,24 @@ println(a(), b())`, "3 1\n")
 }
 
 func TestClosureSharedUpvalue(t *testing.T) {
+	// default capture is by value; capture(ref n) restores the shared cell
+	expectOut(t, `fn pair() {
+    let mut n = 0
+    let bump = fn() capture(ref n) { n = n + 1
+        n }
+    let get = fn() capture(ref n) { n }
+    [bump, get]
+}
+let p = pair()
+let bump = p[0]
+let get = p[1]
+let _ = bump()
+let _ = bump()
+println(get())`, "2\n")
+}
+
+func TestClosureValueCaptureDefault(t *testing.T) {
+	// without capture(ref), the closure holds a snapshot of the captured var
 	expectOut(t, `fn pair() {
     let mut n = 0
     let bump = fn() { n = n + 1
@@ -695,7 +713,7 @@ let bump = p[0]
 let get = p[1]
 let _ = bump()
 let _ = bump()
-println(get())`, "2\n")
+println(get())`, "0\n")
 }
 
 func TestLoopVariableCapture(t *testing.T) {
