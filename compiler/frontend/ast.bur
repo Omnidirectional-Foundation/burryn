@@ -23,7 +23,7 @@ pub enum Node {
     Pipe(Node, Node, [Node], SpanT),
     Index(Node, Node, SpanT),
     ListLit([Node], SpanT),
-    FnLit([str], [bool], [SpanT], [Node], Node, Node, str, SpanT),
+    FnLit([str], [bool], [SpanT], [Node], Node, Node, str, [str], SpanT),
     Block([Node], SpanT),
     IfExpr(Node, Node, Node, SpanT),
     MatchExpr(Node, [Node], SpanT),
@@ -64,7 +64,7 @@ pub enum Node {
     SendStmt(Node, Node, SpanT),
     BreakStmt(str, SpanT),
     ContinueStmt(str, SpanT),
-    DeferStmt(Node, SpanT),
+    DeferStmt(Node, [str], SpanT),
     TypeAliasDecl(str, Node, bool, SpanT),
 
     TEName(str, str, str, [Node], SpanT),
@@ -159,8 +159,8 @@ fn ast_eq(a, b) {
             ListLit(e2, _) => ast_eq_list(e1, e2),
             _ => false,
         },
-        FnLit(p1, m1, _, t1, r1, b1, n1, _) => match b {
-            FnLit(p2, m2, _, t2, r2, b2, n2, _) => ast_eq_strs(p1, p2) && ast_eq_bools(m1, m2) && ast_eq_list(t1, t2) && ast_eq(r1, r2) && ast_eq(b1, b2) && n1 == n2,
+        FnLit(p1, m1, _, t1, r1, b1, n1, c1, _) => match b {
+            FnLit(p2, m2, _, t2, r2, b2, n2, c2, _) => ast_eq_strs(p1, p2) && ast_eq_bools(m1, m2) && ast_eq_list(t1, t2) && ast_eq(r1, r2) && ast_eq(b1, b2) && n1 == n2 && ast_eq_strs(c1, c2),
             _ => false,
         },
         Block(s1, _) => match b {
@@ -315,8 +315,8 @@ fn ast_eq(a, b) {
             ContinueStmt(l2, _) => l1 == l2,
             _ => false,
         },
-        DeferStmt(b1, _) => match b {
-            DeferStmt(b2, _) => ast_eq(b1, b2),
+        DeferStmt(b1, c1, _) => match b {
+            DeferStmt(b2, c2, _) => ast_eq(b1, b2) && ast_eq_strs(c1, c2),
             _ => false,
         },
         TypeAliasDecl(n1, t1, p1, _) => match b {
@@ -410,7 +410,7 @@ pub fn span_of(n) {
         Pipe(_, _, _, sp) => sp,
         Index(_, _, sp) => sp,
         ListLit(_, sp) => sp,
-        FnLit(_, _, _, _, _, _, _, sp) => sp,
+        FnLit(_, _, _, _, _, _, _, _, sp) => sp,
         Block(_, sp) => sp,
         IfExpr(_, _, _, sp) => sp,
         MatchExpr(_, _, sp) => sp,
@@ -449,7 +449,7 @@ pub fn span_of(n) {
         SendStmt(_, _, sp) => sp,
         BreakStmt(_, sp) => sp,
         ContinueStmt(_, sp) => sp,
-        DeferStmt(_, sp) => sp,
+        DeferStmt(_, _, sp) => sp,
         TypeAliasDecl(_, _, _, sp) => sp,
         TEName(_, _, _, _, sp) => sp,
         TEList(_, sp) => sp,
@@ -504,7 +504,7 @@ fn lower_pipe_node(n) {
         },
         Index(target, idx, sp) => Index(lower_pipe_node(target), lower_pipe_node(idx), sp),
         ListLit(elems, sp) => ListLit(lower_pipe_nodes(elems), sp),
-        FnLit(params, muts, pspans, param_tys, ret_ty, body, name, sp) => FnLit(params, muts, pspans, param_tys, ret_ty, lower_pipe_node(body), name, sp),
+        FnLit(params, muts, pspans, param_tys, ret_ty, body, name, crefs, sp) => FnLit(params, muts, pspans, param_tys, ret_ty, lower_pipe_node(body), name, crefs, sp),
         Block(stmts, sp) => Block(lower_pipe_nodes(stmts), sp),
         IfExpr(cond, then, els, sp) => IfExpr(lower_pipe_node(cond), lower_pipe_node(then), lower_pipe_node(els), sp),
         MatchExpr(scrut, arms, sp) => MatchExpr(lower_pipe_node(scrut), lower_pipe_nodes(arms), sp),
@@ -523,7 +523,7 @@ fn lower_pipe_node(n) {
         SelectStmt(arms, has_default, dflt, dsp, sp) => SelectStmt(lower_pipe_nodes(arms), has_default, lower_pipe_node(dflt), dsp, sp),
         SelectArm(is_send, bind, bsp, ch, val, body, sp) => SelectArm(is_send, bind, bsp, lower_pipe_node(ch), lower_pipe_node(val), lower_pipe_node(body), sp),
         SendStmt(ch, val, sp) => SendStmt(lower_pipe_node(ch), lower_pipe_node(val), sp),
-        DeferStmt(body, sp) => DeferStmt(lower_pipe_node(body), sp),
+        DeferStmt(body, crefs, sp) => DeferStmt(lower_pipe_node(body), crefs, sp),
         RecordLit(names, vals, sp) => RecordLit(names, lower_pipe_nodes(vals), sp),
         RecordUpdate(base, names, vals, sp) => RecordUpdate(lower_pipe_node(base), names, lower_pipe_nodes(vals), sp),
         FieldAccess(base, field, sp) => FieldAccess(lower_pipe_node(base), field, sp),

@@ -278,7 +278,7 @@ ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
 
 **List**（header 不移动）：`[8B len][8B cap][8B elements_ptr]`（24 字节）。elements 在 elements_ptr 处，连续 8 字节槽。初始 inline（elements_ptr = header+24）。push 增长：分配新 elements 数组（cap*2, min 4），复制旧数据，更新 header 的 elements_ptr 和 cap。
 
-**Closure**：`[8B fn_index][8B upval0][8B upval1]...`（8*(1+N) 字节）。fn_index 通过跳转表解析：`shl rax, 3; add rax, r13; mov rax, [rax]; call rax`。Slot 0 of callee frame holds closure ptr; op_get_upval reads `[closure + 8 + 8*idx]`。Copy-at-capture-time 语义（非共享 cell）。
+**Closure**：`[8B fn_index][8B upval0][8B upval1]...`（8*(1+N) 字节）。fn_index 通过跳转表解析：`shl rax, 3; add rax, r13; mov rax, [rax]; call rax`。Slot 0 of callee frame holds closure ptr; op_get_upval reads `[closure + 8 + 8*idx]`。默认值捕获（copy-at-capture，非共享 cell）；`capture(ref n)` 引用捕获的槽存** cell 指针**（堆 8B，恒在堆上，无 open/close 概念），读写须二次解引用。
 
 **Enum instance**（堆，由 constructor 调用创建）：
 ```text
@@ -321,7 +321,17 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 - **op_chan_next (47)**: 3 bytes `[op][cidx:2B]`。channel 迭代。
 - **op_select (48)**: variable。多路 select,最复杂 CSP opcode。
 - **op_defer (49)**: 1 byte。需 per-frame defer stack(可与 CSP 并发独立实现,但仍需 defer 栈管理)。
-- **close_upvalue**: 跳过——当前 copy-at-capture 语义不产生 open upvalues。
+- **close_upvalue**: 跳过——默认值捕获不产生 open upvalues；ref 捕获用恒开 cell（见下节）。
+
+#### 闭包捕获语义：默认值捕获 + 显式 ref（设计定案 2026-08-12）
+
+- **默认捕获 = 值拷贝**（copy-at-capture）：闭包槽存捕获时快照。x86 现状即此语义；VM/C runtime 的 `op_closure` 默认分支改为直接压入栈值（不再建 open upvalue cell），两后端语义统一
+- **显式 `capture(ref n)` = 引用捕获**：闭包槽存 cell 指针，读写经 cell 与外部变量共享存储
+  - 语法：闭包块前可选捕获子句，`capture` 为保留字，`ref` 仅 capture 列表内特判；未被 `ref` 声明的捕获项即默认值捕获（显式列出与省略同义）
+- **x86 cell 实现**：被 ref 捕获的 mut 局部**提升为 cell 指针槽**——所在函数预扫描本函数全体闭包的 ref 声明，被声明的变量其栈槽存 `&cell`（声明时堆分配 8B），该变量的 get/set_local 全部经 cell 解引用；闭包 upval 槽存同一 cell 指针。GC：cell 为普通堆对象，mark 跟随内容
+  - **与 VM open-upvalue 的可观察等价性**：open 期读外部栈槽 = 读 cell 当前值（外部帧存活期 cell 只由提升变量写入，两者同值）；close 发生于外部作用域退出后，彼时外部变量已死、cell 无后续写入，闭包读 cell = 固话值。故 x86 无需 open/close 机制
+- **约束**：`ref` 只能作用于局部（含参数），顶层全局拒绝（全局天然共享）；`ref` 捕获不可变变量允许（等价值拷贝，无害）；`ref` 捕获参数允许（参数即栈槽）
+- **字节码**：`op_closure` 描述符 `[1B islocal]` 扩展为标志字节 bit0=islocal、bit1=ref（旧值 1/0 仍合法：旧描述符即默认值捕获）
 
 #### 上下文切换：手写 8 槽 ctx（定案）
 
