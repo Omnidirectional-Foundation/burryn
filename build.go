@@ -89,7 +89,11 @@ func compileC(cc, csrc, out string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(cc, "-O2", "-o", absOut, "program.c", "-lm")
+	opt := os.Getenv("CC_OPT")
+	if opt == "" {
+		opt = "-O2"
+	}
+	cmd := exec.Command(cc, opt, "-o", absOut, "program.c", "-lm")
 	cmd.Dir = dir
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
