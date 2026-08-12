@@ -123,7 +123,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // qualify 限定名字（跨包）/ qualify qualifies a name (cross-package)
-    fn qualify(name) {
+    fn qualify(name) capture(ref cur_pkg) {
         if cur_pkg == "" {
             name
         } else {
@@ -131,14 +131,14 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
     // alias_path 解析 import 别名 / alias_path resolves an import alias
-    fn alias_path(name) {
+    fn alias_path(name) capture(ref cur_aliases) {
         match get(cur_aliases, name) {
             Some(p) => p,
             None => "",
         }
     }
     // mangle_if_decl 对已声明名字做改写 / mangle_if_decl mangles declared names
-    fn mangle_if_decl(name) {
+    fn mangle_if_decl(name) capture(ref pkg_decls) {
         let hit = match get(pkg_decls, name) {
             Some(_) => true,
             None => false,
@@ -161,7 +161,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         len(en_qual) - 1
     }
     // find_variant 查找变体 / find_variant finds a variant
-    fn find_variant(name) {
+    fn find_variant(name) capture(ref cur_pkg) {
         let mut found = -1
         let mut idx = -1
         let mut amb = false
@@ -422,7 +422,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // register_enum_decl 注册枚举声明 / register_enum_decl registers an enum declaration
-    fn register_enum_decl(_ch, name, variants, sp) {
+    fn register_enum_decl(_ch, name, variants, sp) capture(ref cur_pkg) {
         let qual = qualify(name)
         let exists = match get(enum_by, qual) {
             Some(_) => true,
@@ -559,7 +559,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_assign 赋值代码生成 / cp_assign codegens an assignment
-    fn cp_assign(ch, target, val, sp) {
+    fn cp_assign(ch, target, val, sp) capture(ref cp_expr_ref, ref cp_stmt_ref) {
         match target {
             frontend::Node::Ident(name, _) => {
                 match cp_expr_ref(ch, val) {
@@ -638,7 +638,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_block_stmts 块内语句代码生成 / cp_block_stmts codegens block statements
-    fn cp_block_stmts(ch, blk) {
+    fn cp_block_stmts(ch, blk) capture(ref cp_stmt_ref) {
         begin_scope(ch)
         match blk {
             frontend::Node::Block(ss, bsp) => {
@@ -659,7 +659,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
 
     // cp_block_expr 块表达式：作用域退出时对齐值栈
     // cp_block_expr codegens a block expression: align the value stack with scope exit
-    fn cp_block_expr(ch, blk) {
+    fn cp_block_expr(ch, blk) capture(ref cp_expr_ref, ref cp_stmt_ref) {
         begin_scope(ch)
         match blk {
             frontend::Node::Block(ss, bsp) => {
@@ -709,7 +709,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_function 函数字面量代码生成 / cp_function codegens a function literal
-    fn cp_function(ch, lit) {
+    fn cp_function(ch, lit) capture(ref cur_file) {
         match lit {
             // 函数字面量：编译为独立函数表项，闭包捕获外层局部
             // Function literals: compile to a separate function-table entry;
@@ -773,7 +773,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_if if 代码生成 / cp_if codegens if
-    fn cp_if(ch, cond, then, els, sp) {
+    fn cp_if(ch, cond, then, els, sp) capture(ref cp_expr_ref) {
         match cp_expr_ref(ch, cond) {
             Ok(_) => {},
             Err(d) => {
@@ -820,7 +820,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_while while 代码生成 / cp_while codegens while
-    fn cp_while(ch, cond, body, sp) {
+    fn cp_while(ch, cond, body, sp) capture(ref cp_expr_ref) {
         let start = code_len(ch)
         push_loop(ch, next_slot(ch), start)
         match cp_expr_ref(ch, cond) {
@@ -862,7 +862,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_for for 代码生成 / cp_for codegens the for statement
-    fn cp_for(ch, v, idx, iter, body, sp) {
+    fn cp_for(ch, v, idx, iter, body, sp) capture(ref cp_expr_ref, ref cp_stmt_ref) {
         begin_scope(ch)
         match cp_expr_ref(ch, iter) {
             Ok(_) => {},
@@ -977,7 +977,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_for_chan channel 的 for-in 排空 / cp_for_chan codegens the channel for-in drain
-    fn cp_for_chan(ch, v, iter, body, sp) {
+    fn cp_for_chan(ch, v, iter, body, sp) capture(ref cp_expr_ref, ref cp_stmt_ref) {
         begin_scope(ch)
         match cp_expr_ref(ch, iter) {
             Ok(_) => {},
@@ -1050,7 +1050,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_select select 代码生成 / cp_select codegens select
-    fn cp_select(ch, arms, has_default, dflt, dsp, sp) {
+    fn cp_select(ch, arms, has_default, dflt, dsp, sp) capture(ref cp_expr_ref) {
         let base_temps = c_temps[ch]
         for arm in arms {
             match arm {
@@ -1197,7 +1197,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     // cp_match match 代码生成：变体测试（枚举身份 + tag）与字段提取，无哈希、无反射
     // cp_match codegens match: variant tests (enum identity + tag) and field
     // extraction, no hashing, no reflection
-    fn cp_match(ch, scrut, arms, msp) {
+    fn cp_match(ch, scrut, arms, msp) capture(ref cp_expr_ref) {
         begin_scope(ch)
         match cp_expr_ref(ch, scrut) {
             Ok(_) => {},
@@ -1439,7 +1439,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_expr 表达式代码生成（带临时槽跟踪）/ cp_expr codegens an expression with temp tracking
-    fn cp_expr(ch, e) {
+    fn cp_expr(ch, e) capture(ref cur_file) {
         // 表达式编译：按形态发射字节码，临时槽跟踪栈深度
         // Expression compilation: emit per shape, temp tracking mirrors the value stack
         match e {
@@ -1797,7 +1797,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     cp_expr_ref = cp_expr
 
     // cp_stmt 语句代码生成 / cp_stmt codegens a statement
-    fn cp_stmt(ch, s) {
+    fn cp_stmt(ch, s) capture(ref cur_pkg, ref cur_file, ref cp_stmt_ref) {
         match s {
             frontend::Node::DestructLet(names, nspans, is_mut, init, sp) => {
                 match cp_expr(ch, init) {
