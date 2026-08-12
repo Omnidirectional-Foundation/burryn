@@ -275,13 +275,18 @@ func importAlias(d *ImportDecl) string {
 // package-file shape (imports first, then declarations only), resolves import
 // aliases, and rewrites alias-qualified paths to import paths.
 func (m *Module) readPackage(path, fromFile string, fromSpan Span) *Package {
-	if path != m.Path && !strings.HasPrefix(path, m.Path+"/") {
+	isStd := path == "std" || strings.HasPrefix(path, "std/")
+	if path != m.Path && !strings.HasPrefix(path, m.Path+"/") && !isStd {
 		m.errorf(fromFile, fromSpan, "E0432",
 			fmt.Sprintf("only packages inside module `%s` can be imported for now; external dependencies arrive with MVS resolution", m.Path),
 			"cannot resolve import %q", path)
 		return nil
 	}
 	dir := filepath.Join(m.Root, filepath.FromSlash(strings.TrimPrefix(path, m.Path)))
+	if isStd {
+		// std/ lives next to the module root (at the repo root)
+		dir = filepath.Join(filepath.Dir(m.Root), "std", filepath.FromSlash(strings.TrimPrefix(path, "std")))
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		m.errorf(fromFile, fromSpan, "E0433", "", "cannot find package %q: %v", path, err)
@@ -292,6 +297,9 @@ func (m *Module) readPackage(path, fromFile string, fromSpan Span) *Package {
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".bur") {
 			continue
+		}
+		if strings.HasSuffix(e.Name(), "_test.bur") {
+			continue // test files only load when the package is the test target
 		}
 		burFiles++
 		full := filepath.Join(dir, e.Name())

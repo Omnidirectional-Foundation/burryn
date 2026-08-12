@@ -93,6 +93,10 @@ func (g *GC) collect() int {
 			for _, e := range t.Elems {
 				markValue(e)
 			}
+		case *OTuple:
+			for _, e := range t.Elems {
+				markValue(e)
+			}
 		case *OMap:
 			for _, e := range t.entries {
 				markValue(e.key)

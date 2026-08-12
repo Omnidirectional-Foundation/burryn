@@ -24,6 +24,9 @@ type Frame struct {
 	closure *OClosure
 	ip      int
 	base    int
+	defers  []*OClosure // LIFO defer stack (op_defer)
+	dact    bool        // return-with-defers in progress
+	dstash  Value       // return value stashed while defers run
 }
 
 type Fiber struct {
@@ -333,17 +336,70 @@ func (vm *VM) exec(f *Fiber) (bool, error) {
 			vm.gc.alloc(cl)
 			f.push(ObjV(cl))
 			for i := 0; i < fn.NumUpvals; i++ {
-				isLocal := chunk.Code[frame.ip] == 1
+				// descriptor flags: bit0=islocal, bit1=ref
+				flags := chunk.Code[frame.ip]
 				frame.ip++
+				isLocal := flags&1 == 1
+				isRef := flags >= 2
 				uidx := int(readU16(chunk.Code, frame.ip))
 				frame.ip += 2
 				if isLocal {
-					cl.Upvals[i] = vm.captureUpvalue(f, frame.base+uidx)
+					if isRef {
+						cl.Upvals[i] = vm.captureUpvalue(f, frame.base+uidx)
+					} else {
+						// default value capture: an independent closed-cell snapshot
+						cl.Upvals[i] = &OUpvalue{open: false, Closed: f.stack[frame.base+uidx]}
+						vm.gc.alloc(cl.Upvals[i])
+					}
 				} else {
-					cl.Upvals[i] = frame.closure.Upvals[uidx]
+					parent := frame.closure.Upvals[uidx]
+					if parent.open {
+						cl.Upvals[i] = parent
+					} else {
+						// closed (value-captured) parent: copy a fresh snapshot
+						cl.Upvals[i] = &OUpvalue{open: false, Closed: parent.Closed}
+						vm.gc.alloc(cl.Upvals[i])
+					}
 				}
 			}
+		case OpTuple:
+			n := int(chunk.Code[frame.ip])
+			frame.ip++
+			elems := make([]Value, n)
+			copy(elems, f.stack[f.top-n:f.top])
+			f.top -= n
+			f.push(ObjV(&OTuple{Elems: elems}))
+		case OpDefer:
+			cl := f.pop()
+			dh, ok := cl.O.(*OClosure)
+			if !ok {
+				return false, rtErr("defer needs a function, got %s", typeOf(cl))
+			}
+			frame.defers = append(frame.defers, dh)
 		case OpReturn:
+			if len(frame.defers) > 0 || frame.dact {
+				// run the defer chain before actually returning: stash the
+				// result, pop one defer, re-enter OpReturn (mirrors vm.bur)
+				result := f.pop()
+				if !frame.dact {
+					frame.dstash = result
+					frame.dact = true
+				}
+				if len(frame.defers) > 0 {
+					dh := frame.defers[len(frame.defers)-1]
+					frame.defers = frame.defers[:len(frame.defers)-1]
+					frame.ip = startIP
+					f.push(ObjV(dh))
+					if err := vm.callValue(f, 0, sp); err != nil {
+						return false, err
+					}
+				} else {
+					f.push(frame.dstash)
+					frame.dact = false
+					frame.ip = startIP
+				}
+				continue
+			}
 			result := f.pop()
 			vm.closeUpvalues(f, frame.base)
 			f.frames = f.frames[:len(f.frames)-1]
@@ -950,6 +1006,14 @@ func (vm *VM) indexGet(target, idx Value, sp Span) (Value, error) {
 		}
 		if idx.I < 0 || idx.I >= int64(len(o.Elems)) {
 			return Unit, &runtimeErr{msg: fmt.Sprintf("list index %d out of bounds (len %d)", idx.I, len(o.Elems)), span: sp}
+		}
+		return o.Elems[idx.I], nil
+	case *OTuple:
+		if idx.T != VInt {
+			return Unit, &runtimeErr{msg: fmt.Sprintf("tuple index must be an int, got %s", typeOf(idx)), span: sp}
+		}
+		if idx.I < 0 || idx.I >= int64(len(o.Elems)) {
+			return Unit, &runtimeErr{msg: fmt.Sprintf("tuple index %d out of bounds (len %d)", idx.I, len(o.Elems)), span: sp}
 		}
 		return o.Elems[idx.I], nil
 	case *OString:

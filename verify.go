@@ -216,6 +216,33 @@ func verifyStack(fn *OFunc) error {
 					work = append(work, state{target, base})
 				}
 				break path // OpSelect always transfers to an arm
+			case OpDefer:
+				// pops a closure onto the frame defer stack: net -1
+				pops++
+				next = ip + 1
+			case OpTuple:
+				// u8 n: pops n values, pushes one tuple: net 1-n
+				n := int(code[ip+1])
+				pops += n
+				pushes++
+				next = ip + 2
+			case OpRecord:
+				// u8 n, u16 const: pops n values, pushes a record
+				n := int(code[ip+1])
+				pops += n
+				pushes++
+				next = ip + 4
+			case OpGetFieldName:
+				// u16 const: pops a record, pushes its field
+				pops++
+				pushes++
+				next = ip + 3
+			case OpRecordUpdate:
+				// u8 n, u16 const: pops n values + base, pushes a record
+				n := int(code[ip+1])
+				pops += n + 1
+				pushes++
+				next = ip + 4
 			default:
 				return errf(ip, "unknown opcode %d", op)
 			}

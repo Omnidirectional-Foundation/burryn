@@ -113,13 +113,15 @@ type UpvalMeta struct {
 	index   uint16
 	isLocal bool
 	mut     bool
+	name    string // captured variable name (capture(ref ...) matching)
 }
 
 type loopCtx struct {
 	baseSlot      int // stack slot count at loop-body entry
 	breakJumps    []int
 	continueJumps []int
-	continueTo    int // -1 if patched later via continueJumps
+	continueTo    int  // -1 if patched later via continueJumps
+	label         string // labeled-loop name; "" = unlabeled
 }
 
 type Compiler struct {
@@ -328,6 +330,13 @@ func (c *Compiler) declareLocal(name string, mut bool, sp Span) {
 
 func (c *Compiler) beginScope() { c.scopeDepth++ }
 
+// popLocal removes the innermost local without emitting code.
+func (c *Compiler) popLocal(sp Span) {
+	if len(c.locals) > 0 {
+		c.locals = c.locals[:len(c.locals)-1]
+	}
+}
+
 // endScope for statement contexts: emits pop/close for each local
 func (c *Compiler) endScope(sp Span) {
 	c.scopeDepth--
@@ -368,7 +377,7 @@ func (c *Compiler) resolveLocal(name string) int {
 	return -1
 }
 
-func (c *Compiler) addUpvalue(index uint16, isLocal, mut bool, sp Span) int {
+func (c *Compiler) addUpvalue(index uint16, isLocal, mut bool, name string, sp Span) int {
 	for i, uv := range c.upvals {
 		if uv.index == index && uv.isLocal == isLocal {
 			return i
@@ -377,7 +386,7 @@ func (c *Compiler) addUpvalue(index uint16, isLocal, mut bool, sp Span) int {
 	if len(c.upvals) >= 255 {
 		c.fail(sp, "E2004", "", "too many captured variables")
 	}
-	c.upvals = append(c.upvals, UpvalMeta{index: index, isLocal: isLocal, mut: mut})
+	c.upvals = append(c.upvals, UpvalMeta{index: index, isLocal: isLocal, mut: mut, name: name})
 	c.fn.NumUpvals = len(c.upvals)
 	return len(c.upvals) - 1
 }
@@ -389,10 +398,10 @@ func (c *Compiler) resolveUpvalue(name string, sp Span) int {
 	if li := c.enclosing.resolveLocal(name); li >= 0 {
 		l := &c.enclosing.locals[li]
 		l.captured = true
-		return c.addUpvalue(uint16(l.slot), true, l.mut, sp)
+		return c.addUpvalue(uint16(l.slot), true, l.mut, name, sp)
 	}
 	if ui := c.enclosing.resolveUpvalue(name, sp); ui >= 0 {
-		return c.addUpvalue(uint16(ui), false, c.enclosing.upvals[ui].mut, sp)
+		return c.addUpvalue(uint16(ui), false, c.enclosing.upvals[ui].mut, name, sp)
 	}
 	return -1
 }
@@ -442,9 +451,35 @@ func (c *Compiler) stmt(s Stmt) {
 	case *ForStmt:
 		c.forStmt(st)
 	case *BreakStmt:
-		c.breakStmt(st.Span)
+		c.breakStmt(st.Label, st.Span)
 	case *ContinueStmt:
-		c.continueStmt(st.Span)
+		c.continueStmt(st.Label, st.Span)
+	case *LabelStmt:
+		if len(c.loops) == 0 {
+			c.fail(st.Span, "E2013", "", "a labeled statement must wrap a loop")
+		}
+		c.loops[len(c.loops)-1].label = st.Label
+		c.stmt(st.Inner)
+	case *DeferStmt:
+		c.deferStmt(st)
+	case *DestructLet:
+		c.destructLet(st)
+	case *ConstDecl:
+		c.expr(st.Init)
+		if c.scopeDepth == 0 {
+			c.defineGlobal(st.Name, false, st.Span)
+		} else {
+			c.declareLocal(st.Name, false, st.Span)
+		}
+	case *MethodDecl:
+		if c.scopeDepth == 0 {
+			c.function(st.Fn)
+			c.defineGlobal(st.RecvTy+"."+st.Name, false, st.Span)
+		} else {
+			c.fail(st.Span, "E2019", "", "methods must be declared at the top level")
+		}
+	case *TypeAliasDecl:
+		// aliases resolve at the type level; nothing to emit
 	case *SpawnStmt:
 		c.expr(st.CallE.Callee)
 		c.temps++
@@ -525,6 +560,35 @@ func (c *Compiler) assign(st *AssignStmt) {
 	}
 }
 
+// deferStmt compiles `defer { ... }` as a zero-argument closure pushed on
+// the frame's defer stack (op_defer), mirroring compiler.bur.
+func (c *Compiler) deferStmt(st *DeferStmt) {
+	lit := &FnLit{Body: st.Body.(*Block), Name: "<defer>", Crefs: st.Crefs, Span: st.Span}
+	c.function(lit)
+	c.emit(OpDefer, st.Span)
+}
+
+// destructLet compiles `let (a, b) = tuple`: the tuple lands in a temp
+// local, then each element is indexed out and bound, mirroring compiler.bur.
+func (c *Compiler) destructLet(st *DestructLet) {
+	c.expr(st.Init)
+	c.declareLocal("(dtmp)", false, st.Span)
+	tslot := c.locals[len(c.locals)-1].slot
+	for i, name := range st.Names {
+		c.emit(OpGetLocal, st.Span)
+		c.emitU16(uint16(tslot), st.Span)
+		c.emitConst(IntV(int64(i)), st.Span)
+		c.emit(OpIndexGet, st.Span)
+		if c.scopeDepth == 0 {
+			c.defineGlobal(name, st.Mut, st.NameSpans[i])
+		} else {
+			c.declareLocal(name, st.Mut, st.NameSpans[i])
+		}
+	}
+	c.emit(OpPop, st.Span) // (dtmp)
+	c.popLocal(st.Span)
+}
+
 func (c *Compiler) whileStmt(st *WhileStmt) {
 	start := len(c.chunk().Code)
 	c.loops = append(c.loops, loopCtx{baseSlot: c.nextSlot(), continueTo: start})
@@ -565,6 +629,11 @@ func (c *Compiler) forStmt(st *ForStmt) {
 	exitJ := c.emitJump(OpJumpIfFalsePop, st.Span)
 
 	c.beginScope()
+	if st.Idx != "" {
+		c.emit(OpGetLocal, st.Span)
+		c.emitU16(uint16(idxSlot), st.Span)
+		c.declareLocal(st.Idx, false, st.Span)
+	}
 	c.emit(OpGetLocal, st.Span)
 	c.emitU16(uint16(iterSlot), st.Span)
 	c.emit(OpGetLocal, st.Span)
@@ -651,18 +720,39 @@ func (c *Compiler) unwindToLoop(sp Span) *loopCtx {
 	return lp
 }
 
-func (c *Compiler) breakStmt(sp Span) {
-	lp := c.unwindToLoop(sp)
+func (c *Compiler) breakStmt(label string, sp Span) {
+	var lp *loopCtx
+	if label == "" {
+		lp = c.unwindToLoop(sp)
+	} else {
+		lp = c.labeledLoop(label, sp)
+	}
 	lp.breakJumps = append(lp.breakJumps, c.emitJump(OpJump, sp))
 }
 
-func (c *Compiler) continueStmt(sp Span) {
-	lp := c.unwindToLoop(sp)
+func (c *Compiler) continueStmt(label string, sp Span) {
+	var lp *loopCtx
+	if label == "" {
+		lp = c.unwindToLoop(sp)
+	} else {
+		lp = c.labeledLoop(label, sp)
+	}
 	if lp.continueTo >= 0 {
 		c.emitLoop(lp.continueTo, sp)
 	} else {
 		lp.continueJumps = append(lp.continueJumps, c.emitJump(OpJump, sp))
 	}
+}
+
+// labeledLoop finds the innermost loop whose label matches.
+func (c *Compiler) labeledLoop(label string, sp Span) *loopCtx {
+	for i := len(c.loops) - 1; i >= 0; i-- {
+		if c.loops[i].label == label {
+			return &c.loops[i]
+		}
+	}
+	c.fail(sp, "E2013", "", "break/continue with an unknown label %q", label)
+	return nil
 }
 
 // selectStmt compiles a `select`: it evaluates every arm's channel (and send
@@ -873,6 +963,17 @@ func (c *Compiler) expr(e Expr) {
 		}
 		c.emit(OpList, ex.Span)
 		c.emitU16(uint16(len(ex.Elems)), ex.Span)
+	case *TupleLit:
+		for _, el := range ex.Elems {
+			c.expr(el)
+			c.temps++
+		}
+		c.temps -= len(ex.Elems)
+		if len(ex.Elems) > 255 {
+			c.fail(ex.Span, "E2006", "", "tuple literal too large")
+		}
+		c.emit(OpTuple, ex.Span)
+		c.emit(byte(len(ex.Elems)), ex.Span)
 	case *FnLit:
 		c.function(ex)
 	case *Block:
@@ -1004,11 +1105,17 @@ func (c *Compiler) function(lit *FnLit) {
 	c.emit(OpClosure, lit.Span)
 	c.emitU16(idx, lit.Span)
 	for _, uv := range sub.upvals {
+		// descriptor flags: bit0=islocal, bit1=ref (declared via capture(ref name))
+		flag := 0
 		if uv.isLocal {
-			c.emit(1, lit.Span)
-		} else {
-			c.emit(0, lit.Span)
+			flag = 1
 		}
+		for _, cr := range lit.Crefs {
+			if uv.name == cr {
+				flag += 2
+			}
+		}
+		c.emit(byte(flag), lit.Span)
 		c.emitU16(uv.index, lit.Span)
 	}
 }

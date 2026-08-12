@@ -47,6 +47,11 @@ type Call struct {
 	Args   []Expr
 	Span   Span
 }
+type Pipe struct { // lhs |> target(args...)
+	Lhs, Target Expr
+	Args        []Expr
+	Span        Span
+}
 type Index struct {
 	Target Expr
 	Idx    Expr
@@ -56,12 +61,15 @@ type ListLit struct {
 	Elems []Expr
 	Span  Span
 }
-type FnLit struct { // fn(a, b) { ... }
+type FnLit struct { // fn(a, b) capture(ref x) { ... }
 	Params     []string
 	ParamMuts  []bool // parallel to Params: `fn f(mut xs)` marks xs mutable
 	ParamSpans []Span // parallel to Params
+	ParamTys   []TypeExpr
+	RetTy      TypeExpr // nil when not annotated
 	Body       *Block
-	Name       string // "" for anonymous; set for fn declarations
+	Name       string   // "" for anonymous; set for fn declarations
+	Crefs      []string // capture(ref ...) names
 	Span       Span
 }
 type Block struct { // { stmts } ??value = value of final expression statement
@@ -80,9 +88,10 @@ type MatchExpr struct {
 	Span  Span
 }
 type MatchArm struct {
-	Pat  Pattern
-	Body Expr
-	Span Span
+	Pat   Pattern
+	Guard Expr // `pat if guard => body`; nil when absent
+	Body  Expr
+	Span  Span
 }
 type VariantAccess struct { // Shape.Circle
 	EnumName string
@@ -109,6 +118,26 @@ type RecvExpr struct { // <-ch
 	Chan Expr
 	Span Span
 }
+type RecordLit struct { // record { a: 1, b: 2 }
+	Names []string
+	Vals  []Expr
+	Span  Span
+}
+type RecordUpdate struct { // record { base | a: 1 }
+	Base  Expr
+	Names []string
+	Vals  []Expr
+	Span  Span
+}
+type FieldAccess struct { // base.field
+	Base  Expr
+	Field string
+	Span  Span
+}
+type TupleLit struct { // (a, b)
+	Elems []Expr
+	Span  Span
+}
 
 func (*IntLit) exprNode()            {}
 func (*FloatLit) exprNode()          {}
@@ -119,6 +148,7 @@ func (*Unary) exprNode()             {}
 func (*Binary) exprNode()            {}
 func (*Logical) exprNode()           {}
 func (*Call) exprNode()              {}
+func (*Pipe) exprNode()              {}
 func (*Index) exprNode()             {}
 func (*ListLit) exprNode()           {}
 func (*FnLit) exprNode()             {}
@@ -130,6 +160,10 @@ func (*PkgAccess) exprNode()         {}
 func (*QualVariantAccess) exprNode() {}
 func (*TryExpr) exprNode()           {}
 func (*RecvExpr) exprNode()          {}
+func (*RecordLit) exprNode()         {}
+func (*RecordUpdate) exprNode()      {}
+func (*FieldAccess) exprNode()       {}
+func (*TupleLit) exprNode()          {}
 
 func (e *IntLit) span() Span            { return e.Span }
 func (e *FloatLit) span() Span          { return e.Span }
@@ -140,6 +174,7 @@ func (e *Unary) span() Span             { return e.Span }
 func (e *Binary) span() Span            { return e.Span }
 func (e *Logical) span() Span           { return e.Span }
 func (e *Call) span() Span              { return e.Span }
+func (e *Pipe) span() Span              { return e.Span }
 func (e *Index) span() Span             { return e.Span }
 func (e *ListLit) span() Span           { return e.Span }
 func (e *FnLit) span() Span             { return e.Span }
@@ -151,6 +186,10 @@ func (e *PkgAccess) span() Span         { return e.Span }
 func (e *QualVariantAccess) span() Span { return e.Span }
 func (e *TryExpr) span() Span           { return e.Span }
 func (e *RecvExpr) span() Span          { return e.Span }
+func (e *RecordLit) span() Span         { return e.Span }
+func (e *RecordUpdate) span() Span      { return e.Span }
+func (e *FieldAccess) span() Span       { return e.Span }
+func (e *TupleLit) span() Span          { return e.Span }
 
 // ---- Patterns (for match) ----
 
@@ -168,23 +207,29 @@ type PatBinding struct { // bare name: binds anything
 	Name string
 	Span Span
 }
-type PatVariant struct { // Shape.Circle(r) ??or bare variant name like Some(x)/None
-	Pkg      string // geo.Shape.Circle(r): import alias until the loader resolves it
+type PatVariant struct { // Shape::Circle(r) or bare variant name like Some(x)/None
+	Pkg      string // geo::Shape::Circle(r): import alias until the loader resolves it
 	EnumName string // may be "" when written without qualifier
 	Variant  string
 	Binds    []Pattern // sub-patterns for fields (PatBinding or PatWildcard)
 	Span     Span
+}
+type PatRecord struct { // record { x, y }
+	Names []string
+	Span  Span
 }
 
 func (*PatWildcard) patNode() {}
 func (*PatLiteral) patNode()  {}
 func (*PatBinding) patNode()  {}
 func (*PatVariant) patNode()  {}
+func (*PatRecord) patNode()   {}
 
 func (p *PatWildcard) span() Span { return p.Span }
 func (p *PatLiteral) span() Span  { return p.Span }
 func (p *PatBinding) span() Span  { return p.Span }
 func (p *PatVariant) span() Span  { return p.Span }
+func (p *PatRecord) span() Span   { return p.Span }
 
 // ---- Statements ----
 
@@ -198,6 +243,22 @@ type LetStmt struct {
 	NameSpan Span // the bound identifier itself
 	Mut      bool
 	Pub      bool
+	Ty       TypeExpr // optional type annotation
+	Init     Expr
+	Span     Span
+}
+type DestructLet struct { // let (a, b) = tuple
+	Names     []string
+	NameSpans []Span
+	Mut       bool
+	Init      Expr
+	Span      Span
+}
+type ConstDecl struct { // const x = ... (folded at compile time)
+	Name     string
+	NameSpan Span
+	Pub      bool
+	Ty       TypeExpr
 	Init     Expr
 	Span     Span
 }
@@ -218,10 +279,17 @@ type WhileStmt struct {
 type ForStmt struct {
 	Var       string
 	VarSpan   Span // the loop variable identifier
+	Idx       string // index variable ("for i, x in xs"); "" when absent
+	IdxSpan   Span
 	Iter      Expr // evaluates to a list or a channel
 	IterIsChan bool // set by the checker: iterate by receiving until closed
 	Body      *Block
 	Span      Span
+}
+type LabelStmt struct { // label: while ... { break label }
+	Label string
+	Inner Stmt
+	Span  Span
 }
 type ReturnStmt struct {
 	Val  Expr // nil for bare return
@@ -232,6 +300,24 @@ type FnDecl struct {
 	NameSpan Span // the function name identifier
 	Pub      bool
 	Fn       *FnLit
+	Span     Span
+}
+type MethodDecl struct { // fn (recv: Type) name(...) { ... }
+	RecvTy   string // dispatch key: the receiver type name
+	Name     string
+	NameSpan Span
+	Fn       *FnLit
+	Span     Span
+}
+type DeferStmt struct { // defer { ... } / defer capture(ref x) { ... }
+	Body  Expr
+	Crefs []string
+	Span  Span
+}
+type TypeAliasDecl struct { // type X = [int]
+	Name     string
+	Ty       TypeExpr
+	Pub      bool
 	Span     Span
 }
 type EnumDecl struct {
@@ -261,11 +347,12 @@ type TypeExpr interface {
 	span() Span
 }
 
-type TEName struct { // int / str / Shape / Option(int) / a type variable
-	Pkg  string // geo.Shape: import alias until the loader resolves it; "" if unqualified
-	Name string
-	Args []TypeExpr
-	Span Span
+type TEName struct { // int / str / Shape / Option(int) / a type variable / pkg::Name
+	Pkg        string // pkg::Shape: import alias until the loader resolves it; "" if unqualified
+	Name       string
+	Constraint string // `Name: Constraint` (row-poly records); "" when absent
+	Args       []TypeExpr
+	Span       Span
 }
 type TEList struct { // [t]
 	Elem TypeExpr
@@ -276,14 +363,28 @@ type TEFn struct { // fn(a, b) -> r
 	Ret    TypeExpr
 	Span   Span
 }
+type TERecord struct { // record { a: int | r }
+	Names   []string
+	Types   []TypeExpr
+	RowVar  TypeExpr // trailing row variable (open record); nil for closed
+	Span    Span
+}
+type TETuple struct { // (int, str)
+	Types []TypeExpr
+	Span  Span
+}
 
-func (*TEName) typeNode() {}
-func (*TEList) typeNode() {}
-func (*TEFn) typeNode()   {}
+func (*TEName) typeNode()    {}
+func (*TEList) typeNode()    {}
+func (*TEFn) typeNode()      {}
+func (*TERecord) typeNode()  {}
+func (*TETuple) typeNode()   {}
 
-func (t *TEName) span() Span { return t.Span }
-func (t *TEList) span() Span { return t.Span }
-func (t *TEFn) span() Span   { return t.Span }
+func (t *TEName) span() Span   { return t.Span }
+func (t *TEList) span() Span   { return t.Span }
+func (t *TEFn) span() Span     { return t.Span }
+func (t *TERecord) span() Span { return t.Span }
+func (t *TETuple) span() Span  { return t.Span }
 
 type SpawnStmt struct {
 	CallE *Call
@@ -315,31 +416,49 @@ type SendStmt struct { // ch <- v
 	Val  Expr
 	Span Span
 }
-type BreakStmt struct{ Span Span }
-type ContinueStmt struct{ Span Span }
+type BreakStmt struct {
+	Label string // "" = unlabeled
+	Span  Span
+}
+type ContinueStmt struct {
+	Label string // "" = unlabeled
+	Span  Span
+}
 
-func (*LetStmt) stmtNode()      {}
-func (*AssignStmt) stmtNode()   {}
-func (*ExprStmt) stmtNode()     {}
-func (*WhileStmt) stmtNode()    {}
-func (*ForStmt) stmtNode()      {}
-func (*ReturnStmt) stmtNode()   {}
-func (*FnDecl) stmtNode()       {}
-func (*EnumDecl) stmtNode()     {}
-func (*ImportDecl) stmtNode()   {}
-func (*SpawnStmt) stmtNode()    {}
-func (*SelectStmt) stmtNode()   {}
-func (*SendStmt) stmtNode()     {}
-func (*BreakStmt) stmtNode()    {}
-func (*ContinueStmt) stmtNode() {}
+func (*LetStmt) stmtNode()       {}
+func (*DestructLet) stmtNode()   {}
+func (*ConstDecl) stmtNode()     {}
+func (*AssignStmt) stmtNode()    {}
+func (*ExprStmt) stmtNode()      {}
+func (*WhileStmt) stmtNode()     {}
+func (*ForStmt) stmtNode()       {}
+func (*LabelStmt) stmtNode()     {}
+func (*ReturnStmt) stmtNode()    {}
+func (*FnDecl) stmtNode()        {}
+func (*MethodDecl) stmtNode()    {}
+func (*DeferStmt) stmtNode()     {}
+func (*TypeAliasDecl) stmtNode() {}
+func (*EnumDecl) stmtNode()      {}
+func (*ImportDecl) stmtNode()    {}
+func (*SpawnStmt) stmtNode()     {}
+func (*SelectStmt) stmtNode()    {}
+func (*SendStmt) stmtNode()      {}
+func (*BreakStmt) stmtNode()     {}
+func (*ContinueStmt) stmtNode()  {}
 
 func (s *LetStmt) span() Span      { return s.Span }
+func (s *DestructLet) span() Span  { return s.Span }
+func (s *ConstDecl) span() Span    { return s.Span }
 func (s *AssignStmt) span() Span   { return s.Span }
 func (s *ExprStmt) span() Span     { return s.Span }
 func (s *WhileStmt) span() Span    { return s.Span }
 func (s *ForStmt) span() Span      { return s.Span }
+func (s *LabelStmt) span() Span    { return s.Span }
 func (s *ReturnStmt) span() Span   { return s.Span }
 func (s *FnDecl) span() Span       { return s.Span }
+func (s *MethodDecl) span() Span   { return s.Span }
+func (s *DeferStmt) span() Span    { return s.Span }
+func (s *TypeAliasDecl) span() Span { return s.Span }
 func (s *EnumDecl) span() Span     { return s.Span }
 func (s *ImportDecl) span() Span   { return s.Span }
 func (s *SpawnStmt) span() Span    { return s.Span }
