@@ -754,7 +754,7 @@ fn p_method_decl(toks, mut pos) {
             NoNode
         },
     }
-    let lit = FnLit(params, muts, pspans, param_tys, ret_ty, body, tok_lex(name), sp_union(sp_of_tok(tok), span_of(body)))
+    let lit = FnLit(params, muts, pspans, param_tys, ret_ty, body, tok_lex(name), [], sp_union(sp_of_tok(tok), span_of(body)))
     Ok(MethodDecl(rty_name(rty), tok_lex(name), sp_of_tok(name), lit, span_of(lit)))
 }
 
@@ -838,6 +838,17 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     } else {
         NoNode
     }
+    let crefs = if !interface_only && p_match(toks, pos, t_capture) {
+        match p_capture_list(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                []
+            },
+        }
+    } else {
+        []
+    }
     if interface_only {
         match p_end_stmt(toks, pos) {
             Ok(_) => {},
@@ -845,7 +856,7 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
                 return Err(d)
             },
         }
-        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, NoNode, name, sp_union(fn_sp, span_of(ret_ty))))
+        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, NoNode, name, [], sp_union(fn_sp, span_of(ret_ty))))
     } else {
         let body = match p_block(toks, pos) {
             Ok(v) => v,
@@ -854,8 +865,49 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
                 NoNode
             },
         }
-        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, body, name, sp_union(fn_sp, span_of(body))))
+        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, body, name, crefs, sp_union(fn_sp, span_of(body))))
     }
+}
+
+// p_capture_list 解析 capture 子句的捕获列表：返回 ref 捕获名（值捕获项不记录）
+// p_capture_list parses a capture clause list: returns ref-captured names
+// (value-captured items are default and not recorded)
+fn p_capture_list(toks, mut pos) {
+    match p_expect(toks, pos, t_lparen, "'(' after capture") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let mut crefs = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rparen) {
+        let is_ref = tok_type(p_peek(toks, pos)) == t_ident && tok_lex(p_peek(toks, pos)) == "ref"
+        if is_ref {
+            let _ = p_advance(toks, pos)
+        }
+        let ptok = match p_expect(toks, pos, t_ident, "captured name") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        if is_ref {
+            push(crefs, tok_lex(ptok))
+        }
+        if !p_match(toks, pos, t_comma) {
+            break
+        }
+        p_skip_semis(toks, pos)
+    }
+    match p_expect(toks, pos, t_rparen, "')' after capture list") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    Ok(crefs)
 }
 
 // p_enum_decl 解析枚举声明：变体可带类型字段，支持泛型参数表
@@ -1303,8 +1355,19 @@ fn p_spawn_stmt(toks, mut pos) {
 // p_defer_stmt 解析 defer 语句（必须跟块）/ p_defer_stmt parses defer (a block is required)
 fn p_defer_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    if !p_check(toks, pos, t_lbrace) {
+    if !p_check(toks, pos, t_lbrace) && !p_check(toks, pos, t_capture) {
         return perr("E1119", "defer takes a block, e.g. `defer " + chr(123) + " close(ch) }`", "expected '" + chr(123) + "' after defer", sp_of_tok(p_peek(toks, pos)))
+    }
+    let crefs = if p_match(toks, pos, t_capture) {
+        match p_capture_list(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                []
+            },
+        }
+    } else {
+        []
     }
     let body = match p_block(toks, pos) {
         Ok(v) => v,
@@ -1313,7 +1376,7 @@ fn p_defer_stmt(toks, mut pos) {
             NoNode
         },
     }
-    Ok(DeferStmt(body, sp_union(sp_of_tok(tok), span_of(body))))
+    Ok(DeferStmt(body, crefs, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
 // p_select_stmt 解析 select 语句（通信臂 + 至多一个 default）

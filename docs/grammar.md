@@ -25,12 +25,12 @@ block_comment ::= '/*' ... '*/'     // 无嵌套
 ident        ::= [a-zA-Z_][a-zA-Z0-9_]*
 ```
 
-**关键字（23 个，保留字，不可作标识符）：**
+**关键字（24 个，保留字，不可作标识符）：**
 
 ```
 let  mut  const  fn  if  else  while  for  in  return
 true  false  enum  match  spawn  break  continue  pub
-import  select  record  type  defer
+import  select  record  type  defer  capture
 ```
 
 **两个"像关键字但不是关键字"的标识符（词法层特判，语法层语义由上下文决定）：**
@@ -39,6 +39,8 @@ import  select  record  type  defer
 |---|---|---|
 | `default` | `select` 的 default 臂 | 仅 `select` 臂位置特判（`t_ident` + lexeme 检查）；其他位置可作普通标识符 |
 | `chan` | 内建函数 | `chan(n)` / `chan()` 缓冲/无缓冲 channel 构造，是 native 函数调用而非关键字 |
+
+另：`ref` 仅在 `capture` 列表内特判，其余位置仍是普通标识符。
 
 ### 1.3 数字字面量
 
@@ -113,8 +115,9 @@ top_level_decl ::= import | fn_decl | method_decl | enum_decl | let_decl | const
 ## 3. 声明
 
 ```
-fn_decl      ::= 'fn' ident '(' params ')' ['->' type_expr] block
+fn_decl      ::= 'fn' ident '(' params ')' ['->' type_expr] ['capture' '(' captures ')'] block
 method_decl  ::= 'fn' '(' ident ':' type_expr ')' ident '(' params ')' ['->' type_expr] block
+captures     ::= { 'ref'? ident } ,       // ref 前缀 = 引用捕获；无前缀 = 值捕获（默认，与省略同义）
 params       ::= { ['mut'] ident [':' type_expr] },
 let_decl     ::= ['pub'] 'let' ['mut'] ident [':' type_expr] '=' expression
 destruct_let ::= 'let' ['mut'] '(' { ident } ',' ')' '=' expression
@@ -141,7 +144,7 @@ while_stmt   ::= 'while' expression block
 for_stmt     ::= 'for' [ident ','] ident 'in' expression block   // 可选索引变量；channel 禁用索引
 label_stmt   ::= ident ':' ( while_stmt | for_stmt )             // 标签循环（Go 式）
 spawn_stmt   ::= 'spawn' expression                     // 起纤程
-defer_stmt   ::= 'defer' expression                     // 挂包围函数，退出 LIFO
+defer_stmt   ::= 'defer' ['capture' '(' captures ')'] block      // 挂包围函数，退出 LIFO
 return_stmt  ::= 'return' [expression]
 break_stmt   ::= 'break' [ident]                        // 可选标签
 continue_stmt::= 'continue' [ident]                     // 可选标签
@@ -182,7 +185,7 @@ primary      ::= int | float | str | interp_str | 'true' | 'false'
                | '(' expression ')' | tuple_lit | lambda
 tuple_lit    ::= '(' expression ',' { expression ',' } [expression] ')'   // ≥2 元素
 path         ::= ident {'::' ident}                    // 至多三段
-lambda       ::= 'fn' '(' params ')' block            // 体必须是 block
+lambda       ::= 'fn' '(' params ')' ['capture' '(' captures ')'] block   // 体必须是 block
 match_arms   ::= { pattern ['if' expression] '=>' expression },
 record_literal ::= 'record' '{' [fields | update] '}'
 ```

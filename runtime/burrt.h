@@ -1219,6 +1219,22 @@ static OUpvalue *bur_capture_upvalue(int slot) {
     return u;
 }
 
+// bur_new_closed_cell wraps a value in an independent closed cell
+// (value-capture snapshots: never open, never shared)
+static OUpvalue *bur_new_closed_cell(Value v) {
+    OUpvalue *u = (OUpvalue *)bur_alloc(sizeof(OUpvalue), OBJ_UPVALUE);
+    u->fiber = NULL;
+    u->slot = 0;
+    u->open = false;
+    u->closed = v;
+    return u;
+}
+
+// bur_capture_value captures a value-capture snapshot from a stack slot
+static OUpvalue *bur_capture_value(int slot) {
+    return bur_new_closed_cell(bur_cur->stack[slot]);
+}
+
 static void bur_close_upvalues(int from) {
     int kept = 0;
     for (int i = 0; i < bur_cur->nopen; i++) {

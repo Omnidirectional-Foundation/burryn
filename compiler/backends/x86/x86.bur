@@ -78,6 +78,26 @@ pub let FB_DONE = 4
 // per-fiber stack: 1MiB plus a 4KiB guard page (matches C runtime BUR_STACK_SIZE)
 pub let FIBER_STACK_SIZE = 1048576
 pub let BUDGET_SLICE = 10000
+// channel struct 堆布局（112B，OChannel 去 Obj 头）/ channel struct heap layout (112 bytes,
+// OChannel minus the Obj header)
+pub let CH_CAP = 0
+pub let CH_BUF = 8
+pub let CH_BUFLEN = 16
+pub let CH_BUFCAP = 24
+pub let CH_SENDQ = 32
+pub let CH_NSENDQ = 40
+pub let CH_SENDQCAP = 48
+pub let CH_RECVQ = 56
+pub let CH_NRECVQ = 64
+pub let CH_RECVQCAP = 72
+pub let CH_WAITERS = 80
+pub let CH_NWAIT = 88
+pub let CH_WAITCAP = 96
+pub let CH_CLOSED = 104
+pub let CH_SIZE = 112
+// 队列数组倍增系数：len==cap 时 newcap = cap*2 + QUEUE_GROW_ADD
+// queue-array growth: newcap = cap*2 + QUEUE_GROW_ADD when len == cap
+pub let QUEUE_GROW_ADD = 4
 
 // e1 发射 1 字节 / e1 emits one byte
 // Emit one byte
@@ -716,10 +736,21 @@ pub fn vs_pop_n(n) {
 // x86gen_prologue emits the prologue: save the caller base, build the frame base by
 // arity, drain the budget; on exhaustion call the yield block (the call's return
 // address is the instrumentation point, so resume rets straight back)
-fn x86gen_prologue(arity, _locals, yield_addr) {
+fn x86gen_prologue(arity, _locals, yield_addr, lifted) {
     let yield_call = mov_ri64(rdx, yield_addr) + call_r(rdx)
     let budget = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_rm(rcx, rax, FB_BUDGET) + sub_ri32(rcx, 1) + mov_mr(rax, FB_BUDGET, rcx) + test_rr(rcx, rcx) + jg_rel32(str_len(yield_call)) + yield_call
-    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1)) + sub_ri32(rsp, 8) + xor_rr(rax, rax) + mov_mr(rsp, 0, rax) + budget
+    // 提升参数：入口把参数值搬进 cell，槽 = cell 指针（此后 get/set_local 统一解引用）
+    // lifted params: at entry move the param value into a cell, the slot holds the
+    // cell pointer (get/set_local dereference uniformly afterwards)
+    let mut lift_code = ""
+    let mut pslot = 1
+    while pslot <= arity {
+        if pslot < len(lifted) && lifted[pslot] {
+            lift_code = lift_code + mov_rr(r11, r12) + mov_rm(rax, r14, 8 * pslot) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + gc_rec(r11, mov_ri64(rsi, 8)) + mov_mr(r14, 8 * pslot, r11)
+        }
+        pslot = pslot + 1
+    }
+    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1)) + sub_ri32(rsp, 8) + xor_rr(rax, rax) + mov_mr(rsp, 0, rax) + budget + lift_code
 }
 
 // x86gen_epilogue 生成函数尾声：返回值落栈并恢复帧
@@ -794,10 +825,65 @@ fn x86gen_unit_convert_at(off) {
     mov_rm(rax, r15, off) + mov_rr(r11, r12) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 10536) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + gc_rec(r11, mov_rr(rsi, r10)) + mov_mr(r15, off, r11)
 }
 
+// x86gen_chan_format_at 生成 chan→str 转换：<chan cap=<cap> len=<len>>
+// x86gen_chan_format_at emits chan-to-str: <chan cap=<cap> len=<len>>
+fn x86gen_chan_format_at(off) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let dl_loop = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+    let dl_jne = jne_rel32(0 - (str_len(dl_loop) + 6))
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_jne) + str_len(write2))
+    let int2_at = fn(r, foff) {
+        mov_rm(rax, r, foff) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_jne + write2
+    }
+    let l1 = mov_rm(r9, r15, off) + mov_rr(r10, r9) + mov_ri64(rcx, 16) + mov_rm(rax, r10, CH_CAP) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi) + mov_rm(rax, r10, CH_BUFLEN) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi)
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + gc_rec(r9, mov_rr(rsi, rcx))
+    let lit_head = mov_ri64(rdx, 7017488302826087228) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 8) + mov_ri64(rdx, 15728) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 2)
+    let lit_mid = mov_ri64(rdx, 263845145632) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 5)
+    let l2 = lit_head + int2_at(r10, CH_CAP) + lit_mid + int2_at(r10, CH_BUFLEN) + mb(62) + add_ri32(rdi, 1)
+    l1 + alloc + l2 + mov_mr(r15, off, r9)
+}
+
 // is_unimpl_native 判断 native 是否未实现（发射 int3）
 // is_unimpl_native tells whether a native is unimplemented (emits int3)
 fn is_unimpl_native(name) {
-    name == "close" || name == "net_nb" || name == "recv" || name == "chan"
+    name == "net_nb"
+}
+
+// x86gen_trap_exit 发射 trap：文本按 8B 块写入 [rsp-n..] + write(2) + exit 4
+// x86gen_trap_exit emits a trap: the message in 8-byte chunks at [rsp-n..] + write(2) + exit 4
+fn x86gen_trap_exit(msg) {
+    let mlen = str_len(msg)
+    let nchunks = (mlen + 7) / 8
+    let mut code = ""
+    let mut ci = 0
+    while ci < nchunks {
+        let mut ask = 8
+        if mlen - ci * 8 < 8 {
+            ask = mlen - ci * 8
+        }
+        let chunk = substr(msg, ci * 8, ask)
+        let clen = str_len(chunk)
+        let mut v = 0
+        let mut mul = 1
+        let mut bj = 0
+        while bj < clen {
+            v = v + ord(substr(chunk, bj, 1)) * mul
+            if bj + 1 < clen {
+                mul = mul * 256
+            }
+            bj = bj + 1
+        }
+        code = code + mov_ri64(rax, v) + mov_mr(rsp, 0 - 8 * (nchunks - ci), rax)
+        ci = ci + 1
+    }
+    code + mov_ri64(rdi, 2) + lea(rsi, rsp, 0 - 8 * nchunks) + mov_ri64(rdx, mlen) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 4) + mov_ri64(rax, 60) + syscall()
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）
@@ -1468,7 +1554,7 @@ fn x86gen_exec_spawn_native() {
     // copy_one：rcx = 源 str，堆上建 NUL 结尾副本，rdx 返回指针（破坏 rcx/rdx/rsi/rdi/r9）
     // copy_one: rcx = source str, builds a NUL-terminated heap copy, rdx returns the pointer
     // (clobbers rcx/rdx/rsi/rdi/r9)
-    fn copy_one() {
+    fn copy_one() capture(ref c1, ref def_path, ref defb, ref di, ref argv_alloc, ref cmd_copy, ref body, ref cond, ref back, ref argv_loop, ref null_tail, ref pipe1, ref pipe2, ref pipe3, ref envp_load, ref fail_write, ref found_seq, ref env_adv, ref default_seq, ref b5, ref b4, ref b3, ref b2, ref b1, ref env_loop_head, ref env_loop_back, ref env_scan, ref strlen_add, ref strlen_head, ref strlen_body, ref strlen_loop, ref cmd_len_seq, ref dir_len, ref cand_base, ref src_tmp, ref r8_next, ref src, ref bump, ref dst, ref copy_dir, ref slash, ref copy_cmd, ref nul, ref save_cand, ref exec_seq, ref flag_set, ref eacces, ref seg_end_body, ref seg_end_len, ref nul_chk, ref seg_body, ref scan_back, ref seg_head, ref seg_back, ref seg_end, ref set13, ref path_end, ref walk, ref direct, ref nul_je, ref slash_body, ref slash_head, ref slash_back, ref dup1, ref dup2, ref child_closes, ref child_seq, ref init_out, ref init_err, ref parent_ok, ref fork_fail, ref parent_seq, ref done_seq, ref fork_seq, ref f3, ref f2, ref f1, ref skip_fail, ref p3_fail, ref p2_fail, ref p1_fail, ref pipes) {
         let copy = mov_rm(r9, rcx, 0) + mov_rr(rdx, r12) + lea(rsi, rcx, 8) + mov_rr(rdi, rdx) + mov_rr(rcx, r9) + rep_movsb()
         let nul = xor_rr(rax, rax) + e1(136) + e1(7) + add_rr(r12, r9) + add_ri32(r12, 1)
         copy + nul
@@ -1593,7 +1679,7 @@ fn x86gen_exec_spawn_native() {
 fn x86gen_proc_pump() {
     // 单管排空：读到 EAGAIN 或 EOF；缓冲满则倍增缓冲继续收集，不丢弃
     // drain one pipe: read until EAGAIN or EOF; on a full buffer, double it and keep collecting
-    fn drain_fd(fd_off, len_off, ptr_off, cap_off) {
+    fn drain_fd(fd_off, len_off, ptr_off, cap_off) capture(ref store, ref exited, ref signaled, ref code_seq, ref hav, ref failfd_close, ref wait_block, ref out_drain, ref err_drain, ref err_check, ref out_check, ref failfd_read, ref failfd_drain, ref failfd_head) {
         let cap = mov_rm(r10, r9, cap_off) + mov_rm(rdx, r9, len_off) + sub_rr(r10, rdx)
         let grow = mov_rm(r10, r9, cap_off) + add_rr(r10, r10) + mov_rr(r11, r12) + add_rr(r12, r10) + mov_rm(rsi, r9, ptr_off) + mov_rr(rdi, r11) + mov_rm(rcx, r9, len_off) + rep_movsb() + mov_mr(r9, ptr_off, r11) + mov_mr(r9, cap_off, r10) + sub_rr(r10, rdx)
         let append = mov_rm(rsi, r9, ptr_off) + add_rr(rsi, rdx) + mov_rr(rdx, r10)
@@ -2122,24 +2208,24 @@ fn x86gen_deadlock_seq() {
     // 死锁文本 "fatal: deadlock — all fibers blocked on channels\n"（51B）按 8B 块写入 [rsp-56..]
     let exit0 = xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
     let exit4 = sys_mov_rdi(4) + sys_mov_rax(60) + syscall()
-    let c0 = mov_ri64(rax, 7214631213835909217) + mov_mr(rsp, -56, rax)
-    let c1 = mov_ri64(rax, 2335889827856667237) + mov_mr(rsp, -48, rax)
-    let c2 = mov_ri64(rax, 2333133571742292194) + mov_mr(rsp, -40, rax)
-    let c3 = mov_ri64(rax, 7084926555827060070) + mov_mr(rsp, -32, rax)
-    let c4 = mov_ri64(rax, 8015040986370581549) + mov_mr(rsp, -24, rax)
-    let c5 = mov_ri64(rax, 7417193527539253358) + mov_mr(rsp, -16, rax)
-    let c6 = mov_ri64(rax, 7333248) + mov_mr(rsp, -8, rax)
+    let c0 = mov_ri64(rax, 7214830840213430630) + mov_mr(rsp, -56, rax)
+    let c1 = mov_ri64(rax, 2336070161932771685) + mov_mr(rsp, -48, rax)
+    let c2 = mov_ri64(rax, 2336361471112675554) + mov_mr(rsp, -40, rax)
+    let c3 = mov_ri64(rax, 7070778350136093030) + mov_mr(rsp, -32, rax)
+    let c4 = mov_ri64(rax, 8007510524220895084) + mov_mr(rsp, -24, rax)
+    let c5 = mov_ri64(rax, 7308900609911103598) + mov_mr(rsp, -16, rax)
+    let c6 = mov_ri64(rax, 684908) + mov_mr(rsp, -8, rax)
     let write_msg = mov_ri64(rdi, 2) + lea(rsi, rsp, 0 - 56) + mov_ri64(rdx, 51) + sys_mov_rax(1) + syscall()
     let blocked_seq = c0 + c1 + c2 + c3 + c4 + c5 + c6 + write_msg + exit4
-    // 扫描：rax = 游标；blocked = status in 1..=3；段序 dl_init+dl_head2+dl_stat+dl_zero+blocked_seq+dl_next_body+dl_exit0_body+dl_back
+    // 扫描：rax = 游标；blocked = status in 1..=3；段序 dl_init+dl_head2+dl_stat+dl_zero+blocked_seq+dl_next_body+dl_back+dl_exit0_body
     let dl_exit0_body = exit0
     let dl_next_body = mov_rm(rax, rax, FB_LIST_NEXT)
     let dl_zero = test_rr(rcx, rcx) + je_rel32(str_len(blocked_seq))
     let dl_stat = mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, 3) + cmp_rr(rcx, rdx) + jg_rel32(str_len(dl_zero) + str_len(blocked_seq))
-    let dl_head2 = test_rr(rax, rax) + je_rel32(str_len(dl_stat) + str_len(dl_zero) + str_len(blocked_seq) + str_len(dl_next_body))
+    let dl_head2 = test_rr(rax, rax) + je_rel32(str_len(dl_stat) + str_len(dl_zero) + str_len(blocked_seq) + str_len(dl_next_body) + 5)
     let dl_init = mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0)
-    let dl_back = jmp_rel32(0 - (str_len(dl_head2) + str_len(dl_stat) + str_len(dl_zero) + str_len(blocked_seq) + str_len(dl_next_body) + str_len(dl_exit0_body) + 5))
-    dl_init + dl_head2 + dl_stat + dl_zero + blocked_seq + dl_next_body + dl_exit0_body + dl_back
+    let dl_back = jmp_rel32(0 - (str_len(dl_head2) + str_len(dl_stat) + str_len(dl_zero) + str_len(blocked_seq) + str_len(dl_next_body) + 5))
+    dl_init + dl_head2 + dl_stat + dl_zero + blocked_seq + dl_next_body + dl_back + dl_exit0_body
 }
 
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
@@ -2163,6 +2249,75 @@ fn x86gen_sched_block() {
     let pop_head = pop_load + empty_je
     let main_check = mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_rm(rax, rax, 0) + mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, FB_DONE) + cmp_rr(rcx, rdx) + je_rel32(str_len(pop_head) + str_len(pop_body) + str_len(tail_clean) + str_len(resume))
     main_check + pop_head + pop_body + tail_clean + resume + exit0 + dl
+}
+
+// x86gen_chan_schedule_block 生成 schedule 子程序（rax=fiber → status=READY + ready 队尾入队）
+// x86gen_chan_schedule_block emits the schedule subroutine (rax=fiber -> status=READY and
+// append to the ready queue tail)
+fn x86gen_chan_schedule_block() {
+    // 入队段序 branch+EMPTY+jmpSET+NONEMPTY+SET（与 spawn 的 enqueue 同构）
+    let enq_set = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
+    let enq_nonempty = mov_mr(rcx, FB_READY_NEXT, rax)
+    let enq_to_set = jmp_rel32(str_len(enq_nonempty))
+    let enq_empty = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
+    let enq_branch = test_rr(rcx, rcx) + jne_rel32(str_len(enq_empty) + str_len(enq_to_set))
+    let set_ready = mov_ri64(rcx, FB_READY) + mov_mr(rax, FB_STATUS, rcx) + xor_rr(rcx, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
+    set_ready + mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0) + enq_branch + enq_empty + enq_to_set + enq_nonempty + enq_set + ret()
+}
+
+// x86gen_chan_wake_waiters_block 生成 wake_waiters 子程序（rax=ch → 遍历 waiters，
+// FBLOCKED_SELECT 的 schedule；结束后 nwait 清零；保留 rsi/rdi/rdx，毁 rax/rcx/r8/r9/r10）
+// x86gen_chan_wake_waiters_block emits the wake_waiters subroutine (rax=ch -> walk the
+// waiters, schedule every FBLOCKED_SELECT one, clear nwait afterwards; preserves
+// rsi/rdi/rdx, clobbers rax/rcx/r8/r9/r10)
+fn x86gen_chan_wake_waiters_block(sched_addr) {
+    let w_done = xor_rr(rcx, rcx) + mov_mr(rax, CH_NWAIT, rcx) + ret()
+    let w_adv = add_ri32(rsi, 8) + sub_ri32(rdi, 1)
+    let w_wake = mov_rr(rax, rdx) + mov_ri64(r8, sched_addr) + call_r(r8)
+    let w_skip = jmp_rel32(str_len(w_wake) + str_len(w_adv) + 5)
+    let w_check = mov_rm(rdx, rsi, 0) + mov_rm(rcx, rdx, FB_STATUS) + mov_ri64(r9, FB_BLOCKED_SELECT) + cmp_rr(rcx, r9) + jne_rel32(0)
+    let w_loop = test_rr(rdi, rdi) + je_rel32(str_len(w_check) + str_len(w_skip) + str_len(w_wake) + str_len(w_adv) + 5) + w_check + w_skip + w_wake + w_adv + jmp_rel32(0 - (str_len(w_check) + str_len(w_skip) + str_len(w_wake) + str_len(w_adv) + 14))
+    let w_init = mov_rm(rsi, rax, CH_WAITERS) + mov_rm(rdi, rax, CH_NWAIT)
+    w_init + w_loop + w_done
+}
+
+// x86gen_chan_push_queue_block 生成队列 push 子程序（rax=ch, rdi=fiber → 队尾 push，
+// len==cap 时倍增重分配；保留 rax/rdi，毁 rcx/rdx/rsi/r8/r9/r10/r11/r12）
+// x86gen_chan_push_queue_block emits the queue-push subroutine (rax=ch, rdi=fiber -> append
+// to the queue at field offset off, doubling when full; preserves rax/rdi, clobbers
+// rcx/rdx/rsi/r8/r9/r10/r11/r12)
+fn x86gen_chan_push_queue_block(off) {
+    // 布局 head + grow + no_grow + store_n：n==cap 落入 grow（倍增重分配后拷贝旧元素，
+    // 写回新数组指针，落入 no_grow 写 fiber），n<cap 跳 no_grow；store_n 重读 n 自增后 ret。
+    // gc_rec 跨调用只保 rax/r11/r12/rsi/rdi（rdx/rcx/r8/r9/r10 全毁），
+    // 故 grow_copy/no_grow 一律从内存重读 array/n，且 [rax+off] 在拷贝完成前不写回；
+    // grow_copy 把 rdi 覆写为新数组（rep movsb 还会推进），no_grow 在存储前从
+    // rt_cur_fiber 重读 fiber——被 push 的恒是当前 fiber
+    let store_n = mov_rm(r8, rax, off + 8) + add_ri32(r8, 1) + mov_mr(rax, off + 8, r8) + ret()
+    let no_grow = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rdx, rax, off) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(rcx, 0, rdi)
+    // grow_alloc 记录新块但先不写回指针，grow_copy 从 [rax+off] 读旧数组拷贝 n 元素后再写回
+    let grow_alloc = mov_rr(r11, r12) + mov_rr(rsi, r8) + add_rr(r12, rsi) + gc_rec(r11, mov_rr(rsi, rsi)) + mov_rm(rcx, rax, off + 16) + add_rr(rcx, rcx) + add_ri32(rcx, QUEUE_GROW_ADD) + mov_mr(rax, off + 16, rcx)
+    let grow_copy = mov_rm(rsi, rax, off) + mov_rr(rdi, r11) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(rax, off, r11)
+    let grow_size = mov_rr(r8, rcx) + add_rr(r8, r8) + add_ri32(r8, QUEUE_GROW_ADD) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r8)
+    let grow = mov_rm(rdx, rax, off) + mov_rm(rcx, rax, off + 16) + mov_rm(r9, rax, off + 8) + grow_size + grow_alloc + grow_copy
+    let head = mov_rm(rdx, rax, off) + mov_rm(r8, rax, off + 8) + mov_rm(rcx, rax, off + 16) + cmp_rr(r8, rcx) + jne_rel32(str_len(grow))
+    head + grow + no_grow + store_n
+}
+
+// x86gen_chan_remove_waiter_block 生成 waiter 移除子程序（rax=ch, rdi=fiber →
+// 从 waiters 队列删除该 fiber（尾部 memmove），不存在则不动；毁 rcx/rdx/rsi/r8/r9/r10）
+// x86gen_chan_remove_waiter_block emits the waiter-removal subroutine (rax=ch, rdi=fiber ->
+// remove that fiber from the waiters queue (tail memmove); no-op when absent; clobbers
+// rcx/rdx/rsi/r8/r9/r10)
+fn x86gen_chan_remove_waiter_block() {
+    let rm_found_tail = mov_rm(rcx, rax, CH_NWAIT) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NWAIT, rcx) + ret()
+    let rm_found = mov_rr(rsi, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdi, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdi) + add_rr(rdi, r9) + mov_rm(rcx, rax, CH_NWAIT) + sub_rr(rcx, r10) + sub_ri32(rcx, 1) + xor_rr(r8, r8) + add_ri32(r8, 3) + shl_rcl(rcx) + rep_movsb() + rm_found_tail
+    let rm_none = ret()
+    let rm_slot = mov_rr(rsi, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r9) + mov_rm(rcx, rsi, 0)
+    let rm_step = sub_ri32(r10, 1) + rm_slot + cmp_rr(rcx, rdi) + je_rel32(5)
+    let rm_head = mov_rm(r10, rax, CH_NWAIT) + test_rr(r10, r10) + je_rel32(str_len(rm_step) + 5 + str_len(rm_found))
+    let rm_loop = rm_step + jmp_rel32(0 - (str_len(rm_head) + str_len(rm_step) + 5))
+    rm_head + rm_loop + rm_found + rm_none
 }
 
 // x86gen_start 生成 _start：mmap 堆 + 设置寄存器约定 + 建主 fiber（fake frame + 入队）+
@@ -2194,25 +2349,25 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr) {
 pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, en_qual, en_vnames, _en_varities) {
     // read_u16 读 u16 操作数 / read_u16 reads a u16 operand
     // Read a u16 operand
-    fn read_u16(code, at) {
+    fn read_u16(code, at) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         code[at] * 256 + code[at + 1]
     }
     // const_str 生成字符串常量字节 / const_str builds string constant bytes
-    fn const_str(fh, idx) {
+    fn const_str(fh, idx) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match f_consts[fh][idx] {
             lib::CVal::CStr(s) => s,
             _ => "",
         }
     }
     // fn_const 生成函数常量字节 / fn_const builds function constant bytes
-    fn fn_const(fh, idx) {
+    fn fn_const(fh, idx) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match f_consts[fh][idx] {
             lib::CVal::CFn(sub) => sub,
             _ => 0,
         }
     }
     // inst_len 取指令长度 / inst_len returns the instruction length
-    fn inst_len(fh, code, ip) {
+    fn inst_len(fh, code, ip) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let op = code[ip]
         if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
             3
@@ -2235,7 +2390,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // jump_targets 构建跳转目标表 / jump_targets builds the jump target table
-    fn jump_targets(fh) {
+    fn jump_targets(fh) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let code = f_code[fh]
         let mut targets = map()
         let mut ip = 0
@@ -2274,7 +2429,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         targets
     }
     // count_locals 统计局部变量数 / count_locals counts locals
-    fn count_locals(fh) {
+    fn count_locals(fh) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let code = f_code[fh]
         let mut max_slot = f_arity[fh]
         let mut ip = 0
@@ -2291,7 +2446,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         max_slot + 1
     }
     // find_fn_by_name 按名字查找函数 / find_fn_by_name finds a function by name
-    fn find_fn_by_name(name) {
+    fn find_fn_by_name(name) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut i = 0
         if name == "" {
             return 0 - 1
@@ -2308,7 +2463,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // handle of the injected format_float (used by list/enum float formatting)
     let f2s_h = find_fn_by_name("format_float")
     // shadow_pop 弹出影子栈 n 项 / shadow_pop pops n entries from the shadow stack
-    fn shadow_pop(mut lst, n) {
+    fn shadow_pop(mut lst, n) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut k = 0
         while k < n && len(lst) > 0 {
             pop(lst)
@@ -2316,7 +2471,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // type_specificity 类型特异度（重载选择）/ type_specificity scores a type (overload selection)
-    fn type_specificity(t) {
+    fn type_specificity(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if t == "" {
             0
         } else if t == "map" {
@@ -2330,15 +2485,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // is_more_specific 判断是否更特异 / is_more_specific tells whether a is more specific
-    fn is_more_specific(a, b) {
+    fn is_more_specific(a, b) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         type_specificity(a) > type_specificity(b)
     }
     // is_map_type 判断是否为 map 类型 / is_map_type tells whether t is a map type
-    fn is_map_type(t) {
+    fn is_map_type(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         str_len(t) >= 3 && substr(t, 0, 3) == "map"
     }
     // map_key_type 取 map 键类型 / map_key_type extracts the map key type
-    fn map_key_type(t) {
+    fn map_key_type(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if t == "map-str" || t == "map-str-int" || t == "map-str-str" || t == "map-str-float" {
             "str"
         } else if t == "map-int" || t == "map-int-str" || t == "map-int-int" || t == "map-int-float" {
@@ -2348,7 +2503,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // map_val_type 取 map 值类型 / map_val_type extracts the map value type
-    fn map_val_type(t) {
+    fn map_val_type(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if t == "map-str-int" || t == "map-int-int" {
             "int"
         } else if t == "map-str-str" || t == "map-int-str" {
@@ -2360,7 +2515,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // refine_map_type 细化 map 类型 / refine_map_type refines a map type
-    fn refine_map_type(k, v) {
+    fn refine_map_type(k, v) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if k == "" {
             "map"
         } else if v == "" {
@@ -2370,7 +2525,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // refine_map_arg 细化 map 实参 / refine_map_arg refines a map argument
-    fn refine_map_arg(arg_t, k, v) {
+    fn refine_map_arg(arg_t, k, v) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if arg_t == "" || is_map_type(arg_t) {
             let cur_k = map_key_type(arg_t)
             let cur_v = map_val_type(arg_t)
@@ -2390,11 +2545,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // is_record_type 判断是否为 record 类型 / is_record_type tells whether t is a record type
-    fn is_record_type(t) {
+    fn is_record_type(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         t == "record" || str_len(t) >= 7 && substr(t, 0, 7) == "record:"
     }
     // record_schema 取 record 字段 schema / record_schema fetches a record's field schema
-    fn record_schema(t) {
+    fn record_schema(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if str_len(t) >= 7 && substr(t, 0, 7) == "record:" {
             substr(t, 7, str_len(t) - 7)
         } else {
@@ -2402,7 +2557,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // merge_type 合并类型跟踪 / merge_type merges type tracking
-    fn merge_type(cur, new) {
+    fn merge_type(cur, new) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if cur == "" {
             new
         } else if new == "" {
@@ -2414,7 +2569,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // merge_pos 合并位置类型 / merge_pos merges positional types
-    fn merge_pos(pcur, pnew) {
+    fn merge_pos(pcur, pnew) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if pcur == "" || pnew == pcur {
             pnew
         } else if is_map_type(pcur) && is_map_type(pnew) {
@@ -2431,11 +2586,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut const_slot_map = map()
     let mut enum_const_map = map()
     // const_slot_key 生成常量槽键 / const_slot_key keys a constant slot
-    fn const_slot_key(f, i) {
+    fn const_slot_key(f, i) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         f * 100000 + i
     }
     // enum_const_key 生成枚举常量键 / enum_const_key keys an enum constant
-    fn enum_const_key(cv) {
+    fn enum_const_key(cv) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match cv {
             lib::CVal::CEnumType(eh) => "e:" + str(eh),
             lib::CVal::CSingleton(eh, vi) => "s:" + str(eh) + ":" + str(vi),
@@ -2444,7 +2599,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // enum_const_bytes 生成枚举常量字节 / enum_const_bytes builds enum constant bytes
-    fn enum_const_bytes(cv) {
+    fn enum_const_bytes(cv) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match cv {
             lib::CVal::CEnumType(eh) => e8(eh),
             lib::CVal::CSingleton(eh, vi) => e8(eh) + e8(vi),
@@ -2518,7 +2673,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut record_encs = []
     let mut record_offs = []
     // add_record_enc 注册 record 编码 / add_record_enc registers a record encoding
-    fn add_record_enc(enc) {
+    fn add_record_enc(enc) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut i = 0
         while i < len(record_encs) {
             if record_encs[i] == enc {
@@ -2559,14 +2714,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut enum_variant_types = map()
     // enum_variant_fields 取用户枚举某 variant 字段类型 / enum_variant_fields fetches a user enum variant's
     // field types
-    fn enum_variant_fields(eh, vidx) {
+    fn enum_variant_fields(eh, vidx) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match get(enum_variant_types, "v:" + str(eh) + ":" + str(vidx)) {
             Some(vf) => vf,
             None => [],
         }
     }
     // enum_field_key 生成枚举字段类型表 key / enum_field_key builds an enum field-type table key
-    fn enum_field_key(qual, vts) {
+    fn enum_field_key(qual, vts) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut key = "enum:" + qual
         let mut vi = 0
         while vi < len(vts) {
@@ -2586,7 +2741,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // enum_fields_for_variant 取某 variant 的字段类型 / enum_fields_for_variant fetches a variant's field
     // types
-    fn enum_fields_for_variant(enc, vidx) {
+    fn enum_fields_for_variant(enc, vidx) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match get(enum_field_types, enc) {
             Some(vts) => {
                 if vidx >= 0 && vidx < len(vts) {
@@ -2599,13 +2754,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // is_enum_enc 判断是否为枚举编码 / is_enum_enc tells whether t is an enum encoding
-    fn is_enum_enc(t) {
+    fn is_enum_enc(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         str_len(t) >= 5 && substr(t, 0, 5) == "enum:"
     }
     // enum_fields_resolve 从枚举编码解析 variant 字段类型（先全表后用户 variant 表）
     // enum_fields_resolve resolves a variant's field types (full table first, then the user
     // variant table)
-    fn enum_fields_resolve(enc, vidx) {
+    fn enum_fields_resolve(enc, vidx) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let full = enum_fields_for_variant(enc, vidx)
         if len(full) > 0 {
             full
@@ -2620,7 +2775,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
     }
     // enum_variant_name 取用户枚举 variant 名 / enum_variant_name fetches a user enum variant name
-    fn enum_variant_name(eh, vidx) {
+    fn enum_variant_name(eh, vidx) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if eh >= 0 && eh < len(en_vnames) && vidx >= 0 && vidx < len(en_vnames[eh]) {
             en_vnames[eh][vidx]
         } else {
@@ -2629,7 +2784,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // x86gen_enum_format_at 生成枚举格式化：variant 名 + 字段（str 加引号）
     // x86gen_enum_format_at emits enum formatting: variant name plus fields (str quoted)
-    fn x86gen_enum_format_at(off, eh, vts) {
+    fn x86gen_enum_format_at(off, eh, vts) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mb_al = e1(136) + e1(7)
         let mb = fn(c) {
             e1(198) + e1(7) + sb(c)
@@ -2757,7 +2912,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         load_v + lchain + alloc + p2h + wchain + p2t
     }
     // enum_qual 取枚举编码名 / enum_qual extracts the qualifier of an enum encoding
-    fn enum_qual(t) {
+    fn enum_qual(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let bar = match str_index_of(t, "|") {
             Some(b) => b,
             None => str_len(t),
@@ -2770,7 +2925,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // enum_qual_to_eh 从 qualifier 名查枚举 handle
     // enum_qual_to_eh looks up an enum handle by qualifier
-    fn enum_qual_to_eh(qual) {
+    fn enum_qual_to_eh(qual) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut qei = 0
         while qei < len(en_qual) {
             if en_qual[qei] == qual {
@@ -2787,14 +2942,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // call convention: push fn_ref+bits, call; r15 drops by 8 and the result sits at the former
     // fn_ref slot (new [r15-8]);
     // write it back to [r15+off] and restore r15
-    fn x86gen_float_to_str_at(off) {
+    fn x86gen_float_to_str_at(off) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let ff_h = find_fn_by_name("format_float")
         let f2s_call = mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax)
         let f2s_fin = mov_rm(rax, r15, 0 - 8) + mov_mr(r15, off - 8, rax) + sub_ri32(r15, 8)
         f2s_call + f2s_fin
     }
     // enum_format_for_enc 为任意枚举编码生成格式化 / enum_format_for_enc emits formatting for any enum encoding
-    fn enum_format_for_enc(off, enc) {
+    fn enum_format_for_enc(off, enc) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let feh = if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
             match parse_int(substr(enc, 6, str_len(enc) - 6)) {
                 Some(fehv) => fehv,
@@ -2817,13 +2972,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // reg_enum_type 注册枚举实例类型 / reg_enum_type registers an enum instance type
     // qual = 枚举限定名, vts = 各 variant 字段类型列表; 返回编码字符串
-    fn reg_enum_type(qual, vts) {
+    fn reg_enum_type(qual, vts) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let key = enum_field_key(qual, vts)
         put(enum_field_types, key, vts)
         key
     }
     // enum_payload_enc 生成内置枚举 payload 编码 / enum_payload_enc builds a builtin enum payload encoding
-    fn enum_payload_enc(qual, payloads) {
+    fn enum_payload_enc(qual, payloads) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         reg_enum_type(qual, payloads)
     }
     // exec 系列返回类型编码 / exec-family return type encodings
@@ -2834,7 +2989,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // enum_eq_enc 解析枚举操作数的有效编码（enum:e<eh> 经注册表反查）
     // enum_eq_enc resolves an enum operand's effective encoding
     // ("enum:e<eh>" looks up the registry)
-    fn enum_eq_enc(t) {
+    fn enum_eq_enc(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if str_len(t) > 6 && substr(t, 0, 6) == "enum:e" {
             let eh_v = match parse_int(substr(t, 6, str_len(t) - 6)) {
                 Some(ehv) => ehv,
@@ -2864,7 +3019,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // x86gen_enum_cmp_fields 比较两个枚举实例（r9/r10 = 实例基址，r11 = 累加器）
     // x86gen_enum_cmp_fields compares two enum instances (r9/r10 = instance bases, r11 =
     // accumulator)
-    fn x86gen_enum_cmp_fields(enc) {
+    fn x86gen_enum_cmp_fields(enc) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut seq = mov_rm(rax, r9, 0) + mov_rm(rcx, r10, 0) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
         seq = seq + mov_rm(rax, r9, 8) + mov_rm(rcx, r10, 8) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
         let feh = enum_qual_to_eh(enum_qual(enc))
@@ -2911,13 +3066,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // x86gen_enum_eq_at 生成枚举相等（操作数 [r15-16]/[r15-8]，结果回写 [r15-16] 并弹 1）
     // x86gen_enum_eq_at emits enum equality (operands at [r15-16]/[r15-8], result at [r15-16],
     // pops 1)
-    fn x86gen_enum_eq_at(enc) {
+    fn x86gen_enum_eq_at(enc) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut body = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_ri64(r11, 1)
         body = body + x86gen_enum_cmp_fields(enc) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
         body
     }
     // enc_names 取编码字段名 / enc_names lists the encoded field names
-    fn enc_names(enc) {
+    fn enc_names(enc) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut names = []
         let mut pos = 0
         while pos < str_len(enc) {
@@ -2942,7 +3097,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // tup_enc 长度前缀编码 tuple 元素类型；嵌套类型内嵌的分隔符不会引起歧义
     // tup_enc length-prefixes tuple element types; separators nested inside element types never
     // clash
-    fn tup_enc(ets) {
+    fn tup_enc(ets) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut s = "tup:"
         let mut ti = 0
         while ti < len(ets) {
@@ -2952,7 +3107,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         s
     }
     // tup_elems 解析长度前缀编码 / tup_elems parses the length-prefixed encoding
-    fn tup_elems(t) {
+    fn tup_elems(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut out = []
         let body = substr(t, 4, str_len(t) - 4)
         let mut pos = 0
@@ -2980,12 +3135,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         out
     }
     // is_list_type 判断是否为 list 类型 / is_list_type tells whether t is a list type
-    fn is_list_type(t) {
+    fn is_list_type(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         str_len(t) > 5 && substr(t, 0, 5) == "list-"
     }
     // list_elem_type 取 list 元素类型（非 list 类型返回 ""）
     // list_elem_type extracts the list element type (returns "" for non-list types)
-    fn list_elem_type(t) {
+    fn list_elem_type(t) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if is_list_type(t) {
             substr(t, 5, str_len(t) - 5)
         } else {
@@ -2995,7 +3150,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）
     // list_elem_format_code emits the element formatter code for a list element type
     // ("" for str/int/float, which use inline handlers)
-    fn list_elem_format_code_core(et, ff_h) {
+    fn list_elem_format_code_core(et, ff_h) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if et == "str" || et == "int" || et == "float" {
             ""
         } else if et == "bool" {
@@ -3032,7 +3187,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // x86gen_tuple_format_at 生成 tuple 格式化：(e0, e1, ...)，元素按静态类型展开，容器元素递归格式化
     // x86gen_tuple_format_at emits tuple formatting: (e0, e1, ...), elements expanded from static
     // types, containers nested
-    fn x86gen_tuple_format_at(off, types, ff_h) {
+    fn x86gen_tuple_format_at(off, types, ff_h) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mb_al = e1(136) + e1(7)
         let mb = fn(c) {
             e1(198) + e1(7) + sb(c)
@@ -3136,7 +3291,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）
     // list_elem_format_code emits the element formatter code for a list element type
     // ("" for str/int/float, which use inline handlers)
-    fn list_elem_format_code(et, ff_h) {
+    fn list_elem_format_code(et, ff_h) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if et == "str" || et == "int" || et == "float" {
             ""
         } else if et == "bool" {
@@ -3174,7 +3329,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     let const_data_len = str_len(const_data)
     // find_field_in_enc 在编码中查找字段 / find_field_in_enc finds a field in an encoding
-    fn find_field_in_enc(enc, fname) {
+    fn find_field_in_enc(enc, fname) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut i = 0
         let mut pos = 0
         while pos < str_len(enc) {
@@ -3199,7 +3354,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         0 - 1
     }
     // const_addr 取常量地址 / const_addr returns a constant's address
-    fn const_addr(f, i) {
+    fn const_addr(f, i) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match get(const_slot_map, const_slot_key(f, i)) {
             Some(off) => base_addr + 120 + RUNTIME_SIZE + off,
             None => 0,
@@ -3281,6 +3436,48 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         push(fn_param_types, plist)
         phAlloc = phAlloc + 1
     }
+    // created_by: fh -> [创建者 fh, 闭包指令 ip]（upvalue 形态判定的链根）
+    // created_by: fh -> [creator fh, closure instruction ip] (chain root for upvalue cell-ness)
+    let mut created_by = map()
+    let mut cbScan = 0
+    while cbScan < nfn {
+        let cbcode = f_code[cbScan]
+        let mut ccip = 0
+        while ccip < len(cbcode) {
+            if cbcode[ccip] == lib::op_closure {
+                let cbsub = fn_const(cbScan, read_u16(cbcode, ccip + 1))
+                let cexists = match get(created_by, cbsub) {
+                    Some(_) => true,
+                    None => false,
+                }
+                if !cexists {
+                    put(created_by, cbsub, [cbScan, ccip])
+                }
+            }
+            ccip = ccip + inst_len(cbScan, cbcode, ccip)
+        }
+        cbScan = cbScan + 1
+    }
+    // upval_is_ref 沿透传链判定 upvalue 槽是否为 cell（ref 捕获或透传自 ref）
+    // upval_is_ref decides whether an upvalue slot is a cell (ref capture, or
+    // inherited from a ref), following the inheritance chain statically
+    fn upval_is_ref(fh, ui) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
+        match get(created_by, fh) {
+            Some(cb) => {
+                let cfh = cb[0]
+                let cip = cb[1]
+                let flag = f_code[cfh][cip + 3 + 3 * ui]
+                if flag % 2 == 1 {
+                    flag >= 2
+                } else if flag >= 2 {
+                    upval_is_ref(fn_const(cfh, read_u16(f_code[cfh], cip + 1)), read_u16(f_code[cfh], cip + 4 + 3 * ui))
+                } else {
+                    false
+                }
+            },
+            None => false,
+        }
+    }
     let mut p_depth_maps = []
     let mut pglobal_type = map()
     // sig_specs: 多态函数被调用的去重实参签名（key = psig_key(handle, argtypes)）
@@ -3294,7 +3491,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut sig_ret = map()
     let mut p_cur_depth = map()
     // psig_key 长度前缀签名 key（任何类型编码无歧义）/ psig_key length-prefixed signature key
-    fn psig_key(h, ats) {
+    fn psig_key(h, ats) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut k = str(h) + "@"
         let mut ki = 0
         while ki < len(ats) {
@@ -3306,7 +3503,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // psig_lookup 查 per-signature 返回类型（未命中返回 ""）
     // psig_lookup looks up a per-signature return type ("" if absent)
-    fn psig_lookup(h, ats) {
+    fn psig_lookup(h, ats) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match get(sig_ret, psig_key(h, ats)) {
             Some(v) => v,
             None => "",
@@ -3316,7 +3513,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // aggregate=false 纯读（per-signature 返回类型查询）。返回模拟的返回类型。
     // psim pre-scans one function body: aggregate=true writes the shared type tables
     // (multi-round propagation); aggregate=false is read-only (per-signature ret lookup).
-    fn psim(ptfh, param_types, aggregate) {
+    fn psim(ptfh, param_types, aggregate) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let pcode = f_code[ptfh]
         let mut pret_type = ""
         let mut pshadow_ps = []
@@ -4197,7 +4394,57 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 shadow_pop(ptshadow_ps, psn + 1)
                 push(pshadow_ps, "")
                 push(ptshadow_ps, "unit")
-            } else if pop == lib::op_select {}
+            } else if pop == lib::op_send {
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+            } else if pop == lib::op_select {
+                let mut psel_p = pit + 1
+                let psel_n = pcode[psel_p]
+                let psel_has_dflt = pcode[psel_p + 1] != 0
+                psel_p = psel_p + 2
+                let mut psel_slots = 0
+                let mut psel_recvs = 0
+                let mut psel_i = 0
+                while psel_i < psel_n {
+                    let psel_kind = pcode[psel_p]
+                    let psel_dist = read_u16(pcode, psel_p + 1)
+                    psel_p = psel_p + 3
+                    // recv 臂：运行时值覆盖 chan 槽（[ch] → [v]），臂体栈多一个值类型
+                    // recv arm: the runtime value overwrites the channel slot
+                    // ([ch] -> [v]); the arm body stack carries one extra value type
+                    put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs + (if psel_kind == 1 {
+                        0
+                    } else {
+                        1
+                    }))
+                    psel_recvs = psel_recvs + (if psel_kind == 1 {
+                        0
+                    } else {
+                        1
+                    })
+                    psel_slots = psel_slots + (if psel_kind == 1 {
+                        2
+                    } else {
+                        1
+                    })
+                    psel_i = psel_i + 1
+                }
+                if psel_has_dflt {
+                    let psel_dist = read_u16(pcode, psel_p)
+                    psel_p = psel_p + 2
+                    put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs)
+                }
+                shadow_pop(pshadow_ps, psel_slots)
+                shadow_pop(ptshadow_ps, psel_slots)
+                let mut pv = 0
+                while pv < psel_n {
+                    if pcode[pit + 3 + 3 * pv] != 1 {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "int")
+                    }
+                    pv = pv + 1
+                }
+            }
             if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
                 let pdepth = len(ptshadow_ps) - 1
                 if pdepth < len(ppos_auth) && ppos_auth[pdepth] {
@@ -4375,7 +4622,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // variant_index: 实参类型在 fn_variants 中的下标（未命中 0 = 默认变体）
     // variant_index: index of arg types in fn_variants (0 = default variant if absent)
-    fn variant_index(h, ats) {
+    fn variant_index(h, ats) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref pglobal_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         if h >= 0 && h < len(fn_variants) {
             let fv_vs = fn_variants[h]
             let fv_vk = psig_key(h, ats)
@@ -4393,15 +4640,28 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let gc_rec_bytes = x86gen_gc_record()
     let gc_col = x86gen_gc_collect(n_globals, base_addr + 120 + RUNTIME_SIZE + const_data_len)
     let gc_mark = x86gen_mark_addr()
-    // 调度器块（sched/yield/done）在 funcs 头部、GC 子程序之后；地址编译期确定，
-    // 供 _start / prologue 插桩 / spawn 的 fake frame 引用
+    // 调度器块（sched/yield/done）与 channel 子程序（schedule/wake_waiters/push_queue）在
+    // funcs 头部、GC 子程序之后；地址编译期确定，供 _start / prologue 插桩 / spawn 的
+    // fake frame / channel opcode 引用
     let sched_bytes = x86gen_sched_block()
     let sched_addr = base_addr + 120 + RUNTIME_SIZE + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
     let yield_bytes = x86gen_yield_block(sched_addr)
     let yield_addr = sched_addr + str_len(sched_bytes)
     let done_bytes = x86gen_fiber_done_block(sched_addr)
     let done_addr = yield_addr + str_len(yield_bytes)
-    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + sched_bytes + yield_bytes + done_bytes
+    let chan_sched_bytes = x86gen_chan_schedule_block()
+    let chan_sched_addr = done_addr + str_len(done_bytes)
+    let chan_wake_bytes = x86gen_chan_wake_waiters_block(chan_sched_addr)
+    let chan_wake_addr = chan_sched_addr + str_len(chan_sched_bytes)
+    let chan_push_sendq_bytes = x86gen_chan_push_queue_block(CH_SENDQ)
+    let chan_push_sendq_addr = chan_wake_addr + str_len(chan_wake_bytes)
+    let chan_push_recvq_bytes = x86gen_chan_push_queue_block(CH_RECVQ)
+    let chan_push_recvq_addr = chan_push_sendq_addr + str_len(chan_push_sendq_bytes)
+    let chan_push_waiters_bytes = x86gen_chan_push_queue_block(CH_WAITERS)
+    let chan_push_waiters_addr = chan_push_recvq_addr + str_len(chan_push_recvq_bytes)
+    let chan_remove_waiter_bytes = x86gen_chan_remove_waiter_block()
+    let chan_remove_waiter_addr = chan_push_waiters_addr + str_len(chan_push_waiters_bytes)
+    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + sched_bytes + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes
     let mut func_offsets = []
     let mut variant_offsets = []
     let mut fh = 0
@@ -4445,6 +4705,34 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 pos_auth[pseed_e] = true
                 pseed_e = pseed_e + 1
             }
+            // 预扫描本函数闭包描述符：ref 捕获的局部槽提升为 cell 指针槽
+            // pre-scan closure descriptors: ref-captured locals are lifted to cell slots
+            let mut lifted = []
+            let mut lip = 0
+            while lip < len(code) {
+                if code[lip] == lib::op_closure {
+                    let lsub = fn_const(fh, read_u16(code, lip + 1))
+                    let lnup = f_nupvals[lsub]
+                    let mut lui = 0
+                    while lui < lnup {
+                        let lflag = code[lip + 3 + 3 * lui]
+                        if lflag >= 2 && lflag % 2 == 1 {
+                            let luidx = read_u16(code, lip + 4 + 3 * lui)
+                            while len(lifted) <= luidx {
+                                push(lifted, false)
+                            }
+                            lifted[luidx] = true
+                        }
+                        lui = lui + 1
+                    }
+                }
+                lip = lip + inst_len(fh, code, lip)
+            }
+            // is_lifted 判断槽是否已提升为 cell 指针槽
+            // is_lifted tells whether a slot has been lifted to a cell slot
+            fn is_lifted(slot) {
+                slot > 0 && slot < len(lifted) && lifted[slot]
+            }
             let mut ip_to_byte = map()
             // w 追加字节 / w appends bytes
             // Append bytes
@@ -4459,8 +4747,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
 
             // emit_inst 发射单条指令 / emit_inst emits one instruction
             // Emit one instruction
-            fn emit_inst(ip) {
+            fn emit_inst(ip) capture(ref cur_variant) {
                 let op = code[ip]
+                // 所有 park（send/recv/chan_next/select）共享：lea-push 恢复点（P 后紧跟的
+                // L 地址）→ 保存 ctx → 跳 sched；sched 恢复 = ret 弹 [FB_RSP]（与 yield 的
+                // call 返回地址同机制，lea 的 rel32 = push+保存+跳转的固定长度）
+                // Shared park tail: lea-push the resume point (the L right after P), save
+                // the ctx, jump to the scheduler; resume is ret popping [FB_RSP], the
+                // same mechanism as the yield block's call return address
+                let park_save = mov_mr(rax, FB_RSP, rsp) + mov_mr(rax, FB_RBP, rbp) + mov_mr(rax, FB_R14, r14) + mov_mr(rax, FB_R15, r15)
+                let park_tail = mov_ri64(r8, sched_addr) + jmp_r(r8)
+                let park_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(park_save) + str_len(park_tail)) + push_r(r8)
                 // 常量加载：int 立即数直接发射，其余走常量区指针
                 // Constant load: int immediates inline; everything else via constant-area pointers
                 if op == lib::op_const {
@@ -4560,25 +4857,63 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             }
                             pos_types[slot] = stype
                         }
-                        w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
+                        if is_lifted(slot) {
+                            if slot < len(pos_auth) && pos_auth[slot] {
+                                // 提升槽：槽存 cell 指针，读须解引用
+                                // lifted slot: the slot holds a cell pointer, dereference on read
+                                w(mov_rm(rax, r14, 8 * slot) + mov_rm(rax, rax, 0) + vs_push(rax))
+                            } else {
+                                // 兜底：let 初始化无 SET_LOCAL（CONST 落槽），槽里是裸值——
+                                // 分配 cell 装入并回写，后续读写走 cell
+                                // fallback: let init has no SET_LOCAL (const lands in the slot),
+                                // the slot holds a raw value; allocate a cell, move the value in,
+                                // and write the cell pointer back
+                                w(mov_rm(rax, r14, 8 * slot) + mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + gc_rec(r11, mov_ri64(rsi, 8)) + mov_mr(r14, 8 * slot, r11) + mov_rm(rax, r11, 0) + vs_push(rax))
+                                while len(pos_auth) <= slot {
+                                    push(pos_auth, false)
+                                }
+                                pos_auth[slot] = true
+                            }
+                        } else {
+                            w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
+                        }
                         push(shadow, "slot:" + str(slot))
                         push(type_shadow, stype)
                     }
                 } else if op == lib::op_set_local {
                     let slot = read_u16(code, ip + 1)
-                    if slot > 0 && len(type_shadow) > 0 {
-                        if len(pos_types) <= slot {
+                    let was_auth = slot > 0 && slot < len(pos_auth) && pos_auth[slot]
+                    if slot > 0 {
+                        while len(pos_types) <= slot {
                             push(pos_types, "")
                         }
-                        pos_types[slot] = type_shadow[len(type_shadow) - 1]
-                        if len(pos_auth) <= slot {
-                            while len(pos_auth) <= slot {
-                                push(pos_auth, false)
-                            }
+                        if len(type_shadow) > 0 {
+                            pos_types[slot] = type_shadow[len(type_shadow) - 1]
+                        } else {
+                            // select recv 臂体的 set_local：栈顶类型已被 select 弹掉，默认 int
+                            // select recv arm body set_local: select popped the stack-top type,
+                            // default to int instead of leaving the slot untyped
+                            pos_types[slot] = "int"
+                        }
+                        while len(pos_auth) <= slot {
+                            push(pos_auth, false)
                         }
                         pos_auth[slot] = true
                     }
-                    w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
+                    if is_lifted(slot) {
+                        if was_auth {
+                            // 后续写：写 cell 内容
+                            // subsequent writes: write through the cell
+                            w(mov_rm(rcx, r14, 8 * slot) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 0, rax))
+                        } else {
+                            // 首次写：分配 cell，槽存指针（gc_rec 在 r11 跨调用存活）
+                            // first write: allocate the cell, the slot holds the pointer
+                            // (gc_rec preserves r11 across the call)
+                            w(mov_rr(r11, r12) + mov_rm(rax, r15, 0 - 8) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + gc_rec(r11, mov_ri64(rsi, 8)) + mov_mr(r14, 8 * slot, r11))
+                        }
+                    } else {
+                        w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
+                    }
                 } else if op == lib::op_get_global {
                     let idx = read_u16(code, ip + 1)
                     let name = const_str(fh, idx)
@@ -5056,6 +5391,23 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let mut ret_type = ""
                     if callee == "exit" {
                         w(mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(60) + syscall())
+                    } else if callee == "chan" {
+                        // 分配 112B Channel 对象 + max(cap,1)*8 缓冲（cap=0 也要 1 槽：
+                        // recvq 非空时 send 走 R1 push buf，队头 recv 恢复后从 buf 取）
+                        let c_alloc_buf = mov_rr(rdx, r12) + mov_rr(rsi, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rr(r10, rsi) + add_rr(r12, rsi) + gc_rec(rdx, mov_rr(rsi, rsi))
+                        let c_clamp = mov_ri64(rcx, 1)
+                        let c_head = mov_rm(rcx, r15, 0 - 8) + mov_rr(rdi, rcx) + test_rr(rcx, rcx) + jne_rel32(str_len(c_clamp)) + c_clamp + c_alloc_buf
+                        let c_obj = mov_mr(r12, CH_CAP, rdi) + mov_rr(r11, r12) + mov_mr(r11, CH_BUF, rdx) + xor_rr(rax, rax) + mov_mr(r11, CH_BUFLEN, rax) + mov_mr(r11, CH_BUFCAP, rdi) + mov_mr(r11, CH_SENDQ, rax) + mov_mr(r11, CH_NSENDQ, rax) + mov_mr(r11, CH_SENDQCAP, rax) + mov_mr(r11, CH_RECVQ, rax) + mov_mr(r11, CH_NRECVQ, rax) + mov_mr(r11, CH_RECVQCAP, rax) + mov_mr(r11, CH_WAITERS, rax) + mov_mr(r11, CH_NWAIT, rax) + mov_mr(r11, CH_CLOSED, rax) + add_ri32(r12, CH_CLOSED + 8) + gc_rec_imm(r11, CH_CLOSED + 8)
+                        w(c_head + c_obj + mov_mr(r15, 0 - 8 * (n + 1), r11) + vs_pop_n(n))
+                        ret_type = "chan"
+                    } else if callee == "close" {
+                        // 置 closed=1，把 recvq 里所有 fiber 全部 schedule，清 recvq，wake waiters
+                        let cl_shift = mov_rm(rcx, rax, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb()
+                        let cl_body = mov_rm(rdx, rax, CH_RECVQ) + mov_rm(rdi, rdx, 0) + cl_shift + mov_rm(rcx, rax, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NRECVQ, rcx) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + mov_rm(rax, r15, 0 - 8)
+                        let cl_head = mov_rm(rcx, rax, CH_NRECVQ) + test_rr(rcx, rcx) + je_rel32(str_len(cl_body) + 5)
+                        let cl_loop = cl_head + cl_body + jmp_rel32(0 - (str_len(cl_head) + str_len(cl_body) + 5))
+                        w(mov_rm(rax, r15, 0 - 8) + mov_ri64(rcx, 1) + mov_mr(rax, CH_CLOSED, rcx) + cl_loop + mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                        ret_type = "unit"
                     } else if callee == "print" {
                         let mut all_str = true
                         let mut ai = 0
@@ -5099,6 +5451,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                         }
                                     } else if is_enum_enc(atype) {
                                         w(enum_format_for_enc(0 - 8 * (n - ci), atype))
+                                    } else if atype == "chan" {
+                                        w(x86gen_chan_format_at(0 - 8 * (n - ci)))
                                     } else if atype != "str" {
                                         w(x86gen_str_convert_at(0 - 8 * (n - ci)))
                                     }
@@ -5165,6 +5519,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                         }
                                     } else if is_enum_enc(btype) {
                                         w(enum_format_for_enc(0 - 8 * (n - cj), btype))
+                                    } else if btype == "chan" {
+                                        w(x86gen_chan_format_at(0 - 8 * (n - cj)))
                                     } else if btype != "str" {
                                         w(x86gen_str_convert_at(0 - 8 * (n - cj)))
                                     }
@@ -5426,6 +5782,31 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else if callee == "net_close" {
                         w(x86gen_net_close_native())
                         ret_type = "unit"
+                    } else if callee == "recv" {
+                        // 同 op_recv 的 try/park 序列，但结果包 Option：拿到值 → Some(v)；
+                        // closed+空 → None（VM 语义：recv 在 closed+空 返回 None，不 trap）
+                        // recv mirrors op_recv's try/park but wraps the result in an Option:
+                        // a taken value yields Some(v); closed+drained yields None
+                        let recv_eh = enum_qual_to_eh("Option")
+                        let NONE = mov_rr(rcx, r12) + mov_ri64(rdx, recv_eh) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+                        let SOME = mov_rr(rcx, r12) + mov_ri64(rdx, recv_eh) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1) + jmp_rel32(str_len(NONE))
+                        let P_wake = mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + park_push + park_save
+                        let P_status = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, FB_BLOCKED_RECV) + mov_mr(rax, FB_STATUS, rcx)
+                        let P_push = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_rr(rdi, rax) + mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_push_recvq_addr) + call_r(r8)
+                        let P = P_push + P_status + P_wake + park_tail
+                        let CHK = mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + jne_rel32(str_len(P) + 5 + str_len(SOME)) + P
+                        let HANDOFF_END = jmp_rel32(str_len(CHK) + 5 + str_len(SOME))
+                        let HANDOFF_fifo = mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx)
+                        let HANDOFF = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + HANDOFF_fifo + mov_rm(rdx, r9, FB_R15) + mov_rm(r8, rdx, 0 - 8) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + mov_rm(rax, r15, 0 - 8) + push_r(r8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + HANDOFF_END
+                        let TRY_SENDQ = mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + je_rel32(str_len(HANDOFF)) + HANDOFF
+                        let GOT_END = jmp_rel32(str_len(TRY_SENDQ) + str_len(CHK) + 5)
+                        let GOT_wake = mov_rm(rax, r15, 0 - 8) + push_r(r8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + GOT_END
+                        let GOT_handoff = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx) + mov_rm(rdx, r9, FB_R15) + mov_rm(rdx, rdx, 0 - 8) + mov_rm(r10, rax, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(r11, rax, CH_BUF) + add_rr(r11, r10) + mov_mr(r11, 0, rdx) + mov_rm(rcx, rax, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + GOT_wake
+                        let GOT_pop = mov_rm(r10, rax, CH_BUFLEN) + mov_rm(rdx, rax, CH_BUF) + mov_rm(r8, rdx, 0) + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + je_rel32(str_len(GOT_handoff) - str_len(GOT_wake)) + GOT_handoff
+                        let TRY_BUF = mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, CH_BUFLEN) + test_rr(rcx, rcx) + je_rel32(str_len(GOT_pop))
+                        let L = jmp_rel32(0 - (str_len(TRY_BUF) + str_len(GOT_pop) + str_len(TRY_SENDQ) + str_len(CHK) + 5))
+                        w(TRY_BUF + GOT_pop + TRY_SENDQ + CHK + L + SOME + NONE)
+                        ret_type = enum_payload_enc("Option", [[""]])
                     } else if callee == "yield" {
                         // 无调度器：空操作，返回 unit
                         // no scheduler: a no-op returning unit
@@ -5726,21 +6107,38 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let idx = read_u16(code, ip + 1)
                     let sub = fn_const(fh, idx)
                     let nup = f_nupvals[sub]
-                    w(mov_rr(r11, r12) + mov_ri64(rax, sub) + mov_mr(r11, 0, rax))
+                    w(mov_rr(r11, r12) + mov_ri64(rax, sub) + mov_mr(r11, 0, rax) + add_ri32(r12, 8 * (nup + 1)))
                     let mut uip = ip + 3
                     let mut ui = 0
                     while ui < nup {
-                        let is_local = code[uip]
+                        // 描述符：bit0=islocal，bit1=ref；ref 局部槽已提升（槽 = cell 指针），
+                        // 直接搬槽内容即可；透传分支原样继承父槽（值或 cell 指针）
+                        // descriptor: bit0=islocal, bit1=ref; ref locals are lifted (slot holds
+                        // the cell pointer), copy the slot as-is; inheritance copies the
+                        // parent slot verbatim (value or cell pointer)
+                        let flag = code[uip]
                         let uidx = read_u16(code, uip + 1)
-                        if is_local == 1 {
-                            w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
+                        if flag % 2 == 1 {
+                            if is_lifted(uidx) && !(uidx < len(pos_auth) && pos_auth[uidx]) {
+                                // 兜底：let 初始化无 SET_LOCAL，槽里是裸值——cell 化后闭包槽存指针
+                                // fallback: no SET_LOCAL for the let init; lift the raw value
+                                // into a cell so the closure slot holds the cell pointer
+                                // (r11 holds the closure base here, so the cell goes in r10)
+                                w(mov_rm(rax, r14, 8 * uidx) + mov_rr(r10, r12) + mov_mr(r10, 0, rax) + add_ri32(r12, 8) + gc_rec(r10, mov_ri64(rsi, 8)) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10))
+                                while len(pos_auth) <= uidx {
+                                    push(pos_auth, false)
+                                }
+                                pos_auth[uidx] = true
+                            } else {
+                                w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
+                            }
                         } else {
                             w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
                         }
                         uip = uip + 3
                         ui = ui + 1
                     }
-                    w(add_ri32(r12, 8 * (nup + 1)) + vs_push(r11))
+                    w(vs_push(r11))
                     push(shadow, "")
                     if sub < len(fn_ret_type) && fn_ret_type[sub] != "" {
                         push(type_shadow, fn_ret_type[sub])
@@ -5749,12 +6147,24 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                 } else if op == lib::op_get_upval {
                     let idx = read_u16(code, ip + 1)
-                    w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax))
+                    if upval_is_ref(fh, idx) {
+                        // ref 捕获槽：cell 指针须解引用
+                        // ref-captured slot: dereference the cell pointer
+                        w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + mov_rm(rax, rax, 0) + vs_push(rax))
+                    } else {
+                        w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax))
+                    }
                     push(shadow, "")
                     push(type_shadow, "")
                 } else if op == lib::op_set_upval {
                     let idx = read_u16(code, ip + 1)
-                    w(mov_rm(rcx, r14, 0) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 8 + 8 * idx, rax))
+                    if upval_is_ref(fh, idx) {
+                        // ref 捕获槽：写 cell 内容
+                        // ref-captured slot: write through the cell
+                        w(mov_rm(rcx, r14, 0) + mov_rm(rcx, rcx, 8 + 8 * idx) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 0, rax))
+                    } else {
+                        w(mov_rm(rcx, r14, 0) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 8 + 8 * idx, rax))
+                    }
                 } else if op == lib::op_close_upvalue {
                     // no-op：x86 闭包捕获即拷贝，无 open upvalue cell 需关闭
                     // no-op: x86 closures capture by copy, there is no open upvalue cell to close
@@ -5935,11 +6345,246 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let copy_args = mov_rm(rdi, r15, 0 - 8) + add_ri32(rdi, 4096) + lea(rsi, r15, 0 - 8 * (n + 2)) + mov_ri64(rcx, argc_bytes) + rep_movsb()
                     let guard = mov_rm(rdi, r15, 0 - 8) + mov_ri64(rsi, 4096) + xor_rr(rdx, rdx) + xor_rr(r10, r10) + sys_mov_rax(10) + syscall()
                     let mmap = mov_ri64(rdi, 0) + mov_ri64(rsi, FIBER_STACK_SIZE + 4096) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + vs_push(rax)
-                    w(mmap + guard + copy_args + fake_frame + fb_build + enqueue + lea(r15, r15, 0 - 8 * (n + 2)) + vs_push_zero())
+                    w(mmap + guard + copy_args + fake_frame + fb_build + enqueue + lea(r15, r15, 0 - 8 * (n + 2)))
                     shadow_pop(shadow, n + 1)
                     shadow_pop(type_shadow, n + 1)
+                } else if op == lib::op_send {
+                    // 值栈 [ch][v]：check 段不弹栈；handoff（recvq 非空）/buffer（未满）路径
+                    // push buf 后弹两槽；满则 park（值留栈供 recv 方直读 [FB_R15-8]），
+                    // 恢复点 = P 段 jmp sched 之后（lea 弹槽），不重试
+                    let TRAP = x86gen_trap_exit("send on closed channel")
+                    let L = lea(r15, r15, 0 - 16) + jmp_rel32(str_len(TRAP))
+                    let P_wake = mov_rm(rax, r15, 0 - 16) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + park_push + park_save
+                    let P_status = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, FB_BLOCKED_SEND) + mov_mr(rax, FB_STATUS, rcx)
+                    let P_push = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_rr(rdi, rax) + mov_rm(rax, r15, 0 - 16) + mov_ri64(r8, chan_push_sendq_addr) + call_r(r8)
+                    let P = P_push + P_status + P_wake + park_tail
+                    let R_end = jmp_rel32(str_len(P) + str_len(L) + str_len(TRAP))
+                    let R2 = mov_rm(r8, r15, 0 - 8) + mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r9, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(rdx, r9, CH_BUF) + add_rr(rdx, r10) + mov_mr(rdx, 0, r8) + mov_rm(rcx, r9, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(r9, CH_BUFLEN, rcx) + mov_rr(rax, r9) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + lea(r15, r15, 0 - 16) + R_end
+                    let R1_fifo = mov_rm(rdx, r9, CH_RECVQ) + mov_rm(r8, rdx, 0) + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_mr(r9, CH_NRECVQ, rcx) + mov_rr(rax, r8) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + lea(r15, r15, 0 - 16) + jmp_rel32(str_len(R2) + str_len(P) + str_len(L) + str_len(TRAP))
+                    let R1_push = mov_rm(r8, r15, 0 - 8) + mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r9, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(rdx, r9, CH_BUF) + add_rr(rdx, r10) + mov_mr(rdx, 0, r8) + mov_rm(rcx, r9, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(r9, CH_BUFLEN, rcx)
+                    let R1 = R1_push + R1_fifo
+                    let CHK_C = mov_rm(rcx, rax, CH_BUFLEN) + mov_rm(rdx, rax, CH_CAP) + cmp_rr(rcx, rdx) + jb_rel32(str_len(R1) + 5) + jmp_rel32(str_len(R1) + str_len(R2))
+                    let CHK_B = mov_rm(rcx, rax, CH_NRECVQ) + test_rr(rcx, rcx) + jne_rel32(str_len(CHK_C))
+                    let CHK_A = mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + jne_rel32(str_len(CHK_B) + str_len(CHK_C) + str_len(R1) + str_len(R2) + str_len(P) + str_len(L))
+                    w(CHK_A + CHK_B + CHK_C + R1 + R2 + P + L + TRAP)
+                    shadow_pop(shadow, 2)
+                    shadow_pop(type_shadow, 2)
+                } else if op == lib::op_recv {
+                    // 值栈 [ch]：buf 有值 / sendq 有人 → 拿值覆写栈顶槽；均空且 closed → trap；
+                    // 否则 park（值留栈顶），恢复点跳回序列头重试
+                    let TRAP = x86gen_trap_exit("receive on closed channel")
+                    let P_wake = mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + park_push + park_save
+                    let P_status = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, FB_BLOCKED_RECV) + mov_mr(rax, FB_STATUS, rcx)
+                    let P_push = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_rr(rdi, rax) + mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_push_recvq_addr) + call_r(r8)
+                    let P = P_push + P_status + P_wake + park_tail
+                    let CHK = mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + jne_rel32(str_len(P) + 5) + P
+                    // HANDOFF：buf 空、sendq 有人——直接取 send 方值（[FB_R15-8]），弹队首 + schedule
+                    let HANDOFF_END = jmp_rel32(str_len(CHK) + 5 + str_len(TRAP))
+                    let HANDOFF_fifo = mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx)
+                    let HANDOFF = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + HANDOFF_fifo + mov_rm(rdx, r9, FB_R15) + mov_rm(r8, rdx, 0 - 8) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + mov_rm(rax, r15, 0 - 8) + push_r(r8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, 0 - 8, r8) + HANDOFF_END
+                    let TRY_SENDQ = mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + je_rel32(str_len(HANDOFF)) + HANDOFF
+                    // GOT：buf pop；sendq 有人则补位 + schedule；wake 后覆写栈顶
+                    let GOT_END = jmp_rel32(str_len(TRY_SENDQ) + str_len(CHK) + 5 + str_len(TRAP))
+                    let GOT_wake = mov_rm(rax, r15, 0 - 8) + push_r(r8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, 0 - 8, r8) + GOT_END
+                    let GOT_handoff = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx) + mov_rm(rdx, r9, FB_R15) + mov_rm(rdx, rdx, 0 - 8) + mov_rm(r10, rax, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(r11, rax, CH_BUF) + add_rr(r11, r10) + mov_mr(r11, 0, rdx) + mov_rm(rcx, rax, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + GOT_wake
+                    let GOT_pop = mov_rm(r10, rax, CH_BUFLEN) + mov_rm(rdx, rax, CH_BUF) + mov_rm(r8, rdx, 0) + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + je_rel32(str_len(GOT_handoff) - str_len(GOT_wake)) + GOT_handoff
+                    let TRY_BUF = mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, CH_BUFLEN) + test_rr(rcx, rcx) + je_rel32(str_len(GOT_pop))
+                    let L = jmp_rel32(0 - (str_len(TRY_BUF) + str_len(GOT_pop) + str_len(TRY_SENDQ) + str_len(CHK) + 5))
+                    w(TRY_BUF + GOT_pop + TRY_SENDQ + CHK + L + TRAP)
+                    shadow_pop(shadow, 1)
+                    shadow_pop(type_shadow, 1)
                     push(shadow, "")
-                    push(type_shadow, "unit")
+                    push(type_shadow, "")
+                } else if op == lib::op_chan_next {
+                    // 值栈 [ch]：got → 覆写栈顶 = v，跳序列尾（循环体）；closed → 弹槽跳
+                    // exit；否则 park（恢复点跳回序列头重试）
+                    let exit_ip = ip + 3 + read_u16(code, ip + 1)
+                    let P_wake = mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + park_push + park_save
+                    let P_status = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, FB_BLOCKED_RECV) + mov_mr(rax, FB_STATUS, rcx)
+                    let P_push = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_rr(rdi, rax) + mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_push_recvq_addr) + call_r(r8)
+                    let P = P_push + P_status + P_wake + park_tail
+                    let CHK_closed = mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + je_rel32(9) + lea(r15, r15, 0 - 8)
+                    let HANDOFF_END = jmp_rel32(str_len(CHK_closed) + 5 + str_len(P) + 5)
+                    let HANDOFF_fifo = mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx)
+                    let HANDOFF = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + HANDOFF_fifo + mov_rm(rdx, r9, FB_R15) + mov_rm(r8, rdx, 0 - 8) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + mov_rm(rax, r15, 0 - 8) + push_r(r8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, 0 - 8, r8) + HANDOFF_END
+                    let TRY_SENDQ = mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + je_rel32(str_len(HANDOFF)) + HANDOFF
+                    let GOT_END = jmp_rel32(str_len(TRY_SENDQ) + str_len(CHK_closed) + 5 + str_len(P) + 5)
+                    let GOT_wake = mov_rm(rax, r15, 0 - 8) + push_r(r8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, 0 - 8, r8) + GOT_END
+                    let GOT_handoff = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx) + mov_rm(rdx, r9, FB_R15) + mov_rm(rdx, rdx, 0 - 8) + mov_rm(r10, rax, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(r11, rax, CH_BUF) + add_rr(r11, r10) + mov_mr(r11, 0, rdx) + mov_rm(rcx, rax, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + GOT_wake
+                    let GOT_pop = mov_rm(r10, rax, CH_BUFLEN) + mov_rm(rdx, rax, CH_BUF) + mov_rm(r8, rdx, 0) + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + je_rel32(str_len(GOT_handoff) - str_len(GOT_wake)) + GOT_handoff
+                    let TRY_BUF = mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, CH_BUFLEN) + test_rr(rcx, rcx) + je_rel32(str_len(GOT_pop))
+                    let L = jmp_rel32(0 - (str_len(TRY_BUF) + str_len(GOT_pop) + str_len(TRY_SENDQ) + str_len(CHK_closed) + 5 + str_len(P) + 5))
+                    w(TRY_BUF + GOT_pop + TRY_SENDQ + CHK_closed)
+                    push(patches, [cur_byte() + 1, exit_ip])
+                    w(jmp_rel32(0) + P + L)
+                    shadow_pop(shadow, 1)
+                    shadow_pop(type_shadow, 1)
+                    push(shadow, "")
+                    push(type_shadow, "int")
+                } else if op == lib::op_select {
+                    // 值栈 = 各臂槽（recv 臂 [ch]、send 臂 [ch][v]）：顺序检查第一个 ready 臂
+                    // → 执行（send 完成 / recv 拿值）→ 弹槽跳臂体；全不 ready：有 default →
+                    // 弹槽跳 default，否则全部 chan 注册 waiters + park（恢复点重试）
+                    let mut psel_p = ip + 1
+                    let n_arms = code[psel_p]
+                    let has_default = code[psel_p + 1] != 0
+                    psel_p = psel_p + 2
+                    let mut arm_kind = []
+                    let mut arm_target = []
+                    let mut slots = 0
+                    let mut sel_i = 0
+                    while sel_i < n_arms {
+                        let skind = code[psel_p]
+                        let sdist = read_u16(code, psel_p + 1)
+                        psel_p = psel_p + 3
+                        push(arm_kind, skind)
+                        push(arm_target, psel_p + sdist)
+                        slots = slots + (if skind == 1 {
+                            2
+                        } else {
+                            1
+                        })
+                        sel_i = sel_i + 1
+                    }
+                    let mut default_target = -1
+                    if has_default {
+                        let sdist = read_u16(code, psel_p)
+                        default_target = psel_p + 2 + sdist
+                    }
+                    let base_disp = 0 - 8 * slots
+                    let mut arm_ch = []
+                    let mut arm_val = []
+                    let mut soff = 0
+                    sel_i = 0
+                    while sel_i < n_arms {
+                        push(arm_ch, base_disp + 8 * soff)
+                        if arm_kind[sel_i] == 1 {
+                            push(arm_val, base_disp + 8 * (soff + 1))
+                            soff = soff + 2
+                        } else {
+                            push(arm_val, 0)
+                            soff = soff + 1
+                        }
+                        sel_i = sel_i + 1
+                    }
+                    if n_arms == 0 {
+                        // 无臂 select：只能走 default 或永远 park
+                        if has_default {
+                            let jmp_off = cur_byte()
+                            w(jmp_rel32(0))
+                            push(patches, [jmp_off + 1, default_target])
+                        } else {
+                            w(mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, FB_BLOCKED_SELECT) + mov_mr(rax, FB_STATUS, rcx) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rax, FB_RSP, rsp) + mov_mr(rax, FB_RBP, rbp) + mov_mr(rax, FB_R14, r14) + mov_mr(rax, FB_R15, r15) + mov_ri64(r8, sched_addr) + jmp_r(r8))
+                        }
+                    } else {
+                        // 每臂执行尾：从全部臂 chan 移除自己的 waiter 注册（防陈旧假唤醒）
+                        let mut sel_unregs = ""
+                        sel_i = 0
+                        while sel_i < n_arms {
+                            sel_unregs = sel_unregs + mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rax, r15, arm_ch[sel_i]) + mov_ri64(r8, chan_remove_waiter_addr) + call_r(r8)
+                            sel_i = sel_i + 1
+                        }
+                        // P：先移除旧注册（重试残留）再注册全部臂 waiters + park（无 default 时）
+                        let mut sel_regs = ""
+                        sel_i = 0
+                        while sel_i < n_arms {
+                            sel_regs = sel_regs + mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rax, r15, arm_ch[sel_i]) + mov_ri64(r8, chan_remove_waiter_addr) + call_r(r8) + mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rax, r15, arm_ch[sel_i]) + mov_ri64(r8, chan_push_waiters_addr) + call_r(r8)
+                            sel_i = sel_i + 1
+                        }
+                        let sel_P_wake = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + park_push + park_save
+                        let sel_P_status = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, FB_BLOCKED_SELECT) + mov_mr(rax, FB_STATUS, rcx)
+                        let sel_P = sel_regs + sel_P_status + sel_P_wake + park_tail
+                        let def_pre = lea(r15, r15, base_disp)
+                        // 执行段与检查段（从后往前构建）
+                        let mut sel_execs = []
+                        let mut sel_chks = []
+                        let mut sel_j = n_arms - 1
+                        while sel_j >= 0 {
+                            let chd = arm_ch[sel_j]
+                            let vd = arm_val[sel_j]
+                            let mut exec_pre = ""
+                            if arm_kind[sel_j] == 1 {
+                                // send 臂：closed → trap；push buf；recvq 非空 → 队头唤醒；wake
+                                let se_wake = mov_rr(rax, r9) + mov_ri64(r8, chan_wake_addr) + call_r(r8)
+                                let se_fifo = mov_rm(rdx, r9, CH_RECVQ) + mov_rm(r8, rdx, 0) + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_mr(r9, CH_NRECVQ, rcx) + mov_rr(rax, r8) + mov_ri64(r10, chan_sched_addr) + call_r(r10)
+                                let se_buf = mov_rr(r9, rax) + mov_rm(r8, r15, vd) + mov_rm(rdx, r9, CH_BUF) + mov_rm(r10, r9, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + add_rr(rdx, r10) + mov_mr(rdx, 0, r8) + mov_rm(rcx, r9, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(r9, CH_BUFLEN, rcx) + mov_rm(rcx, r9, CH_NRECVQ) + test_rr(rcx, rcx) + je_rel32(str_len(se_fifo)) + se_fifo
+                                let se_trap = x86gen_trap_exit("send on closed channel")
+                                exec_pre = mov_rm(rax, r15, chd) + mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + je_rel32(str_len(se_trap)) + se_trap + se_buf + se_wake + sel_unregs + lea(r15, r15, base_disp)
+                            } else {
+                                // recv 臂：try_recv（buf pop / sendq 直取）+ wake + 覆写 base 槽
+                                // exec 布局：re_head(内嵌 re_mid+re_trap) + re_pop + re_fill +
+                                // re_sendq + sel_unregs + re_wake + lea；re_pop 的 nsendq 分支跳
+                                // re_fill（补位 sender），re_mid 跳 re_sendq（直取），值一律在
+                                // r8 经 re_wake 覆写槽；chan_wake 毁 r8，故 re_wake 先 push 保护
+                                // exec layout: re_head(embeds re_mid+re_trap) + re_pop + re_fill +
+                                // re_sendq + sel_unregs + re_wake + lea; re_pop's nsendq branch
+                                // jumps to re_fill (top-up from sender), re_mid to re_sendq
+                                // (direct take), the value rides in r8 to re_wake which stores it;
+                                // chan_wake clobbers r8 so re_wake push-protects it first
+                                let re_sendq = mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx) + mov_rm(rdx, r9, FB_R15) + mov_rm(r8, rdx, 0 - 8) + push_r(r8) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10)
+                                let re_fill = push_r(r8) + mov_rm(rdx, rax, CH_SENDQ) + mov_rm(r9, rdx, 0) + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_NSENDQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NSENDQ, rcx) + mov_rm(rdx, r9, FB_R15) + mov_rm(r8, rdx, 0 - 8) + mov_rm(r10, rax, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(rdx, rax, CH_BUF) + add_rr(rdx, r10) + mov_mr(rdx, 0, r8) + mov_rm(rcx, rax, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rr(rax, r9) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + jmp_rel32(str_len(re_sendq))
+                                let re_pop = mov_rm(rdx, rax, CH_BUF) + mov_rm(r8, rdx, 0) + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, rax, CH_BUFLEN) + sub_ri32(rcx, 1) + mov_mr(rax, CH_BUFLEN, rcx) + mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + jne_rel32(str_len(push_r(r8)) + 5) + push_r(r8) + jmp_rel32(str_len(re_fill) + str_len(re_sendq)) + re_fill
+                                let re_trap = x86gen_trap_exit("receive on closed channel")
+                                let re_mid = mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + jne_rel32(str_len(re_trap) + str_len(re_pop))
+                                let re_head = mov_rm(rax, r15, chd) + mov_rm(rcx, rax, CH_BUFLEN) + test_rr(rcx, rcx) + jne_rel32(str_len(re_mid) + str_len(re_trap)) + re_mid + re_trap
+                                // recv 值经 re_wake 覆写槽：re_pop 的 nsendq=0 分支与 re_sendq/re_fill
+                                // 均在进入 sel_unregs 前把 recv 值 push 到机器栈（sel_unregs 的
+                                // movabs 会毁 r8，chan_wake 也毁 r8），re_wake 只负责 call wake
+                                // 后 pop 回来；re_fill 已含于 re_pop 末尾，exec_pre 不得重复拼接
+                                let re_wake = mov_rm(rax, r15, chd) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, chd, r8)
+                                exec_pre = re_head + re_pop + re_sendq + sel_unregs + re_wake + lea(r15, r15, base_disp + 8)
+                            }
+                            push(sel_execs, exec_pre)
+                            // 检查段：jcc 目标 = exec 开头（跳过 chk_next 的 5B）
+                            let chk_next = jmp_rel32(str_len(exec_pre) + 5)
+                            let chk_tail = if arm_kind[sel_j] == 1 {
+                                let c3 = mov_rm(rcx, rax, CH_BUFLEN) + mov_rm(rdx, rax, CH_CAP) + cmp_rr(rcx, rdx) + jb_rel32(5)
+                                let c2 = mov_rm(rcx, rax, CH_NRECVQ) + test_rr(rcx, rcx) + jne_rel32(str_len(c3) + 5)
+                                let c1 = mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + jne_rel32(str_len(c2) + str_len(c3) + 5)
+                                mov_rm(rax, r15, chd) + c1 + c2 + c3 + chk_next
+                            } else {
+                                let c3 = mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + jne_rel32(5)
+                                let c2 = mov_rm(rcx, rax, CH_NSENDQ) + test_rr(rcx, rcx) + jne_rel32(str_len(c3) + 5)
+                                let c1 = mov_rm(rcx, rax, CH_BUFLEN) + test_rr(rcx, rcx) + jne_rel32(str_len(c2) + str_len(c3) + 5)
+                                mov_rm(rax, r15, chd) + c1 + c2 + c3 + chk_next
+                            }
+                            push(sel_chks, chk_tail)
+                            sel_j = sel_j - 1
+                        }
+                        // 发射：检查_i + 执行_i + 跳臂体 patch 交替；最后：default 段或 P + 回跳
+                        let sel_start = cur_byte()
+                        let mut sel_k = 0
+                        while sel_k < n_arms {
+                            w(sel_chks[n_arms - 1 - sel_k])
+                            w(sel_execs[n_arms - 1 - sel_k])
+                            let jmp_off = cur_byte()
+                            w(jmp_rel32(0))
+                            push(patches, [jmp_off + 1, arm_target[sel_k]])
+                            sel_k = sel_k + 1
+                        }
+                        if has_default {
+                            w(def_pre)
+                            let jmp_off = cur_byte()
+                            w(jmp_rel32(0))
+                            push(patches, [jmp_off + 1, default_target])
+                        } else {
+                            w(sel_P)
+                            w(jmp_rel32(0 - (cur_byte() - sel_start + 5)))
+                        }
+                        shadow_pop(shadow, slots)
+                        shadow_pop(type_shadow, slots)
+                        let mut pv = 0
+                        while pv < n_arms {
+                            if arm_kind[pv] != 1 {
+                                // recv 臂：运行时值覆盖 chan 槽（[ch] → [v]），编译期推回值类型
+                                // recv arm: the runtime value overwrites the channel slot
+                                // ([ch] -> [v]); push the value type back on the shadow stack
+                                push(shadow, "")
+                                push(type_shadow, "int")
+                            }
+                            pv = pv + 1
+                        }
+                    }
                 } else {
                     w(int3())
                 }
@@ -5960,7 +6605,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             // 函数序言后逐指令发射；深度图驱动影子栈裁剪
             // After the prologue, emit instruction by instruction; depth maps drive shadow-stack
             // truncation
-            w(x86gen_prologue(arity, locals, yield_addr))
+            w(x86gen_prologue(arity, locals, yield_addr, lifted))
             let dm = p_depth_maps[nfn - 1 - fh]
             let mut ip = 0
             while ip < len(code) {

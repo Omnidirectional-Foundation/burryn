@@ -89,6 +89,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut o_h1 = []
     let mut o_h2 = []
     let mut o_h3 = []
+    // 闭包 upvalue 槽（[Value]）：值捕获存快照值，ref 捕获存 VObj(cell)
+    // closure upvalue slots ([Value]): value capture stores a snapshot, ref capture stores VObj(cell)
+    let mut o_cu = []
     let mut free_slots = []
     let mut pinned = []
     let mut obj_count = 0
@@ -148,7 +151,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     let mut cur_ip = 0
 
     // trap 打印运行时错误并 exit(4) / trap prints a runtime error and exits with code 4
-    fn trap(msg) {
+    fn trap(msg) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         eprintln("runtime error: " + msg)
         if cur_f >= 0 {
             let mut d = len(fb_fr_cl[cur_f]) - 1
@@ -201,49 +204,49 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // is_str 判断值是否为字符串 / is_str tells whether v is a string
-    fn is_str(v) {
+    fn is_str(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VStr(_) => true,
             _ => false,
         }
     }
     // str_of 取字符串负载 / str_of extracts the string payload
-    fn str_of(v) {
+    fn str_of(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VStr(s) => s,
             _ => "",
         }
     }
     // is_int 判断值是否为 int / is_int tells whether v is an int
-    fn is_int(v) {
+    fn is_int(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VInt(_) => true,
             _ => false,
         }
     }
     // int_of 取 int 负载 / int_of extracts the int payload
-    fn int_of(v) {
+    fn int_of(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VInt(n) => n,
             _ => 0,
         }
     }
     // is_bool 判断值是否为 bool / is_bool tells whether v is a bool
-    fn is_bool(v) {
+    fn is_bool(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VBool(_) => true,
             _ => false,
         }
     }
     // bool_of 取 bool 负载 / bool_of extracts the bool payload
-    fn bool_of(v) {
+    fn bool_of(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VBool(b) => b,
             _ => false,
         }
     }
     // is_num 判断值是否为数字（int/float）/ is_num tells whether v is numeric (int/float)
-    fn is_num(v) {
+    fn is_num(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VInt(_) => true,
             VFloat(_) => true,
@@ -251,7 +254,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // num_f 把数字值转为 float / num_f converts a numeric value to float
-    fn num_f(v) {
+    fn num_f(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VInt(n) => to_float(n),
             VFloat(x) => x,
@@ -259,14 +262,14 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // obj_h 取堆对象句柄 / obj_h extracts the heap-object handle
-    fn obj_h(v) {
+    fn obj_h(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VObj(h) => h,
             _ => -1,
         }
     }
     // tagged_h 取带 tag 的句柄 / tagged_h extracts the tag and handle
-    fn tagged_h(v, t) {
+    fn tagged_h(v, t) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VObj(h) => if o_tag[h] == t {
                 h
@@ -278,7 +281,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // type_name 取值类型名（错误消息用）/ type_name names a value's type (error messages)
-    fn type_name(v) {
+    fn type_name(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VUnit => "unit",
             VBool(_) => "bool",
@@ -315,7 +318,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // format_val 把值转文本（可选加引号）/ format_val renders a value as text (optionally quoted)
-    fn format_val(v, quote) {
+    fn format_val(v, quote) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VUnit => "()",
             VBool(b) => str(b),
@@ -394,7 +397,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // eq_val 比较值相等（结构化）/ eq_val compares values structurally
-    fn eq_val(a, b) {
+    fn eq_val(a, b) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match a {
             VUnit => match b {
                 VUnit => true,
@@ -515,7 +518,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // mark_val 标记一个值（GC）/ mark_val marks one value (GC)
-    fn mark_val(v) {
+    fn mark_val(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match v {
             VObj(h) => {
                 if !o_mark[h] {
@@ -527,7 +530,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // mark_obj 标记一个对象（GC）/ mark_obj marks one object (GC)
-    fn mark_obj(h) {
+    fn mark_obj(h) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if !o_mark[h] {
             o_mark[h] = true
             push(gray, h)
@@ -537,7 +540,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     // collect 触发一次 mark-sweep 回收 / collect triggers a mark-sweep collection
     // collect 标记存活对象（根：值栈、调用帧、channel、defer 栈）后清扫
     // collect marks live objects (roots: value stacks, frames, channels, defers) then sweeps
-    fn collect() {
+    fn collect() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         // 根集：pinned 对象、全局表、所有 fiber 的栈与调用帧
         // Roots: pinned objects, the global table, every fiber's stacks and frames
         gc_cycles_n = gc_cycles_n + 1
@@ -602,8 +605,13 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     mark_val(e)
                 }
             } else if t == ot_closure {
-                for uh in o_h1[h] {
-                    mark_obj(uh)
+                // upvalue 槽：ref 捕获是 cell（VObj ot_upval），值捕获是普通值
+                // upvalue slots: ref captures hold a cell (VObj ot_upval), value captures a plain value
+                for uv in o_cu[h] {
+                    match uv {
+                        VObj(uh) if o_tag[uh] == ot_upval => mark_obj(uh),
+                        v => mark_val(v),
+                    }
                 }
             } else if t == ot_upval {
                 if !o_b1[h] {
@@ -633,6 +641,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     o_h1[h] = []
                     o_h2[h] = []
                     o_h3[h] = []
+                    o_cu[h] = []
                     push(free_slots, h)
                     freed = freed + 1
                 }
@@ -644,7 +653,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // alloc_obj 分配对象槽位（空闲链表复用）/ alloc_obj allocates an object slot (free-list reuse)
-    fn alloc_obj(tag) {
+    fn alloc_obj(tag) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if vm_on && obj_count + 1 > gc_threshold {
             let _ = collect()
             gc_threshold = obj_count * 2 + 64
@@ -669,35 +678,36 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             push(o_h1, [])
             push(o_h2, [])
             push(o_h3, [])
+            push(o_cu, [])
             len(o_tag) - 1
         }
     }
 
     // fpush 压栈 / fpush pushes onto the fiber stack
-    fn fpush(f, v) {
+    fn fpush(f, v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         push(fb_stack[f], v)
     }
     // fpop 弹栈 / fpop pops the fiber stack
-    fn fpop(f) {
+    fn fpop(f) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         pop(fb_stack[f])
     }
     // fpeek 取栈内元素 / fpeek peeks the fiber stack
-    fn fpeek(f, n) {
+    fn fpeek(f, n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         fb_stack[f][len(fb_stack[f]) - 1 - n]
     }
     // ftop 取栈顶 / ftop returns the stack top
-    fn ftop(f) {
+    fn ftop(f) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         len(fb_stack[f])
     }
     // fsettop 设置栈顶 / fsettop sets the stack top
-    fn fsettop(f, n) {
+    fn fsettop(f, n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         while len(fb_stack[f]) > n {
             let _ = pop(fb_stack[f])
         }
     }
 
     // make_inst 构造枚举实例 / make_inst builds an enum instance
-    fn make_inst(eh, variant, fields) {
+    fn make_inst(eh, variant, fields) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let h = alloc_obj(ot_enuminst)
         o_i1[h] = eh
         o_i2[h] = variant
@@ -705,25 +715,25 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         VObj(h)
     }
     // make_some 构造 Some / make_some builds Some(v)
-    fn make_some(f, v) {
+    fn make_some(f, v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         fpush(f, v)
         let r = make_inst(opt_enum, 0, [fpeek(f, 0)])
         let _ = fpop(f)
         r
     }
     // make_none 构造 None / make_none builds None
-    fn make_none() {
+    fn make_none() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         make_inst(opt_enum, 1, [])
     }
     // make_ok 构造 Ok / make_ok builds Ok(v)
-    fn make_ok(f, v) {
+    fn make_ok(f, v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         fpush(f, v)
         let r = make_inst(res_enum, 0, [fpeek(f, 0)])
         let _ = fpop(f)
         r
     }
     // make_err 构造 Err / make_err builds Err(v)
-    fn make_err(f, v) {
+    fn make_err(f, v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         fpush(f, v)
         let r = make_inst(res_enum, 1, [fpeek(f, 0)])
         let _ = fpop(f)
@@ -731,13 +741,13 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // schedule 入队一个 fiber / schedule enqueues a fiber
-    fn schedule(f) {
+    fn schedule(f) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         fb_status[f] = fs_ready
         push(ready, f)
     }
 
     // conv_exec_result 转换 exec 结果 / conv_exec_result converts an exec result
-    fn conv_exec_result(f, r) {
+    fn conv_exec_result(f, r) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match r {
             Ok(o) => match o {
                 Output(code, so, se) => {
@@ -750,7 +760,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_reset 清空等待注册 / wait_reset clears wait registrations
-    fn wait_reset() {
+    fn wait_reset() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         wait_fiber = []
         wait_kind = []
         wait_deadline = []
@@ -758,7 +768,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_add_timer 注册定时器等待 / wait_add_timer registers a timer wait
-    fn wait_add_timer(f, deadline) {
+    fn wait_add_timer(f, deadline) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         push(wait_fiber, f)
         push(wait_kind, wait_timer)
         push(wait_deadline, deadline)
@@ -766,7 +776,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_add_exec 注册子进程等待 / wait_add_exec registers a process wait
-    fn wait_add_exec(f, h) {
+    fn wait_add_exec(f, h) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         push(wait_fiber, f)
         push(wait_kind, wait_exec)
         push(wait_deadline, -1.0)
@@ -774,7 +784,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_register_all 注册所有阻塞 fiber 的 fd / wait_register_all registers all blocked fibers' fds
-    fn wait_register_all() {
+    fn wait_register_all() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         wait_reset()
         let mut i = 0
         while i < len(fb_status) {
@@ -793,7 +803,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_poll_io 轮询 IO 就绪 / wait_poll_io polls for IO readiness
-    fn wait_poll_io() {
+    fn wait_poll_io() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let mut i = 0
         while i < len(wait_fiber) {
             if wait_kind[i] == wait_exec {
@@ -814,7 +824,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_poll_net 轮询网络就绪 / wait_poll_net polls for network readiness
-    fn wait_poll_net() {
+    fn wait_poll_net() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let mut i = 0
         while i < len(fb_status) {
             if fb_status[i] != fs_blocked_net {
@@ -877,7 +887,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_poll_stdin 轮询 stdin 就绪 / wait_poll_stdin polls for stdin readiness
-    fn wait_poll_stdin() {
+    fn wait_poll_stdin() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let mut i = 0
         while i < len(fb_status) {
             if fb_status[i] != fs_blocked_stdin {
@@ -903,7 +913,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_nearest_timer 取最近的定时器截止 / wait_nearest_timer returns the nearest timer deadline
-    fn wait_nearest_timer() {
+    fn wait_nearest_timer() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let mut nearest = -1.0
         let mut i = 0
         while i < len(wait_fiber) {
@@ -918,7 +928,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wake_due_timers 唤醒到期的定时器 / wake_due_timers wakes due timers
-    fn wake_due_timers() {
+    fn wake_due_timers() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let now = clock()
         let mut going = true
         while going {
@@ -942,7 +952,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wait_idle 空转等待（无就绪） / wait_idle idles when nothing is ready
-    fn wait_idle() {
+    fn wait_idle() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         while len(ready) == 0 {
             wait_register_all()
             if nio > 0 || nio_net > 0 || nio_stdin > 0 {
@@ -968,7 +978,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // new_fiber 创建 fiber / new_fiber creates a fiber
-    fn new_fiber(cl, args) {
+    fn new_fiber(cl, args) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         push(fb_stack, [VObj(cl)])
         push(fb_status, fs_ready)
         push(fb_sendval, VUnit)
@@ -998,7 +1008,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // wake_waiters 唤醒等待者 / wake_waiters wakes waiters
-    fn wake_waiters(ch) {
+    fn wake_waiters(ch) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if len(o_h3[ch]) > 0 {
             for w in o_h3[ch] {
                 if fb_status[w] == fs_blocked_select {
@@ -1009,7 +1019,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // remove_waiter 移除等待者 / remove_waiter removes a waiter
-    fn remove_waiter(ch, f) {
+    fn remove_waiter(ch, f) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let mut kept = []
         for w in o_h3[ch] {
             if w != f {
@@ -1019,15 +1029,15 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         o_h3[ch] = kept
     }
     // chan_recv_ready 判断接收是否就绪 / chan_recv_ready tells whether a receive is ready
-    fn chan_recv_ready(ch) {
+    fn chan_recv_ready(ch) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         len(o_vals[ch]) > 0 || len(o_h1[ch]) > 0 || o_b1[ch]
     }
     // chan_send_ready 判断发送是否就绪 / chan_send_ready tells whether a send is ready
-    fn chan_send_ready(ch) {
+    fn chan_send_ready(ch) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         o_b1[ch] || len(o_h2[ch]) > 0 || len(o_vals[ch]) < o_i1[ch]
     }
     // chan_try_recv 尝试接收 / chan_try_recv tries a receive
-    fn chan_try_recv(ch) {
+    fn chan_try_recv(ch) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if len(o_vals[ch]) > 0 {
             let v = o_vals[ch][0]
             o_vals[ch] = slice(o_vals[ch], 1, len(o_vals[ch]))
@@ -1052,7 +1062,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // uv_get 读 upvalue / uv_get reads an upvalue
-    fn uv_get(h) {
+    fn uv_get(h) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if o_b1[h] {
             fb_stack[o_i1[h]][o_i2[h]]
         } else {
@@ -1060,7 +1070,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // uv_set 写 upvalue / uv_set writes an upvalue
-    fn uv_set(h, v) {
+    fn uv_set(h, v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if o_b1[h] {
             fb_stack[o_i1[h]][o_i2[h]] = v
         } else {
@@ -1089,7 +1099,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // close_upvalues 在作用域退出时关闭 upvalue / close_upvalues closes upvalues at scope exit
-    fn close_upvalues(f, from) {
+    fn close_upvalues(f, from) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let mut kept = []
         for uh in fb_openuv[f] {
             if o_i2[uh] >= from {
@@ -1103,7 +1113,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // map_find 查找 map 键 / map_find looks up a map key
-    fn map_find(mh, k) {
+    fn map_find(mh, k) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match k {
             VInt(n) => match get(o_idxi[mh], n) {
                 Some(p) => p,
@@ -1117,7 +1127,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // map_index_put 插入 map（保持插入序）/ map_index_put inserts into a map (preserves insertion order)
-    fn map_index_put(mh, k, pos) {
+    fn map_index_put(mh, k, pos) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         match k {
             VInt(n) => put(o_idxi[mh], n, pos),
             VStr(s) => put(o_idxs[mh], s, pos),
@@ -1127,7 +1137,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
 
     // do_native 按 id 分派 native（与 C runtime 的 bur_register_native 对齐）
     // do_native dispatches natives by id (aligned with bur_register_native in the C runtime)
-    fn do_native(f, id, argc) {
+    fn do_native(f, id, argc) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let nm = lib::native_names[id]
         // 打印族：格式化多参并用空格连接
         // Print family: format the args and join with spaces
@@ -1802,7 +1812,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
 
     // call_value 调用一个值（closure/native/构造器分派）
     // call_value calls a value (closure/native/ctor dispatch)
-    fn call_value(f, argc) {
+    fn call_value(f, argc) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let callee = fpeek(f, argc)
         let h = obj_h(callee)
         if h < 0 {
@@ -1865,7 +1875,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // arith_name 取算术操作符名（错误消息用）/ arith_name names an arithmetic operator (error messages)
-    fn arith_name(op) {
+    fn arith_name(op) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         if op == lib::op_add {
             "+"
         } else if op == lib::op_sub {
@@ -1879,7 +1889,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // do_arith 执行算术运算 / do_arith executes arithmetic
-    fn do_arith(f, op) {
+    fn do_arith(f, op) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         // 按操作数类型分派：str 仅拼接，int 溢出检查，float 直算，混合 trap
         // Dispatch on operand types: str concats only, int checks overflow,
         // float computes, mixed traps
@@ -1969,7 +1979,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
         }
     }
     // do_compare 执行比较运算 / do_compare executes comparisons
-    fn do_compare(f, op) {
+    fn do_compare(f, op) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         let b = fpop(f)
         let a = fpop(f)
         if is_str(a) && is_str(b) {
@@ -2017,7 +2027,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
     }
 
     // exec_fiber 是主解释循环（opcode 分派）/ exec_fiber is the main interpreter loop (opcode dispatch)
-    fn exec_fiber(f) {
+    fn exec_fiber(f) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref vm_args, ref ls_files, ref ls_names, ref ls_tables, ref max_int, ref min_int, ref o_tag, ref o_mark, ref o_vals, ref o_keys, ref o_idxi, ref o_idxs, ref o_cu, ref free_slots, ref pinned, ref obj_count, ref gc_threshold, ref gc_total_alloc, ref gc_cycles_n, ref vm_on, ref gray, ref globals, ref fb_stack, ref fb_status, ref fb_sendval, ref fb_selectch, ref fb_openuv, ref fb_fr_cl, ref fb_fr_ip, ref fb_fr_base, ref fb_fr_callip, ref fb_fr_defers, ref fb_fr_dstash, ref fb_fr_dact, ref fb_wakeat, ref fb_ioproc, ref fb_iohas, ref fb_iores, ref fb_netop, ref fb_nethandle, ref fb_netdata, ref fb_netmax, ref fb_stdinmax, ref ready, ref main_fiber, ref park_recv, ref park_sleep, ref park_io, ref park_netop, ref park_nethandle, ref park_netdata, ref park_netmax, ref park_stdinmax, ref ntimers, ref nio, ref nio_net, ref nio_stdin, ref wait_fiber, ref wait_kind, ref wait_deadline, ref wait_handle, ref yield_flag, ref opt_enum, ref res_enum, ref out_enum, ref k_vals, ref cur_f, ref cur_ip, ref et_obj, ref e, ref fh, ref ni, ref mcl) {
         // 协作时间片：预算耗尽即让出，防旋转饿死
         // Cooperative slice: yield when the budget runs out (no starvation)
         let mut budget = vm_time_slice
@@ -2121,11 +2131,24 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             } else if op == lib::op_get_upval {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
-                fpush(f, uv_get(o_h1[clh][idx]))
+                // ref 捕获（cell）解引用；值捕获取快照
+                // dereference a ref-captured cell; value captures yield the snapshot
+                match o_cu[clh][idx] {
+                    VObj(uh) if o_tag[uh] == ot_upval => fpush(f, uv_get(uh)),
+                    v => fpush(f, v),
+                }
             } else if op == lib::op_set_upval {
                 let idx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
-                uv_set(o_h1[clh][idx], fpeek(f, 0))
+                // ref 捕获写 cell（外部可见）；值捕获只改闭包本地副本
+                // ref captures write the cell (visible outside); value captures only
+                // update the closure-local copy
+                match o_cu[clh][idx] {
+                    VObj(uh) if o_tag[uh] == ot_upval => uv_set(uh, fpeek(f, 0)),
+                    _ => {
+                        o_cu[clh][idx] = fpeek(f, 0)
+                    },
+                }
                 // 比较：值相等与排序
                 // Comparison: equality and ordering
             } else if op == lib::op_eq {
@@ -2260,13 +2283,24 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 fpush(f, VObj(nclh))
                 let mut i = 0
                 while i < f_nupvals[sub] {
-                    let is_local = code[ip] == 1
+                    // 描述符：bit0=islocal，bit1=ref（capture(ref name) 声明）
+                    // descriptor: bit0=islocal, bit1=ref (capture(ref name) declaration)
+                    let is_local = code[ip] % 2 == 1
+                    let is_ref = code[ip] >= 2
                     let uidx = rd_u16(code, ip + 1)
                     ip = ip + 3
                     if is_local {
-                        push(o_h1[nclh], capture_upvalue(f, fb_fr_base[f][fi] + uidx))
+                        if is_ref {
+                            push(o_cu[nclh], VObj(capture_upvalue(f, fb_fr_base[f][fi] + uidx)))
+                        } else {
+                            // 默认值捕获：拷贝当前栈值（快照）
+                            // default value capture: copy the current stack value (snapshot)
+                            push(o_cu[nclh], fb_stack[f][fb_fr_base[f][fi] + uidx])
+                        }
                     } else {
-                        push(o_h1[nclh], o_h1[clh][uidx])
+                        // 透传父 upvalue：原样继承槽内容（值或 cell 句柄）
+                        // inherit the parent upvalue slot as-is (value or cell handle)
+                        push(o_cu[nclh], o_cu[clh][uidx])
                     }
                     i = i + 1
                 }
