@@ -359,6 +359,12 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 - 堆对象布局照 C runtime `OChannel`：bounded FIFO buf + sendq/recvq/waiters + closed
 - send/recv/close 三路分支照 VM 语义（`vm.bur` op_send/op_recv）逐条翻译
 - **操作数留在值栈直到操作完成**——单 send 不用 fiber.sendVal 字段，park 期间值栈整体保留，比 C runtime 更简单
+- **元素类型传播（设计定案 2026-08-13，方案 ②）**：x86 后端不消费 checker 输出，bytecode 的 op_send/op_recv 无类型操作数，故 channel 元素类型由 x86 后端自维护的栈类型影子（`type_shadow`/`pos_types`）传播：
+  - `chan(n)` 构造推类型 `"chan"`（元素未知）；`ch <- v` 处若 v 的类型影子已知（非空），把 ch 持有槽的类型升级为 `"chan:<v>"`（经 op_get_local 推入的 `"slot:N"` 影子定位槽位，写回 `pos_types[N]`）
+  - `<-ch` / `for x in ch` / select recv 臂的结果类型从 ch 的类型影子取元素：`"chan:X"` → 结果类型 `X`；`"chan"`（未知）→ 空/`int` 兜底
+  - **跨函数传播**：复用已实现的 `fn_param_types` 调用点聚合（sig_specs 机制）——spawn/fn 调用实参为 `"chan:X"` 时，被调函数参数槽类型经 prologue 填充拿到 `"chan:X"`，函数体内 recv 即正确
+  - **边界**：send 值类型未知 → 保持 `"chan"` 兜底（recv 后 print 退化为 int 转换，与既有启发式一致）；同一 chan 被不同类型 send（类型错误程序）→ 以最后一次 send 的元素类型为准，行为不定
+  - **未来评估**：接入 LLVM/Cranelift 后端、或语言层面需要真正多态（泛型单态化/约束）时，重新评估 bytecode 类型标注方案，届时与 checker 输出接入 bytecode 一并设计
 
 #### select：重试循环 + 顺序选臂（定案）
 
