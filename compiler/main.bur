@@ -590,10 +590,14 @@ fn build_input(input, emit_c, out, backend) {
     if backend == "c" {
         let csrc = compile_to_c(input)
         if emit_c {
+            let mut s = ""
+            for f in csrc {
+                s = s + f[1]
+            }
             if out == "" || out == "-" {
-                print(csrc)
+                print(s)
             } else {
-                match write_file(out, csrc) {
+                match write_file(out, s) {
                     Ok(_) => {},
                     Err(msg) => {
                         eprintln("error: " + msg)
@@ -673,13 +677,32 @@ fn compile_file_to_x86(path) {
             exit(exit_no_input)
         },
     }
-    // 注入 float 运行时（dtoa/strtod 大整数核心），供 parse_float / float 格式化使用
-    // inject the float runtime (bigint dtoa/strtod core) for parse_float / float formatting
+    // 注入 float 运行时（dtoa/strtod 大整数核心），供 parse_float / float 格式化使用。
+    // 注入源码必须排在用户源码之前：float_rt 的顶层常量（TWO_52 等）经 def_global
+    // 初始化，x86 的 float 格式化在运行期调用 format_float，若常量尚未定义则读到 0
+    // 并触发除法陷阱（idiv by zero）。C/VM 的 println 走 runtime native 不依赖注入，
+    // 但注入顺序对三者统一无害。
+    // inject the float runtime (bigint dtoa/strtod core) for parse_float / float
+    // formatting. The injected source must precede user code: float_rt's top-level
+    // constants (TWO_52 etc.) are initialized via def_global, and x86 float formatting
+    // calls format_float at runtime; reading a not-yet-defined constant yields 0 and
+    // triggers an idiv trap. C/VM println goes through runtime natives and does not
+    // depend on the injection, but the ordering is harmless for all three.
     let injected = match read_file("compiler/lib/float_rt.bur") {
         Ok(s) => s,
         Err(_) => "",
     }
-    match frontend::lex(injected + src) {
+    // 首行 shebang 只在文本偏移 1 处被识别（lexer.bur），注入把用户代码推到中间；
+    // 编译产物是 ELF 不需要 shebang，把 #! 换为 // 注释以保持行号与列偏移。
+    // The first-line shebang is only recognized at text offset 1 (lexer.bur), and
+    // injection pushes user code to the middle; the ELF output needs no shebang,
+    // so #! becomes a // comment, keeping line and column offsets intact.
+    let src2 = if str_len(src) >= 2 && substr(src, 0, 2) == "#!" {
+        "//" + substr(src, 2, str_len(src) - 2)
+    } else {
+        src
+    }
+    match frontend::lex(injected + src2) {
         lib::LexOut::Lexed(toks, ldiags, _) => {
             if emit_errors(ldiags, path, false) {
                 exit(exit_static)
@@ -812,14 +835,16 @@ fn base_name(p) {
 }
 
 // build_native 调 cc 产出原生二进制 / build_native invokes cc to produce a native binary
-fn build_native(csrc, out) {
-    let cfile = "program.c"
-    match write_file(cfile, csrc) {
-        Ok(_) => {},
-        Err(msg) => {
-            eprintln("error: " + msg)
-            exit(exit_no_input)
-        },
+fn build_native(files, out) {
+    for f in files {
+        match write_file(f[0], f[1]) {
+            Ok(_) => {},
+            Err(msg) => {
+                cleanup_native(files, [], [])
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
     }
     let cc = find_cc()
     if cc == "" {
@@ -827,24 +852,108 @@ fn build_native(csrc, out) {
         eprintln("hint: run without a toolchain using `bur run`")
         exit(exit_static)
     }
-    match exec(cc, ["-O1", "-g1", "-o", out, cfile, "-Iruntime", "-lm"]) {
+    let mut objs = []
+    for f in files {
+        if ends_with(f[0], ".c") {
+            match exec(cc, ["-O1", "-g1", "-c", f[0], "-Iruntime"]) {
+                Ok(o) => match o {
+                    Output(code, _, err) => {
+                        if code != 0 {
+                            cleanup_native(files, objs, [])
+                            eprint_raw(err)
+                            eprintln("error: C compiler failed")
+                            exit(exit_static)
+                        }
+                        push(objs, obj_name(f[0]))
+                    },
+                },
+                Err(msg) => {
+                    cleanup_native(files, objs, [])
+                    eprintln("error: " + msg)
+                    exit(exit_static)
+                },
+            }
+        }
+    }
+    let mut runtime_objs = []
+    for r in ["runtime/burrt_impl.c", "runtime/burrt_natives.c"] {
+        match exec(cc, ["-O1", "-g1", "-c", r, "-Iruntime"]) {
+            Ok(o) => match o {
+                Output(code, _, err) => {
+                    if code != 0 {
+                        cleanup_native(files, objs, runtime_objs)
+                        eprint_raw(err)
+                        eprintln("error: C compiler failed")
+                        exit(exit_static)
+                    }
+                    push(runtime_objs, obj_name(r))
+                },
+            },
+            Err(msg) => {
+                cleanup_native(files, objs, runtime_objs)
+                eprintln("error: " + msg)
+                exit(exit_static)
+            },
+        }
+    }
+    let mut args = ["-O1", "-g1", "-o", out]
+    for o in objs {
+        push(args, o)
+    }
+    for o in runtime_objs {
+        push(args, o)
+    }
+    push(args, "-lm")
+    let mut link_ok = false
+    match exec(cc, args) {
         Ok(o) => match o {
             Output(code, _, err) => {
                 if code != 0 {
                     eprint_raw(err)
                     eprintln("error: C compiler failed")
-                    exit(exit_static)
-                }
-                match exec("rm", [cfile]) {
-                    Ok(_) => {},
-                    Err(_) => {},
+                } else {
+                    link_ok = true
                 }
             },
         },
         Err(msg) => {
             eprintln("error: " + msg)
-            exit(exit_static)
         },
+    }
+    cleanup_native(files, objs, runtime_objs)
+    if !link_ok {
+        exit(exit_static)
+    }
+}
+
+// obj_name .c 源文件路径 → 目标 .o 名 / obj_name maps a .c source path to its .o name
+fn obj_name(c) {
+    let b = base_name(c)
+    if ends_with(b, ".c") {
+        substr(b, 0, str_len(b) - 2) + ".o"
+    } else {
+        b + ".o"
+    }
+}
+
+// cleanup_native 删除构建中间产物 / cleanup_native removes build intermediates
+fn cleanup_native(files, objs, runtime_objs) {
+    let mut rm_args = []
+    for f in files {
+        push(rm_args, f[0])
+        if ends_with(f[0], ".c") {
+            push(rm_args, obj_name(f[0]))
+        }
+    }
+    for o in objs {
+        push(rm_args, o)
+    }
+    for o in runtime_objs {
+        push(rm_args, o)
+    }
+    match exec("rm", rm_args) {
+        Ok(_) => {},
+        Err(_) => {},
     }
 }
 
