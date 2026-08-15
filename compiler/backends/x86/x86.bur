@@ -2461,7 +2461,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // format_float 注入函数 handle（列表/枚举浮点格式化用）
     // handle of the injected format_float (used by list/enum float formatting)
-    let f2s_h = find_fn_by_name("format_float")
+    let f2s_h = find_fn_by_name("frt_format_float")
     // shadow_pop 弹出影子栈 n 项 / shadow_pop pops n entries from the shadow stack
     fn shadow_pop(mut lst, n) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut k = 0
@@ -2956,7 +2956,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // fn_ref slot (new [r15-8]);
     // write it back to [r15+off] and restore r15
     fn x86gen_float_to_str_at(off) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
-        let ff_h = find_fn_by_name("format_float")
+        let ff_h = find_fn_by_name("frt_format_float")
         let f2s_call = mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax)
         let f2s_fin = mov_rm(rax, r15, 0 - 8) + mov_mr(r15, off - 8, rax) + sub_ri32(r15, 8)
         f2s_call + f2s_fin
@@ -3503,6 +3503,24 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // sig_ret: per-signature return types, filled by the signature solve after the rounds
     let mut sig_ret = map()
     let mut p_cur_depth = map()
+    // pt_target_shadow: 跳转目标处的 shadow/type_shadow 快照（psim 记录、主循环替换），
+    // 修复 break/return 的互斥弹栈导致的静态模拟错位
+    // pt_target_shadow: shadow/type_shadow snapshots at jump targets (recorded by psim,
+    // applied by the emit loop); fixes static-simulation drift from mutually exclusive
+    // pops on break/return paths
+    let mut pt_target_shadow = map()
+    // cp_ps 复制 shadow 列表（E0597：mutable 绑定只能接 fresh 堆源，快照须隔离）
+    // cp_ps copies a shadow list (E0597: mutable bindings take only fresh heap sources;
+    // snapshots must stay isolated from the working shadow)
+    fn cp_ps(lst) {
+        let mut r = []
+        let mut i = 0
+        while i < len(lst) {
+            push(r, lst[i])
+            i = i + 1
+        }
+        r
+    }
     // psig_key 长度前缀签名 key（任何类型编码无歧义）/ psig_key length-prefixed signature key
     fn psig_key(h, ats) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut k = str(h) + "@"
@@ -3526,7 +3544,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // aggregate=false 纯读（per-signature 返回类型查询）。返回模拟的返回类型。
     // psim pre-scans one function body: aggregate=true writes the shared type tables
     // (multi-round propagation); aggregate=false is read-only (per-signature ret lookup).
-    fn psim(ptfh, param_types, aggregate) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
+    fn psim(ptfh, param_types, aggregate) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref pt_target_shadow, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let pcode = f_code[ptfh]
         let mut pret_type = ""
         let mut pshadow_ps = []
@@ -3554,7 +3572,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         let mut p_depth_at = map()
         let mut pit = 0
+        let mut p_dead = false
         while pit < len(pcode) {
+            if p_dead {
+                match get(pt_target_shadow, pit) {
+                    Some(pss) => {
+                        pshadow_ps = cp_ps(pss[0])
+                        ptshadow_ps = cp_ps(pss[1])
+                        p_dead = false
+                    },
+                    None => {},
+                }
+            }
             let pal = match get(p_depth_at, pit) {
                 Some(pd) => pd,
                 None => 0 - 1,
@@ -3566,6 +3595,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 while len(ptshadow_ps) > pal {
                     shadow_pop(ptshadow_ps, 1)
                 }
+            }
+            if p_dead {
+                pit = pit + inst_len(ptfh, pcode, pit)
+                continue
             }
             let pop = pcode[pit]
             if pop == lib::op_return {
@@ -4099,14 +4132,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(ptshadow_ps, "")
             } else if pop == lib::op_jump {
                 put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+                put(pt_target_shadow, pit + 3 + read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                p_dead = true
             } else if pop == lib::op_loop {
                 put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
+                put(pt_target_shadow, pit + 3 - read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
             } else if pop == lib::op_jump_if_false || pop == lib::op_jump_if_true {
                 put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+                put(pt_target_shadow, pit + 3 + read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
             } else if pop == lib::op_jump_if_false_pop {
                 shadow_pop(pshadow_ps, 1)
                 shadow_pop(ptshadow_ps, 1)
                 put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
+                put(pt_target_shadow, pit + 3 + read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
             } else if pop == lib::op_chan_next {
                 put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
                 // 结果类型 = ch 槽的元素类型（chan:X → X；未知 → 空）
@@ -4882,8 +4920,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
 
             // emit_inst 发射单条指令 / emit_inst emits one instruction
             // Emit one instruction
-            fn emit_inst(ip) capture(ref cur_variant) {
+            fn emit_inst(ip, in_dead) capture(ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth) {
                 let op = code[ip]
+                let sl_ed = len(shadow)
+                let tl_ed = len(type_shadow)
+                let pl_ed = len(pos_types)
                 // 所有 park（send/recv/chan_next/select）共享：lea-push 恢复点（P 后紧跟的
                 // L 地址）→ 保存 ctx → 跳 sched；sched 恢复 = ret 弹 [FB_RSP]（与 yield 的
                 // call 返回地址同机制，lea 的 rel32 = push+保存+跳转的固定长度）
@@ -6061,7 +6102,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         // parse_float：调用注入的 parse_float_bits（返回 [ok, bits] list）→ Option<f64>
                         // parse_float: calls the injected parse_float_bits (returns [ok, bits] list)
                         // -> Option<f64>
-                        let pf_h = find_fn_by_name("parse_float_bits")
+                        let pf_h = find_fn_by_name("frt_parse_float_bits")
                         let pf_eh = enum_qual_to_eh("Option")
                         let pf_box = mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r11)
                         // 盒写到 [r15-8]（函数返回后返回值所在槽）不 pop，与内联 native 的值栈约定一致
@@ -6782,7 +6823,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else {
                     w(int3())
                 }
-                if len(type_shadow) > 0 {
+                if in_dead {
+                    while len(shadow) > sl_ed {
+                        shadow_pop(shadow, 1)
+                    }
+                    while len(type_shadow) > tl_ed {
+                        shadow_pop(type_shadow, 1)
+                    }
+                } else if len(type_shadow) > 0 {
                     let vdepth = len(type_shadow) - 1
                     if vdepth < len(pos_auth) && pos_auth[vdepth] {
                         // 已由 set_local 权威设置，跳过栈顶启发式写入
@@ -6802,8 +6850,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             w(x86gen_prologue(arity, locals, yield_addr, lifted))
             let dm = p_depth_maps[nfn - 1 - fh]
             let mut ip = 0
+            let mut in_dead = false
             while ip < len(code) {
                 put(ip_to_byte, ip, cur_byte())
+                if in_dead {
+                    match get(pt_target_shadow, ip) {
+                        Some(tss) => {
+                            shadow = cp_ps(tss[0])
+                            type_shadow = cp_ps(tss[1])
+                            in_dead = false
+                        },
+                        None => {},
+                    }
+                }
                 let dmv = match get(dm, ip) {
                     Some(dvv) => dvv,
                     None => 0 - 1,
@@ -6816,7 +6875,22 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         shadow_pop(type_shadow, 1)
                     }
                 }
-                emit_inst(ip)
+                if in_dead {
+                    let sl = len(shadow)
+                    let tl = len(type_shadow)
+                    emit_inst(ip, in_dead)
+                    while len(shadow) > sl {
+                        shadow_pop(shadow, 1)
+                    }
+                    while len(type_shadow) > tl {
+                        shadow_pop(type_shadow, 1)
+                    }
+                } else {
+                    emit_inst(ip, in_dead)
+                    if code[ip] == lib::op_jump {
+                        in_dead = true
+                    }
+                }
                 ip = ip + inst_len(fh, code, ip)
             }
             // 跳转补丁：回填 rel32 偏移（字节位置差）

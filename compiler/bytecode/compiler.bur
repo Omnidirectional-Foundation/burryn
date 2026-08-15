@@ -700,7 +700,23 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     i = i + 1
                 }
                 if !produced {
-                    emit(ch, lib::op_unit, bsp)
+                    // 块尾是发散语句（break/return 已转移控制流）时不补块值：
+                    // 补 UNIT 会生成死代码，x86 后端线性静态模拟会把它算入影子栈。
+                    // Skip the block value when the block ends in a diverging statement
+                    // (break/return already transferred control); a padding UNIT would be
+                    // dead code that the x86 linear shadow simulation would count.
+                    let last_diverges = if n > 0 {
+                        match ss[n - 1] {
+                            frontend::Node::BreakStmt(_, _) => true,
+                            frontend::Node::ReturnStmt(_, _) => true,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                    if !last_diverges {
+                        emit(ch, lib::op_unit, bsp)
+                    }
                 }
                 end_scope_expr(ch, bsp)
             },
