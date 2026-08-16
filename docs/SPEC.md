@@ -1,6 +1,6 @@
 # SPEC — Burryn 项目规范
 
-> SPEC v0.5 | Last updated: 2026-08-07
+> SPEC v0.6 | Last updated: 2026-08-16
 > 状态:最高优先级约束(权威来源) · 编号体系:统一 `S<n>[.<m>]`(见 §5)
 > 相关文档:[`NUMBERING.md`](NUMBERING.md) 旧编号历史映射 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
 
@@ -311,6 +311,14 @@ Callee prologue: `push rbp; mov rbp, r14; lea r14, [r15 - 8*(arity+1)]`。
 Callee epilogue: peek return value, collapse to r14, restore rbp, ret。
 op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
+#### 已知限制：net/exec IO 非 fiber 感知（现状）
+
+x86 后端的 `net_read` / `net_write` / `tcp_accept` / `tcp_dial` 内联为**裸阻塞 syscall**（`compiler/backends/x86/x86.bur` 的 `x86gen_net_read_native` / `x86gen_tcp_accept_native` 等直接 `sys_read` / `sys_accept`，无 fd 注册与 park 机制），与 C runtime / VM 的 fiber 感知阻塞（`bur_wait_current_fd` + 调度器轮询）不同。
+
+- **后果**：阻塞期间卡死整个 VM 的全部 fiber——既不能 `exec_poll` 子进程，也不能 drain 子进程 stdout pipe（pipe 写满即死锁）
+- **现状边界**：supervisor+worker 这类「进程级并发」模型只能运行在 VM（`bur run`）或 C 后端（cgen 链接 fiber-aware C runtime）上；x86 原生编译暂不支持该模型，只适合单连接顺序处理
+- 补齐方案（x86 fiber 感知 IO）为待定设计项，见 §7
+
 ### Phase 3: CSP opcode（设计定案 2026-08-11）
 
 x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、上下文切换全部自写。值表示是 8B raw int64（无 tag），与 C runtime 的 16B tagged Value 不兼容，**不能链接 burrt.c 的 CSP**。以下为定案设计，全部子项照此实现：
@@ -419,6 +427,38 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 
 **前置与依赖**：S9 前置 = S8.2 语法冻结(语法不再变，LSP 不追语法债)。S9.1 的 check 管线改造(内存源码)可与 S8.3/S8.4 并行，但 S9 整体排在 S8 之后。`std/json` 已就绪(S6.6)，JSON-RPC 层无需新 native。**前置缺口**：语言目前无 stdin 读取能力——全部 native 中无 `read_line`/`read_stdin`/`input` 等，LSP 服务器的 JSON-RPC Content-Length 帧需要精确读 N 字节。修法 = 新增 `read_stdin(max: int) -> str`(读至多 max 字节，EOF 返回 `""`，fiber 级阻塞)或更通用的 fd 读取接口；配合现有 `print`(stdout 写)即构成 LSP 传输层。归 S9.1 前置小批。
 
+## 6.3 进程间通信与 runtime IO 现状（exec / net）
+
+> 本节为已实测确认的现状条款（非设计定案）；行为边界与定案同属项目约束，实现不得偏离本节描述的行为。
+
+### exec 子进程：收尾式，非流式
+
+- `exec_start(cmd, args)` 仅为子进程建立 stdout / stderr 两个 pipe；**stdin 未重定向**（子进程继承父进程 stdin）；另有 fail pipe 仅用于 execvp 失败探测（CLOEXEC，exec 成功即闭）
+- `exec_poll(h)`：子进程运行期间返回 `None`，**退出后**才一次性返回 `Some(Ok(Output(code, stdout, stderr)))`；stdout/stderr 全程由父进程缓冲，退出时打包交付
+- **不支持运行期间流式读写**：无 exec 侧句柄式管道访问；父进程无法向子进程写，也无法在子进程存活期内读取其增量输出
+
+### 进程间双向流式通信：唯一路径 = TCP loopback
+
+- 全语言唯一支持双向流式通信的原语为 `tcp_listen` / `tcp_accept` / `tcp_dial` + `net_read` / `net_write` / `net_close`；C runtime 与 VM 均为 fiber 感知阻塞（park 当前 fiber，调度器继续运行）
+- 实测 loopback 数据（VM runtime；机器原生闭环基线 ~34 µs/round-trip）：
+  - 单进程内两 fiber echo：~231 µs/round-trip
+  - 跨进程（`exec_start` 拉起 worker，TCP）：~1350–1550 µs/msg
+  - 512KiB 往返：~65 MiB/s（单向 ~32.6 MiB/s）
+- 跨进程延迟的主导开销在运行时调度器的 idle-wait 路径（实测观察：socket fd 未注册进 waitset、等待周期 ~1ms），非 TCP 层本身；该路径成因未定案，优化与否为独立工作项（不隐含语义承诺）
+- exec 管道与 TCP 无可比 round-trip：exec 为单向、收尾式，无双向通道
+
+### 消息分帧：不存在，需自行实现
+
+- `std/net` 仅提供 `write_line`（末尾追加 `\n`）作为事实上的行分隔约定；`std/json` 仅提供 parse/render/pretty/get
+- 无长度前缀、无内置帧协议；消息边界必须由使用者自行实现（如基于 `std/json` 手写 newline 分帧）
+
 ## 7. 当前待定项(动工前必须先问 owner)
 
-(暂无。新出现的待定设计决策须登记于此并先问 owner，规矩不变。)
+（新出现的待定设计决策须登记于此并先问 owner，规矩不变。）
+
+已登记待定项（来自进程级并发实测，背景见 §6.3）：
+
+- **Unix domain socket 原语**：是否为本机进程间通信新增 AF_UNIX 原语（比 TCP loopback 少一层协议栈开销）。现状：无，`tcp_listen` / `tcp_dial` 只走 IP。
+- **内置标准 IPC 消息协议**：worker 间消息是否定义 Burryn 内置协议（类 Erlang 消息格式），还是维持现状（使用者在 `std/json` 上手写分帧）。
+- **进程级并行一等能力**：supervisor/worker 模式是否做成语言 / stdlib 一等能力（如 `std/procpool`），还是保持「模式可用，语言不提供额外支持」。
+- **x86 后端 fiber 感知 IO**：是否补齐 x86 的 fiber 感知 net/exec IO（消除 §6.1 已知限制）。**暂不预设结论**——不默认「以后会修」，也不默认「不做」，原样挂起待 owner 定案。

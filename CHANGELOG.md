@@ -6,6 +6,30 @@ All notable changes to this project are documented here.
 Versions use a 2-day date range. Latest first.
 版本号采用 2 天日期区间，最新在前。
 
+## v0.6 (2026-08-16 ~ 08-17)
+
+**Recorded process-level inter-process communication clauses in SPEC** — the
+exec collect-at-exit semantics, TCP-loopback-only bidirectional streaming with
+measured numbers, the missing framing protocol, and the x86 net-IO known
+limitation; four IPC design questions open for owner decision.
+**落地 SPEC 进程级进程间通信条款** — exec 收尾式语义、仅 TCP 的双向流式路径与实测
+loopback 延迟、缺失的分帧协议、x86 net IO 已知限制；四个 IPC 设计取舍挂起待 owner 定案。
+
+- **Added:** SPEC `§6.3` formal clauses — `exec_start`/`exec_poll` pipe and
+  collect-at-exit behavior (stdin inherited, no streaming), TCP loopback as the
+  only bidirectional IPC with measured numbers (231 µs in-process, 1350–1550 µs
+  cross-process, 65 MiB/s 512KiB round-trip), no built-in message framing.
+- **Added:** SPEC `§6.1` known limitation — x86 `net_read`/`tcp_accept` are raw
+  blocking syscalls that stall every fiber; the supervisor/worker concurrency
+  model runs on the VM or the C backend only.
+- **Added:** SPEC `§7` four pending owner decisions — Unix domain socket
+  primitive, built-in IPC message protocol, first-class process pool, x86
+  fiber-aware IO (no conclusion preset).
+- **Changed:** Version constants extended to 0.6.0 in lockstep with the new
+  window (`compiler/main.bur` CLI version, `compiler/lib/defs.bur`
+  toolchain_version, `compiler/tooling/lsp.bur` serverInfo); `docs/SPEC.md`
+  header advanced to v0.6.
+
 ## v0.5 (2026-08-03 ~ 08-04)
 
 **Landed S8.2 syntax freeze** — the language syntax is frozen; the formal
@@ -45,6 +69,7 @@ process.
   examples table gained the new samples; the SPEC x86 backend status and
   progress were refreshed.
 
+## v0.4 (2026-07-21 ~ 07-22)
 
 **Landed S7.6 `defer`** — `defer { ... }` registers a block on the enclosing
 function; deferred blocks run LIFO when the function exits normally.
@@ -366,18 +391,9 @@ unblocking every remaining S6 line.
 
 **Initial community scaffolding added** — set up the open-source contribution
 infrastructure and rounded out the README.
+**新增初始社区脚手架** — 搭建开源贡献基础设施，补全 README。
 
 - Added `CONTRIBUTING.md`, `SECURITY.md`, and `CODE_OF_CONDUCT.md`, adapted to
   the `main`-only workflow and the bootstrap-fixpoint verification rule.
 - Added Apache-2.0 and self-hosted badges plus a "License & Disclaimer" section
   to `README.md`.
-
-<!--
-模板 / Template for future entries:
-
-## vX.Y (YYYY-MM-DD ~ MM-DD)
-
-**Lead-in naming what changed** — short expansion.
-
-- Detail line. Quote key conventions (rules, commands, field names) verbatim.
--->
