@@ -3556,12 +3556,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut pcur_variant = -1
         let pa_ps = f_arity[ptfh]
         let mut pseed = 0
-        while pseed < pa_ps + 1 {
+        while pseed < pa_ps {
             push(pshadow_ps, "")
             push(ptshadow_ps, "")
+            pseed = pseed + 1
+        }
+        let mut pseed2 = 0
+        while pseed2 < pa_ps + 1 {
             push(ppos_types, "")
             push(ppos_auth, false)
-            pseed = pseed + 1
+            pseed2 = pseed2 + 1
         }
         let mut pp = 1
         while pp < pa_ps + 1 {
@@ -4131,8 +4135,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(pshadow_ps, "")
                 push(ptshadow_ps, "")
             } else if pop == lib::op_jump {
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-                put(pt_target_shadow, pit + 3 + read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                let jt = pit + 3 + read_u16(pcode, pit + 1)
+                match get(p_depth_at, jt) {
+                    Some(_) => {},
+                    None => {
+                        put(p_depth_at, jt, len(pshadow_ps))
+                        put(pt_target_shadow, jt, [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
                 p_dead = true
             } else if pop == lib::op_loop {
                 put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
@@ -4620,7 +4630,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
             }
             if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
-                let pdepth = len(ptshadow_ps) - 1
+                // 种子无槽 0 占位项，栈顶槽号 = 模拟栈深（与 emit 的 vds 对齐）
+                // the seed has no slot-0 placeholder, so the top slot = shadow depth
+                // (aligned with emit's vds)
+                let pdepth = len(ptshadow_ps)
                 if pdepth < len(ppos_auth) && ppos_auth[pdepth] {
                     // 已由 set_local 权威设置，跳过栈顶启发式写入
                     // skip the stack-top heuristic write for slots set authoritatively
@@ -4861,12 +4874,16 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             let mut pos_types = []
             let mut pos_auth = []
             let mut seed = 0
-            while seed < arity + 1 {
+            while seed < arity {
                 push(shadow, "")
                 push(type_shadow, "")
+                seed = seed + 1
+            }
+            let mut seed2 = 0
+            while seed2 < arity + 1 {
                 push(pos_types, "")
                 push(pos_auth, false)
-                seed = seed + 1
+                seed2 = seed2 + 1
             }
             let mut pseed_e = 1
             while pseed_e < arity + 1 {
@@ -6832,14 +6849,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                 } else if len(type_shadow) > 0 {
                     let vdepth = len(type_shadow) - 1
-                    if vdepth < len(pos_auth) && pos_auth[vdepth] {
+                    let vds = vdepth + 1
+                    if vds < len(pos_auth) && pos_auth[vds] {
                         // 已由 set_local 权威设置，跳过栈顶启发式写入
                         // skip the stack-top heuristic write for slots set authoritatively by set_local
                     } else {
-                        while len(pos_types) <= vdepth {
+                        while len(pos_types) <= vds {
                             push(pos_types, "")
                         }
-                        pos_types[vdepth] = merge_pos(pos_types[vdepth], type_shadow[len(type_shadow) - 1])
+                        pos_types[vds] = merge_pos(pos_types[vds], type_shadow[len(type_shadow) - 1])
                     }
                 }
             }
