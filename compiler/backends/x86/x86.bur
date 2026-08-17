@@ -4919,6 +4919,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             let mut cur_variant = -1
             let mut pos_types = []
             let mut pos_auth = []
+            let mut top_slot = -1
+            let mut pending_cvds = []
+            let mut pending_olds = []
             let mut seed = 0
             while seed < arity {
                 push(shadow, "")
@@ -4983,7 +4986,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
 
             // emit_inst 发射单条指令 / emit_inst emits one instruction
             // Emit one instruction
-            fn emit_inst(ip, in_dead) capture(ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth) {
+            fn emit_inst(ip, in_dead) capture(ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref top_slot, ref pending_cvds, ref pending_olds) {
                 if in_dead {
                     // 死代码不可达：只发占位 trap，不做任何 shadow 维护
                     // unreachable code: emit a placeholder trap, no shadow bookkeeping
@@ -5123,6 +5126,22 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             w(mov_rm(rax, r14, 8 * slot) + vs_push(rax))
                         }
                         push(shadow, "slot:" + str(slot))
+                        top_slot = slot
+                        // 声明值被读取，确认是真声明：摘除该槽的回滚链，不再回滚
+                        // the declaration value has been read; confirm it and drop
+                        // its rollback chain
+                        let mut pc_c = 0
+                        let mut pc_f = []
+                        let mut pc_fo = []
+                        while pc_c < len(pending_cvds) {
+                            if pending_cvds[pc_c] != slot {
+                                push(pc_f, pending_cvds[pc_c])
+                                push(pc_fo, pending_olds[pc_c])
+                            }
+                            pc_c = pc_c + 1
+                        }
+                        pending_cvds = pc_f
+                        pending_olds = pc_fo
                         push(type_shadow, stype)
                     }
                 } else if op == lib::op_set_local {
@@ -6909,6 +6928,37 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if len(type_shadow) > 0 {
                     let vdepth = len(type_shadow) - 1
                     let vds = vdepth + 1
+                    // 回滚检查先于 pos_auth 门：pending 槽是此前指令写入的，
+                    // 当前 vds 是否权威只决定本次写不写，不影响回滚
+                    // the rollback check precedes the pos_auth gate: the pending
+                    // slot was written by an earlier instruction; whether the
+                    // current vds is authoritative only decides this write, not
+                    // the rollback
+                    // 栈深回落到链写入深度以下，链值已被弹栈消费，还原旧值；
+                    // set_local 权威写的槽不还原
+                    // stack depth fell below a chain's write depth, its value was
+                    // consumed by a pop; restore the recorded old value, except
+                    // slots written authoritatively by set_local
+                    let mut pc_r = 0
+                    let mut pc_s = []
+                    let mut pc_so = []
+                    while pc_r < len(pending_cvds) {
+                        let pch = pending_cvds[pc_r]
+                        if vds < pch {
+                            if pch < len(pos_auth) && pos_auth[pch] {
+                                // 跳过权威槽：set_local 已定值，预写链无意义
+                                // skip authoritative slots: set_local owns the value
+                            } else {
+                                pos_types[pch] = pending_olds[pc_r]
+                            }
+                        } else {
+                            push(pc_s, pch)
+                            push(pc_so, pending_olds[pc_r])
+                        }
+                        pc_r = pc_r + 1
+                    }
+                    pending_cvds = pc_s
+                    pending_olds = pc_so
                     if vds < len(pos_auth) && pos_auth[vds] {
                         // 已由 set_local 权威设置，跳过栈顶启发式写入
                         // skip the stack-top heuristic write for slots set authoritatively by set_local
@@ -6916,7 +6966,52 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         while len(pos_types) <= vds {
                             push(pos_types, "")
                         }
-                        pos_types[vds] = merge_pos(pos_types[vds], type_shadow[len(type_shadow) - 1])
+                        // 上一条指令写入的槽类型若已被弹栈消费（栈深回落到写入深度
+                        // 以下），说明那是临时值（如循环参数、CALL 结果），回滚还原
+                        // 旧值，避免预写污染未来同号槽的声明（str 拼接、EQ 误判）；
+                        // 被 get_local 读过的声明不回滚
+                        // if the type written by the previous instruction has been
+                        // consumed by a pop (stack depth fell below the write depth),
+                        // it was a transient (loop argument, CALL result); restore the
+                        // old value so the write cannot corrupt a future declaration
+                        // of the same-numbered slot; reads via get_local confirm the
+                        // declaration and disable rollback
+                        // 纯弹栈/控制流指令（无推入）后栈顶是残留值，写穿活槽会污染
+                        // 同号槽（str 拼接、EQ 误判）；只有推入新值的指令才写
+                        // after pure-pop/control-flow instructions (no push) the stack top
+                        // is a leftover; writing through corrupts the same-numbered slot
+                        // (str concat, EQ misclassification); only instructions that push
+                        // a new value may write
+                        let nopush = op == lib::op_pop || op == lib::op_pop_n || op == lib::op_end_block || op == lib::op_jump_if_false_pop || op == lib::op_index_set || op == lib::op_no_match || op == lib::op_return || op == lib::op_set_local || op == lib::op_def_global || op == lib::op_set_global
+                        // 只写死槽（声明位置，类型为空）与 get_local 自写副本；活槽被
+                        // 非自写指令的栈顶写穿会污染同号槽（str 拼接、EQ 误判）
+                        // write only into dead slots (declaration positions, empty type)
+                        // and get_local self-copies; transients writing through a live
+                        // slot corrupt it (str concat, EQ misclassification)
+                        if !nopush && (top_slot < 0 || top_slot == vds) {
+                            let w_old = pos_types[vds]
+                            let w_new = merge_pos(w_old, type_shadow[len(type_shadow) - 1])
+                            let mut pc_h = -1
+                            let mut pc_i2 = 0
+                            while pc_i2 < len(pending_cvds) {
+                                if pending_cvds[pc_i2] == vds {
+                                    pc_h = pc_i2
+                                }
+                                pc_i2 = pc_i2 + 1
+                            }
+                            if pc_h < 0 {
+                                // 新槽位开回滚链：记录写链起点的真值；同槽链式重写
+                                // （临时值叠加）保留最早的真值，回滚还原到链起点，
+                                // 不还原中间叠加值
+                                // a new slot opens a rollback chain recording the true
+                                // pre-chain value; same-slot rewrites (transient stacking)
+                                // keep the chain's original value so a rollback restores
+                                // the chain start, not an intermediate overlay
+                                push(pending_cvds, vds)
+                                push(pending_olds, w_old)
+                            }
+                            pos_types[vds] = w_new
+                        }
                     }
                 }
             }
@@ -6929,6 +7024,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             let mut ip = 0
             let mut in_dead = false
             while ip < len(code) {
+                top_slot = -1
                 put(ip_to_byte, ip, cur_byte())
                 if in_dead && code[ip] != lib::op_no_match {
                     match get(pt_target_shadow, ip) {
