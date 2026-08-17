@@ -3521,6 +3521,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         r
     }
+    // cp_ps_n 复制列表前 n 项（n 超界则复制全部）/ cp_ps_n copies the first n
+    // entries of a list (all entries if n exceeds the length)
+    fn cp_ps_n(lst, n) {
+        let mut r = []
+        let mut i = 0
+        while i < n && i < len(lst) {
+            push(r, lst[i])
+            i = i + 1
+        }
+        r
+    }
     // psig_key 长度前缀签名 key（任何类型编码无歧义）/ psig_key length-prefixed signature key
     fn psig_key(h, ats) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         let mut k = str(h) + "@"
@@ -4572,6 +4583,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let mut psel_slots = 0
                 let mut psel_recvs = 0
                 let mut psel_ets = []
+                // psel_cum: 已扫臂中 recv 臂的元素类型（臂体快照增量累积）
+                // psel_cum: element types of recv arms scanned so far (incremental for arm snapshots)
+                let mut psel_cum = []
                 let mut psel_i = 0
                 while psel_i < psel_n {
                     let psel_kind = pcode[psel_p]
@@ -4606,6 +4620,23 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         }
                         push(psel_ets, paet)
                     }
+                    // 臂体跳入点快照：底部槽 + 已扫 recv 值 + 本臂 recv 值（与深度公式对齐）
+                    // arm-body snapshot: bottom slots + scanned recv values + this arm's recv
+                    // value (aligned with the depth formula)
+                    let mut psel_ss = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_slots)
+                    let mut psel_ts = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_slots)
+                    let mut psel_cj = 0
+                    while psel_cj < len(psel_cum) {
+                        push(psel_ss, "")
+                        push(psel_ts, psel_cum[psel_cj])
+                        psel_cj = psel_cj + 1
+                    }
+                    if psel_kind != 1 {
+                        push(psel_ss, "")
+                        push(psel_ts, psel_ets[psel_i])
+                        push(psel_cum, psel_ets[psel_i])
+                    }
+                    put(pt_target_shadow, psel_p + psel_dist, [psel_ss, psel_ts])
                     psel_slots = psel_slots + (if psel_kind == 1 {
                         2
                     } else {
@@ -4617,6 +4648,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let psel_dist = read_u16(pcode, psel_p)
                     psel_p = psel_p + 2
                     put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs)
+                    // default 跳入点快照：底部槽 + 全部 recv 值（与深度公式对齐）
+                    // default snapshot: bottom slots + all recv values (aligned with the depth formula)
+                    let mut psel_ds = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_slots)
+                    let mut psel_dt = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_slots)
+                    let mut psel_cj = 0
+                    while psel_cj < len(psel_cum) {
+                        push(psel_ds, "")
+                        push(psel_dt, psel_cum[psel_cj])
+                        psel_cj = psel_cj + 1
+                    }
+                    put(pt_target_shadow, psel_p + psel_dist, [psel_ds, psel_dt])
                 }
                 shadow_pop(pshadow_ps, psel_slots)
                 shadow_pop(ptshadow_ps, psel_slots)
@@ -4938,6 +4980,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             // emit_inst 发射单条指令 / emit_inst emits one instruction
             // Emit one instruction
             fn emit_inst(ip, in_dead) capture(ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth) {
+                if in_dead {
+                    // 死代码不可达：只发占位 trap，不做任何 shadow 维护
+                    // unreachable code: emit a placeholder trap, no shadow bookkeeping
+                    w(int3())
+                    return
+                }
                 let op = code[ip]
                 let sl_ed = len(shadow)
                 let tl_ed = len(type_shadow)
