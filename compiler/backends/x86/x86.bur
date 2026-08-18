@@ -6141,9 +6141,23 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         w(TRY_BUF + GOT_pop + TRY_SENDQ + CHK + L + SOME + NONE)
                         ret_type = enum_payload_enc("Option", [[""]])
                     } else if callee == "yield" {
-                        // 无调度器：空操作，返回 unit
-                        // no scheduler: a no-op returning unit
-                        w(xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax))
+                        // 显式让出：push 恢复点（让出序列后，即下一条 opcode 分支），保存 ctx，
+                        // 当前 fiber 排到 ready 队尾后回调度器（与 budget 耗尽块同构）
+                        // explicit yield: push the resume point (right after this sequence,
+                        // i.e. the next opcode branch), save ctx, enqueue the current fiber,
+                        // re-enter the scheduler (isomorphic to the budget block)
+                        let y_join = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
+                        let y_first = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
+                        let y_to_join = jmp_rel32(str_len(y_join))
+                        let y_tail_link = mov_mr(rcx, FB_READY_NEXT, rax)
+                        let y_branch = test_rr(rcx, rcx) + je_rel32(str_len(y_tail_link) + str_len(y_to_join))
+                        let y_tail = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0)
+                        let y_set_ready = xor_rr(rcx, rcx) + mov_mr(rax, FB_STATUS, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
+                        let y_cur = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0)
+                        let y_save = mov_mr(rax, FB_RSP, rsp) + mov_mr(rax, FB_RBP, rbp) + mov_mr(rax, FB_R14, r14) + mov_mr(rax, FB_R15, r15)
+                        let y_sched = mov_ri64(r8, sched_addr) + jmp_r(r8)
+                        let y_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(y_save) + str_len(y_set_ready) + str_len(y_tail) + str_len(y_branch) + str_len(y_tail_link) + str_len(y_to_join) + str_len(y_first) + str_len(y_join) + str_len(y_sched)) + push_r(r8)
+                        w(y_cur + y_push + y_save + y_set_ready + y_tail + y_branch + y_tail_link + y_to_join + y_first + y_join + y_sched)
                         ret_type = "unit"
                     } else if callee == "gc" {
                         // 强制执行一次回收，返回本次释放的对象数
