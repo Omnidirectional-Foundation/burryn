@@ -311,13 +311,17 @@ Callee prologue: `push rbp; mov rbp, r14; lea r14, [r15 - 8*(arity+1)]`。
 Callee epilogue: peek return value, collapse to r14, restore rbp, ret。
 op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
-#### 已知限制：net/exec IO 非 fiber 感知（现状）
+#### net/exec IO fiber 感知（设计定案 2026-08-19，原「已知限制：非 fiber 感知」升级）
 
-x86 后端的 `net_read` / `net_write` / `tcp_accept` / `tcp_dial` 内联为**裸阻塞 syscall**（`compiler/backends/x86/x86.bur` 的 `x86gen_net_read_native` / `x86gen_tcp_accept_native` 等直接 `sys_read` / `sys_accept`，无 fd 注册与 park 机制），与 C runtime / VM 的 fiber 感知阻塞（`bur_wait_current_fd` + 调度器轮询）不同。
+x86 后端的 net/exec IO 从裸阻塞 syscall 升级为 fiber 感知等待，语义对齐 C runtime（`bur_wait_current_fd` + 调度器轮询）：
 
-- **后果**：阻塞期间卡死整个 VM 的全部 fiber——既不能 `exec_poll` 子进程，也不能 drain 子进程 stdout pipe（pipe 写满即死锁）
-- **现状边界**：supervisor+worker 这类「进程级并发」模型只能运行在 VM（`bur run`）或 C 后端（cgen 链接 fiber-aware C runtime）上；x86 原生编译暂不支持该模型，只适合单连接顺序处理
-- 补齐方案（x86 fiber 感知 IO）为待定设计项，见 §7
+- **禁止裸阻塞 syscall 卡死全进程**：`O_NONBLOCK` + 当前 fiber park + 调度器等已注册 fd 就绪后唤醒
+- **等 fd 用 `poll(2)`**，不上 epoll（epoll 是独立债，见 `reports/backlog-net-io-runtime.md`）
+- **覆盖面**：`tcp_accept` / `tcp_dial` / `net_read` / `net_write` / `sleep`；`exec_poll` 的等待不得在别的 fiber 做 net 时把整进程卡住。不改 §6.3 的 exec「收尾式、非流式」
+- **不链 `burrt.c` 的 CSP**：park/wake 走现有 8 槽 fiber 调度器（值表示 8B raw int64 与 C runtime 16B tagged Value 不兼容）
+- **`net_nb` 与本项同一设计**：作为非阻塞原语 + 阻塞 native 的 park 路径一并落地（S8 收尾），不做 int3 占位再推翻
+
+定案前现状（留档）：x86 的 `net_read` / `net_write` / `tcp_accept` / `tcp_dial` 曾是裸阻塞 syscall（`x86gen_net_read_native` 等直接 `sys_read` / `sys_accept`，无 fd 注册与 park 机制），阻塞期间卡死全部 fiber——`exec_poll` 不能并发、pipe 写满即死锁；该模型只适合单连接顺序处理。定案后与 VM/C 对齐。
 
 ### Phase 3: CSP opcode（设计定案 2026-08-11）
 
@@ -456,9 +460,9 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 
 （新出现的待定设计决策须登记于此并先问 owner，规矩不变。）
 
-已登记待定项（来自进程级并发实测，背景见 §6.3）：
+以下四项（原「进程级并发待定」）已由 owner 于 2026-08-19 定案，从待定表划走，不再接受重新提案：
 
-- **Unix domain socket 原语**：是否为本机进程间通信新增 AF_UNIX 原语（比 TCP loopback 少一层协议栈开销）。现状：无，`tcp_listen` / `tcp_dial` 只走 IP。
-- **内置标准 IPC 消息协议**：worker 间消息是否定义 Burryn 内置协议（类 Erlang 消息格式），还是维持现状（使用者在 `std/json` 上手写分帧）。
-- **进程级并行一等能力**：supervisor/worker 模式是否做成语言 / stdlib 一等能力（如 `std/procpool`），还是保持「模式可用，语言不提供额外支持」。
-- **x86 后端 fiber 感知 IO**：是否补齐 x86 的 fiber 感知 net/exec IO（消除 §6.1 已知限制）。**暂不预设结论**——不默认「以后会修」，也不默认「不做」，原样挂起待 owner 定案。
+- **Unix domain socket 原语：不做**。TCP loopback 保持本机双向流式通信的唯一原语。§6.3 实测跨进程延迟主导在调度器 idle-wait（~1ms、fd 未注册进 waitset），非 TCP 层本身；先加 AF_UNIX 不解决实测瓶颈，还多一套 native（五处 + x86）并与 S8.5 PE/Windows 移植冲突。等 fiber 感知 IO 落地、waitset 真成瓶颈再重开。
+- **内置 IPC 消息协议：不做**。维持 `std/json` + 使用者自行分帧（行分隔或长度前缀都在库/应用层）。类 Erlang 内置消息格式等于第二套运行时协议，与「显式优先 / 护住简洁」冲突；CSP 已是唯一并发模型，不再叠 actor 线格式。需要约定时仅文档化「JSON + `\n`」惯例，不进语言。
+- **`std/procpool` 一等能力：不做**。supervisor/worker 维持「模式可用，语言不提供额外支持」。一等化会倒逼流式 exec stdin、重启策略、跨后端行为——而 §6.3 仍定 exec 收尾式、非流式。真要做 std 包，也须在 x86 fiber 感知 IO 落地后另开，不能现在设计。
+- **x86 后端 fiber 感知 IO：做**。S8.1 与 VM/C 的 CSP+net 对齐缺口，非新语言特性。不定它，`net_loopback` / `net_errors` 的 x86 死锁不会消失，x86 也撑不住进程级并发。实现约束见 §6.1「net/exec IO fiber 感知（设计定案 2026-08-19）」；`net_nb` 与本项同一设计一并落地（S8 收尾）。
