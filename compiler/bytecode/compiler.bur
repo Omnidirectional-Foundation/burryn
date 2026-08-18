@@ -1455,6 +1455,29 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     }
 
     // cp_expr 表达式代码生成（带临时槽跟踪）/ cp_expr codegens an expression with temp tracking
+    // field_sort_order 返回字段名按字典序排序后的下标排列 /
+    // field_sort_order returns field indices sorted by name (lexicographic)
+    fn field_sort_order(names) {
+        let mut ord = []
+        let mut oi = 0
+        while oi < len(names) {
+            push(ord, oi)
+            oi = oi + 1
+        }
+        let mut k = 1
+        while k < len(ord) {
+            let key = ord[k]
+            let mut j = k - 1
+            while j >= 0 && names[ord[j]] > names[key] {
+                ord[j + 1] = ord[j]
+                j = j - 1
+            }
+            ord[j + 1] = key
+            k = k + 1
+        }
+        ord
+    }
+
     fn cp_expr(ch, e) capture(ref cur_file) {
         // 表达式编译：按形态发射字节码，临时槽跟踪栈深度
         // Expression compilation: emit per shape, temp tracking mirrors the value stack
@@ -1752,8 +1775,11 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             // record 字面量：字段值入栈后构造对象
             // Record literals: push field values, then build the object
             frontend::Node::RecordLit(names, vals, sp) => {
-                for v in vals {
-                    match cp_expr(ch, v) {
+                // 字段按字典序入栈并编码：三端按下标即按名，字段顺序不进入对象身份
+                // Fields pushed and encoded in lexicographic order so index comparison is name comparison
+                let ord = field_sort_order(names)
+                for k in ord {
+                    match cp_expr(ch, vals[k]) {
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
@@ -1761,8 +1787,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     }
                 }
                 let mut enc = ""
-                for n in names {
-                    enc = enc + n + "\n"
+                for k in ord {
+                    enc = enc + names[k] + "\n"
                 }
                 let cidx = add_const(ch, lib::CVal::CStr(enc))
                 emit(ch, lib::op_record, sp)
@@ -1777,8 +1803,11 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         return Err(d)
                     },
                 }
-                for v in vals {
-                    match cp_expr(ch, v) {
+                // 字段按字典序入栈并编码：与 op_record 同一约定
+                // Fields pushed and encoded in lexicographic order, same convention as op_record
+                let ord = field_sort_order(names)
+                for k in ord {
+                    match cp_expr(ch, vals[k]) {
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
@@ -1786,8 +1815,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     }
                 }
                 let mut enc = ""
-                for n in names {
-                    enc = enc + n + "\n"
+                for k in ord {
+                    enc = enc + names[k] + "\n"
                 }
                 let cidx = add_const(ch, lib::CVal::CStr(enc))
                 emit(ch, lib::op_record_update, sp)
