@@ -2274,9 +2274,11 @@ fn x86gen_chan_wake_waiters_block(sched_addr) {
     let w_done = xor_rr(rcx, rcx) + mov_mr(rax, CH_NWAIT, rcx) + ret()
     let w_adv = add_ri32(rsi, 8) + sub_ri32(rdi, 1)
     let w_wake = mov_rr(rax, rdx) + mov_ri64(r8, sched_addr) + call_r(r8)
-    let w_skip = jmp_rel32(str_len(w_wake) + str_len(w_adv) + 5)
-    let w_check = mov_rm(rdx, rsi, 0) + mov_rm(rcx, rdx, FB_STATUS) + mov_ri64(r9, FB_BLOCKED_SELECT) + cmp_rr(rcx, r9) + jne_rel32(0)
-    let w_loop = test_rr(rdi, rdi) + je_rel32(str_len(w_check) + str_len(w_skip) + str_len(w_wake) + str_len(w_adv) + 5) + w_check + w_skip + w_wake + w_adv + jmp_rel32(0 - (str_len(w_check) + str_len(w_skip) + str_len(w_wake) + str_len(w_adv) + 14))
+    // 匹配（FB_BLOCKED_SELECT）顺序执行 w_wake；不匹配 jne 跳过 w_wake 落 w_adv
+    // a matching (FB_BLOCKED_SELECT) waiter falls through into w_wake; a non-matching
+    // one jumps over w_wake into w_adv
+    let w_check = mov_rm(rdx, rsi, 0) + mov_rm(rcx, rdx, FB_STATUS) + mov_ri64(r9, FB_BLOCKED_SELECT) + cmp_rr(rcx, r9) + jne_rel32(str_len(w_wake))
+    let w_loop = test_rr(rdi, rdi) + je_rel32(str_len(w_check) + str_len(w_wake) + str_len(w_adv) + 5) + w_check + w_wake + w_adv + jmp_rel32(0 - (str_len(w_check) + str_len(w_wake) + str_len(w_adv) + 13))
     let w_init = mov_rm(rsi, rax, CH_WAITERS) + mov_rm(rdi, rax, CH_NWAIT)
     w_init + w_loop + w_done
 }
@@ -6784,7 +6786,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let P = P_push + P_status + P_wake + park_tail
                     let R_end = jmp_rel32(str_len(P) + str_len(L) + str_len(TRAP))
                     let R2 = mov_rm(r8, r15, 0 - 8) + mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r9, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(rdx, r9, CH_BUF) + add_rr(rdx, r10) + mov_mr(rdx, 0, r8) + mov_rm(rcx, r9, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(r9, CH_BUFLEN, rcx) + mov_rr(rax, r9) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + lea(r15, r15, 0 - 16) + R_end
-                    let R1_fifo = mov_rm(rdx, r9, CH_RECVQ) + mov_rm(r8, rdx, 0) + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_mr(r9, CH_NRECVQ, rcx) + mov_rr(rax, r8) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + lea(r15, r15, 0 - 16) + jmp_rel32(str_len(R2) + str_len(P) + str_len(L) + str_len(TRAP))
+                    let R1_fifo = mov_rm(rdx, r9, CH_RECVQ) + mov_rm(r8, rdx, 0) + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_rr(r10, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, rdx) + rep_movsb() + mov_rm(rcx, r9, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_mr(r9, CH_NRECVQ, rcx) + mov_rr(rax, r8) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + mov_rr(rax, r9) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + lea(r15, r15, 0 - 16) + jmp_rel32(str_len(R2) + str_len(P) + str_len(L) + str_len(TRAP))
                     let R1_push = mov_rm(r8, r15, 0 - 8) + mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r9, CH_BUFLEN) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rm(rdx, r9, CH_BUF) + add_rr(rdx, r10) + mov_mr(rdx, 0, r8) + mov_rm(rcx, r9, CH_BUFLEN) + add_ri32(rcx, 1) + mov_mr(r9, CH_BUFLEN, rcx)
                     let R1 = R1_push + R1_fifo
                     let CHK_C = mov_rm(rcx, rax, CH_BUFLEN) + mov_rm(rdx, rax, CH_CAP) + cmp_rr(rcx, rdx) + jb_rel32(str_len(R1) + 5) + jmp_rel32(str_len(R1) + str_len(R2))
@@ -6805,6 +6807,21 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                             push(pos_types, "")
                                         }
                                         pos_types[sn] = "chan:" + s_vt
+                                        // 传播是编译期事实：摘除该槽回滚链，栈深回落不再还原
+                                        // the propagation is a compile-time fact: drop the
+                                        // slot's rollback chain so depth fallback cannot restore
+                                        let mut pc_x = 0
+                                        let mut pc_xf = []
+                                        let mut pc_xfo = []
+                                        while pc_x < len(pending_cvds) {
+                                            if pending_cvds[pc_x] != sn {
+                                                push(pc_xf, pending_cvds[pc_x])
+                                                push(pc_xfo, pending_olds[pc_x])
+                                            }
+                                            pc_x = pc_x + 1
+                                        }
+                                        pending_cvds = pc_xf
+                                        pending_olds = pc_xfo
                                     }
                                 },
                                 None => {},
@@ -7010,7 +7027,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 // 均在进入 sel_unregs 前把 recv 值 push 到机器栈（sel_unregs 的
                                 // movabs 会毁 r8，chan_wake 也毁 r8），re_wake 只负责 call wake
                                 // 后 pop 回来；re_fill 已含于 re_pop 末尾，exec_pre 不得重复拼接
-                                let re_wake = mov_rm(rax, r15, chd) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, chd, r8)
+                                let re_wake = mov_rm(rax, r15, chd) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, base_disp, r8)
                                 exec_pre = re_head + re_pop + re_sendq + sel_unregs + re_wake + lea(r15, r15, base_disp + 8)
                             }
                             push(sel_execs, exec_pre)
@@ -7131,7 +7148,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         // is a leftover; writing through corrupts the same-numbered slot
                         // (str concat, EQ misclassification); only instructions that push
                         // a new value may write
-                        let nopush = op == lib::op_pop || op == lib::op_pop_n || op == lib::op_end_block || op == lib::op_jump_if_false_pop || op == lib::op_index_set || op == lib::op_no_match || op == lib::op_return || op == lib::op_set_local || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_spawn
+                        let nopush = op == lib::op_pop || op == lib::op_pop_n || op == lib::op_end_block || op == lib::op_jump_if_false_pop || op == lib::op_index_set || op == lib::op_no_match || op == lib::op_return || op == lib::op_set_local || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_spawn || op == lib::op_send
                         // 只写死槽（声明位置，类型为空）与 get_local 自写副本；活槽被
                         // 非自写指令的栈顶写穿会污染同号槽（str 拼接、EQ 误判）
                         // write only into dead slots (declaration positions, empty type)
