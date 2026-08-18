@@ -3399,6 +3399,24 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
     // 方法全名映射：CLOSURE + DEF_GLOBAL 配对记录「全局名 → fn handle」
     // map from fully-qualified method names to fn handles (CLOSURE + DEF_GLOBAL pairs)
+    // 被 SET_GLOBAL 重赋值的全局不是稳定函数定义（如闭包变量），不注册——否则调用
+    // 会误走「按名直接调用」而跳过闭包读取
+    // globals reassigned via SET_GLOBAL are not stable function definitions (e.g.
+    // closure variables); skip them so calls go through the closure slot
+    let mut set_globals = map()
+    let mut sgi = 0
+    while sgi < nfn {
+        let mut sgip = 0
+        while sgip < len(f_code[sgi]) {
+            if f_code[sgi][sgip] == lib::op_set_global {
+                let sgidx = read_u16(f_code[sgi], sgip + 1)
+                let sgname = const_str(sgi, sgidx)
+                put(set_globals, sgname, true)
+            }
+            sgip = sgip + inst_len(sgi, f_code[sgi], sgip)
+        }
+        sgi = sgi + 1
+    }
     let mut method_full_map = map()
     let mut mfi = 0
     while mfi < nfn {
@@ -3414,7 +3432,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         Some(_) => true,
                         None => false,
                     }
-                    if !exists {
+                    let reassigned = match get(set_globals, mgname) {
+                        Some(_) => true,
+                        None => false,
+                    }
+                    if !exists && !reassigned {
                         put(method_full_map, mgname, mfh)
                     }
                 }
