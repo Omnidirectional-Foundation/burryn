@@ -1420,8 +1420,13 @@ fn x86gen_net_write_native() {
 // x86gen_net_close_native 内联 net_close：close syscall，返回 unit
 // x86gen_net_close_native inlines net_close: a close syscall, returning unit
 fn x86gen_net_close_native() {
-    let close_seq = mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(3) + syscall() + xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax) + vs_pop_n(1)
-    close_seq
+    // close 前 fcntl(F_GETFD) 校验句柄：无效/已关闭 fd 走 trap（VM 语义：invalid or closed handle）
+    // validate the handle with fcntl(F_GETFD) before closing; invalid/closed fds trap
+    let ok_tail = xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax) + vs_pop_n(1)
+    let close_ops = mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(3) + syscall()
+    let trap_seq = x86gen_trap_exit("net_close: invalid or closed handle")
+    let check_seq = mov_rm(rdi, r15, 0 - 8) + mov_ri64(rsi, 1) + sys_mov_rax(72) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(close_ops) + str_len(ok_tail) + str_len(jmp_rel32(str_len(trap_seq))))
+    check_seq + close_ops + ok_tail + jmp_rel32(str_len(trap_seq)) + trap_seq
 }
 
 // x86gen_read_dir_native 内联 read_dir：open/getdents64/close syscall + 名字排序，返回 Result<[str], str>
@@ -4479,9 +4484,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     match get(record_field_types, pg_schema) {
                         Some(pg_ft) => {
                             if pg_idx >= 0 && pg_idx < len(pg_ft) {
-                                if pg_ft[pg_idx] == "str" {
-                                    pg_field_t = "str"
-                                }
+                                pg_field_t = pg_ft[pg_idx]
                             }
                         },
                         None => {},
@@ -5774,7 +5777,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         let cl_body = mov_rm(rdx, rax, CH_RECVQ) + mov_rm(rdi, rdx, 0) + cl_shift + mov_rm(rcx, rax, CH_NRECVQ) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NRECVQ, rcx) + mov_ri64(r10, chan_sched_addr) + call_r(r10) + mov_rm(rax, r15, 0 - 8)
                         let cl_head = mov_rm(rcx, rax, CH_NRECVQ) + test_rr(rcx, rcx) + je_rel32(str_len(cl_body) + 5)
                         let cl_loop = cl_head + cl_body + jmp_rel32(0 - (str_len(cl_head) + str_len(cl_body) + 5))
-                        w(mov_rm(rax, r15, 0 - 8) + mov_ri64(rcx, 1) + mov_mr(rax, CH_CLOSED, rcx) + cl_loop + mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
+                        let cl_body_full = mov_rm(rax, r15, 0 - 8) + mov_ri64(rcx, 1) + mov_mr(rax, CH_CLOSED, rcx) + cl_loop + mov_rm(rax, r15, 0 - 8) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+                        let cl_trap = x86gen_trap_exit("close of closed channel")
+                        let cl_check = mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, CH_CLOSED) + test_rr(rcx, rcx) + jne_rel32(str_len(cl_body_full) + str_len(jmp_rel32(str_len(cl_trap))))
+                        w(cl_check + cl_body_full + jmp_rel32(str_len(cl_trap)) + cl_trap)
                         ret_type = "unit"
                     } else if callee == "print" {
                         let mut all_str = true
