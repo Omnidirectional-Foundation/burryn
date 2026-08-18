@@ -4174,7 +4174,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else if pop == lib::op_jump {
                 let jt = pit + 3 + read_u16(pcode, pit + 1)
                 match get(p_depth_at, jt) {
-                    Some(_) => {},
+                    Some(pd) => {
+                        // 汇聚点取最大栈深：fall-through 路径的栈不被错误裁剪
+                        // take the max depth at a join point so fall-through paths keep their stack
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, jt, len(pshadow_ps))
+                        }
+                    },
                     None => {
                         put(p_depth_at, jt, len(pshadow_ps))
                         put(pt_target_shadow, jt, [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
@@ -4182,16 +4188,46 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 p_dead = true
             } else if pop == lib::op_loop {
-                put(p_depth_at, pit + 3 - read_u16(pcode, pit + 1), len(pshadow_ps))
-                put(pt_target_shadow, pit + 3 - read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                let ljt = pit + 3 - read_u16(pcode, pit + 1)
+                match get(p_depth_at, ljt) {
+                    Some(pd) => {
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, ljt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, ljt, len(pshadow_ps))
+                        put(pt_target_shadow, ljt, [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
             } else if pop == lib::op_jump_if_false || pop == lib::op_jump_if_true {
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-                put(pt_target_shadow, pit + 3 + read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                let jjt = pit + 3 + read_u16(pcode, pit + 1)
+                match get(p_depth_at, jjt) {
+                    Some(pd) => {
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, jjt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, jjt, len(pshadow_ps))
+                        put(pt_target_shadow, jjt, [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
             } else if pop == lib::op_jump_if_false_pop {
                 shadow_pop(pshadow_ps, 1)
                 shadow_pop(ptshadow_ps, 1)
-                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps))
-                put(pt_target_shadow, pit + 3 + read_u16(pcode, pit + 1), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                let pjt = pit + 3 + read_u16(pcode, pit + 1)
+                match get(p_depth_at, pjt) {
+                    Some(pd) => {
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, pjt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, pjt, len(pshadow_ps))
+                        put(pt_target_shadow, pjt, [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
             } else if pop == lib::op_chan_next {
                 put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
                 // 结果类型 = ch 槽的元素类型（chan:X → X；未知 → 空）
