@@ -29,17 +29,15 @@ run_trio() {
     local vm_rc=0 c_rc=0 x_rc=0 vm_out="" c_out="" x_out=""
     SEQ=$((SEQ + 1))
 
-    if ! vm_out=$("$BUR" run "$file" 2>/dev/null); then
-        vm_rc=$?
-    fi
+    vm_out=$(timeout 20 "$BUR" run "$file" 2>/dev/null)
+    vm_rc=$?
 
     local cbin="$TMP/c_$SEQ"
     local cerr=""
     cerr=$("$BUR" build --backend c "$file" -o "$cbin" 2>&1)
     if [ -x "$cbin" ]; then
-        if ! c_out=$("$cbin" 2>/dev/null); then
-            c_rc=$?
-        fi
+        c_out=$(timeout 20 "$cbin" 2>/dev/null)
+        c_rc=$?
     elif echo "$cerr" | grep -q "does not support\|not allowed here"; then
         c_rc=98
     else
@@ -50,9 +48,8 @@ run_trio() {
     local xerr=""
     xerr=$("$BUR" build --backend x86 "$file" -o "$xbin" 2>&1)
     if [ -x "$xbin" ]; then
-        if ! x_out=$("$xbin" 2>/dev/null); then
-            x_rc=$?
-        fi
+        x_out=$(timeout 20 "$xbin" 2>/dev/null)
+        x_rc=$?
     elif echo "$xerr" | grep -q "does not support\|not allowed here"; then
         x_rc=98
     else
