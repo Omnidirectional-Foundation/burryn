@@ -1,6 +1,6 @@
 # SPEC — Burryn 项目规范
 
-> SPEC v0.6 | Last updated: 2026-08-16
+> SPEC v0.6 | Last updated: 2026-08-19
 > 状态:最高优先级约束(权威来源) · 编号体系:统一 `S<n>[.<m>]`(见 §5)
 > 相关文档:[`NUMBERING.md`](NUMBERING.md) 旧编号历史映射 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
 
@@ -98,7 +98,7 @@
 |---|---|---|---|---|---|
 | 字节码栈式 VM | 16B tagged Value(开发/测试基线、自举 oracle) | 已完整(burrt.h:mark-sweep + ucontext) | 自举期 cc(构建 `bur` 本身) | 天然跨平台(POSIX,两处 #ifdef) | 并入核心 `bur` |
 | **C 后端** | 16B tagged Value | 已完整(同 VM,链接 burrt.c) | `cc`/`gcc`/`clang`(任一) | 天然跨平台 | 并入核心 `bur`,`bur build` 运行期探测 cc |
-| **手写 x86-64** | 8B raw int64,无 tag | 独立实现(shadow stack 编译期类型跟踪;并发 opcode 待设计) | **无**(硬约束) | Linux ELF(已做);macOS Mach-O / Windows PE 待序列化层 | 并入核心 `bur` |
+| **手写 x86-64** | 8B raw int64,无 tag | 独立实现(shadow stack 编译期类型跟踪;并发 opcode 待设计) | **无**(硬约束) | Linux ELF（S8.1）；Mach-O / PE 有目标 OS 测试环境再开序列化层 | 并入核心 `bur` |
 | **LLVM 后端** | 复用 C runtime 16B tagged | 链接 burrt.c,免费获得 | `clang`(必须是 clang) | 三平台(随 clang target) | 并入核心 `bur`,运行期探测 clang |
 | **Cranelift 后端** | 复用 C runtime 16B tagged | 链接 burrt.c | 构建期 `cargo`;运行期 `cranelift-driver` + 系统链接器(`cc`/`ld`)落地 `.o` | 三平台(随 driver 编译目标) | codegen 在核心 `bur`;**独立 `cranelift-driver` 二进制** |
 | **WASM 后端** | 16B tagged(仅 GC 子集) | GC 链接 wasm32 版 burrt.c;**CSP 不能链接 ucontext**,须独立状态机或等 WASM Stack Switching 提案 | `clang --target=wasm32` + `wasm-ld` | 平台无关(wasm 本身) | 并入核心 `bur`,运行期探测 clang |
@@ -107,8 +107,8 @@
 
 ### 后端次序
 
-主线先 x86(Linux ELF → macOS Mach-O → Windows PE),其后并行铺多后端公共基础(runtime 平台抽象、工具链探测),再开 LLVM → Cranelift → WASM。**次序原因**:
-- x86 是唯一真正零工具链依赖的后端,先做完校验"无 cc 也能产出可执行"这个路线核心假设。
+主线先 x86 Linux ELF（S8.1）。Mach-O 与 PE 不接在 ELF 收尾之后排期，各自等可验收的目标 OS 环境再开（PE = S8.5；Mach-O 同级前置 = macOS 测试环境）。其后并行铺多后端公共基础(runtime 平台抽象、工具链探测),再开 LLVM → Cranelift → WASM。**次序原因**:
+- x86 是唯一真正零工具链依赖的后端,先做完校验"无 cc 也能产出可执行"这个路线核心假设。该假设的验收对象是 Linux 上的单文件程序,不是三平台容器格式,也不是用 x86 编 compiler。
 - 后续三原生后端(LLVM/Cranelift/WASM)在 CSP 上都间接依赖平台抽象层,平台抽象比 x86 序列化层更优先。
 - WASM 的 CSP 不能靠链接现有代码得到,工作量被低估,单独排期(见下)。
 
@@ -201,7 +201,7 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 | **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
 | **S6 生态工具链** | S6.1 依赖解析；S6.2 网络拉取；S6.3 `bur fmt`；S6.4 `bur test`；S6.5 诊断/DX；S6.6 std/json + std/testing；S6.7 runtime IO；S6.8 checker 债批 | 已完成 |
 | **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `|>`；S7.3 match guard；S7.4 命名参数(**已否决**，编号保留)；S7.5 编译期常量；S7.6 `defer`；S7.7 net stdlib；S7.8 可选函数签名标注 | 已完成 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 后端(**ELF**/Linux + **Mach-O**/macOS + **PE**/Windows)；S8.2 语法冻结 + [`grammar.md`](grammar.md) **已完成**；S8.3 row polymorphism；S8.4 封闭 records；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名。**全部子项由 LLM 实现** | 进行中 |
+| **S8 后端与重型类型** | S8.1 手写 x86-64 Linux ELF 后端（单文件程序；完成线见 §6.1）；S8.2 语法冻结 + [`grammar.md`](grammar.md) **已完成**；S8.3 row polymorphism **已完成**；S8.4 封闭 records（按字段名合一）；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名 **已完成**。**全部子项由 LLM 实现** | 进行中 |
 | **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段。前置 = S8.2 语法冻结 | 部分实现 |
 | **S10 包生态** | 已有 std 包：`json`/`net`/`testing`/`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板 + 示例包；S10.3 `bur doc`(导出签名 + 注释 → Markdown)；S10.4 包质量基础设施(CI 模板、测试约定、版本规范)。原则：能纯 Burryn 就不加 native；每包带 bur.mod + `*_test.bur`，随 std_embed 分发 | 未开工 |
 
@@ -209,7 +209,7 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 - stdlib 按「够自举用 + owner 真实脚本需求」逐个生长，不追大而全
 - 编译速度是硬指标：任何特性提案先回答「是否显著拖慢编译」
 - 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
-- **S8 内部推进顺序**：S8.3 row poly → S8.4 封闭 records → S8.1 ELF → S8.5 PE。类型先行(日常效用高于第二后端)。S8 之后进 S9
+- **S8 内部推进顺序**：S8.4 封闭 records → S8.1 ELF 收尾（fiber 感知 IO）→ S8.5 PE。S8.2 / S8.3 / S8.7 已完成。Mach-O 不在此顺序内（见 §6.1）。类型先行(日常效用高于第二后端)。S8 之后进 S9
 
 ## 6. 工程规范
 
@@ -224,6 +224,9 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 
 - **纳入**:row polymorphism(S8.3,首位) → 封闭 record(S8.4)。复用现有 var/generalize 加「行 var」,扁平 if-链撑得住;是结构化接口的公共地基,唯一值得投入的重型项
 - **S8.3 实现定案**:行变量复用类型变量句柄（`tn="row"` 标记），开放 record 编码为 `@rec|field|?rowvar`——`?` 前缀 = 行变量槽，置于字段名列表末尾，对应句柄置于 `ta` 末尾。`ty_unify` record 开放分支：开放侧已知字段按名与另一侧配对（须为子集），行变量绑定另一侧剩余字段的（开放/封闭）record；行变量独立出现时绑定整个 record 或另一行变量。generalize/occurs/adjust 经 `ta` 递归自动覆盖行变量。标注解析经 `collect_annotation_vars` 预建行变量句柄
+- **S8.4 实现定案**:封闭 record 是结构类型。合一按字段名配对（与开放分支同一套），字段书写顺序不进入类型身份——`record { x: int, y: int }` 与 `record { y: int, x: int }` 是同一类型。封闭额外要求字段集合相等（无剩余、无缺失）；开放侧仍按 S8.3。完成条件（类型与运行时缺一不可）：`take_xy(record { y: 2, x: 1 })` 在标注 `record { x: int, y: int }` 下通过类型检查且三后端求值均为 `3`；`record { x: 1, y: 2 } == record { y: 2, x: 1 }` 三后端均为 true。相等与字段偏移按名，不按插入顺序下标
+- **S8.1 完成线（定案）**:Linux ELF 单文件程序后端（`bur build --backend x86 <file.bur>`）。完成条件 = fiber 感知 IO + `net_nb` 落地 + multi-backend 已知缺陷清零或显式登记为语言级限制。**不含**模块包、**不含**用 x86 编 compiler（x86 自举）、**不含** Mach-O/PE。自举判定维持 §3：编译器由本语言写成且能编译自己；输出 C 再经 cc 落地，完全算自举。模块包与 x86 自举若将来做，必须拆成两项（用户包 ≠ 编 compiler），另开编号，不得并入 S8.1
+- **Mach-O**:从 S8.1 拆出。不接在 Linux ELF 收尾之后排期。与 S8.5 PE 同级：有可验收的目标 OS 环境再开（Mach-O 前置 = macOS 测试环境）
 - **排除**:Effects——与现有 CSP(fiber/channel/select)竞争控制流转移,CSP 已覆盖 IO/并发大半实用场景,边际价值与代价不成比例
 - **排除**:Refinement Types——无 constraint solver 地基,须从零造子系统;与轻标注工程气质冲突(Rust 未上)
 - **排除**:GADTs——动 HM 最微妙处,通用工程价值最低
