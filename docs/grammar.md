@@ -10,28 +10,30 @@
 
 ## 1. 词法
 
-### 1.1 注释
+### 1.1 注释与 shebang
 
-```
-comment      ::= '//' 行尾之前任意字符
+```text
+comment       ::= '//' 行尾之前任意字符
 block_comment ::= '/*' ... '*/'     // 无嵌套
-```
+shebang       ::= '#!' 仅当位于源文件字节偏移 0
+```text
 
-注释作为 trivia 收集，不进入 token 流；`bur fmt` 按 span 重插。
+注释作为 trivia 收集，不进入 token 流。
+文件开头的 `#!` 行由 lexer 整行跳过（脚本可执行）；不进入 token 流。
 
 ### 1.2 标识符与关键字
 
-```
+```text
 ident        ::= [a-zA-Z_][a-zA-Z0-9_]*
-```
+```text
 
 **关键字（24 个，保留字，不可作标识符）：**
 
-```
+```text
 let  mut  const  fn  if  else  while  for  in  return
 true  false  enum  match  spawn  break  continue  pub
 import  select  record  type  defer  capture
-```
+```text
 
 **两个"像关键字但不是关键字"的标识符（词法层特判，语法层语义由上下文决定）：**
 
@@ -44,26 +46,26 @@ import  select  record  type  defer  capture
 
 ### 1.3 数字字面量
 
-```
+```text
 int          ::= '0x' hex_digit+ | '0b' bin_digit+ | digit+        // i64，溢出 trap
 float        ::= digit+ '.' digit+ [ ('e'|'E') ['+'|'-'] digit+ ]  // f64
 digit_sep    ::= 数字之间允许 '_'（lexer 剥离，`1_000_000` = 1000000）
-```
+```text
 
 - hex/二进制前缀 `0x`/`0b`（大写 `0X`/`0B` 亦可），parser 端转换；`0x`/`0b` 后必须有数字
 - 指数 `e`/`E` 后可选 `+`/`-`；前瞻判断避免吞掉标识符（`1e`、`1ex` 不是指数）
-- `_` 必须在数字之间（`1_`、`_5`、`1__2` 均报 E1005）
+- `_` 必须在数字之间（`1_`、`_5`、`1__2` 非法）
 - `.` 两侧必须有数字（`3.` 与 `.5` 均非法，歧义留给字段访问）
 
 ### 1.4 字符串与插值
 
-```
+```text
 str          ::= '"' { string_char | '{' expression '}' | '{{' } '"'
 ml_str       ::= '"""' '\n' { ml_line } '"""'          // 多行字符串
 ml_line      ::= 行首空白 { '\' 内容到行尾 | 空白行 }
 string_char  ::= 转义序列 | 非 `"`、非 `{` 字符
 escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
-```
+```text
 
 - 插值 `{expr}` 内必须是 `str` 值（非 str 编译错，提示 `str()`）
 - `{{` 转义为字面 `{`
@@ -72,10 +74,10 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 
 ### 1.5 符号（token 全表）
 
-```
+```text
 (  )  {  }  [  ]  ,  .  ..  -  +  *  /  %  ;  ?  :  ::  !  !=  =
 ==  >  >=  <  <=  &&  ||  =>  <-  ->  |>  |  +=  -=  *=  /=  %=  "  \n(自动分号)
-```
+```text
 
 **符号语义分工：**
 
@@ -103,18 +105,18 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 
 ## 2. 程序结构
 
-```
+```text
 program      ::= { top_level_decl }
 top_level_decl ::= import | fn_decl | method_decl | enum_decl | let_decl | const_decl
                  | type_decl | pub_decl
-```
+```text
 
 - 包：目录即包，`bur.mod` 声明 `module <path>`；`require` 声明依赖
 - `import` 只能在顶层：`import [ident] '"' import_path '"'`（可选别名，默认别名 = 路径末段）
 
 ## 3. 声明
 
-```
+```text
 fn_decl      ::= 'fn' ident '(' params ')' ['->' type_expr] ['capture' '(' captures ')'] block
 method_decl  ::= 'fn' '(' ident ':' type_expr ')' ident '(' params ')' ['->' type_expr] block
 captures     ::= { 'ref'? ident } ,       // ref 前缀 = 引用捕获；无前缀 = 值捕获（默认，与省略同义）
@@ -127,7 +129,7 @@ type_param   ::= ident
 variants     ::= { ident ['(' type_expr {',' type_expr} ')'] },
 type_decl    ::= ['pub'] 'type' ident '=' type_expr
 pub_decl     ::= 'pub' ( fn_decl | enum_decl | let_decl | const_decl | type_decl )
-```
+```text
 
 - **零标注**：参数/返回类型可省略；`interface` 文件要求显式标注
 - **`const` 初始化式**：编译期可折叠（字面量、const 引用、算术/比较/bool、str 拼接），折叠溢出 = 编译错；不可 `mut`
@@ -135,11 +137,11 @@ pub_decl     ::= 'pub' ( fn_decl | enum_decl | let_decl | const_decl | type_decl
 
 ## 4. 语句
 
-```
+```text
 statement    ::= let_decl | const_decl | fn_decl | enum_decl | type_decl
                | pub_decl | import_decl | while_stmt | for_stmt | spawn_stmt
                | select_stmt | defer_stmt | return_stmt | break_stmt
-               | continue_stmt | expr_stmt | assign_stmt | send_stmt
+               | continue_stmt | expr_stmt | assign_stmt | send_stmt | label_stmt
 while_stmt   ::= 'while' expression block
 for_stmt     ::= 'for' [ident ','] ident 'in' expression block   // 可选索引变量；channel 禁用索引
 label_stmt   ::= ident ':' ( while_stmt | for_stmt )             // 标签循环（Go 式）
@@ -153,24 +155,25 @@ send_stmt    ::= expression '<-' expression            // ch <- v
 select_stmt   ::= 'select' '{' { select_arm } '}'
 select_arm   ::= ( '<-' expression | ident '=' '<-' expression
                  | expression '<-' expression | 'default' ) '=>' expression,
-```
+```text
 
 **select 细节：**
 - 臂形态：`<-ch => ...`（接收丢弃）、`v = <-ch => ...`（接收绑定，左侧必须是裸名）、`ch <- v => ...`（发送）、`default => ...`（非阻塞；至多一个）
 - `default` 是特判标识符，非关键字
 - 臂体是表达式（block 是表达式的一种），`=>` 之后可有逗号
 
-**for 迭代 channel**：`for x in ch` 排空 channel，关闭后结束；索引形式（`for i, x in ch`）报 E0599。
+**for 迭代 channel**：`for x in ch` 排空 channel，关闭后结束；索引形式（`for i, x in ch`）非法。
 
-**标签循环**：`label: while/for` 起标签；`break label` / `continue label` 跳转到该标签循环（可跨嵌套层）；无标签 `break`/`continue` 作用于最近循环；标签不可跨函数；未定义标签 = E2018。
+**标签循环**：`label: while/for` 起标签；`break label` / `continue label` 跳转到该标签循环（可跨嵌套层）；无标签 `break`/`continue` 作用于最近循环；标签不可跨函数；未定义标签非法。
 
 ## 5. 表达式（优先级从低到高）
 
-```
+```text
 expression   ::= pipe_expr
 pipe_expr    ::= or_expr { '|>' pipe_target }
 pipe_target  ::= path ['(' args ')']                  // path = ident {'::' ident}，至多三段
-or_expr      ::= and_expr { '||' and_expr }
+or_expr      ::= range_expr { '||' range_expr }
+range_expr   ::= and_expr [ '..' and_expr ]          // 半开 [a, b)，脱糖为 range(a, b)
 and_expr     ::= equality { '&&' equality }
 equality     ::= comparison { ('==' | '!=') comparison }
 comparison   ::= term { ('<' | '<=' | '>' | '>=') term }
@@ -188,7 +191,7 @@ path         ::= ident {'::' ident}                    // 至多三段
 lambda       ::= 'fn' '(' params ')' ['capture' '(' captures ')'] block   // 体必须是 block
 match_arms   ::= { pattern ['if' expression] '=>' expression },
 record_literal ::= 'record' '{' [fields | update] '}'
-```
+```text
 
 **postfix 语义分工：**
 
@@ -208,29 +211,29 @@ record_literal ::= 'record' '{' [fields | update] '}'
 
 ## 6. 模式（match 臂）
 
-```
+```text
 pattern      ::= or_pattern
 or_pattern   ::= simple { '|' simple }              // 展开为多个臂（同一 guard + body）
 simple       ::= '_' | ident | int | float | str | path ['(' {pattern} ')'] | record_pattern
 record_pattern ::= 'record' '{' { ident } ',' '}'  // 解构字段到同名绑定
 path         ::= ident {'::' ident}
-```
+```text
 
 - `_` 通配；裸 `ident` 绑定；`Shape::Circle(r)` 变体解构；`pkg::Enum::Variant(...)` 跨包
 - **or-pattern**：`A | B => body` 在 parser 展开为两个臂；绑定一致性由 checker 保证（None 臂引用 Some 的绑定会报错）
-- **record 模式**：`record { x, y }` 解构字段到同名绑定（字段子集合法）；非 record 值 = E0609；字段不存在 = E0609
-- 变体模式字段数必须与声明一致（E0023）
-- 穷尽性：缺臂 = E0004 编译错
+- **record 模式**：`record { x, y }` 解构字段到同名绑定（字段子集合法）；非 record 值或字段不存在均非法
+- 变体模式字段数必须与声明一致
+- 穷尽性：缺臂为编译错
 
 ## 7. 类型表达式
 
-```
+```text
 type_expr    ::= ident [':' constraint] | path ['(' type_args ')'] | '[' type_expr ']'
                | '(' {type_expr} ')' '->' type_expr | tuple_type | record_type
 constraint   ::= 'num' | 'addord' | 'key' | 'int' | 'float' | 'str'
 tuple_type   ::= '(' type_expr ',' { type_expr ',' } ')'       // ≥2 元素
 record_type  ::= 'record' '{' { ident ':' type_expr } ',' [ '|' ident ] '}'
-```
+```text
 
 - 类型参数：`[a]`（list）；`fn` 类型必须带 `fn` 关键字（`fn (T1, T2) -> T3`）；裸括号 `(T1, T2)` 是 tuple 类型
 - 约束变量：`fn f(a: addord)` 小写类型参数可带约束
@@ -239,32 +242,32 @@ record_type  ::= 'record' '{' { ident ':' type_expr } ',' [ '|' ident ] '}'
 
 ## 8. record
 
-```
+```text
 record_literal  ::= 'record' '{' [ field {',' field} [','] ] '}'
                   | 'record' '{' ident '|' field {',' field} [','] '}'   // 更新
 field           ::= ident ':' expression
 record_type     ::= 'record' '{' [ type_field {',' type_field} [','] [ '|' ident ] ] '}'
 type_field      ::= ident ':' type_expr
 access          ::= postfix '.' ident               // r.x
-```
+```text
 
 - 字面量必须带 `record` 关键字（与 block 区分）
 - 更新 `record { r | x: 3 }`：以 `r` 为基底复制、覆写字段，生成新 record；**基底必须是裸 ident**（表达式先绑定到变量再更新）
 - 空 record `record {}` 合法（字面量与类型皆可）
-- 字段名重复（`record { x: 1, x: 2 }`）：语法层合法，行为由类型检查实现决定（无专门错误码）
+- 字段名重复（`record { x: 1, x: 2 }`）：语法层合法；语义由 checker 决定
 
 ## 9. interface 文件语法
 
-```
+```text
 interface    ::= { import_decl | enum_decl | pub_interface_fn }
 pub_interface_fn ::= 'pub' 'fn' ident '(' { ident ':' type_expr } ',' ')' '->' type_expr
-```
+```text
 
-- interface 文件是包导出签名（checker 缓存格式），**参数与返回类型必须显式标注**（E1101）
+- interface 文件是包导出签名，**参数与返回类型必须显式标注**
 - 无函数体；`pub` 标记导出
 
 ## 10. 变更流程
 
 1. 语法变更 = 改本文件 + parser/lexer + 全仓 `bur fmt` + 自举 fixpoint + parity 全绿
-2. 语义变更（不改表层语法）不触碰本文件，但须更新 SPEC
+2. 语义变更（不改表层语法）不触碰本文件，但须更新 [`SPEC.md`](SPEC.md)；阶段/完成线更新 [`GOALS.md`](GOALS.md)
 3. LSP 以本文件为语法契约，语法变更须同步 TextMate grammar 与 LSP 词法

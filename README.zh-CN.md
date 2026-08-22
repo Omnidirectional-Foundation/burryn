@@ -1,14 +1,16 @@
 [English](README.md) | 中文
 
-# Burryn
-
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
 [![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
 
+# Burryn
+
 > 一座洞穴，一枚戒指——在地下安静生长。
 
+## 简介
+
 Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
-它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机、可移植的 C 后端，以及一个开发中的手写 x86-64 后端。
+它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断（需要时可选签名标注）、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机、可移植的 C 后端，以及手写 x86-64 Linux ELF 后端（单文件程序；剩余工作见 `docs/GOALS.md`）。
 
 **编译器是自举的。**
 `compiler/` 用 Burryn 自身重实现了整条编译管线——词法、语法、类型检查、字节码编译、C 代码生成、虚拟机、模块加载、工具链与 `bur` CLI。
@@ -22,7 +24,15 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 **burr** 是锻造在金属上留下的毛刺。
 *burrin* 则近似 **burin**——雕版师精细而安静的刻刀。
 
-## 取自 Rust
+## 环境要求
+
+- 一份原生 `bur` 二进制，或用 **Go 1.26+** 从 `archive/go-host` 自举
+- C99 编译器（`gcc` 或 `clang`），用于 `bur build` 以及重建 `bur`
+- Linux，用于 x86-64 ELF 后端（`bur build --backend x86`）
+
+## 特性
+
+### 取自 Rust
 
 - **默认不可变。**
   `let x = 1` 不可重新赋值——在*编译期*强制执行。
@@ -43,7 +53,7 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 - **代数数据类型。**
   `enum Shape { Circle(float), Rect(int, int), Point }`。
 
-## 取自 Go
+### 取自 Go
 
 - **GC 替代借用检查。**
   手写 mark-sweep 直接回收虚拟机自身堆。
@@ -59,10 +69,10 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 - **无分号。**
   换行结束语句（Go 风格的自动分号插入），所以 `} else` 要写在同一行。
 
-## 语言速览
+## 示例
 
 ```sh
-bur run examples/concurrency/sieve.bur
+$ bur run examples/concurrency/sieve.bur
 ```
 
 ```text
@@ -85,10 +95,10 @@ fn ratio(a, b) {
     Ok(x * 100)
 }
 
-// closures capture by reference
+// capture(ref) 与 mut 局部共享；默认是 copy-at-capture
 fn make_counter() {
     let mut n = 0
-    fn() { n = n + 1
+    fn() capture(ref n) { n = n + 1
            n }
 }
 
@@ -101,8 +111,6 @@ spawn producer(ch)
 let mut sum = 0
 for _i in range(0, 5) { sum = sum + <-ch }
 ```
-
-## 示例
 
 | 文件 | 说明 |
 | ------ | ------ |
@@ -143,8 +151,8 @@ source --lexer--> tokens --parser--> AST --checker--> typed --compiler--> byteco
                                          |                   |
                                          v                   v
                                    BurrynVM               原生后端
-                                   (vm.bur)               - C backend (cgen.bur)
-                                   fibers + GC            - x86-64 ELF (x86.bur + elf.bur)
+                                   (vm.bur)               - C backend (backends/c/cgen.bur)
+                                   fibers + GC            - x86-64 ELF (backends/x86/)
 
 Burryn 已完成自举：整条管线位于 `compiler/` 下（`frontend/`、`bytecode/`、
 `backends/`、`module/`、`tooling/`），`bur` CLI 位于 `compiler/main.bur`。
@@ -152,79 +160,68 @@ Burryn 已完成自举：整条管线位于 `compiler/` 下（`frontend/`、`byt
 ```
 
 - **编译器：** 单遍编译，clox 风格的局部变量/upvalue，配合临时值追踪，使 `match`/块表达式（会声明局部变量）可出现在任意表达式深度。
-- **闭包：** upvalue 在打开时引用 `(fiber, slot)`，作用域退出时关闭，在 fiber 切换与栈增长时保持安全。
+- **闭包：** 捕获语义见 `docs/SPEC.md` §6.1。
 - **Match：** 编译为变体测试（基于枚举标识与 tag 的 `TEST_VARIANT`）和字段提取，无需哈希，无需反射。
-- **GC：** 每个语言对象都在一个侵入式列表中；根包括全局变量、每个 fiber 的栈/帧/开放 upvalue/待发送的 channel 值。
+- **GC：** 每个语言对象都在一个侵入式列表中；根包括全局变量、每个 fiber 的栈/帧/闭包 cell/待发送的 channel 值。
 - **调度器：** FIFO 就绪队列；fiber 在 channel 等待队列上 park；接收方/发送方直接交接值。
 
 ## 命令
 
 ```sh
-bur run <file|dir>    类型检查并在 VM 上运行
-bur <file|dir>        同上
-bur check <file|dir>  仅类型检查（rustc 风格诊断）
-bur build <file|dir>  经 C 编译为原生二进制（需要 cc/gcc/clang）
-bur build --backend x86 <file.bur> -o <out>  编译为 x86-64 ELF 原生二进制
-bur fmt <file|dir|->  按官方格式重写源码
-bur dis <file|dir>    反编译字节码
-bur test [dir]        运行 *_test.bur 中的 test_* 函数
-bur mod <subcommand>  模块管理（init、tidy、download、verify）
-bur get <path>@<ver>  添加或升级模块依赖
-bur version           打印版本号
+$ bur run <file|dir>    类型检查并在 VM 上运行
+$ bur <file|dir>        同上
+$ bur check <file|dir>  仅类型检查（rustc 风格诊断）
+$ bur build <file|dir>  经 C 编译为原生二进制（需要 cc/gcc/clang）
+$ bur build --backend x86 <file.bur> -o <out>  编译为 x86-64 ELF 原生二进制
+$ bur fmt <file|dir|->  按官方格式重写源码
+$ bur dis <file|dir>    反编译字节码
+$ bur test [dir]        运行 *_test.bur 中的 test_* 函数
+$ bur mod <subcommand>  模块管理（init、tidy、download、verify）
+$ bur get <path>@<ver>  添加或升级模块依赖
+$ bur lsp               language server（stdin/stdout JSON-RPC）
+$ bur version           打印版本号
 ```
 
-构建（自举）：原生 `bur` 用 `bur build compiler -o bur` 构建自身。
-要从零自举，请使用归档的 Go 宿主和冻结的 `seed-base-1` 过桥分支：
+原生 `bur` 重建自身：
 
 ```sh
-git worktree add ../go-host archive/go-host
-(cd ../go-host && go build -o ../bur-seed .)
-git worktree add ../seed-base seed-base-1
-(cd ../seed-base && ../bur-seed build burc -o ../bur-base)
-./bur-base build compiler -o bur
+$ bur build compiler -o bur
 ```
 
-> **注意：** 从归档的 Go 宿主自举需要 **Go 1.26+**。
-> C 后端与 `bur build` 需要 C99 编译器，如 `gcc` 或 `clang`。
+从零自举（归档 Go 宿主 + 冻结的 `seed-base-1` 过桥）：
+
+```sh
+$ git worktree add ../go-host archive/go-host
+$ (cd ../go-host && go build -o ../bur-seed .)
+$ git worktree add ../seed-base seed-base-1
+$ (cd ../seed-base && ../bur-seed build burc -o ../bur-base)
+$ ./bur-base build compiler -o bur
+```
 
 ## 安全
 
-Burryn 是自举编译器与运行时。
-安全敏感面包括：
-
-- **编译器与生成 C**：`bur build` 会写入 `program.c` 并调用系统 C 编译器。
-  运行不可信来源时请审计生成的 C 代码。
-- **进程创建**：`exec` 原语调用 `fork` + `execvp`，不经过 shell。
-- **持久化状态**：工具链会在工作目录写入构建产物（`program.c`、输出二进制与临时文件）。
-- **网络端点**：`bur mod download` 与 `bur get` 通过网络执行 `git clone` 拉取依赖。
-- **信任边界**：编译后的原生二进制与来自不可信来源的 `.bur` 源码都应视为不可信代码。
-
-完整策略与私密报告方式见 [`SECURITY.md`](SECURITY.md)。
-
-## 诚实局限
-
-S1-S7 已全部完成。
-覆盖范围包括语义内核、可移植的 C 后端、模块、map、`select`/`close`、依赖工具、诊断、字符串插值、管道操作符 `|>`、match guard、编译期常量（`const`）、`defer`、TCP 网络，以及移除 Go 宿主后的完全自举编译器。
-
-当前主线是 S8 与 S9。
-**语法已冻结（S8.2）**，正式 grammar 见 [`docs/grammar.md`](docs/grammar.md)。冻结定案包括：`::` 与 `.` 的分工（路径 vs 成员）、复合赋值、带索引的 `for` 循环、or-pattern、标签循环、record 模式、receiver 方法、tuple 与解构、hex/二进制/指数字面量、多行字符串、`..` range——此后语法变更须走 grammar 修订流程。
-手写 x86-64 ELF 后端正在 Linux 上推进，功能覆盖仍落后于 C 后端。
-row polymorphism、封闭 records、类型别名，以及剩余编辑器能力仍在开发中。
-深 `mut` 是绑定级别的规则，不是借用检查器：两个 `mut` 绑定仍可能别名同一个列表。
+敏感面：生成的 C、`exec`、构建产物、模块的 `git clone`、不可信 `.bur`。
+策略与私密报告：[`SECURITY.md`](SECURITY.md)。
 
 ## 文档
 
 | 文档 | 用途 |
 | ----------------- | ---------------- |
 | [`tutorial.zh-CN.md`](tutorial.zh-CN.md) | 用户 —— 语言实践导览（[English](tutorial.md)） |
-| [`docs/grammar.md`](docs/grammar.md) | 已冻结的正式 grammar（S8.2）—— 词法与语法参考 |
-| [`docs/SPEC.md`](docs/SPEC.md) | 设计权威 —— 语言设计、路线图与分阶段里程碑 |
+| [`docs/grammar.md`](docs/grammar.md) | 已冻结的表层 grammar |
+| [`docs/SPEC.md`](docs/SPEC.md) | 设计权威 —— 语言定案与拒绝清单 |
+| [`docs/GOALS.md`](docs/GOALS.md) | 路线 —— 分阶段里程碑（S1–S10）与剩余完成线 |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | 贡献者 —— 旧 `v`/`L` 标签到新 `S` 编号的历史对照 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献者 —— 分支策略、提交规范与自举定点要求 |
 | [`SECURITY.md`](SECURITY.md) | 私下报告安全漏洞 |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | 社区行为准则 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 重要变更，最新优先 |
 | [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) | 拉取请求模板 |
+| 本地 `reports/`（gitignore） | 工作笔记 —— 不是权威 |
+
+## 诚实局限
+
+缺口见 [`docs/GOALS.md`](docs/GOALS.md)。当前可观察：x86-64 ELF 仅 Linux、仅单文件；std 没有 `sort`、`getenv`、regex。
 
 ## 许可与免责
 

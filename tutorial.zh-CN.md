@@ -2,7 +2,7 @@
 
 # Burryn 教程
 
-> 相关文档：[`README.zh-CN.md`](README.zh-CN.md) 项目概览 · [`docs/SPEC.md`](docs/SPEC.md) 设计定案与里程碑
+> 相关文档：[`README.zh-CN.md`](README.zh-CN.md) 项目概览 · [`docs/SPEC.md`](docs/SPEC.md) 设计定案 · [`docs/GOALS.md`](docs/GOALS.md) 里程碑
 
 Burryn 是一门静态推导、零标注、CSP 并发的实用工具语言：Rust 式的类型与
 `match`，Go 式的并发与简洁，一个二进制交付。本教程只用**当前能跑**的特性，
@@ -10,30 +10,30 @@ Burryn 是一门静态推导、零标注、CSP 并发的实用工具语言：Rus
 
 ---
 
-## 0. 运行与构建 🚀
+## 0. 运行与构建
 
 把代码存成 `.bur` 文件，用 VM 直接跑——**不需要任何 C 工具链**：
 
 ```sh
-bur run hello.bur       # 类型检查并运行
-bur hello.bur           # 同上
-bur check hello.bur     # 只做类型检查
+$ bur run hello.bur       # 类型检查并运行
+$ bur hello.bur           # 同上
+$ bur check hello.bur     # 只做类型检查
 ```
 
 想要一个可独立分发的**原生二进制**，用 `bur build`（这一步需要系统的
 `cc`/`gcc`/`clang`）：
 
 ```sh
-bur build hello.bur -o hello   # 经由 C 编译成原生二进制
-./hello                        # 独立运行，不再需要 bur 或 cc
-bur build hello.bur --emit c   # 只吐出生成的 C
+$ bur build hello.bur -o hello   # 经由 C 编译成原生二进制
+$ ./hello                        # 独立运行，不再需要 bur 或 cc
+$ bur build hello.bur --emit c   # 只吐出生成的 C
 ```
 
 `bur run` 永远零依赖；`cc` 只在 `bur build` 那一下需要，编好的二进制拷到哪都能跑。
 
 ---
 
-## 1. 你好，Burryn 👋
+## 1. 你好，Burryn
 
 ```rust
 // 这是注释。语句以换行结束——没有分号（Go 式自动分号）。
@@ -48,7 +48,7 @@ println("hello from", name)
 
 ---
 
-## 2. 变量：let、mut、遮蔽 📦
+## 2. 变量：let、mut、遮蔽
 
 `let` 绑定**默认不可变**，重新赋值是编译错误。要可变得写 `let mut`。
 
@@ -116,7 +116,7 @@ n *= 2                // 10
 
 ---
 
-## 3. 基本类型 🔢
+## 3. 基本类型
 
 数值只有两种：`int`（i64）和 `float`（f64）。还有 `bool`、`string`、以及 unit
 `()`（"没有有意义的值"）。**禁止一切隐式转换**。
@@ -195,7 +195,7 @@ println("literal brace: {{")
 
 ---
 
-## 4. 表达式导向 🧮
+## 4. 表达式导向
 
 `if`、`match`、块 `{}` 都是**表达式**——有值。函数返回它最后一个表达式。
 
@@ -213,7 +213,7 @@ let y = {                 // 块也有值
 
 ---
 
-## 5. 函数与闭包 ⚙️
+## 5. 函数与闭包
 
 函数参数与返回值**零标注**（类型自动推导）。用 `return` 可提前返回，否则返回最后
 一个表达式。
@@ -230,13 +230,13 @@ fn classify(n) {
 }
 ```
 
-**闭包**：匿名函数 `fn() { ... }` 捕获它环境里的变量。捕获是按引用的——闭包能读写
-外层的 `mut` 变量。
+**闭包**：匿名函数 `fn() { ... }` **按值**捕获（copy-at-capture）。要与外层
+`mut` 局部共享，写 `capture(ref n)` —— 见 `docs/SPEC.md` §6.1 与 `docs/grammar.md`。
 
 ```rust
 fn make_counter() {
     let mut n = 0
-    fn() {               // 返回一个闭包
+    fn() capture(ref n) {   // 返回闭包；与 n 共享
         n = n + 1
         n
     }
@@ -259,7 +259,7 @@ fn append_one(mut xs) {
 
 `x |> f` 把左侧的值作为第一个实参传给右侧调用，等价 `f(x)`；带参写 `x |> f(a)` =
 `f(x, a)`。`|>` 优先级最低、左结合，所以 `x |> f |> g` 是 `g(f(x))`，
-`1 + 2 |> str` 是 `str(1 + 2)`。右侧只接受函数名或 `pkg.name`（可带实参），
+`1 + 2 |> str` 是 `str(1 + 2)`。右侧只接受函数名或路径 `pkg::fn`（可带实参），
 其它表达式是 parse error；`?` 结合更紧，传播错误写 `(x |> parse)?`。
 
 ```rust
@@ -275,13 +275,13 @@ println(1 + 2 |> str)             // 3
 ### defer / 延迟清理
 
 `defer { ... }` 把一个块挂到**包围函数**上，函数退出时按注册的逆序（LIFO）执行——
-`return`、末尾表达式和 `?` 传播都算退出。块是闭包：按引用捕获环境，退出时读到的是
-变量的最终值。trap 是进程级中止，不执行 defer。
+`return`、末尾表达式和 `?` 传播都算退出。块是闭包（默认 copy-at-capture）。
+要看见之后的赋值，写 `defer capture(ref name)`。trap 是进程级中止，不执行 defer。
 
 ```rust
 fn process(path) {
     let mut lines = 0
-    defer {
+    defer capture(ref lines) {
         println("processed " + str(lines) + " line(s)")
     }
     let text = read_file(path)?
@@ -312,7 +312,7 @@ println(p.dist())                        // 25.0
 
 ---
 
-## 6. 列表与循环 🔁
+## 6. 列表与循环
 
 列表用 `[...]` 字面量，`l[i]` 索引（越界 trap），`l[i] = v` 赋值（需 `mut`）。
 
@@ -372,7 +372,7 @@ outer: for x in xs {
 
 ---
 
-## 7. 字符串 🔤
+## 7. 字符串
 
 `+` 拼接字符串，`<` `>` 等按字节序比较。字符串是不可变的字节序列。
 
@@ -400,7 +400,7 @@ let s = """
 
 ---
 
-## 8. Map / 映射 🗺️
+## 8. Map / 映射
 
 map 用**纯函数 API**，不开 `m[k]` 语法糖（零标注推导下，`容器[键]` 在未标注参数里
 分不清是列表还是 map）。键只能是 `int` 或 `str`，迭代按**插入顺序**。
@@ -426,7 +426,7 @@ println(len(counts))             // map 里的条目数
 
 ---
 
-## 9. 枚举与 match 🧩
+## 9. 枚举与 match
 
 枚举是带类型字段的代数数据类型——**唯一需要写类型的地方**。变体可以有 0 个或多个
 字段。
@@ -491,7 +491,7 @@ let letter = match grade / 10 {
 
 ---
 
-## 10. 没有 null：Option、Result 与 ? 🛡️
+## 10. 没有 null：Option、Result 与 `?` 运算符
 
 **没有 null**。可能缺失的值用内建枚举 `Option`（`Some(v)` / `None`）；可能失败的用
 `Result`（`Ok(v)` / `Err(e)`）。你被迫用 `match` 处理两种情况。
@@ -538,7 +538,7 @@ match read_file("notes.txt") {
 
 ---
 
-## 11. 并发：spawn、channel、select 🧵
+## 11. 并发：spawn、channel、select
 
 CSP 模型：`spawn` 起一个**纤程**（green thread），纤程间用 **channel** 通信。执行
 **始终单 OS 线程**——协作调度 + 10k 指令时间片，单线程交织意味着**天然无数据竞争**。
@@ -580,10 +580,9 @@ select {
 
 ---
 
-## 12. 网络 🌐
+## 12. 网络
 
-Burryn 内建 TCP 支持：六个 native 提供非阻塞的 TCP 连接管理，调度器在等待网络
-IO 时自动 park/唤醒 fiber——和 channel 一样自然。
+Burryn 内建 TCP native。等待网络的调用会 park 当前 fiber，调度器继续跑其他 fiber——和 channel 一样。
 
 核心原语：
 
@@ -632,12 +631,11 @@ match client() {
 `std/net` 提供两个便利函数：`read_all(h)` 读到 EOF 并返回完整字符串，
 `write_line(h, s)` 写一行（自动追加 `\n`）。
 
-**已知限制**：DNS 解析同步阻塞调度器；不提供 UDP、Unix socket 或 TLS——这些是
-后续版本的事。
+**已知限制**：DNS 解析同步阻塞调度器。语言里没有 UDP、TLS。Unix domain socket 已否决（`docs/SPEC.md` §7）。
 
 ---
 
-## 13. 模块 📚
+## 13. 模块
 
 **目录即包**。一个模块的根放一个 `bur.mod` 声明它的 import path。同一目录的文件共享
 顶层作用域；跨包才需要 `pub` 和 `import`。
@@ -679,11 +677,11 @@ pub fn describe(s) {                        // pub 才跨包可见
 选择）。常用命令：
 
 ```sh
-bur mod init example.com/myapp    # 初始化 bur.mod
-bur get example.com/lib@v1.2.0    # 添加/升级依赖
-bur mod tidy                      # 按实际 import 增删 require
-bur mod download                  # 拉取全部依赖到本地缓存
-bur mod verify                    # 校验缓存与 bur.sum 一致
+$ bur mod init example.com/myapp    # 初始化 bur.mod
+$ bur get example.com/lib@v1.2.0    # 添加/升级依赖
+$ bur mod tidy                      # 按实际 import 增删 require
+$ bur mod download                  # 拉取全部依赖到本地缓存
+$ bur mod verify                    # 校验缓存与 bur.sum 一致
 ```
 
 依赖缓存在 `$BURCACHE`（默认 `~/.cache/bur`）；拉取走 `git clone` 浅克隆
@@ -691,7 +689,7 @@ bur mod verify                    # 校验缓存与 bur.sum 一致
 
 ---
 
-## 14. 标准库速查 🗄️
+## 14. 标准库速查
 
 现有的全部内建函数（按域分组）。`-> Option` / `-> Result` 表示返回相应枚举。
 
@@ -736,7 +734,7 @@ bur mod verify                    # 校验缓存与 bur.sum 一致
 - `net_read(h, max) -> Result<str, str>` — 读至多 max 字节；空串 = EOF
 - `net_write(h, s) -> Result<(), str>` — 写完全部字节
 - `net_close(h)` — 关闭句柄；无效句柄 trap
-- `net_nb(h, timeout_ms, host, port) -> Result<str, str>` — 非阻塞内部原语
+- `net_nb(op, h, data, max) -> Result<str, str>` — 非阻塞 accept（`op=0`）/ read（`1`）/ write（`2`）；会阻塞时返回 `Err("__eagain")`
 
 **标准库模块**（`import "std/..."`）
 - `std/net` — `read_all(h) -> Result<str, str>`（读到 EOF）、`write_line(h, s)`（写一行）
@@ -762,17 +760,17 @@ fn main() {
 
 ---
 
-## 15. 命令行 💻
+## 15. 命令行
 
 ```sh
-bur run <file|dir>       类型检查并在 VM 上运行
-bur <file|dir>           同 run
-bur check <file|dir>     只类型检查（rustc 式诊断）
-bur build <file|dir>     经由 C 编译成原生二进制
-bur fmt <file|dir|->     格式化源码（--check 只检查不写回）
-bur test [dir]           运行测试（--run <substr> 过滤，-v 详细）
-bur dis <file|dir>       反汇编字节码
-bur version
+$ bur run <file|dir>       类型检查并在 VM 上运行
+$ bur <file|dir>           同 run
+$ bur check <file|dir>     只类型检查（rustc 式诊断）
+$ bur build <file|dir>     经由 C 编译成原生二进制
+$ bur fmt <file|dir|->     格式化源码（--check 只检查不写回）
+$ bur test [dir]           运行测试（--run <substr> 过滤，-v 详细）
+$ bur dis <file|dir>       反汇编字节码
+$ bur version
 ```
 
 `bur build` 选项：`-o <path>` 输出路径；`--emit c` 吐出 C 而非二进制。找
@@ -789,7 +787,7 @@ bur version
 
 ---
 
-## 16. 测试 🧪
+## 16. 测试
 
 `bur test` 自动发现当前包（及子包）里 `*_test.bur` 文件中所有零参 `fn test_*`
 函数，每个测试跑在独立子进程里。trap 或死锁 = FAIL。
@@ -808,9 +806,9 @@ fn test_div_by_zero() {
 ```
 
 ```sh
-bur test              # 跑全部
-bur test --run add    # 只跑名字含 "add" 的
-bur test -v           # 详细输出
+$ bur test              # 跑全部
+$ bur test --run add    # 只跑名字含 "add" 的
+$ bur test -v           # 详细输出
 ```
 
 `*_test.bur` 文件被普通 `bur run`/`bur build`/`bur check` 排除，只在 `bur test`
@@ -819,21 +817,12 @@ bur test -v           # 详细输出
 
 ---
 
-## 17. 当前限制（诚实） ⚠️
+## 17. 当前限制（诚实）
 
-语言层还没有的东西：
-
-- 还没有 `sort`、`getenv`、`math`（sqrt/floor…）、regex 等标准库；按需生长中。
-- 深 `mut` 是绑定级别的规则，不是借用检查器：两个 `mut` 绑定仍可能别名同一个列表。
-- x86-64 原生后端的功能覆盖落后于 C 后端。
+缺口与剩余里程碑见 [`docs/GOALS.md`](docs/GOALS.md)。
+绑定级 `mut` 见第 2 节。
 
 ---
 
-*自举里程碑 S3-S5 已达成并收尾：整条编译管线、VM 与 CLI 都用 Burryn 写成，位于
-`compiler/` 下（`frontend/`、`bytecode/`、`backends/`、`module/`、`tooling/`，
-以及 `compiler/main.bur`）。`bur` 把自己编译成 C、经 cc 落地成原生二进制，再由该
-二进制逐字节重建自身。曾作为参照的 Go 宿主已归档到 `archive/go-host` 分支。想看一个
-"真实规模"的 Burryn 程序，`compiler/` 是最好的读物。*
-
----
+要读完整规模的 Burryn 程序，看 `compiler/`。自举概述见 [`README.zh-CN.md`](README.zh-CN.md)。
 

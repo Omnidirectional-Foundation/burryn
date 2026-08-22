@@ -2,7 +2,7 @@ English | [中文](tutorial.zh-CN.md)
 
 # The Burryn Tutorial
 
-> See also: [`README.md`](README.md) project overview · [`docs/SPEC.md`](docs/SPEC.md) design authority and milestones
+> See also: [`README.md`](README.md) project overview · [`docs/SPEC.md`](docs/SPEC.md) design decisions · [`docs/GOALS.md`](docs/GOALS.md) milestones
 
 Burryn is a small, statically-inferred, zero-annotation language with CSP
 concurrency: Rust-style types and `match`, Go-style concurrency and
@@ -11,23 +11,23 @@ work **today**, every snippet checked against the compiler.
 
 ---
 
-## 0. Running and building 🚀
+## 0. Running and building
 
 Save code as a `.bur` file and run it on the VM — **no C toolchain needed**:
 
 ```sh
-bur run hello.bur       # typecheck and run
-bur hello.bur           # same thing
-bur check hello.bur     # typecheck only
+$ bur run hello.bur       # typecheck and run
+$ bur hello.bur           # same thing
+$ bur check hello.bur     # typecheck only
 ```
 
 For a standalone **native binary**, use `bur build` (this step needs a system
 `cc`/`gcc`/`clang`):
 
 ```sh
-bur build hello.bur -o hello   # compile to a native binary via C
-./hello                        # runs on its own
-bur build hello.bur --emit c   # dump the generated C instead
+$ bur build hello.bur -o hello   # compile to a native binary via C
+$ ./hello                        # runs on its own
+$ bur build hello.bur --emit c   # dump the generated C instead
 ```
 
 `bur run` is always dependency-free; `cc` is needed only at `bur build` time,
@@ -35,7 +35,7 @@ and the resulting binary runs anywhere.
 
 ---
 
-## 1. Hello, Burryn 👋
+## 1. Hello, Burryn
 
 ```rust
 // A comment. Statements end at newlines — no semicolons (Go-style).
@@ -51,7 +51,7 @@ Because a newline ends a statement, `} else {` must sit on one line (like Go).
 
 ---
 
-## 2. Variables: let, mut, shadowing 📦
+## 2. Variables: let, mut, shadowing
 
 A `let` binding is **immutable by default**; reassigning is a compile error.
 Use `let mut` for mutability.
@@ -124,7 +124,7 @@ n *= 2                // 10
 
 ---
 
-## 3. Primitive types 🔢
+## 3. Primitive types
 
 There are exactly two number types: `int` (i64) and `float` (f64). Plus `bool`,
 `string`, and unit `()` ("no meaningful value"). **No implicit conversions,
@@ -207,7 +207,7 @@ println("literal brace: {{")
 
 ---
 
-## 4. Expression orientation 🧮
+## 4. Expression orientation
 
 `if`, `match` and blocks `{}` are **expressions** — they have values. A function
 returns its last expression.
@@ -226,7 +226,7 @@ An `if` used as a value must have an `else` (otherwise one branch has no value).
 
 ---
 
-## 5. Functions and closures ⚙️
+## 5. Functions and closures
 
 Function parameters and return types are **unannotated** (types are inferred).
 Use `return` to return early; otherwise the last expression is returned.
@@ -243,13 +243,14 @@ fn classify(n) {
 }
 ```
 
-**Closures**: an anonymous function `fn() { ... }` captures variables from its
-environment, by reference — a closure can read and write an enclosing `mut`.
+**Closures**: an anonymous function `fn() { ... }` captures by **value**
+(copy-at-capture). To share a `mut` local, write `capture(ref n)` — see
+`docs/SPEC.md` §6.1 and `docs/grammar.md`.
 
 ```rust
 fn make_counter() {
     let mut n = 0
-    fn() {               // returns a closure
+    fn() capture(ref n) {   // returns a closure; shares n
         n = n + 1
         n
     }
@@ -274,8 +275,8 @@ fn append_one(mut xs) {
 `x |> f` feeds the left value as the first argument of the call on the right,
 equivalent to `f(x)`; with arguments, `x |> f(a)` is `f(x, a)`. `|>` has the
 lowest precedence and associates left, so `x |> f |> g` is `g(f(x))` and
-`1 + 2 |> str` is `str(1 + 2)`. The right side only accepts a function name or
-`pkg.name`, optionally with arguments; any other expression is a parse error.
+`1 + 2 |> str` is `str(1 + 2)`. The right side only accepts a function name or a path
+(`pkg::fn`), optionally with arguments; any other expression is a parse error.
 `?` binds tighter, so error propagation is written `(x |> parse)?`.
 
 ```rust
@@ -292,14 +293,14 @@ println(1 + 2 |> str)             // 3
 
 `defer { ... }` attaches a block to the **enclosing function**; the blocks run
 in reverse registration order (LIFO) when the function exits — via `return`,
-the tail expression, or `?` propagation. The block is a closure: it captures
-its environment by reference and sees each variable's final value at exit. A
+the tail expression, or `?` propagation. The block is a closure (default
+copy-at-capture). Use `defer capture(ref name)` to see later assignments. A
 trap aborts the process and runs no defers.
 
 ```rust
 fn process(path) {
     let mut lines = 0
-    defer {
+    defer capture(ref lines) {
         println("processed " + str(lines) + " line(s)")
     }
     let text = read_file(path)?
@@ -331,7 +332,7 @@ println(p.dist())                        // 25.0
 
 ---
 
-## 6. Lists and loops 🔁
+## 6. Lists and loops
 
 Lists use `[...]` literals, `l[i]` to index (out-of-bounds traps), `l[i] = v` to
 assign (needs `mut`).
@@ -392,7 +393,7 @@ Common list functions: `len`, `push`, `pop`, `slice(xs, start, end)`,
 
 ---
 
-## 7. Strings 🔤
+## 7. Strings
 
 `+` concatenates strings; `<` `>` etc. compare bytewise. Strings are immutable
 byte sequences.
@@ -423,7 +424,7 @@ code point -> int), `chr(n)` (code point -> string), `split`, `join`, `substr`,
 
 ---
 
-## 8. Maps 🗺️
+## 8. Maps
 
 Maps use a **function API**, with no `m[k]` sugar (under zero-annotation
 inference, `container[key]` can't tell a list from a map in an unannotated
@@ -450,7 +451,7 @@ println(len(counts))             // number of entries
 
 ---
 
-## 9. Enums and match 🧩
+## 9. Enums and match
 
 Enums are algebraic data types with typed fields — the **only place you write
 types**. Variants may have zero or more fields.
@@ -517,7 +518,7 @@ When a variant name is shared across enums, qualify it as `Enum.Variant`, e.g.
 
 ---
 
-## 10. No null: Option, Result, and ? 🛡️
+## 10. No null: Option, Result, and the `?` operator
 
 **There is no null.** A possibly-absent value is the built-in `Option`
 (`Some(v)` / `None`); a possibly-failing one is `Result` (`Ok(v)` / `Err(e)`).
@@ -566,7 +567,7 @@ match read_file("notes.txt") {
 
 ---
 
-## 11. Concurrency: spawn, channel, select 🧵
+## 11. Concurrency: spawn, channel, select
 
 CSP model: `spawn` starts a **fiber** (green thread); fibers talk over
 **channels**. Execution is **always single-threaded** — cooperative scheduling
@@ -613,11 +614,10 @@ select {
 
 ---
 
-## 12. Networking 🌐
+## 12. Networking
 
-Burryn has built-in TCP support: six natives provide non-blocking TCP handle
-management, and the scheduler automatically parks/wakes fibers waiting on
-network IO — as natural as channels.
+Burryn has built-in TCP natives. Calls that wait for the network park the
+current fiber; the scheduler runs other fibers — as natural as channels.
 
 Core primitives:
 
@@ -666,12 +666,13 @@ match client() {
 `std/net` offers two convenience functions: `read_all(h)` reads until EOF and
 returns the full string; `write_line(h, s)` writes a line (appends `\n`).
 
-**Known limitations**: DNS resolution blocks the scheduler synchronously; UDP,
-Unix sockets and TLS are not provided — those are for later versions.
+**Known limitations**: DNS resolution blocks the scheduler synchronously.
+UDP and TLS are not in the language. Unix domain sockets are rejected
+(`docs/SPEC.md` §7).
 
 ---
 
-## 13. Modules 📚
+## 13. Modules
 
 **A directory is a package.** A module root holds a `bur.mod` declaring its
 import path. Files in the same directory share a top-level scope; `pub` and
@@ -715,11 +716,11 @@ External dependencies live in the `require` block of `bur.mod`; versions follow
 semver and resolution uses MVS (minimal version selection). Common commands:
 
 ```sh
-bur mod init example.com/myapp    # initialize bur.mod
-bur get example.com/lib@v1.2.0    # add or upgrade a dependency
-bur mod tidy                      # sync require with actual imports
-bur mod download                  # fetch all deps to local cache
-bur mod verify                    # verify cache against bur.sum
+$ bur mod init example.com/myapp    # initialize bur.mod
+$ bur get example.com/lib@v1.2.0    # add or upgrade a dependency
+$ bur mod tidy                      # sync require with actual imports
+$ bur mod download                  # fetch all deps to local cache
+$ bur mod verify                    # verify cache against bur.sum
 ```
 
 Dependencies cache under `$BURCACHE` (default `~/.cache/bur`); fetching is a
@@ -727,7 +728,7 @@ shallow `git clone` of the `v<semver>` tag.
 
 ---
 
-## 14. Standard library cheat sheet 🗄️
+## 14. Standard library cheat sheet
 
 Every built-in function today, grouped. `-> Option` / `-> Result` means it
 returns that enum.
@@ -773,12 +774,12 @@ returns that enum.
 - `net_read(h, max) -> Result<str, str>` — read up to max bytes; empty = EOF
 - `net_write(h, s) -> Result<(), str>` — write all bytes
 - `net_close(h)` — close; invalid handle traps
-- `net_nb(h, timeout_ms, host, port) -> Result<str, str>` — non-blocking internal primitive
+- `net_nb(op, h, data, max) -> Result<str, str>` — non-blocking accept (`op=0`) / read (`1`) / write (`2`); would-block is `Err("__eagain")`
 
 **Standard library modules** (`import "std/..."`)
 - `std/net` — `read_all(h) -> Result<str, str>` (read to EOF), `write_line(h, s)` (write a line)
 - `std/json` — `parse(s) -> Result`, `render(v)`, `pretty(v, indent)`, `get(keys, vals, key) -> Option`
-- `std/testing` — `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)` (for `bur test`); 包成员一律 `pkg::name` 访问（S8.2 冻结）
+- `std/testing` — `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)` (for `bur test`); package members use `pkg::name`
 
 `std/json` usage (inside a module):
 
@@ -799,17 +800,17 @@ fn main() {
 
 ---
 
-## 15. The CLI 💻
+## 15. The CLI
 
 ```sh
-bur run <file|dir>       typecheck and run on the VM
-bur <file|dir>           same as run
-bur check <file|dir>     typecheck only (rustc-style diagnostics)
-bur build <file|dir>     compile to a native binary via C
-bur fmt <file|dir|->     format source (--check reports without writing)
-bur test [dir]           run tests (--run <substr> filter, -v verbose)
-bur dis <file|dir>       disassemble the bytecode
-bur version
+$ bur run <file|dir>       typecheck and run on the VM
+$ bur <file|dir>           same as run
+$ bur check <file|dir>     typecheck only (rustc-style diagnostics)
+$ bur build <file|dir>     compile to a native binary via C
+$ bur fmt <file|dir|->     format source (--check reports without writing)
+$ bur test [dir]           run tests (--run <substr> filter, -v verbose)
+$ bur dis <file|dir>       disassemble the bytecode
+$ bur version
 ```
 
 `bur build` flags: `-o <path>` output path; `--emit c` emits C instead of a
@@ -830,7 +831,7 @@ on both paths, enforced by tests.
 
 ---
 
-## 16. Testing 🧪
+## 16. Testing
 
 `bur test` discovers all zero-argument `fn test_*` functions in `*_test.bur`
 files across the package (and subpackages). Each test runs in its own
@@ -850,9 +851,9 @@ fn test_div_by_zero() {
 ```
 
 ```sh
-bur test              # run all
-bur test --run add    # filter by substring
-bur test -v           # verbose
+$ bur test              # run all
+$ bur test --run add    # filter by substring
+$ bur test -v           # verbose
 ```
 
 `*_test.bur` files are excluded from normal `bur run`/`bur build`/`bur check`;
@@ -861,24 +862,13 @@ helpers: `assert_eq(got, want)`, `assert_ok(r)`, `assert_err(r)`.
 
 ---
 
-## 17. Honest limitations ⚠️
+## 17. Honest limitations
 
-Not in the language yet:
-
-- No `sort`, `getenv`, `math`, regex yet; growing as needed.
-- Deep `mut` is binding-level discipline, not a borrow checker: two `mut`
-  bindings may still alias the same list.
-- The x86-64 native backend trails the C backend in feature coverage.
+Gaps and remaining milestones: [`docs/GOALS.md`](docs/GOALS.md).
+Binding-level `mut` is in section 2.
 
 ---
 
-*The self-hosting milestones S3-S5 are done and wrapped up: the whole pipeline,
-VM, and CLI are written in Burryn under `compiler/` (`frontend/`, `bytecode/`,
-`backends/`, `module/`, `tooling/`, plus `compiler/main.bur`). `bur` compiles
-itself to C, `cc` turns that into a native binary, and the binary rebuilds
-itself byte for byte. The Go host that once served as the reference is archived
-on the `archive/go-host` branch. For a real-sized Burryn program to read,
-`compiler/` is the best material.*
-
----
+Read `compiler/` for a full-sized Burryn program. Bootstrap and self-hosting
+are summarized in [`README.md`](README.md).
 

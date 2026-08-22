@@ -1,14 +1,16 @@
 English | [中文](README.zh-CN.md)
 
-# Burryn
-
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
 [![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
 
+# Burryn
+
 > A burrow, a ring — quiet work underground.
 
+## Introduction
+
 Burryn is a small programming language forged from Go and Rust — a practical tool language for ops scripts, CSP-style concurrent pipelines, and small tools with static guarantees.
-It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference (zero annotations by default, optional signature annotations when you want them), a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and an in-progress hand-written x86-64 backend.
+It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference (zero annotations by default, optional signature annotations), a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and a hand-written x86-64 Linux ELF backend (single-file programs; remaining work in `docs/GOALS.md`).
 
 **The compiler is self-hosted.**
 `compiler/` reimplements the whole pipeline — lexer, parser, type checker, bytecode compiler, C code generator, VM, module loader, tooling, and the `bur` CLI — in Burryn itself.
@@ -22,7 +24,15 @@ The name: a **burrow** is where a gopher (Go) lives, and it puns on Rust's *borr
 A **burr** is what forging leaves on metal.
 *Burrin* reads like **burin** — the engraver's tool for precise, quiet work.
 
-## What It Takes from Rust
+## Prerequisites
+
+- A native `bur` binary, or **Go 1.26+** to bootstrap from `archive/go-host`
+- A C99 compiler (`gcc` or `clang`) for `bur build` and for rebuilding `bur`
+- Linux, for the x86-64 ELF backend (`bur build --backend x86`)
+
+## Features
+
+### From Rust
 
 - **Immutable by default.**
   `let x = 1` cannot be reassigned — enforced at *compile time*.
@@ -42,7 +52,7 @@ A **burr** is what forging leaves on metal.
 - **Algebraic data types.**
   `enum Shape { Circle(float), Rect(int, int), Point }`.
 
-## What It Takes from Go
+### From Go
 
 - **A garbage collector instead of a borrow checker.**
   Hand-written mark-sweep over the VM's own heap.
@@ -58,10 +68,10 @@ A **burr** is what forging leaves on metal.
 - **No semicolons.**
   Newlines end statements (Go-style automatic insertion), so `} else` belongs on one line.
 
-## Tour
+## Examples
 
 ```sh
-bur run examples/concurrency/sieve.bur
+$ bur run examples/concurrency/sieve.bur
 ```
 
 ```text
@@ -84,10 +94,10 @@ fn ratio(a, b) {
     Ok(x * 100)
 }
 
-// closures capture by reference
+// capture(ref) shares a mut local; default is copy-at-capture
 fn make_counter() {
     let mut n = 0
-    fn() { n = n + 1
+    fn() capture(ref n) { n = n + 1
            n }
 }
 
@@ -100,8 +110,6 @@ spawn producer(ch)
 let mut sum = 0
 for _i in range(0, 5) { sum = sum + <-ch }
 ```
-
-## Examples
 
 | file | description |
 | ------ | ------------- |
@@ -142,8 +150,8 @@ source --lexer--> tokens --parser--> AST --checker--> typed --compiler--> byteco
                                          |                   |
                                          v                   v
                                    BurrynVM            Native backends
-                                   (vm.bur)            - C backend (cgen.bur)
-                                   fibers + GC         - x86-64 ELF (x86.bur + elf.bur)
+                                   (vm.bur)            - C backend (backends/c/cgen.bur)
+                                   fibers + GC         - x86-64 ELF (backends/x86/)
 
 Burryn is self-hosted: the whole pipeline lives under `compiler/`
 (`frontend/`, `bytecode/`, `backends/`, `module/`, `tooling/`), and the `bur`
@@ -152,79 +160,68 @@ native binary, and the result rebuilds itself byte for byte.
 ```
 
 - **Compiler**: single pass, clox-style locals/upvalues, with a temp-tracking scheme that lets `match`/block expressions (which declare locals) appear at any expression depth.
-- **Closures**: upvalues reference `(fiber, slot)` while open and are closed on scope exit — safe across fiber switches and stack growth.
+- **Closures**: capture semantics in `docs/SPEC.md` §6.1.
 - **Match**: compiles to variant tests (`TEST_VARIANT` on enum identity + tag) and field extraction, no hashing, no reflection.
-- **GC**: every language object lives in an intrusive list; roots are globals, every fiber's stack/frames/open upvalues/pending channel sends.
+- **GC**: every language object lives in an intrusive list; roots are globals, every fiber's stack/frames/closure cells/pending channel sends.
 - **Scheduler**: FIFO ready queue; fibers park on channel wait queues; the receiver/sender hands values across directly.
 
 ## Commands
 
 ```sh
-bur run <file|dir>    typecheck and run on the VM
-bur <file|dir>        same
-bur check <file|dir>  typecheck only (rustc-style diagnostics)
-bur build <file|dir>  compile to a native binary via C (needs cc/gcc/clang)
-bur build --backend x86 <file.bur> -o <out>  compile to a native x86-64 ELF binary
-bur fmt <file|dir|->  rewrite source in the official format
-bur dis <file|dir>    disassemble the compiled bytecode
-bur test [dir]        run test_* functions from *_test.bur files
-bur mod <subcommand>  module management (init, tidy, download, verify)
-bur get <path>@<ver>  add or upgrade a module dependency
-bur version           print the version
+$ bur run <file|dir>    typecheck and run on the VM
+$ bur <file|dir>        same
+$ bur check <file|dir>  typecheck only (rustc-style diagnostics)
+$ bur build <file|dir>  compile to a native binary via C (needs cc/gcc/clang)
+$ bur build --backend x86 <file.bur> -o <out>  compile to a native x86-64 ELF binary
+$ bur fmt <file|dir|->  rewrite source in the official format
+$ bur dis <file|dir>    disassemble the compiled bytecode
+$ bur test [dir]        run test_* functions from *_test.bur files
+$ bur mod <subcommand>  module management (init, tidy, download, verify)
+$ bur get <path>@<ver>  add or upgrade a module dependency
+$ bur lsp               language server (stdin/stdout JSON-RPC)
+$ bur version           print the version
 ```
 
-Build (self-hosting): a native `bur` builds itself with `bur build compiler -o bur`.
-To bootstrap from scratch, use the archived Go host plus the frozen `seed-base-1` bridge:
+A native `bur` rebuilds itself with:
 
 ```sh
-git worktree add ../go-host archive/go-host
-(cd ../go-host && go build -o ../bur-seed .)
-git worktree add ../seed-base seed-base-1
-(cd ../seed-base && ../bur-seed build burc -o ../bur-base)
-./bur-base build compiler -o bur
+$ bur build compiler -o bur
 ```
 
-> **Note:** Bootstrapping from the archived Go host requires **Go 1.26+**.
-> The C backend and `bur build` require a C99 compiler such as `gcc` or `clang`.
+Bootstrap from scratch (archived Go host + frozen `seed-base-1` bridge):
+
+```sh
+$ git worktree add ../go-host archive/go-host
+$ (cd ../go-host && go build -o ../bur-seed .)
+$ git worktree add ../seed-base seed-base-1
+$ (cd ../seed-base && ../bur-seed build burc -o ../bur-base)
+$ ./bur-base build compiler -o bur
+```
 
 ## Security
 
-Burryn is a self-hosted compiler and runtime.
-Security-sensitive surfaces include:
-
-- **Compiler and emitted C**: `bur build` writes `program.c` and invokes the system C compiler.
-  Audit generated C when running untrusted sources.
-- **Process spawning**: the `exec` native calls `fork` + `execvp` without a shell.
-- **Persistent state**: the toolchain writes build artifacts (`program.c`, the output binary, and temporary files) to the working directory.
-- **Network endpoints**: `bur mod download` and `bur get` fetch dependencies with `git clone` over the network.
-- **Trust boundary**: treat compiled native binaries and `.bur` source from untrusted origins as untrusted code.
-
-See [`SECURITY.md`](SECURITY.md) for the full policy and private reporting instructions.
-
-## Honest Limitations
-
-Stages S1-S7 are done.
-They cover the semantic core, the portable C backend, modules, maps, `select`/`close`, dependency tooling, diagnostics, string interpolation, the `|>` pipe operator, match guards, compile-time constants (`const`), `defer`, TCP networking, and a fully self-hosted compiler with the Go host removed.
-
-Current work is in S8 and S9.
-The syntax is frozen (S8.2): the formal grammar lives in `docs/grammar.md`. The freeze covers `::` vs `.` (paths vs members), compound assignment, indexed `for` loops, or-patterns, labeled loops, record patterns, receiver methods, tuples with destructuring, hex/binary/exponent literals, multiline strings, and `..` ranges — syntax changes now go through the grammar revision process.
-The hand-written x86-64 ELF backend is in progress on Linux and currently trails the C backend in feature coverage.
-Row polymorphism, closed records, type aliases, and the remaining editor features are still in progress.
-Deep `mut` is a binding-level discipline, not a borrow checker: two `mut` bindings may still alias the same list.
+Surfaces: generated C, `exec`, build artifacts, `git clone` for modules, untrusted `.bur`.
+Policy and private reporting: [`SECURITY.md`](SECURITY.md).
 
 ## Documentation
 
 | Document | Purpose |
 | ----------------- | ---------------- |
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language ([中文](tutorial.zh-CN.md)) |
-| [`docs/grammar.md`](docs/grammar.md) | the frozen formal grammar (S8.2) — lexical and syntax reference |
-| [`docs/SPEC.md`](docs/SPEC.md) | design authority — the language design, roadmap, and staged milestones (S1-S10) |
+| [`docs/grammar.md`](docs/grammar.md) | frozen surface grammar |
+| [`docs/SPEC.md`](docs/SPEC.md) | design authority — language decisions and the rejection list |
+| [`docs/GOALS.md`](docs/GOALS.md) | roadmap — staged milestones (S1–S10) and remaining completion lines |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
 | [`SECURITY.md`](SECURITY.md) | reporting vulnerabilities privately |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | community conduct standards |
 | [`CHANGELOG.md`](CHANGELOG.md) | notable changes, latest first |
 | [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) | PR template |
+| Local `reports/` (gitignored) | working notes — not authority |
+
+## Honest Limitations
+
+Known gaps: [`docs/GOALS.md`](docs/GOALS.md). Observable today: x86-64 ELF is Linux-only and single-file; std has no `sort`, `getenv`, or regex.
 
 ## License & Disclaimer
 
