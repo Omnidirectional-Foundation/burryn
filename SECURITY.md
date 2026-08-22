@@ -4,6 +4,12 @@ Reports are accepted in **English or Chinese**.
 
 报告接受**英文或中文**。
 
+## Supported versions / 支持的版本
+
+Only the latest commit on `main` (currently toolchain 0.6.x) is supported.
+
+只支持 `main` 上最新提交（当前工具链 0.6.x）。
+
 ## Reporting a vulnerability / 报告漏洞
 
 **Do not open a public issue for security vulnerabilities.**
@@ -33,6 +39,9 @@ Security-sensitive areas include, but are not limited to:
 Burryn 是一门自举编译器与虚拟机。
 安全敏感面包括但不限于：
 
+- **x86-64 ELF backend** — hand-written native codegen and scheduler (`compiler/backends/x86/`).
+
+  x86-64 ELF 后端 — 手写原生代码生成与调度器。
 - **C backend** — code generation and the emitted `program.c` compiled by `cc`.
 
   C 后端 — 代码生成与交给 `cc` 编译的 `program.c`。

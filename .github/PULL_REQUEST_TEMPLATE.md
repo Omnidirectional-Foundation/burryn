@@ -27,6 +27,7 @@ You may write in English or Chinese — either is fine.
 - [ ] checker / types
 - [ ] compiler
 - [ ] cgen / C backend
+- [ ] x86 / ELF backend
 - [ ] vm / runtime
 - [ ] module system
 - [ ] stdlib / natives

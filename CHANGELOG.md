@@ -3,17 +3,22 @@
 All notable changes to this project are documented here.
 本文件记录项目的所有重要变更。
 
-Versions use a 2-day date range. Latest first.
-版本号采用 2 天日期区间，最新在前。
+Version numbers follow seed-base tags (`v0.(N+1)` after `seed-base-N`), not the
+global two-day window. The date range on each heading spans that version: from
+the day the window opened until the next seed-base tag. Latest first.
+版本号跟 `seed-base-N` tag（打 tag 后下一号为 `v0.(N+1)`），不走全局两日窗口。
+条目标题上的日期是该版本的跨度：从开窗到下一枚 seed-base 之前。最新在前。
 
-## v0.6 (2026-08-16 ~ 08-17)
+## v0.6 (2026-08-13 ~ 08-22)
 
-**Recorded process-level inter-process communication clauses in SPEC** — the
-exec collect-at-exit semantics, TCP-loopback-only bidirectional streaming with
-measured numbers, the missing framing protocol, and the x86 net-IO known
-limitation; four IPC design questions open for owner decision.
-**落地 SPEC 进程级进程间通信条款** — exec 收尾式语义、仅 TCP 的双向流式路径与实测
-loopback 延迟、缺失的分帧协议、x86 net IO 已知限制；四个 IPC 设计取舍挂起待 owner 定案。
+**Recorded IPC clauses, then settled them; landed capture and name-based records;
+stopped restating live status across docs** — SPEC keeps decisions, GOALS keeps
+milestones, grammar keeps surface syntax, CHANGELOG keeps the version window,
+README/tutorial follow observable semantics, CLAUDE.md keeps gates not a second
+roadmap.
+**先落地 IPC 条款再定案；补上 capture 与封闭 record 按名合一；文档不再互相复述「现在怎样」** —
+SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口，README/tutorial
+跟可观察语义，CLAUDE.md 管闸门而不是第二份路线图。
 
 - **Added:** SPEC `§6.3` formal clauses — `exec_start`/`exec_poll` pipe and
   collect-at-exit behavior (stdin inherited, no streaming), TCP loopback as the
@@ -29,6 +34,28 @@ loopback 延迟、缺失的分帧协议、x86 net IO 已知限制；四个 IPC �
   window (`compiler/main.bur` CLI version, `compiler/lib/defs.bur`
   toolchain_version, `compiler/tooling/lsp.bur` serverInfo); `docs/SPEC.md`
   header advanced to v0.6.
+- **Added:** `capture` / `capture(ref …)` clause — default copy-at-capture;
+  `ref` shares a heap cell. Grammar keyword list, parser, and SPEC §6.1
+  (grammar.md §10 revision after the S8.2 freeze).
+- **Added:** S8.4 closed records unify by field name (`record { x, y }` is
+  `record { y, x }`); RecordLit/RecordUpdate emit fields in lexicographic order.
+- **Changed:** SPEC §7 four IPC questions settled by owner — no AF_UNIX
+  primitive, no built-in IPC framing, no first-class `std/procpool`, x86
+  fiber-aware IO approved (`O_NONBLOCK` + fiber park + `poll(2)`; `net_nb` in
+  the same design). The §6.1 "raw blocking net syscall" limitation is superseded
+  by that decision.
+- **Changed:** User-facing closure text in README and tutorial matches SPEC
+  (copy-at-capture; `capture(ref)` for shared `mut`). grammar.md records
+  shebang, labeled loops in `statement`, and `..` range in the expression EBNF.
+- **Changed:** Split `docs/GOALS.md` (milestones and remaining completion lines)
+  from `docs/SPEC.md` (retrospective decisions). Stage state no longer lives in
+  SPEC §5; that section points at GOALS.
+- **Changed:** User-facing docs match the current toolchain: `bur lsp` in the
+  command list; tutorial `net_nb` is `(op, h, data, max)`; CONTRIBUTING uses
+  `bur test [dir]`.
+- **Changed:** README follows the CLI skeleton (Prerequisites, Features,
+  Examples, Documentation before Honest Limitations) with `$` on command
+  examples. Tutorial headings drop emoji.
 
 ## v0.5 (2026-08-03 ~ 08-04)
 
@@ -252,10 +279,10 @@ members.
 
 ## v0.2 (2026-07-10 ~ 07-11)
 
-**Recorded the 2026-07-10 design-review decisions in `docs/GOALS.md`** — a
+**Recorded the 2026-07-10 design-review decisions in `docs/SPEC.md`** — a
 full audit of settled decisions, with corrections where the doc had drifted
 from the implementation.
-**在 `docs/GOALS.md` 记录 2026-07-10 设计审查定案** — 对已定决策的全面
+**在 `docs/SPEC.md` 记录 2026-07-10 设计审查定案** — 对已定决策的全面
 审计，并纠正文档与实现漂移之处。
 
 - Narrowed the determinism promise: pure-compute programs stay byte-for-byte

@@ -45,7 +45,7 @@ Example / 示例:
 ```markdown
 feat(lexer): collect comments as out-of-band trivia
 fix(cgen): access enum fields by integer index
-docs(SPEC): add S4 ecosystem toolchain roadmap
+docs(SPEC): record a capture-semantics decision
 ```
 
 ## Bootstrap fixpoint / 自举定点
@@ -62,10 +62,10 @@ Burryn 的编译器是自举的。任何触及 `ty_unify`、token 编号或自�
 ### Running tests / 运行测试
 
 ```sh
-bur test ./...              # run all *_test.bur files (subprocess-isolated)
-bur test std/json           # run tests in a specific package
-bur test ./... --run parse  # filter by substring
-bur test ./... -v           # verbose: print each test name
+bur test                    # all *_test.bur files (subprocess-isolated)
+bur test std/json           # tests in a specific package
+bur test --run parse        # filter by substring
+bur test -v                 # verbose: print each test name
 ```
 
 Each `test_*` function with zero parameters in a `*_test.bur` file is a test.
@@ -125,7 +125,7 @@ Before submitting a PR that touches the compiler:
 提交触及编译器的 PR 前：
 
 1. `bur check compiler` — no type errors in the compiler itself
-2. `bur test ./...` — all tests pass
+2. `bur test` — all tests pass
 3. `./scripts/examples-verify.sh` — every example matches its `.golden` (or traps with exit 4)
 4. `./scripts/testdata-verify.sh` — whole-program samples + double bootstrap fixpoint
 5. `bur fmt --check compiler` — compiler source is formatted
@@ -152,4 +152,4 @@ Do **not** open public issues for security vulnerabilities. See
 2. Make changes with clear, conventional commits. / 用规范的 commit 提交改动。
 3. If the compiler was changed, verify the bootstrap fixpoint. / 若改动了编译器，验证自举定点。
 4. Open a PR against `main`. / 向 `main` 开 PR。
-5. Be patient — see the maintenance notice in the README. / 请耐心等待，参见 README 中的维护说明。
+5. Be patient — see [Before you start](#before-you-start--开始之前). / 请耐心等待，见上文「开始之前」。
