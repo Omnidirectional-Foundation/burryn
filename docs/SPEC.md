@@ -1,8 +1,8 @@
 # SPEC — Burryn 项目规范
 
-> SPEC v0.6 | Last updated: 2026-08-19
-> 状态:最高优先级约束(权威来源) · 编号体系:统一 `S<n>[.<m>]`(见 §5)
-> 相关文档:[`NUMBERING.md`](NUMBERING.md) 旧编号历史映射 · [`../tutorial.md`](../tutorial.md) 语言教程 · [`../README.md`](../README.md) 项目概览
+> v0.6 · active · 2026-08-22
+> 状态:回顾性权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
+> 相关文档:[`GOALS.md`](GOALS.md) 路线与完成线 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
 > **注意：** 本文档是本项目的最高优先级约束。
 > 所有实现工作以此为准。
@@ -43,7 +43,7 @@
 - 内存管理：GC(mark-sweep)。
   明确不做所有权/借用检查
 - **`mut` 为深语义、绑定级纪律**：经由 `let` 绑定名不可修改其值(含容器内容)；push/元素修改要求 `mut`。
-  不可变性挂在**绑定**上而非值上——无借用检查器与 move 语义，别名可绕过(实测 `let mut b = a` 后改 `b` 可见于 `a`)，故**不承诺值级不可变**。
+  不可变性挂在**绑定**上而非值上——无借用检查器与 move 语义，别名可绕过（`let mut b = a` 后改 `b` 可见于 `a`），故**不承诺值级不可变**。
   **流规则**：`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)，违者 error。
   **只对堆类型(list/map 及含其的类型)生效**：int/float/bool/str/unit 为拷贝语义、无别名危害，豁免；**chan 整体豁免、不论元素类型**(send/recv/close 在现行纪律里本就不要求 mut，chan 别名是 CSP 语义本体)；if/match 作来源时递归看各臂尾表达式，皆新鲜则整体新鲜；来源类型未解时延迟判 error(宁滥勿缺)。
 - **参数默认不可变；`fn f(mut xs)` 声明可变参数**——调用点无标记，与「无借用检查器 + GC」的定位一致，属 Go 式取舍。
@@ -98,19 +98,14 @@
 |---|---|---|---|---|---|
 | 字节码栈式 VM | 16B tagged Value(开发/测试基线、自举 oracle) | 已完整(burrt.h:mark-sweep + ucontext) | 自举期 cc(构建 `bur` 本身) | 天然跨平台(POSIX,两处 #ifdef) | 并入核心 `bur` |
 | **C 后端** | 16B tagged Value | 已完整(同 VM,链接 burrt.c) | `cc`/`gcc`/`clang`(任一) | 天然跨平台 | 并入核心 `bur`,`bur build` 运行期探测 cc |
-| **手写 x86-64** | 8B raw int64,无 tag | 独立实现(shadow stack 编译期类型跟踪;并发 opcode 待设计) | **无**(硬约束) | Linux ELF（S8.1）；Mach-O / PE 有目标 OS 测试环境再开序列化层 | 并入核心 `bur` |
+| **手写 x86-64** | 8B raw int64,无 tag | 独立实现(shadow stack；CSP 不链 burrt.c，见 §6.1) | **无**(硬约束) | Linux ELF（S8.1）；Mach-O / PE 有目标 OS 测试环境再开序列化层 | 并入核心 `bur` |
 | **LLVM 后端** | 复用 C runtime 16B tagged | 链接 burrt.c,免费获得 | `clang`(必须是 clang) | 三平台(随 clang target) | 并入核心 `bur`,运行期探测 clang |
 | **Cranelift 后端** | 复用 C runtime 16B tagged | 链接 burrt.c | 构建期 `cargo`;运行期 `cranelift-driver` + 系统链接器(`cc`/`ld`)落地 `.o` | 三平台(随 driver 编译目标) | codegen 在核心 `bur`;**独立 `cranelift-driver` 二进制** |
 | **WASM 后端** | 16B tagged(仅 GC 子集) | GC 链接 wasm32 版 burrt.c;**CSP 不能链接 ucontext**,须独立状态机或等 WASM Stack Switching 提案 | `clang --target=wasm32` + `wasm-ld` | 平台无关(wasm 本身) | 并入核心 `bur`,运行期探测 clang |
 
 **单二进制交付(§1)精化**:`bur` 一个二进制打包 VM + C + x86 + WASM(codegen) + LLVM(codegen) 五种后端的 codegen 逻辑。真正"零外部工具链"的只有 x86;C/WASM/LLVM 三个后端在运行期需要机器上有 clang 才能产出可执行文件,Cranelift 还需独立 `cranelift-driver` 二进制 + 系统链接器。简言之:**发行的编译器本身自包含,非所有后端都自包含**。
 
-### 后端次序
-
-主线先 x86 Linux ELF（S8.1）。Mach-O 与 PE 不接在 ELF 收尾之后排期，各自等可验收的目标 OS 环境再开（PE = S8.5；Mach-O 同级前置 = macOS 测试环境）。其后并行铺多后端公共基础(runtime 平台抽象、工具链探测),再开 LLVM → Cranelift → WASM。**次序原因**:
-- x86 是唯一真正零工具链依赖的后端,先做完校验"无 cc 也能产出可执行"这个路线核心假设。该假设的验收对象是 Linux 上的单文件程序,不是三平台容器格式,也不是用 x86 编 compiler。
-- 后续三原生后端(LLVM/Cranelift/WASM)在 CSP 上都间接依赖平台抽象层,平台抽象比 x86 序列化层更优先。
-- WASM 的 CSP 不能靠链接现有代码得到,工作量被低估,单独排期(见下)。
+后端开工次序见 [`GOALS.md`](GOALS.md) §5。下列条款是次序背后的约束，不是进度。
 
 ### 工具链探测:按工具聚类,判定独立
 
@@ -186,30 +181,10 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 - 顶级 UX:一个命令、好报错、内建 `test` / `fmt` / `build`
 - `fmt` 唯一官方格式，零配置
 
-## 5. 阶段里程碑(统一 S 编号)
+## 5. 阶段里程碑
 
-全项目单一编号体系为 `S<n>[.<m>]`：`S<n>` 为阶段，`S<n>.<m>` 为阶段内可独立开工、独立验收(自举 fixpoint)的模块。
-旧 `v1/v2/v3/v4`、`L1/L2`、旧「S4 工具链」编号一律作废，历史对照见 [`NUMBERING.md`](NUMBERING.md)。
-状态标记：已完成 / 进行中 / 未开工。
-
-| 阶段 | 子项 | 状态 |
-|------|------|------|
-| **S1 语义内核** | S1.1 HM 全程序推导(occurs + level generalize + let-poly)；S1.2 穷尽性检查；S1.3 GC(mark-sweep 保守栈扫描)；S1.4 CSP 基础(spawn/channel/死锁检测) | 已完成 |
-| **S2 C 后端与语言完备** | S2.1 C 后端(顺序 + 并发)；S2.2 模块系统；S2.3 map；S2.4 `select` + `close`；S2.5 深 `mut` + `fn(mut xs)`；S2.6 `pub`；S2.7 必要 stdlib(os/exec、fs) | 已完成 |
-| **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已完成 |
-| **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已完成 |
-| **S5 删 Go** | CLI driver 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已完成 |
-| **S6 生态工具链** | S6.1 依赖解析；S6.2 网络拉取；S6.3 `bur fmt`；S6.4 `bur test`；S6.5 诊断/DX；S6.6 std/json + std/testing；S6.7 runtime IO；S6.8 checker 债批 | 已完成 |
-| **S7 语言特性扩展** | S7.1 字符串插值；S7.2 管道 `|>`；S7.3 match guard；S7.4 命名参数(**已否决**，编号保留)；S7.5 编译期常量；S7.6 `defer`；S7.7 net stdlib；S7.8 可选函数签名标注 | 已完成 |
-| **S8 后端与重型类型** | S8.1 手写 x86-64 Linux ELF 后端（单文件程序；完成线见 §6.1）；S8.2 语法冻结 + [`grammar.md`](grammar.md) **已完成**；S8.3 row polymorphism **已完成**；S8.4 封闭 records（按字段名合一）；S8.5 PE 后端(前提 = runtime Windows 移植)；S8.7 类型别名 **已完成**。**全部子项由 LLM 实现** | 进行中 |
-| **S9 LSP 与编辑器生态** | S9.1 LSP 核心服务器(JSON-RPC + 文档同步 + 诊断推送)；S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)；S9.3 VSCode 薄扩展(TextMate grammar + LSP client)；S9.4 nvim/vim/emacs 配置片段。前置 = S8.2 语法冻结 | 部分实现 |
-| **S10 包生态** | 已有 std 包：`json`/`net`/`testing`/`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板 + 示例包；S10.3 `bur doc`(导出签名 + 注释 → Markdown)；S10.4 包质量基础设施(CI 模板、测试约定、版本规范)。原则：能纯 Burryn 就不加 native；每包带 bur.mod + `*_test.bur`，随 std_embed 分发 | 未开工 |
-
-- S1–S5 为自举闭环：`bur` 由本语言写成、经 cc 逐字节重建自身，main 上 Go 整棵树已清零，Go 种子归档 `archive/go-host`
-- stdlib 按「够自举用 + owner 真实脚本需求」逐个生长，不追大而全
-- 编译速度是硬指标：任何特性提案先回答「是否显著拖慢编译」
-- 触及 `ty_unify` / token 编号 / 自举链的改动(尤其 S8.3/S8.4)，改完必验 fixpoint(gen1 == gen2 逐字节)
-- **S8 内部推进顺序**：S8.4 封闭 records → S8.1 ELF 收尾（fiber 感知 IO）→ S8.5 PE。S8.2 / S8.3 / S8.7 已完成。Mach-O 不在此顺序内（见 §6.1）。类型先行(日常效用高于第二后端)。S8 之后进 S9
+阶段表、完成线、未开工项见 [`GOALS.md`](GOALS.md)。编号仍为 `S<n>[.<m>]`，旧编号对照 [`NUMBERING.md`](NUMBERING.md)。
+编译速度是硬指标：任何特性提案先回答「是否显著拖慢编译」。
 
 ## 6. 工程规范
 
@@ -233,9 +208,9 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 - **排除**:Linear(全局)——永不
 - **backlog**:局部 Affine(资源)——file/socket/channel 的 use-after-close 检查,流敏感 lint 级,不碰 GC,能把 close-of-closed-channel 运行时 trap 提前为编译期错
 
-### x86-64 后端架构（S8.1，开发中）
+### x86-64 后端架构（S8.1）
 
-单文件 `compiler/backends/x86.bur` + ELF64 发射 `compiler/backends/elf.bur`。无 cc 依赖,手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义(cgen 的根栈纪律照搬到手写代码生成)。
+实现：`compiler/backends/x86/x86.bur` + ELF64 发射 `compiler/backends/x86/elf.bur`。无 cc 依赖,手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义(cgen 的根栈纪律照搬到手写代码生成)。
 
 #### 寄存器约定
 
@@ -314,33 +289,30 @@ Callee prologue: `push rbp; mov rbp, r14; lea r14, [r15 - 8*(arity+1)]`。
 Callee epilogue: peek return value, collapse to r14, restore rbp, ret。
 op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 
-#### net/exec IO fiber 感知（设计定案 2026-08-19，原「已知限制：非 fiber 感知」升级）
+#### net/exec IO fiber 感知
 
-x86 后端的 net/exec IO 从裸阻塞 syscall 升级为 fiber 感知等待，语义对齐 C runtime（`bur_wait_current_fd` + 调度器轮询）：
+x86 后端的 net/exec IO 为 fiber 感知等待，语义对齐 C runtime（`bur_wait_current_fd` + 调度器轮询）。落地进度见 [`GOALS.md`](GOALS.md) §2。
 
 - **禁止裸阻塞 syscall 卡死全进程**：`O_NONBLOCK` + 当前 fiber park + 调度器等已注册 fd 就绪后唤醒
-- **等 fd 用 `poll(2)`**，不上 epoll（epoll 是独立债，见 `reports/backlog-net-io-runtime.md`）
+- **等 fd 用 `poll(2)`**，不上 epoll
 - **覆盖面**：`tcp_accept` / `tcp_dial` / `net_read` / `net_write` / `sleep`；`exec_poll` 的等待不得在别的 fiber 做 net 时把整进程卡住。不改 §6.3 的 exec「收尾式、非流式」
-- **不链 `burrt.c` 的 CSP**：park/wake 走现有 8 槽 fiber 调度器（值表示 8B raw int64 与 C runtime 16B tagged Value 不兼容）
-- **`net_nb` 与本项同一设计**：作为非阻塞原语 + 阻塞 native 的 park 路径一并落地（S8 收尾），不做 int3 占位再推翻
+- **不链 `burrt.c` 的 CSP**：park/wake 走 8 槽 fiber 调度器（8B raw int64 与 C runtime 16B tagged Value 不兼容）
+- **`net_nb` 与本项同一设计**：非阻塞原语与阻塞 native 的 park 路径一并落地，不做 int3 占位再推翻
 
-定案前现状（留档）：x86 的 `net_read` / `net_write` / `tcp_accept` / `tcp_dial` 曾是裸阻塞 syscall（`x86gen_net_read_native` 等直接 `sys_read` / `sys_accept`，无 fd 注册与 park 机制），阻塞期间卡死全部 fiber——`exec_poll` 不能并发、pipe 写满即死锁；该模型只适合单连接顺序处理。定案后与 VM/C 对齐。
+### CSP opcode 与调度
 
-### Phase 3: CSP opcode（设计定案 2026-08-11）
+x86 后端无 libc、无 ucontext——fiber 调度、park/wake、上下文切换全部自写。值表示 8B raw int64（无 tag），与 C runtime 16B tagged Value 不兼容，**不能链接 burrt.c 的 CSP**。
 
-x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、上下文切换全部自写。值表示是 8B raw int64（无 tag），与 C runtime 的 16B tagged Value 不兼容，**不能链接 burrt.c 的 CSP**。以下为定案设计，全部子项照此实现：
+- **op_spawn (44)**: 2 bytes `[op][argc:1B]`。fiber struct + 独立栈 + 上下文切换
+- **op_send (45)** / **op_recv (46)**: 各 2 bytes。channel + sendq/recvq + park/wake
+- **op_chan_next (47)**: 3 bytes `[op][cidx:2B]`
+- **op_select (48)**: variable
+- **op_defer (49)**: 1 byte。per-frame defer 栈
+- **close_upvalue**: 跳过——默认值捕获不产生 open upvalues；ref 捕获用恒开 cell（见下节）
 
-- **op_spawn (44)**: 2 bytes `[op][argc:1B]`。需 fiber struct + 独立栈 + 上下文切换。
-- **op_send (45)**: 2 bytes。需 channel struct + sendq/recvq + park/wake。
-- **op_recv (46)**: 2 bytes。同 send。
-- **op_chan_next (47)**: 3 bytes `[op][cidx:2B]`。channel 迭代。
-- **op_select (48)**: variable。多路 select,最复杂 CSP opcode。
-- **op_defer (49)**: 1 byte。需 per-frame defer stack(可与 CSP 并发独立实现,但仍需 defer 栈管理)。
-- **close_upvalue**: 跳过——默认值捕获不产生 open upvalues；ref 捕获用恒开 cell（见下节）。
+#### 闭包捕获语义：默认值捕获 + 显式 ref
 
-#### 闭包捕获语义：默认值捕获 + 显式 ref（设计定案 2026-08-12）
-
-- **默认捕获 = 值拷贝**（copy-at-capture）：闭包槽存捕获时快照。x86 现状即此语义；VM/C runtime 的 `op_closure` 默认分支改为直接压入栈值（不再建 open upvalue cell），两后端语义统一
+- **默认捕获 = 值拷贝**（copy-at-capture）：闭包槽存捕获时快照。VM、C runtime 与 x86 的 `op_closure` 默认分支均直接压入栈值（不建 open upvalue cell），三端可观察语义相同
 - **显式 `capture(ref n)` = 引用捕获**：闭包槽存 cell 指针，读写经 cell 与外部变量共享存储
   - 语法：闭包块前可选捕获子句，`capture` 为保留字，`ref` 仅 capture 列表内特判；未被 `ref` 声明的捕获项即默认值捕获（显式列出与省略同义）
 - **x86 cell 实现**：被 ref 捕获的 mut 局部**提升为 cell 指针槽**——所在函数预扫描本函数全体闭包的 ref 声明，被声明的变量其栈槽存 `&cell`（声明时堆分配 8B），该变量的 get/set_local 全部经 cell 解引用；闭包 upval 槽存同一 cell 指针。GC：cell 为普通堆对象，mark 跟随内容
@@ -374,7 +346,7 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 - 堆对象布局照 C runtime `OChannel`：bounded FIFO buf + sendq/recvq/waiters + closed
 - send/recv/close 三路分支照 VM 语义（`vm.bur` op_send/op_recv）逐条翻译
 - **操作数留在值栈直到操作完成**——单 send 不用 fiber.sendVal 字段，park 期间值栈整体保留，比 C runtime 更简单
-- **元素类型传播（设计定案 2026-08-13，方案 ②）**：x86 后端不消费 checker 输出，bytecode 的 op_send/op_recv 无类型操作数，故 channel 元素类型由 x86 后端自维护的栈类型影子（`type_shadow`/`pos_types`）传播：
+- **元素类型传播**：x86 后端不消费 checker 输出，bytecode 的 op_send/op_recv 无类型操作数，故 channel 元素类型由 x86 后端自维护的栈类型影子（`type_shadow`/`pos_types`）传播：
   - `chan(n)` 构造推类型 `"chan"`（元素未知）；`ch <- v` 处若 v 的类型影子已知（非空），把 ch 持有槽的类型升级为 `"chan:<v>"`（经 op_get_local 推入的 `"slot:N"` 影子定位槽位，写回 `pos_types[N]`）
   - `<-ch` / `for x in ch` / select recv 臂的结果类型从 ch 的类型影子取元素：`"chan:X"` → 结果类型 `X`；`"chan"`（未知）→ 空/`int` 兜底
   - **跨函数传播**：复用已实现的 `fn_param_types` 调用点聚合（sig_specs 机制）——spawn/fn 调用实参为 `"chan:X"` 时，被调函数参数槽类型经 prologue 填充拿到 `"chan:X"`，函数体内 recv 即正确
@@ -389,19 +361,18 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 #### GC 覆盖与 park 一致性（定案）
 
 - fiber 表 = 全局 root；chan 的 buf、sendq→fiber→sendVal、waiters 全链路可达
-- **测试硬性要求（第一批单测必含）**：fiber A park 在 send 上时触发 GC，断言待发送值仍存活——防 top 指针漂移导致漏扫
+- park 在 send 上的 fiber 触发 GC 时，待发送值仍须存活（防 top 指针漂移漏扫）
 - mark 时当前 fiber 扫值栈 `[stack_base, r15)`，其余 fiber 扫其 ctx 槽 + 值栈（保守扫，地址范围检查排除 raw int 误判）
 
 #### 死锁检测（定案）
 
 - 调度器主循环：ready 空 && 存在非 done fiber → fatal deadlock（exit 4，文本照 C runtime）
-- x86 无 timer/io 阻塞（net_nb 等仍未实现 int3），检测条件比 C runtime 简单
+- 等 fd / timer 的 fiber 不算 ready；未注册进 waitset 的阻塞不得误判为死锁（与 §6.1 fiber 感知 IO 一致）
 
 #### defer（定案，独立于 CSP 先行实现）
 
 - per-fiber defer 栈（数组存 closure 指针）+ 帧进入记 watermark（照 C runtime `bur_run_defers` 的 dbase 语义）
 - op_defer 压入；函数 epilogue 前按 watermark LIFO 执行，返回值先 peek 保留在栈上再执行 defer（防 defer 内分配回收）
-- **实现顺序（从独立到耦合）**：defer → fiber 调度器（切换 + spawn + 死锁检测）→ channel（send/recv/close）→ chan_next → select
 
 ## 6.2 LSP 与编辑器生态(工程视角，对应 S9)
 
@@ -416,7 +387,7 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 **语言特性(S9.2)**：
 - hover：显示推导类型/签名(复用 checker 推导结果)
 - go-to-definition：从名字使用处跳到绑定处(需 AST span → 定义 span 映射，跨文件走 module loader)
-- completion：作用域感知名字补全(局部变量、函数名、包成员 `pkg.`)
+- completion：作用域感知名字补全(局部变量、函数名、包成员 `pkg::`)
 - formatting：调 `bur fmt -`(stdin→stdout)
 - signature-help：函数调用时显示参数信息
 
@@ -430,13 +401,11 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 | Emacs | 用户配置 | lsp-mode 或 eglot 配置片段 |
 | 其他 | — | Helix / Zed / Sublime 等 LSP-capable 编辑器直连 |
 
-**实现顺序**：S9.1 核心服务器(JSON-RPC 传输 + 文档同步 + 诊断推送)→ S9.2 语言特性(hover / go-to-def / completion / formatting / signature-help)→ S9.3 VSCode 扩展(首个客户端，验证服务器)→ S9.4 JetBrains 插件 + 其他编辑器配置。
+传输层用 S6.7 的 `read_stdin(max: int) -> str`（读至多 max 字节，EOF 返回 `""`）配合 `print`（stdout）。S9 剩余项与顺序见 [`GOALS.md`](GOALS.md) §3。
 
-**前置与依赖**：S9 前置 = S8.2 语法冻结(语法不再变，LSP 不追语法债)。S9.1 的 check 管线改造(内存源码)可与 S8.3/S8.4 并行，但 S9 整体排在 S8 之后。`std/json` 已就绪(S6.6)，JSON-RPC 层无需新 native。**前置缺口**：语言目前无 stdin 读取能力——全部 native 中无 `read_line`/`read_stdin`/`input` 等，LSP 服务器的 JSON-RPC Content-Length 帧需要精确读 N 字节。修法 = 新增 `read_stdin(max: int) -> str`(读至多 max 字节，EOF 返回 `""`，fiber 级阻塞)或更通用的 fd 读取接口；配合现有 `print`(stdout 写)即构成 LSP 传输层。归 S9.1 前置小批。
+## 6.3 进程间通信与 runtime IO（exec / net）
 
-## 6.3 进程间通信与 runtime IO 现状（exec / net）
-
-> 本节为已实测确认的现状条款（非设计定案）；行为边界与定案同属项目约束，实现不得偏离本节描述的行为。
+> 本节为行为条款，与语言定案同属约束。实现不得偏离。
 
 ### exec 子进程：收尾式，非流式
 
@@ -447,11 +416,11 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 ### 进程间双向流式通信：唯一路径 = TCP loopback
 
 - 全语言唯一支持双向流式通信的原语为 `tcp_listen` / `tcp_accept` / `tcp_dial` + `net_read` / `net_write` / `net_close`；C runtime 与 VM 均为 fiber 感知阻塞（park 当前 fiber，调度器继续运行）
-- 实测 loopback 数据（VM runtime；机器原生闭环基线 ~34 µs/round-trip）：
-  - 单进程内两 fiber echo：~231 µs/round-trip
-  - 跨进程（`exec_start` 拉起 worker，TCP）：~1350–1550 µs/msg
-  - 512KiB 往返：~65 MiB/s（单向 ~32.6 MiB/s）
-- 跨进程延迟的主导开销在运行时调度器的 idle-wait 路径（实测观察：socket fd 未注册进 waitset、等待周期 ~1ms），非 TCP 层本身；该路径成因未定案，优化与否为独立工作项（不隐含语义承诺）
+- VM runtime 上 TCP loopback（机器原生闭环基线约 34 µs/round-trip）：
+  - 单进程内两 fiber echo：约 231 µs/round-trip
+  - 跨进程（`exec_start` 拉起 worker，TCP）：约 1350–1550 µs/msg
+  - 512KiB 往返：约 65 MiB/s（单向约 32.6 MiB/s）
+- 跨进程延迟的主导开销在调度器 idle-wait（socket fd 未注册进 waitset、等待周期约 1ms），非 TCP 层本身。是否优化见 [`GOALS.md`](GOALS.md) §6，不改本节语义
 - exec 管道与 TCP 无可比 round-trip：exec 为单向、收尾式，无双向通道
 
 ### 消息分帧：不存在，需自行实现
@@ -459,13 +428,11 @@ x86 后端无 libc、无 ucontext——fiber 调度器、阻塞、park/wake、�
 - `std/net` 仅提供 `write_line`（末尾追加 `\n`）作为事实上的行分隔约定；`std/json` 仅提供 parse/render/pretty/get
 - 无长度前缀、无内置帧协议；消息边界必须由使用者自行实现（如基于 `std/json` 手写 newline 分帧）
 
-## 7. 当前待定项(动工前必须先问 owner)
+## 7. 已决、不再重开
 
-（新出现的待定设计决策须登记于此并先问 owner，规矩不变。）
+新出现的设计决策仍须先问 owner，写入本文件对应节，不在实现侧自行拍板。下列四项不再接受重新提案：
 
-以下四项（原「进程级并发待定」）已由 owner 于 2026-08-19 定案，从待定表划走，不再接受重新提案：
-
-- **Unix domain socket 原语：不做**。TCP loopback 保持本机双向流式通信的唯一原语。§6.3 实测跨进程延迟主导在调度器 idle-wait（~1ms、fd 未注册进 waitset），非 TCP 层本身；先加 AF_UNIX 不解决实测瓶颈，还多一套 native（五处 + x86）并与 S8.5 PE/Windows 移植冲突。等 fiber 感知 IO 落地、waitset 真成瓶颈再重开。
-- **内置 IPC 消息协议：不做**。维持 `std/json` + 使用者自行分帧（行分隔或长度前缀都在库/应用层）。类 Erlang 内置消息格式等于第二套运行时协议，与「显式优先 / 护住简洁」冲突；CSP 已是唯一并发模型，不再叠 actor 线格式。需要约定时仅文档化「JSON + `\n`」惯例，不进语言。
-- **`std/procpool` 一等能力：不做**。supervisor/worker 维持「模式可用，语言不提供额外支持」。一等化会倒逼流式 exec stdin、重启策略、跨后端行为——而 §6.3 仍定 exec 收尾式、非流式。真要做 std 包，也须在 x86 fiber 感知 IO 落地后另开，不能现在设计。
-- **x86 后端 fiber 感知 IO：做**。S8.1 与 VM/C 的 CSP+net 对齐缺口，非新语言特性。不定它，`net_loopback` / `net_errors` 的 x86 死锁不会消失，x86 也撑不住进程级并发。实现约束见 §6.1「net/exec IO fiber 感知（设计定案 2026-08-19）」；`net_nb` 与本项同一设计一并落地（S8 收尾）。
+- **Unix domain socket 原语：不做**。TCP loopback 保持本机双向流式通信的唯一原语。§6.3 跨进程延迟主导在调度器 idle-wait，加 AF_UNIX 不解决该瓶颈，还多一套 native 并与 S8.5 PE/Windows 移植冲突。fiber 感知 IO 落地且 waitset 成为瓶颈后再议。
+- **内置 IPC 消息协议：不做**。维持 `std/json` + 使用者自行分帧。类 Erlang 内置消息格式等于第二套运行时协议，与「显式优先」冲突。
+- **`std/procpool` 一等能力：不做**。supervisor/worker 维持「模式可用，语言不提供额外支持」。一等化会倒逼流式 exec stdin；§6.3 仍定 exec 收尾式、非流式。
+- **x86 后端 fiber 感知 IO：做**。约束见 §6.1；完成线见 [`GOALS.md`](GOALS.md) §2。

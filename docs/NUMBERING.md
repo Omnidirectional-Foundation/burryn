@@ -1,8 +1,8 @@
 # NUMBERING.md — 编号历史映射
 
-> 相关文档：[`SPEC.md`](SPEC.md) · [`../tutorial.md`](../tutorial.md) · [`../README.md`](../README.md)
+> 相关文档：[`SPEC.md`](SPEC.md) 已定设计 · [`GOALS.md`](GOALS.md) 阶段表 · [`../README.md`](../README.md)
 
-> 早期多套编号并存、语义交叉，已统一为 SPEC §5 的 `S<n>[.<m>]`；旧编号按映射表回溯。
+> 早期多套编号并存、语义交叉，已统一为 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）；旧编号按映射表回溯。
 
 ## 旧 → 新 映射
 
@@ -26,4 +26,4 @@
 | §6.6 轻量特性评估 | 插值/管道/guard/命名参数/常量 | **S7**(S7.1–S7.5) |
 | §6.6 封闭 records | 改 unify，原标「独立 milestone」 | **S8.4**(移出 S7，与 row poly 同段) |
 | §6.7 Row Polymorphism(v4) | 重型类型系统首选项 | **S8.3** |
-| §6.7 Effects / Refinement / GADTs / Linear | 重型类型系统其余项 | 明确排除(见 §6.7) |
+| §6.7 Effects / Refinement / GADTs / Linear | 重型类型系统其余项 | 明确排除(见 SPEC §6.1) |
