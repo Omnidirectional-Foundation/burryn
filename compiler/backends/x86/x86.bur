@@ -52,20 +52,27 @@ pub let rt_main_fiber = 112
 pub let rt_fiber_list = 120
 pub let rt_waitset_n = 128
 pub let rt_timer_n = 136
-// waitset 每项 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]，数组本身即 pollfd 数组
-// waitset entries are 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]; the array is the pollfd array
+// waitset 每项 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]；poll(2) 只认连续 8B 记录，
+// 故 poll 前把各条目前 8B 拷入 POLLFD_BASE 暂存区，返回后把 revents 回写条目 +6
+// waitset entries are 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]; poll(2) consumes
+// contiguous 8B records, so each entry's leading 8B is staged into POLLFD_BASE before polling,
+// and revents is written back to entry+6 afterwards
 pub let WAITSET_CAP = 64
 pub let TIMER_CAP = 64
 // timer 每项 16B = [deadline_ns:8][fiber:8]
 // timer entries are 16B = [deadline_ns:8][fiber:8]
 pub let WAITSET_BASE = 144
-// TIMER_BASE/RUNTIME_SIZE 是包级字面量（编译器限制：包级 let 只允许字面量算术），
-// 依赖 WAITSET_CAP/TIMER_CAP=64：TIMER_BASE = 144 + 64*16 = 1168；
-// RUNTIME_SIZE = 128 + 16 + 64*16 + 64*16 = 2192
-// TIMER_BASE/RUNTIME_SIZE are package-level literals (the compiler restricts package
-// lets to literal arithmetic); they depend on WAITSET_CAP/TIMER_CAP=64
+// POLLFD_BASE/TIMER_BASE/RUNTIME_SIZE 是包级字面量（编译器限制：包级 let 只允许字面量算术），
+// 依赖 WAITSET_CAP/TIMER_CAP=64：TIMER_BASE = 144 + 64*16 = 1168、
+// POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2192；
+// RUNTIME_SIZE = 128 + 16 + 64*16 + 64*16 + 64*8 = 2704
+// POLLFD_BASE/TIMER_BASE/RUNTIME_SIZE are package-level literals (the compiler restricts
+// package lets to literal arithmetic); they depend on WAITSET_CAP/TIMER_CAP=64:
+// TIMER_BASE = 144 + 64*16 = 1168, POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2192;
+// RUNTIME_SIZE = 128 + 16 + 64*16 + 64*16 + 64*8 = 2704
 pub let TIMER_BASE = 1168
-pub let RUNTIME_SIZE = 2192
+pub let POLLFD_BASE = 2192
+pub let RUNTIME_SIZE = 2704
 // gc_recs 每项 24B：[ptr][size][mark]；gray 区首 8B 为计数
 // gc_recs entries are 24B: [ptr][size][mark]; the gray area's first 8B holds its count
 pub let GC_RECS_CAP = 65536
@@ -890,12 +897,6 @@ fn x86gen_chan_format_at(off) {
     l1 + alloc + l2 + mov_mr(r15, off, r9)
 }
 
-// is_unimpl_native 判断 native 是否未实现（发射 int3）
-// is_unimpl_native tells whether a native is unimplemented (emits int3)
-fn is_unimpl_native(name) {
-    name == "net_nb"
-}
-
 // x86gen_trap_exit 发射 trap：文本按 8B 块写入 [rsp-n..] + write(2) + exit 4
 // x86gen_trap_exit emits a trap: the message in 8-byte chunks at [rsp-n..] + write(2) + exit 4
 fn x86gen_trap_exit(msg) {
@@ -1344,6 +1345,28 @@ fn x86gen_stdin_nb_native() {
     head
 }
 
+// x86gen_set_nonblock_at 生成 fcntl 设置 O_NONBLOCK 的代码：[base+off] 的 fd
+// x86gen_set_nonblock_at emits fcntl setting O_NONBLOCK on the fd at [base+off]
+fn x86gen_set_nonblock_at(base, off) {
+    let get = mov_rm(rdi, base, off) + mov_ri64(rsi, 3) + xor_rr(rdx, rdx) + sys_mov_rax(72) + syscall()
+    let set = mov_rm(rdi, base, off) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
+    get + mov_rr(r8, rax) + mov_ri64(rdx, 2048) + or_rr(rdx, r8) + set
+}
+
+// x86gen_fd_park_at 生成 fd 等待序列：waitset 注册（[base+off] 的 fd + events 低 16 位）→
+// 置 FB_BLOCKED_FD → push 恢复点 → 保存 ctx → 回调度器。唤醒后从下一条指令继续
+// x86gen_fd_park_at emits the fd-wait sequence: waitset registration (fd at [base+off] with
+// events low 16 bits), set FB_BLOCKED_FD, push the resume point, save ctx, re-enter the
+// scheduler. The fiber resumes at the following instruction
+fn x86gen_fd_park_at(sched_addr, waitset_add_addr, base, off, events) {
+    let park_save = mov_mr(rdi, FB_RSP, rsp) + mov_mr(rdi, FB_RBP, rbp) + mov_mr(rdi, FB_R14, r14) + mov_mr(rdi, FB_R15, r15)
+    let park_tail = mov_ri64(r8, sched_addr) + jmp_r(r8)
+    let park_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(park_save) + str_len(park_tail)) + push_r(r8)
+    let set_status = mov_ri64(r8, FB_BLOCKED_FD) + mov_mr(rdi, FB_STATUS, r8)
+    let add_call = mov_rm(rax, base, off) + mov_ri64(rcx, events) + mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_ri64(r8, waitset_add_addr) + call_r(r8)
+    add_call + set_status + park_push + park_save + park_tail
+}
+
 // x86gen_parse_ip_at 解析 [r15+off] 的 str 为 IPv4 四字节（内存序）到 [rsp+0..3]
 // 成功 rax=0，失败 rax=-1。寄存器：rsi 字符指针、rdi 结束、r8 移位数(0/8/16/24)、r9 累加、r10 段值、r11 段位数
 // x86gen_parse_ip_at parses the str at [r15+off] as four IPv4 bytes (memory order) into [rsp]
@@ -1404,76 +1427,133 @@ fn x86gen_tcp_listen_native() {
     let listen_seq = mov_rr(rdi, r9) + mov_ri64(rsi, 128) + sys_mov_rax(50) + syscall()
     let bind_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(49) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let reuse_seq = mov_ri64(rax, 1) + mov_mr(rsp, 4, rax) + mov_rr(rdi, r9) + mov_ri64(rsi, 1) + mov_ri64(rdx, 2) + lea(r10, rsp, 4) + mov_ri64(r8, 4) + sys_mov_rax(54) + syscall()
-    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    // listener fd 置 O_NONBLOCK：accept 返回 EAGAIN 才能 park（VM 语义：socket 出生即非阻塞）
+    // set O_NONBLOCK on the listener fd: accept must return EAGAIN to park (VM semantics: sockets
+    // are born non-blocking)
+    let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let sockaddr = x86gen_sockaddr_at()
-    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
-    head + sockaddr + socket_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close
+    head + sockaddr + socket_seq + nonblock_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close
 }
 
-// x86gen_tcp_accept_native 内联 tcp_accept：阻塞式 accept syscall，返回 Result<int, str>
-// x86gen_tcp_accept_native inlines tcp_accept: a blocking accept syscall, returning Result<int,
-// str>
-fn x86gen_tcp_accept_native() {
-    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 8, rcx) + vs_pop_n(1)
-    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 8, rcx) + vs_pop_n(1)
+// x86gen_tcp_accept_native 内联 tcp_accept：accept syscall + O_NONBLOCK + EAGAIN/EINTR 重试，
+// 返回 Result<int, str>。fd 非阻塞：EAGAIN → waitset 注册 POLLIN → park；唤醒后重试
+// x86gen_tcp_accept_native inlines tcp_accept: the accept syscall with O_NONBLOCK and
+// EAGAIN/EINTR retry, returning Result<int, str>. The fd is non-blocking: EAGAIN registers
+// POLLIN on the waitset and parks; on wake it retries
+fn x86gen_tcp_accept_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
     let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
-    let fail = err_str + err_inst
-    let ok_path = ok_inst + jmp_rel32(str_len(fail))
-    let accept_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(ok_path) + str_len(fail))
-    accept_seq + ok_path + fail
+    let fail = err_str + err_inst + add_ri32(rsp, 8)
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 8, 1)
+    let retry_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall()
+    let ok_path = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path))
+    let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
+    sub_ri32(rsp, 8) + retry_seq + err_check + fd_park + retry_back + ok_path + fail
 }
 
-// x86gen_tcp_dial_native 内联 tcp_dial：socket/connect syscalls，返回 Result<int, str>
-// x86gen_tcp_dial_native inlines tcp_dial: socket/connect syscalls, returning Result<int, str>
-fn x86gen_tcp_dial_native() {
+// x86gen_tcp_dial_native 内联 tcp_dial：socket/connect/getsockopt syscalls，返回 Result<int, str>。
+// fd 非阻塞：EINPROGRESS/EAGAIN → waitset 注册 POLLOUT → park；唤醒后 getsockopt(SO_ERROR) 验连通
+// x86gen_tcp_dial_native inlines tcp_dial: socket/connect/getsockopt syscalls, returning
+// Result<int, str>. The fd is non-blocking: EINPROGRESS/EAGAIN registers POLLOUT on the waitset
+// and parks; on wake, getsockopt(SO_ERROR) confirms the connection
+fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
     let fail = err_str + err_inst + add_ri32(rsp, 32)
-    let fail_close = mov_rr(rdi, r9) + sys_mov_rax(3) + syscall() + fail
-    let connect_ok = mov_rr(rax, r9) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
-    let connect_fail = test_rr(rax, rax) + jl_rel32(str_len(connect_ok))
-    let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
-    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(connect_seq) + str_len(connect_fail) + str_len(connect_ok))
+    // park 后 r9 不可靠：fd 一律从 [rsp+8] 重载（VM 语义：fd 是 int，不参与 GC 指针更新）
+    // r9 is unreliable after park: reload the fd from [rsp+8] everywhere (VM semantics: an fd is
+    // an int, so GC pointer updates never apply)
+    let close_ops = mov_rm(rdi, rsp, 8) + sys_mov_rax(3) + syscall()
+    let fail_close = close_ops + fail
     let sockaddr = x86gen_sockaddr_at()
-    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(connect_seq) + str_len(connect_fail) + str_len(connect_ok))
+    let connect_ok = mov_rm(rax, rsp, 8) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    // sockcheck：getsockopt(SO_ERROR) == 0 才算连通；失败走 fail_close
+    // sockcheck: getsockopt(SO_ERROR) == 0 confirms the connection; failures go to fail_close
+    let sockcheck = mov_rm(rdi, rsp, 8) + mov_ri64(rsi, 1) + mov_ri64(rdx, 4) + lea(r10, rsp, 12) + lea(r8, rsp, 4) + mov_ri32(rcx, 4) + mov_mr32(rsp, 4, rcx) + sys_mov_rax(55) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(mov_rm32(rcx, rsp, 12)) + str_len(test_rr(rcx, rcx)) + str_len(je_rel32(0)) + str_len(connect_ok)) + mov_rm32(rcx, rsp, 12) + test_rr(rcx, rcx) + jne_rel32(str_len(connect_ok))
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, rsp, 8, 4)
+    let connect_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 115)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + str_len(sockcheck)) + neg_r(rax) + mov_ri64(rdx, 115) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0))) + jmp_rel32(str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
+    let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
-    head + sockaddr + socket_seq + connect_seq + connect_fail + connect_ok + fail_close
+    head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close
 }
 
-// x86gen_net_read_native 内联 net_read：read syscall 进新 str，返回 Result<str, str>
+// x86gen_net_read_native 内联 net_read：read syscall 进新 str，返回 Result<str, str>。
+// fd 非阻塞：EAGAIN → waitset 注册 POLLIN → park；唤醒后重试；EINTR 直接重试
 // x86gen_net_read_native inlines net_read: a read syscall into a fresh str, returning Result<str,
-// str>
-fn x86gen_net_read_native() {
+// str>. The fd is non-blocking: EAGAIN registers POLLIN on the waitset and parks; on wake it
+// retries; EINTR retries directly
+fn x86gen_net_read_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
     let fail = err_str + err_inst
-    let ok_path = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(fail))
-    let read_seq = mov_rm(rdi, r15, 0 - 16) + mov_rr(rdx, r10) + sys_mov_rax(0) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(ok_path)) + ok_path
-    let alloc_seq = mov_rr(r10, r11) + mov_rr(r8, r12) + mov_mr(r8, 0, r10) + lea(rsi, r8, 8) + add_rr(r12, r10) + add_ri32(r12, 8)
-    let empty_ok = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(alloc_seq) + str_len(read_seq) + str_len(ok_path) + str_len(fail))
-    let max_seq = mov_rm(r11, r15, 0 - 8) + test_rr(r11, r11) + jl_rel32(str_len(empty_ok) + str_len(alloc_seq) + str_len(read_seq) + str_len(ok_path)) + je_rel32(0) + jmp_rel32(str_len(empty_ok))
-    max_seq + empty_ok + alloc_seq + read_seq + ok_path + fail
+    // alloc_seq 先按 max 分配 str（len 头 + 字节区），root 存 [r15-24]；park 后 GC 会更新 root，
+    // retry_seq 从 root 重载 buf 指针（r8 在 park 间不可靠）
+    // alloc_seq allocates the str for max bytes (len header plus byte area), rooting it at
+    // [r15-24]; GC updates the root across a park, so retry_seq reloads the buf pointer from it
+    // (r8 is unreliable across a park)
+    let alloc_seq = mov_rr(r8, r12) + mov_mr(r8, 0, r11) + add_ri32(r12, 8) + add_rr(r12, r11) + mov_mr(r15, 0 - 24, r8)
+    let retry_seq = mov_rm(rdi, r15, 0 - 16) + mov_rm(r8, r15, 0 - 24) + lea(rsi, r8, 8) + mov_rm(rdx, r15, 0 - 8) + sys_mov_rax(0) + syscall() + test_rr(rax, rax)
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 1)
+    // zero_ok：max == 0 → Ok("")（VM 语义：立即返回空串，不进系统调用）
+    // zero_ok: max == 0 yields Ok("") (VM semantics: an immediate empty string, no syscall)
+    let zero_ok = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(fail))
+    // ok_path：n >= 0（含 0 = EOF）→ Ok(str)，落 len 后跳 END（跳过 zero_ok + fail）
+    // ok_path: n >= 0 (0 is EOF) yields Ok(str); after storing the length it jumps to END (past
+    // zero_ok and fail)
+    let ok_path = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(zero_ok) + str_len(fail))
+    let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path) + str_len(zero_ok))
+    let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
+    let max_check = mov_rm(r11, r15, 0 - 8) + test_rr(r11, r11) + jl_rel32(6 + str_len(alloc_seq) + str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + str_len(retry_back) + str_len(ok_path) + str_len(zero_ok)) + je_rel32(str_len(alloc_seq) + str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + str_len(retry_back) + str_len(ok_path))
+    max_check + alloc_seq + retry_seq + err_check + fd_park + retry_back + ok_path + zero_ok + fail
 }
 
-// x86gen_net_write_native 内联 net_write：循环 write syscall 直到写完，返回 Result<unit, str>
+// x86gen_net_write_native 内联 net_write：循环 write syscall 直到写完，返回 Result<unit, str>。
+// fd 非阻塞：EAGAIN → waitset 注册 POLLOUT → park；唤醒后跳回 loop_check 重试；
+// 偏移累加存 [r15-24]（syscall 毁 rcx，w_adv 从内存重载）
 // x86gen_net_write_native inlines net_write: looping write syscalls until done, returning
-// Result<unit, str>
-fn x86gen_net_write_native() {
+// Result<unit, str>. The fd is non-blocking: EAGAIN registers POLLOUT on the waitset and parks;
+// on wake it jumps back to loop_check to retry. The byte offset accumulates in [r15-24] (syscall
+// clobbers rcx, so w_adv reloads it from memory)
+fn x86gen_net_write_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
     let fail = err_str + err_inst
     let done = ok_inst + jmp_rel32(str_len(fail))
-    let w1 = mov_rr(rdx, r10) + neg_r(rdx) + mov_rm(rax, r9, 0) + add_rr(rdx, rax) + mov_rr(rdi, r11) + mov_rr(rsi, r9) + add_rr(rsi, r10) + add_ri32(rsi, 8) + sys_mov_rax(1) + syscall() + test_rr(rax, rax)
-    let w3 = add_rr(r10, rax)
-    let w2 = jle_rel32(str_len(w3) + 5 + str_len(done))
-    let loop_check = mov_rm(rdx, r9, 0) + cmp_rr(r10, rdx) + jae_rel32(str_len(w1) + str_len(w2) + str_len(w3) + 5)
-    let j_back = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + str_len(w3) + 5))
-    let head = mov_rm(r9, r15, 0 - 8) + mov_rm(r11, r15, 0 - 16) + xor_rr(r10, r10) + jmp_rel32(0)
-    head + loop_check + w1 + w2 + w3 + j_back + done + fail
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 4)
+    // w_adv：off += n；随后的 w_adv_jmp 跳回 loop_check（两处 5 = 各自 jmp_rel32 长度）
+    // w_adv: off += n; the following w_adv_jmp jumps back to loop_check (the two 5s are the
+    // jmp_rel32 lengths of w_adv_jmp and fd_park_jmp)
+    let w_adv = mov_rm(rcx, r15, 0 - 24) + add_rr(rcx, rax) + mov_mr(r15, 0 - 24, rcx)
+    // w_err_len 是 w_err 的固定长度（neg/mov/cmp/je/je/jmp），供 loop_check/w2/w_adv_jmp/
+    // fd_park_jmp 前向引用破环；内含 6 = je_rel32 长度、5 = jmp_rel32 长度
+    // w_err_len is the fixed length of w_err (neg/mov/cmp/je/je/jmp), used by loop_check/w2/
+    // w_adv_jmp/fd_park_jmp to break forward-reference cycles; it embeds 6 for je_rel32 and 5
+    // for jmp_rel32
+    let w_err_len = str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))
+    let w1 = mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, r9, 0) + mov_rm(rcx, r15, 0 - 24) + sub_rr(rdx, rcx) + mov_rm(rdi, r15, 0 - 16) + mov_rr(rsi, r9) + add_rr(rsi, rcx) + add_ri32(rsi, 8) + sys_mov_rax(1) + syscall() + test_rr(rax, rax)
+    // w2：n > 0 → w_adv；n == 0 → fail（VM 语义：write returned zero bytes）
+    // w2: n > 0 goes to w_adv; n == 0 fails (VM semantics: write returned zero bytes)
+    let w2 = jg_rel32(6 + w_err_len) + je_rel32(w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done) + str_len(fail))
+    let loop_check = mov_rm(r9, r15, 0 - 8) + mov_rm(rax, r9, 0) + mov_rm(rcx, r15, 0 - 24) + cmp_rr(rcx, rax) + jae_rel32(str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5)
+    let w_err = neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(w_adv) + 5) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + 6 + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(w1) + str_len(w2) + str_len(loop_check))) + jmp_rel32(str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done))
+    let w_adv_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5))
+    let fd_park_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5))
+    // head：off 清零存 [r15-24]，jmp 进 loop_check（同 net_loopback 的 off 槽用法）
+    // head: zeroes off into [r15-24] and jumps into loop_check (same off-slot usage as
+    // net_loopback)
+    let head = xor_rr(rcx, rcx) + mov_mr(r15, 0 - 24, rcx) + jmp_rel32(0)
+    head + loop_check + w1 + w2 + w_err + w_adv + w_adv_jmp + fd_park + fd_park_jmp + done + fail
 }
 
 // x86gen_net_close_native 内联 net_close：close syscall，返回 unit
@@ -1486,6 +1566,55 @@ fn x86gen_net_close_native() {
     let trap_seq = x86gen_trap_exit("net_close: invalid or closed handle")
     let check_seq = mov_rm(rdi, r15, 0 - 8) + mov_ri64(rsi, 1) + sys_mov_rax(72) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(close_ops) + str_len(ok_tail) + str_len(jmp_rel32(str_len(trap_seq))))
     check_seq + close_ops + ok_tail + jmp_rel32(str_len(trap_seq)) + trap_seq
+}
+
+// x86gen_net_nb_native 内联 net_nb(op, h, str, max)：accept/read/write 单次非阻塞尝试，
+// 返回 Result<str, str>。EAGAIN → Err("__eagain")（VM 语义），EINTR 重试，从不 park
+// x86gen_net_nb_native inlines net_nb(op, h, str, max): a single non-blocking accept/read/write
+// attempt returning Result<str, str>. EAGAIN yields Err("__eagain") (VM semantics), EINTR
+// retries, and the sequence never parks
+fn x86gen_net_nb_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, rcx) + vs_pop_n(4)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, rcx) + vs_pop_n(4)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let eagain_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 7955997313370251103) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 8)
+    let eagain = eagain_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    // wr_zero：len == 0 → Ok("0")（VM 语义：0 字节的十进制字符串）
+    // wr_zero: len == 0 yields Ok("0") (VM semantics: the decimal string of 0 bytes)
+    let wr_zero = mov_rr(r8, r12) + mov_ri64(r10, 1) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 48) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(eagain) + str_len(fail))
+    let wr_jmp = jmp_rel32(str_len(wr_zero) + str_len(eagain) + str_len(fail))
+    let wr_ok = mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
+    let wr_send = mov_rm(rdi, r15, 0 - 24) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdx, rax) + sys_mov_rax(1) + syscall()
+    let wr_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(wr_send))) + jmp_rel32(str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero) + str_len(eagain))
+    let wr_head = mov_rm(r9, r15, 0 - 16) + mov_rm(rax, r9, 0) + test_rr(rax, rax) + je_rel32(str_len(wr_send) + str_len(wr_err) + str_len(wr_ok) + str_len(wr_jmp))
+    let wr_path_len = str_len(wr_head) + str_len(wr_send) + str_len(wr_err) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)
+    // rd_zero_body：max == 0 → Ok("")（VM 语义：立即空串）
+    // rd_zero_body: max == 0 yields Ok("") (VM semantics: an immediate empty string)
+    let rd_zero_body = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(wr_path_len + str_len(eagain) + str_len(fail))
+    let rd_jmp = jmp_rel32(str_len(rd_zero_body) + wr_path_len + str_len(eagain) + str_len(fail))
+    let rd_ok_body = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8)
+    let rd_read = mov_rm(rdi, r15, 0 - 24) + mov_rm(r8, r15, 0 - 40) + lea(rsi, r8, 8) + mov_rm(rdx, r15, 0 - 8) + sys_mov_rax(0) + syscall()
+    let rd_alloc = mov_rr(r8, r12) + mov_mr(r8, 0, r9) + add_ri32(r12, 8) + add_rr(r12, r9) + mov_mr(r15, 0 - 40, r8)
+    let rd_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body) + wr_path_len) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(rd_read))) + jmp_rel32(str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body) + wr_path_len + str_len(eagain))
+    let rd_head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jl_rel32(6 + str_len(rd_alloc) + str_len(rd_read) + str_len(rd_err) + str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body) + wr_path_len + str_len(eagain)) + je_rel32(str_len(rd_alloc) + str_len(rd_read) + str_len(rd_err) + str_len(rd_ok_body) + str_len(rd_jmp))
+    let rd_path_len = str_len(rd_head) + str_len(rd_alloc) + str_len(rd_read) + str_len(rd_err) + str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body)
+    // acc_ok_body：accepted fd 置 O_NONBLOCK，handle 转十进制 str 后包 Ok（VM 语义：Ok(handle 串)）
+    // acc_ok_body: sets O_NONBLOCK on the accepted fd, converts the handle to a decimal str and
+    // wraps Ok (VM semantics: Ok(handle string))
+    let acc_ok_body = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
+    let acc_err = err_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
+    let acc_seq = mov_rm(rdi, r15, 0 - 24) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall() + test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err)) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err) + str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(syscall()) + str_len(sys_mov_rax(43)) + str_len(xor_rr(rdx, rdx)) + str_len(xor_rr(rsi, rsi)) + str_len(mov_rm(rdi, r15, 0 - 24)))) + jmp_rel32(0)
+    let acc_jmp = jmp_rel32(rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
+    let acc_path_len = str_len(acc_seq) + str_len(acc_err) + str_len(acc_ok_body) + str_len(acc_jmp)
+    let wr_path = wr_head + wr_send + wr_err + wr_ok + wr_jmp + wr_zero
+    let rd_path = rd_head + rd_alloc + rd_read + rd_err + rd_ok_body + rd_jmp + rd_zero_body
+    let acc_path = acc_seq + acc_err + acc_ok_body + acc_jmp
+    // head：按 op 分派（0=accept, 1=read, 2=write）；2 的 fall-through 会进 acc_path，须显式跳
+    // head: dispatches on op (0=accept, 1=read, 2=write); op 2 must jump explicitly since
+    // fall-through would enter acc_path
+    let head = sub_ri32(rsp, 8) + mov_rm(rax, r15, 0 - 32) + test_rr(rax, rax) + je_rel32(str_len(mov_ri64(rdx, 1)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 2)) + str_len(cmp_rr(rax, rdx)) + str_len(jne_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 1) + cmp_rr(rax, rdx) + je_rel32(acc_path_len + str_len(mov_ri64(rdx, 2)) + str_len(cmp_rr(rax, rdx)) + str_len(jne_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 2) + cmp_rr(rax, rdx) + jne_rel32(str_len(jmp_rel32(0)) + acc_path_len + rd_path_len + wr_path_len + str_len(eagain)) + jmp_rel32(acc_path_len + rd_path_len)
+    head + acc_path + rd_path + wr_path + eagain + fail
 }
 
 // x86gen_read_dir_native 内联 read_dir：open/getdents64/close syscall + 名字排序，返回 Result<[str], str>
@@ -2314,7 +2443,8 @@ fn x86gen_sched_block() {
     // empty_je 目标 = poll_wait（exit0 之后）；poll_wait 内部判定 fd/timer 等待或死锁
     let empty_je = je_rel32(str_len(pop_body) + str_len(tail_clean) + str_len(resume) + str_len(exit0))
     let pop_head = pop_load + empty_je
-    let main_check = mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_rm(rax, rax, 0) + mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, FB_DONE) + cmp_rr(rcx, rdx) + je_rel32(str_len(pop_head) + str_len(pop_body) + str_len(tail_clean) + str_len(resume))
+    // main_check 定义移至 sw_gate 之后：DONE 直达 exit0 的 je 需计入闸门长度
+    // （main_check moved after sw_gate: the DONE fast-path je must skip the sweep gate）
     // ===== poll_wait 段（布局：checks + fd_path + timer_path + timer_due + pop_ret）=====
     // ---- timer_due：重算 now_ns → r10；遍历 timer 表，deadline<=now 的 schedule + 末项
     // 压缩；循环 do-while（n>0 回 body），r9=n、r11=游标 ----
@@ -2356,7 +2486,7 @@ fn x86gen_sched_block() {
     let fd_jne = jne_rel32(str_len(pw_timer_path))
     let fd_done = mov_ri64(rcx, rt_slot(rt_timer_n)) + mov_rm(rcx, rcx, 0) + test_rr(rcx, rcx) + je_rel32(str_len(fd_jne) + str_len(pw_timer_path) + str_len(pw_timer_due)) + fd_jne
     let fd_next = sub_ri32(r9, 1)
-    let fd_drop = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rcx, rsi, 0) + sub_ri32(rcx, 1) + mov_mr(rsi, 0, rcx) + jmp_rel32(str_len(fd_next))
+    let fd_drop = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rcx, rsi, 0) + sub_ri32(rcx, 1) + mov_mr(rsi, 0, rcx)
     let fd_loop_copy = mov_rr(rdi, r11) + mov_ri32(rcx, 4) + shl_rcl(rdi) + add_rr(rdi, r8) + mov_rm(rsi, rdi, 0) + mov_mr(r10, 0, rsi) + mov_rm(rsi, rdi, 8) + mov_mr(r10, 8, rsi)
     let fd_loop_remove = mov_ri64(r11, rt_slot(rt_waitset_n)) + mov_rm(r11, r11, 0) + sub_ri32(r11, 1) + cmp_rr(r9, r11) + je_rel32(str_len(fd_loop_copy))
     let fd_loop_sched_enq_set = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
@@ -2373,9 +2503,25 @@ fn x86gen_sched_block() {
     let fd_loop_check_pre = test_rr(r9, r9)
     let fd_loop_back = jge_rel32(0 - (str_len(fd_loop_body) + str_len(fd_drop) + str_len(fd_next) + str_len(fd_loop_check_pre) + 6))
     let fd_loop_check = fd_loop_check_pre + fd_loop_back
-    let fd_poll_pre = mov_ri64(rdi, rt_slot(WAITSET_BASE)) + mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rsi, rsi, 0) + sys_mov_rax(7) + syscall()
+    // ---- 紧凑 pollfd 暂存区：waitset 条目 16B（交错 fiber 指针），poll(2) 只认连续 8B 记录。
+    // 先把各条目 [fd|events] 拷入 POLLFD_BASE（revents 清零）再 poll；返回后把 revents
+    // 回写条目 +6，fd_loop_rev 仍从原条目读就绪位 ----
+    // ---- compact pollfd staging: waitset entries interleave an 8B fiber pointer while
+    // poll(2) consumes contiguous 8B records. Stage [fd|events] into POLLFD_BASE (revents
+    // zeroed) before polling; afterwards write revents back to entry+6, where fd_loop_rev
+    // keeps reading readiness ----
+    let st_init = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rsi, rsi, 0) + xor_rr(rdi, rdi) + mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_ri64(r11, rt_slot(POLLFD_BASE))
+    let st_body = mov_rm(rcx, r10, 0) + mov_mr32(r11, 0, rcx) + mov_rm(rcx, r10, 4) + mov_mr32(r11, 4, rcx) + xor_rr(rcx, rcx) + mov_mr16(r11, 6, rcx) + add_ri32(r10, 16) + add_ri32(r11, 8) + add_ri32(rdi, 1)
+    let st_top = cmp_rr(rdi, rsi) + jge_rel32(str_len(st_body) + 5)
+    let st_back = jmp_rel32(0 - (str_len(st_top) + str_len(st_body) + 5))
+    let fd_poll_pre = mov_ri64(rdi, rt_slot(POLLFD_BASE)) + sys_mov_rax(7) + syscall()
     let fd_poll_back = jl_rel32(0 - (str_len(fd_poll_pre) + 9))
     let fd_poll_test = test_rr(rax, rax) + fd_poll_back
+    let cb_init = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rsi, rsi, 0) + xor_rr(rdi, rdi) + mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_ri64(r11, rt_slot(POLLFD_BASE))
+    let cb_step = mov_rm32(rcx, r11, 4) + lea(r9, r10, 4) + mov_mr32(r9, 0, rcx) + add_ri32(r10, 16) + add_ri32(r11, 8) + add_ri32(rdi, 1)
+    let cb_top = cmp_rr(rdi, rsi) + jge_rel32(str_len(cb_step) + 5)
+    let cb_back = jmp_rel32(0 - (str_len(cb_top) + str_len(cb_step) + 5))
+    let fd_cursor = mov_ri64(r9, rt_slot(rt_waitset_n)) + mov_rm(r9, r9, 0) + sub_ri32(r9, 1)
     let fd_tmo_zero = mov_ri32(rdx, 0)
     let fd_tmo_clamp_mov = mov_ri64(rax, 2147483647)
     let fd_tmo_clamp = fd_tmo_clamp_mov + mov_rr(rdx, rax)
@@ -2391,7 +2537,7 @@ fn x86gen_sched_block() {
     let fd_tmo = fd_tmo_zero + fd_tmo_head + fd_tmo_scan_body + fd_tmo_scan_upd + fd_tmo_scan_skip_pre + fd_tmo_scan_check + fd_tmo_scan_done + fd_tmo_calc + fd_tmo_clamp
     let fd_none = mov_ri64(rdx, -1) + jmp_rel32(str_len(fd_tmo))
     let fd_head = mov_ri64(r9, rt_slot(rt_waitset_n)) + mov_rm(r9, r9, 0) + sub_ri32(r9, 1) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(fd_none))
-    let pw_fd_path = fd_head + fd_none + fd_tmo + fd_poll_pre + fd_poll_test + fd_loop_body + fd_drop + fd_next + fd_loop_check + fd_done
+    let pw_fd_path = fd_head + fd_none + fd_tmo + st_init + st_top + st_body + st_back + fd_poll_pre + fd_poll_test + cb_init + cb_top + cb_step + cb_back + fd_cursor + fd_loop_body + fd_drop + fd_next + fd_loop_check + fd_done
     // ---- checks：waitset 非空 → fd_path；timer 非空 → timer_path；皆空 → dl ----
     let checks_dl = jmp_rel32(str_len(pw_fd_path) + str_len(pw_timer_path) + str_len(pw_timer_due) + 5)
     let checks_timer = mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(checks_dl))
@@ -2402,7 +2548,28 @@ fn x86gen_sched_block() {
     // → pw_checks 循环依赖
     let pw_pop_ret = jmp_rel32(0 - (5 + str_len(pw_checks) + str_len(pw_fd_path) + str_len(pw_timer_path) + str_len(pw_timer_due) + str_len(exit0) + str_len(resume) + str_len(tail_clean) + str_len(pop_body) + str_len(pop_head)))
     let poll_wait = pw_checks + pw_fd_path + pw_timer_path + pw_timer_due + pw_pop_ret
-    main_check + pop_head + pop_body + tail_clean + resume + exit0 + poll_wait + dl
+    // ===== 非阻塞服务趟：就绪队列非空时也唤醒到期 timer 与就绪 fd，防 yield 自旋饿死阻塞者
+    // （对齐 C 调度器每轮 bur_wake_due_timers() + bur_wait_poll(false)；复用既有段，rdx=0 超时）
+    // ===== Nonblocking service pass: with a non-empty ready queue, still wake due timers and
+    // ready fds so yield-spinners cannot starve blockers (mirrors C scheduler's per-iteration
+    // bur_wake_due_timers() + bur_wait_poll(false); reuses existing segments, timeout 0) =====
+    let sw_load_ws = mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0)
+    let sw_load_tm = mov_ri64(rcx, rt_slot(rt_timer_n)) + mov_rm(rcx, rcx, 0)
+    let sw_or_test = or_rr(rax, rcx) + test_rr(rax, rax)
+    let sw_enter = mov_ri64(rdx, 0) + jmp_rel32(str_len(pop_head) + str_len(pop_body) + str_len(tail_clean) + str_len(resume) + str_len(exit0) + str_len(poll_wait) + str_len(dl))
+    let sw_gate = sw_load_ws + sw_load_tm + sw_or_test + je_rel32(str_len(sw_enter)) + sw_enter
+    let main_check = mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_rm(rax, rax, 0) + mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, FB_DONE) + cmp_rr(rcx, rdx) + je_rel32(str_len(sw_gate) + str_len(pop_head) + str_len(pop_body) + str_len(tail_clean) + str_len(resume))
+    let sw_due = pw_timer_due
+    let sw_tmo0 = mov_ri64(rdx, 0)
+    let sw_stage = st_init + st_top + st_body + st_back
+    let sw_poll = fd_poll_pre + fd_poll_test
+    let sw_cb = cb_init + cb_top + cb_step + cb_back
+    let sw_cursor = fd_cursor
+    let sw_loop = fd_loop_body
+    let sw_tail = fd_drop + fd_next + fd_loop_check
+    let sw_ret = jmp_rel32(0 - (str_len(pop_head) + str_len(pop_body) + str_len(tail_clean) + str_len(resume) + str_len(exit0) + str_len(poll_wait) + str_len(dl) + str_len(sw_due) + str_len(sw_tmo0) + str_len(sw_stage) + str_len(sw_poll) + str_len(sw_cb) + str_len(sw_cursor) + str_len(sw_loop) + str_len(sw_tail) + 5))
+    let sw_body = sw_due + sw_tmo0 + sw_stage + sw_poll + sw_cb + sw_cursor + sw_loop + sw_tail + sw_ret
+    main_check + sw_gate + pop_head + pop_body + tail_clean + resume + exit0 + poll_wait + dl + sw_body
 }
 
 // x86gen_chan_schedule_block 生成 schedule 子程序（rax=fiber → status=READY + ready 队尾入队）
@@ -2477,14 +2644,16 @@ fn x86gen_chan_remove_waiter_block() {
 }
 
 // x86gen_waitset_add_block 生成 waitset 追加子程序（rax=fd 低 32 位、rcx=events 低 16 位、
-// rdi=fiber → 写 waitset[n] 并 n++；满则 trap）。保留 rax/rdi/rsi/rdx，毁 rcx/r8/r9/r10/r11
+// rdi=fiber → 写 waitset[n] 并 n++；满则 trap）。保留 rax/rdi/rsi，毁 rcx/rdx/r8/r9/r10/r11
+// （rcx=events 先转存 rdx：add_addr 的移位计数复用 rcx）
 // x86gen_waitset_add_block emits the waitset-append subroutine (rax=fd low 32 bits,
 // rcx=events low 16 bits, rdi=fiber -> write waitset[n] and bump n; trap when full).
-// Preserves rax/rdi/rsi/rdx, clobbers rcx/r8/r9/r10/r11
+// Preserves rax/rdi/rsi, clobbers rcx/rdx/r8/r9/r10/r11 (rcx=events is stashed into
+// rdx first: add_addr reuses rcx as the shift count)
 fn x86gen_waitset_add_block() {
     let add_set = mov_mr(r11, 8, rdi) + add_ri32(r9, 1) + mov_mr(r8, 0, r9) + ret()
-    let add_store = mov_mr32(r11, 0, rax) + mov_mr16(r11, 4, rcx)
-    let add_addr = mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_rr(r11, r9) + mov_ri32(rcx, 4) + shl_rcl(r11) + add_rr(r11, r10) + add_store
+    let add_store = mov_mr32(r11, 0, rax) + mov_mr16(r11, 4, rdx)
+    let add_addr = mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_rr(r11, r9) + mov_rr(rdx, rcx) + mov_ri32(rcx, 4) + shl_rcl(r11) + add_rr(r11, r10) + add_store
     let add_trap = x86gen_trap_exit("waitset capacity exceeded")
     let add_check = mov_ri64(r8, rt_slot(rt_waitset_n)) + mov_rm(r9, r8, 0) + mov_ri64(r10, WAITSET_CAP) + cmp_rr(r9, r10) + jae_rel32(str_len(add_addr) + str_len(add_set))
     add_check + add_addr + add_set + add_trap
@@ -6325,25 +6494,27 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else if callee == "sleep" {
                         w(x86gen_sleep_native(sched_addr, timer_add_addr))
                         ret_type = "unit"
-                    } else if callee == "tcp_listen" || callee == "tcp_dial" {
-                        if callee == "tcp_listen" {
-                            w(x86gen_tcp_listen_native())
-                        } else {
-                            w(x86gen_tcp_dial_native())
-                        }
+                    } else if callee == "tcp_listen" {
+                        w(x86gen_tcp_listen_native())
+                        ret_type = enum_payload_enc("Result", [["int"], ["str"]])
+                    } else if callee == "tcp_dial" {
+                        w(x86gen_tcp_dial_native(sched_addr, waitset_add_addr))
                         ret_type = enum_payload_enc("Result", [["int"], ["str"]])
                     } else if callee == "tcp_accept" {
-                        w(x86gen_tcp_accept_native())
+                        w(x86gen_tcp_accept_native(sched_addr, waitset_add_addr))
                         ret_type = enum_payload_enc("Result", [["int"], ["str"]])
                     } else if callee == "net_read" {
-                        w(x86gen_net_read_native())
+                        w(x86gen_net_read_native(sched_addr, waitset_add_addr))
                         ret_type = enum_payload_enc("Result", [["str"], ["str"]])
                     } else if callee == "net_write" {
-                        w(x86gen_net_write_native())
+                        w(x86gen_net_write_native(sched_addr, waitset_add_addr))
                         ret_type = enum_payload_enc("Result", [["unit"], ["str"]])
                     } else if callee == "net_close" {
                         w(x86gen_net_close_native())
                         ret_type = "unit"
+                    } else if callee == "net_nb" {
+                        w(x86gen_net_nb_native())
+                        ret_type = enum_payload_enc("Result", [["str"], ["str"]])
                     } else if callee == "recv" {
                         // 同 op_recv 的 try/park 序列，但结果包 Option：拿到值 → Some(v)；
                         // closed+空 → None（VM 语义：recv 在 closed+空 返回 None，不 trap）
@@ -6515,8 +6686,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else if callee == "clock" {
                         w(x86gen_clock_native(n_globals))
                         ret_type = "float"
-                    } else if is_unimpl_native(callee) {
-                        w(int3())
                     } else if callee == "contains" {
                         w(x86gen_contains_native())
                         ret_type = "bool"
@@ -7469,7 +7638,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // exactly RUNTIME_SIZE long; the rest are set by _start
     let mut rt_zero = ""
     let mut rzi = 0
-    while rzi < 16 + WAITSET_CAP * 16 + TIMER_CAP * 16 {
+    while rzi < 16 + WAITSET_CAP * 16 + TIMER_CAP * 16 + WAITSET_CAP * 8 {
         rt_zero = rt_zero + byte_chr(0)
         rzi = rzi + 1
     }
