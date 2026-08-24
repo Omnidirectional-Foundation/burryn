@@ -7,7 +7,7 @@
 
 Fiber *bur_cur;                 // the running fiber
 Fiber *bur_main_fiber;          // program ends (Go semantics) when this returns
-ucontext_t bur_sched_ctx;       // the scheduler's own context
+BurFiberCtx bur_sched_ctx;      // the scheduler's own context (ucontext / Win32 fiber)
 
 Fiber **bur_fibers;             // every fiber ever created, for GC root scanning
 int64_t bur_nfibers, bur_fiberscap;
@@ -1170,6 +1170,9 @@ void bur_set_global(const char *name, int64_t n, Value v) {
 // retry once woken" becomes a real C-level retry loop around bur_park.
 
 void bur_fiber_entry(void); // trampoline for a fiber's first resume
+#ifdef _WIN32
+void CALLBACK bur_fiber_trampoline(LPVOID param); // CreateFiber entry point
+#endif
 
 // growable FIFO of fibers (used for channel send/recv/waiter queues)
 void fq_push(Fiber ***a, int *n, int *cap, Fiber *f) {
@@ -1274,10 +1277,14 @@ bool chan_try_recv(OChannel *ch, Value *out) {
 // resumes here once the scheduler picks it again, with a fresh time slice.
 void bur_park(FiberStatus st) {
     bur_cur->status = st;
+#ifdef _WIN32
+    SwitchToFiber(bur_sched_ctx);
+#else
     swapcontext(&bur_cur->ctx, &bur_sched_ctx);
+#endif
     bur_cur->budget = BUR_TIMESLICE;
 }
-void bur_wait_current_fd(int fd, short events) {
+void bur_wait_current_fd(intptr_t fd, short events) {
     bur_cur->io_proc = -1;
     bur_cur->io_fd = fd;
     bur_cur->io_events = events;
@@ -1286,7 +1293,11 @@ void bur_wait_current_fd(int fd, short events) {
     bur_park(FBLOCKED_IO);
 }
 void bur_switch_to_sched(void) {
+#ifdef _WIN32
+    SwitchToFiber(bur_sched_ctx);
+#else
     swapcontext(&bur_cur->ctx, &bur_sched_ctx);
+#endif
     bur_cur->budget = BUR_TIMESLICE;
 }
 // preemption: the running fiber has spent its time slice; yield the CPU by
@@ -1318,30 +1329,43 @@ Fiber *bur_new_fiber(OClosure *cl, Value *args, int argc, size_t stacksize) {
     f->trace_fn[0] = cl->fn; // the entry body runs at depth 0, outside bur_call
     f->stack[f->top++] = bur_obj((Obj *)cl); // closure + args, like vm.newFiber
     for (int i = 0; i < argc; i++) f->stack[f->top++] = args[i];
+#ifdef _WIN32
+    f->ctx = CreateFiber(stacksize, bur_fiber_trampoline, f);
+#else
     f->cstack = (char *)malloc(stacksize);
     getcontext(&f->ctx);
     f->ctx.uc_stack.ss_sp = f->cstack;
     f->ctx.uc_stack.ss_size = stacksize;
     f->ctx.uc_link = &bur_sched_ctx;
     makecontext(&f->ctx, bur_fiber_entry, 0);
+#endif
     bur_fibers_push(f);
     return f;
 }
 
-void bur_fiber_entry(void) {
+// shared body of a fiber's first resume; the platform tails hand control
+// back to the scheduler once it returns
+static void bur_fiber_run_body(void) {
     Fiber *f = bur_cur;
     bur_cur_closure = f->entry;
     f->budget = BUR_TIMESLICE;
     f->entry->fn->code(); // run the body on this fiber's own C stack
     f->status = FDONE;
+}
+#ifndef _WIN32
+void bur_fiber_entry(void) {
+    bur_fiber_run_body();
     setcontext(&bur_sched_ctx); // hand control back for good
 }
-
-int64_t bur_now_ns(void) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+#else
+void CALLBACK bur_fiber_trampoline(LPVOID param) {
+    (void)param; // the scheduler already parked the fiber pointer in bur_cur
+    bur_fiber_run_body();
+    SwitchToFiber(bur_sched_ctx); // hand control back for good
 }
+#endif
+
+int64_t bur_now_ns(void) { return bur_mono_ns(); }
 
 // ---- child processes (exec_start/exec_poll and the exec native) --------
 //
@@ -1362,7 +1386,7 @@ void bur_wait_reset(void) {
     bur_waitset.deadline_ns = INT64_MAX;
 }
 
-void bur_wait_fd(int fd, short events, int64_t owner, BurWaitReadyFn ready) {
+void bur_wait_fd(intptr_t fd, short events, int64_t owner, BurWaitReadyFn ready) {
     if (fd < 0) return;
     if (bur_waitset.n == bur_waitset.cap) {
         bur_waitset.cap = bur_waitset.cap * 2 + 16;
@@ -1372,7 +1396,7 @@ void bur_wait_fd(int fd, short events, int64_t owner, BurWaitReadyFn ready) {
         bur_waitset.ready = (BurWaitReadyFn *)realloc(bur_waitset.ready, sizeof(BurWaitReadyFn) * size);
     }
     int i = bur_waitset.n++;
-    bur_waitset.fds[i].fd = fd;
+    bur_waitset.fds[i].fd = fd; // SOCKET on Windows; implicit intptr_t fit
     bur_waitset.fds[i].events = events;
     bur_waitset.fds[i].revents = 0;
     bur_waitset.owners[i] = owner;
@@ -1387,35 +1411,69 @@ bool bur_proc_valid(int64_t h) {
     return h >= 0 && h < bur_nprocs && bur_procs[h].used && !bur_procs[h].consumed;
 }
 
-// drain whatever the pipes hold without blocking; reap once both hit EOF
+// drain whatever the pipes hold without blocking; reap once both hit EOF.
+// POSIX polls raw fds; Windows peeks named pipes because pipe handles are
+// not fds, and reaps through the process handle instead of waitpid.
+#ifndef _WIN32
 void bur_proc_pump(BurProc *p) {
     if (p->complete) return;
     char chunk[8192]; ssize_t r;
     if (p->failfd >= 0) {
-        r = read(p->failfd, &p->child_err, sizeof p->child_err);
+        r = read((int)p->failfd, &p->child_err, sizeof p->child_err);
         if (r == (ssize_t)sizeof p->child_err) p->have_err = true;
-        if (r == 0 || r > 0) { close(p->failfd); p->failfd = -1; }
+        if (r == 0 || r > 0) { close((int)p->failfd); p->failfd = -1; }
     }
     if (p->outfd >= 0) {
-        while ((r = read(p->outfd, chunk, sizeof chunk)) > 0) buf_bytes(&p->ob, chunk, (int64_t)r);
-        if (r == 0) { close(p->outfd); p->outfd = -1; }
+        while ((r = read((int)p->outfd, chunk, sizeof chunk)) > 0) buf_bytes(&p->ob, chunk, (int64_t)r);
+        if (r == 0) { close((int)p->outfd); p->outfd = -1; }
     }
     if (p->errfd >= 0) {
-        while ((r = read(p->errfd, chunk, sizeof chunk)) > 0) buf_bytes(&p->eb, chunk, (int64_t)r);
-        if (r == 0) { close(p->errfd); p->errfd = -1; }
+        while ((r = read((int)p->errfd, chunk, sizeof chunk)) > 0) buf_bytes(&p->eb, chunk, (int64_t)r);
+        if (r == 0) { close((int)p->errfd); p->errfd = -1; }
     }
     if (p->outfd < 0 && p->errfd < 0) {
         if (p->failfd >= 0) { // exec succeeded: CLOEXEC closed it; drain the EOF
-            r = read(p->failfd, &p->child_err, sizeof p->child_err);
+            r = read((int)p->failfd, &p->child_err, sizeof p->child_err);
             if (r == (ssize_t)sizeof p->child_err) p->have_err = true;
-            close(p->failfd); p->failfd = -1;
+            close((int)p->failfd); p->failfd = -1;
         }
         int status = 0;
-        waitpid(p->pid, &status, 0); // both pipes are EOF, the child is gone
+        waitpid((pid_t)p->pid, &status, 0); // both pipes are EOF, the child is gone
         p->code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
         p->complete = true;
     }
 }
+#else
+void bur_proc_pump(BurProc *p) {
+    if (p->complete) return;
+    char chunk[8192];
+    HANDLE h[2] = { (HANDLE)p->outfd, (HANDLE)p->errfd };
+    Buf *into[2] = { &p->ob, &p->eb };
+    for (int k = 0; k < 2; k++) {
+        if ((intptr_t)h[k] == -1) continue;
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h[k], NULL, 0, NULL, &avail, NULL)) { // broken pipe => EOF
+            CloseHandle(h[k]);
+            if (k == 0) p->outfd = -1; else p->errfd = -1;
+            continue;
+        }
+        while (avail > 0) {
+            DWORD want = avail > sizeof chunk ? (DWORD)sizeof chunk : avail, got = 0;
+            if (!ReadFile(h[k], chunk, want, &got, NULL) || got == 0) break;
+            buf_bytes(into[k], chunk, (int64_t)got);
+            avail -= got;
+        }
+    }
+    if (p->outfd == -1 && p->errfd == -1 &&
+        WaitForSingleObject((HANDLE)p->pid, 0) == WAIT_OBJECT_0) {
+        DWORD code = 0;
+        GetExitCodeProcess((HANDLE)p->pid, &code);
+        p->code = (int)code;
+        CloseHandle((HANDLE)p->pid);
+        p->complete = true;
+    }
+}
+#endif
 
 void bur_proc_ready(int64_t owner, short revents) {
     (void)revents;
@@ -1453,7 +1511,11 @@ void bur_wait_poll(bool block) {
             timeout_ms = d <= 0 ? 0 : (int)(d / 1000000) + 1;
         }
     }
+#ifdef _WIN32
+    WSAPoll(bur_waitset.fds, (ULONG)bur_waitset.n, timeout_ms);
+#else
     poll(bur_waitset.fds, (nfds_t)bur_waitset.n, timeout_ms);
+#endif
     for (int i = 0; i < bur_waitset.n; i++)
         if (bur_waitset.fds[i].revents)
             bur_waitset.ready[i](bur_waitset.owners[i], bur_waitset.fds[i].revents);
@@ -1520,7 +1582,11 @@ void bur_scheduler(void) {
         }
         if (f->status != FREADY) continue; // stale ready entry (already woken elsewhere)
         bur_cur = f;
+#ifdef _WIN32
+        SwitchToFiber(f->ctx);
+#else
         swapcontext(&bur_sched_ctx, &f->ctx);
+#endif
     }
 }
 
@@ -1590,7 +1656,9 @@ int bur_select(const unsigned char *kinds, int nArms, bool hasDefault) {
     int slots = 0;
     for (int i = 0; i < nArms; i++) slots += kinds[i] ? 2 : 1;
     int base = bur_cur->top - slots;
-    int chanPos[nArms], valPos[nArms];
+    // MSVC has no VLAs; one allocation holds both position tables
+    int *chanPos = (int *)malloc(sizeof(int) * (size_t)nArms * 2);
+    int *valPos = chanPos + nArms;
     int off = base;
     for (int i = 0; i < nArms; i++) {
         chanPos[i] = off;
@@ -1620,9 +1688,10 @@ int bur_select(const unsigned char *kinds, int nArms, bool hasDefault) {
                 bur_cur->top = base;
                 bur_push(v); // left on the stack for a binding arm
             }
+            free(chanPos);
             return chosen;
         }
-        if (hasDefault) { bur_cur->top = base; return nArms; }
+        if (hasDefault) { bur_cur->top = base; free(chanPos); return nArms; }
         // nothing ready: park on every arm's channel, retry when any wakes us
         for (int i = 0; i < nArms; i++) {
             OChannel *ch = (OChannel *)bur_cur->stack[chanPos[i]].u.o;
@@ -1642,7 +1711,12 @@ void bur_boot(int argc, char **argv) {
     bur_argv = argv;
     const char *det = getenv("BUR_DETERMINISTIC");
     bur_deterministic = det && det[0] == '1' && det[1] == '\0';
-    clock_gettime(CLOCK_MONOTONIC, &bur_start_time);
+    bur_start_ns = bur_mono_ns();
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    bur_sched_ctx = ConvertThreadToFiber(NULL); // the main thread schedules
+#endif
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     // fibers (including the main one) are created by generated main()
 }

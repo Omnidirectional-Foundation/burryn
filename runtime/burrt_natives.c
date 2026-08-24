@@ -1,6 +1,87 @@
 // Burryn C runtime — native functions (multi-file implementation unit).
 #include "burrt.h"
 
+// ---- platform glue -----------------------------------------------------
+// Winsock errors and sentinels differ from errno; these thin helpers keep
+// every socket call site on one code path across platforms.
+#ifdef _WIN32
+#define strdup _strdup
+static int bur_sock_err(void) { return WSAGetLastError(); }
+static void bur_sock_set_err(int e) { WSASetLastError(e); }
+static bool bur_sock_would_block(int err) {
+    return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
+}
+static bool bur_sock_intr(int err) { return err == WSAEINTR; }
+static const char *bur_sock_strerror(int err) {
+    static char buf[32];
+    snprintf(buf, sizeof buf, "winsock error %d", err);
+    return buf;
+}
+static void bur_sock_close(intptr_t fd) { closesocket((SOCKET)fd); }
+static int bur_sock_prep(intptr_t fd) { // non-blocking; inheritability N/A
+    u_long nb = 1;
+    return ioctlsocket((SOCKET)fd, FIONBIO, &nb) == 0 ? 0 : -1;
+}
+static intptr_t bur_sock_accept(intptr_t lfd) {
+    SOCKET s = accept((SOCKET)lfd, NULL, NULL);
+    return s == INVALID_SOCKET ? -1 : (intptr_t)s;
+}
+static int bur_sock_connect(intptr_t fd, const struct sockaddr *sa, socklen_t len) {
+    return connect((SOCKET)fd, sa, (int)len);
+}
+static int bur_sock_recv(intptr_t fd, char *buf, size_t max) {
+    return (int)recv((SOCKET)fd, buf, (int)max, 0);
+}
+static int bur_sock_send(intptr_t fd, const char *buf, size_t len) {
+    return (int)send((SOCKET)fd, buf, (int)len, 0);
+}
+static int bur_sock_take_error(intptr_t fd) {
+    int e = 0;
+    int n = sizeof e;
+    if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_ERROR, (char *)&e, &n) < 0)
+        e = WSAGetLastError();
+    return e;
+}
+#else
+static int bur_sock_err(void) { return errno; }
+static void bur_sock_set_err(int e) { errno = e; }
+static bool bur_sock_would_block(int err) {
+    return err == EAGAIN || err == EWOULDBLOCK || err == EINPROGRESS;
+}
+static bool bur_sock_intr(int err) { return err == EINTR; }
+static const char *bur_sock_strerror(int err) { return strerror(err); }
+static void bur_sock_close(intptr_t fd) { close((int)fd); }
+static int bur_sock_prep(intptr_t fd) { // non-blocking + close-on-exec
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags < 0 || fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+        fcntl((int)fd, F_SETFD, FD_CLOEXEC) < 0)
+        return -1;
+    return 0;
+}
+static intptr_t bur_sock_accept(intptr_t lfd) {
+    return (intptr_t)accept((int)lfd, NULL, NULL);
+}
+static int bur_sock_connect(intptr_t fd, const struct sockaddr *sa, socklen_t len) {
+    return connect((int)fd, sa, len);
+}
+static int bur_sock_recv(intptr_t fd, char *buf, size_t max) {
+    return (int)recv((int)fd, buf, max, 0);
+}
+static int bur_sock_send(intptr_t fd, const char *buf, size_t len) {
+#ifdef MSG_NOSIGNAL
+    return (int)send((int)fd, buf, len, MSG_NOSIGNAL);
+#else
+    return (int)send((int)fd, buf, len, 0);
+#endif
+}
+static int bur_sock_take_error(intptr_t fd) {
+    int e = 0;
+    socklen_t n = sizeof e;
+    if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &e, &n) < 0) e = errno;
+    return e;
+}
+#endif
+
 bool nat_as_str(Value v, const char **s, int64_t *n) {
     if (v.t == VOBJ && v.u.o->type == OBJ_STRING) {
         OString *o = (OString *)v.u.o;
@@ -375,6 +456,22 @@ Value nat_read_dir(Value *args, int argc) {
     (void)argc;
     const char *path; int64_t pn;
     if (!nat_as_str(args[0], &path, &pn)) bur_trap("read_dir() needs a str, got %s", bur_typename(args[0]));
+#ifdef _WIN32
+    size_t plen = strlen(path) + 4;
+    char *pattern = (char *)malloc(plen);
+    snprintf(pattern, plen, "%s\\*", path[0] ? path : ".");
+    WIN32_FIND_DATAA find;
+    HANDLE dh = FindFirstFileA(pattern, &find);
+    free(pattern);
+    if (dh == INVALID_HANDLE_VALUE) return bur_err_str("cannot open directory");
+    char **names = NULL; int64_t count = 0, cap = 0;
+    do {
+        if (strcmp(find.cFileName, ".") == 0 || strcmp(find.cFileName, "..") == 0) continue;
+        if (count == cap) { cap = cap * 2 + 16; names = (char **)realloc(names, sizeof(char *) * (size_t)cap); }
+        names[count++] = strdup(find.cFileName);
+    } while (FindNextFileA(dh, &find));
+    FindClose(dh);
+#else
     DIR *d = opendir(path);
     if (!d) return bur_err_str(strerror(errno));
     char **names = NULL; int64_t count = 0, cap = 0;
@@ -385,6 +482,7 @@ Value nat_read_dir(Value *args, int argc) {
         names[count++] = strdup(e->d_name);
     }
     closedir(d);
+#endif
     qsort(names, (size_t)count, sizeof(char *), nat_strcmp_qsort); // os.ReadDir sorts by name
     OList *l = bur_new_list(NULL, 0);
     bur_push(bur_obj((Obj *)l));
@@ -419,16 +517,26 @@ int64_t bur_proc_alloc(void) {
 
 // wait on one proc's own fds until it completes (deterministic mode and
 // single-runnable shortcuts); pointer stays valid: no allocation inside
+#ifndef _WIN32
 void bur_proc_finish(BurProc *p) {
     while (!p->complete) {
         struct pollfd pf[3]; int n = 0;
-        int fds[3] = { p->outfd, p->errfd, p->failfd };
+        int fds[3] = { (int)p->outfd, (int)p->errfd, (int)p->failfd };
         for (int k = 0; k < 3; k++)
             if (fds[k] >= 0) { pf[n].fd = fds[k]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
         if (n > 0) poll(pf, (nfds_t)n, -1);
         bur_proc_pump(p);
     }
 }
+#else
+void bur_proc_finish(BurProc *p) {
+    // deterministic mode serializes execution, so latency is not a contract
+    while (!p->complete) {
+        bur_proc_pump(p);
+        if (!p->complete) Sleep(1);
+    }
+}
+#endif
 
 // consume a completed proc slot into exec's Result value
 Value bur_proc_result(BurProc *p) {
@@ -460,6 +568,84 @@ int64_t bur_proc_spawn(Value cmdv, Value argsv, const char **errmsg) {
     }
     cargv[n + 1] = NULL;
 
+#ifdef _WIN32
+    // Join argv into a command line with the standard CommandLineToArgvW
+    // quoting: args holding space/tab/quote get wrapped, backslash runs
+    // preceding a quote double up, embedded quotes escape as \".
+    size_t clen = 1;
+    for (int i = 0; i <= n; i++) clen += strlen(cargv[i]) * 2 + 3;
+    char *cmdline = (char *)malloc(clen);
+    size_t off = 0;
+    for (int i = 0; i <= n; i++) {
+        const char *a = cargv[i];
+        int quote = a[0] == '\0' || strpbrk(a, " \t\"") != NULL;
+        if (i) cmdline[off++] = ' ';
+        if (quote) cmdline[off++] = '"';
+        for (const char *q = a;; q++) {
+            int bs = 0;
+            while (q[bs] == '\\') bs++;
+            q += bs;
+            if (*q == '"') {
+                for (int k = 0; k < bs * 2; k++) cmdline[off++] = '\\';
+                cmdline[off++] = '"';
+            } else if (*q == '\0' && quote) {
+                for (int k = 0; k < bs * 2; k++) cmdline[off++] = '\\';
+                break;
+            } else {
+                for (int k = 0; k < bs; k++) cmdline[off++] = '\\';
+                if (*q == '\0') break;
+                cmdline[off++] = *q;
+            }
+        }
+        if (quote) cmdline[off++] = '"';
+    }
+    cmdline[off] = '\0';
+
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+    HANDLE outrd, outwr, errrd, errwr;
+    if (!CreatePipe(&outrd, &outwr, &sa, 0) || !CreatePipe(&errrd, &errwr, &sa, 0)) {
+        for (int i = 0; i <= n; i++) free(cargv[i]);
+        free(cargv);
+        *errmsg = "cannot create pipe";
+        return -1;
+    }
+    SetHandleInformation(outrd, HANDLE_FLAG_INHERIT, 0); // parent ends stay private
+    SetHandleInformation(errrd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES; // stdin inherited, stdout/stderr piped
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = outwr;
+    si.hStdError = errwr;
+
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof pi);
+    // A CreateProcess failure IS exec failure reported synchronously, so the
+    // POSIX fail pipe has no counterpart here; failfd stays -1 forever.
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                             NULL, NULL, &si, &pi);
+    CloseHandle(outwr);
+    CloseHandle(errwr);
+    free(cmdline);
+    for (int i = 0; i <= n; i++) free(cargv[i]);
+    free(cargv);
+    if (!ok) {
+        CloseHandle(outrd);
+        CloseHandle(errrd);
+        *errmsg = "cannot start process";
+        return -1;
+    }
+    CloseHandle(pi.hThread);
+
+    int64_t h = bur_proc_alloc();
+    BurProc *p = &bur_procs[h];
+    p->pid = (intptr_t)pi.hProcess;
+    p->outfd = (intptr_t)outrd; p->errfd = (intptr_t)errrd; p->failfd = -1;
+    if (bur_deterministic) bur_proc_finish(p); // serialize: no IO overlap
+    return h;
+#else
     int outp[2], errp[2], failp[2];
     if (pipe(outp) || pipe(errp) || pipe(failp)) { for (int i = 0; i <= n; i++) free(cargv[i]); free(cargv); *errmsg = strerror(errno); return -1; }
     fcntl(failp[1], F_SETFD, FD_CLOEXEC);
@@ -485,6 +671,7 @@ int64_t bur_proc_spawn(Value cmdv, Value argsv, const char **errmsg) {
     p->outfd = outp[0]; p->errfd = errp[0]; p->failfd = failp[0];
     if (bur_deterministic) bur_proc_finish(p); // serialize: no IO overlap
     return h;
+#endif
 }
 
 // exec blocks its fiber, not the scheduler: it parks as FBLOCKED_IO and the
@@ -544,25 +731,27 @@ Value bur_net_ok_str(const char *data, int64_t len) {
     return res;
 }
 
-int bur_net_socket(int family, int socktype, int protocol) {
-    int fd = socket(family, socktype, protocol);
+intptr_t bur_net_socket(int family, int socktype, int protocol) {
+    intptr_t fd = (intptr_t)socket(family, socktype, protocol);
+#ifdef _WIN32
+    if (fd == -1) return -1;
+#else
     if (fd < 0) return -1;
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
-        fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
+#endif
+    if (bur_sock_prep(fd) < 0) {
+        int saved = bur_sock_err();
+        bur_sock_close(fd);
+        bur_sock_set_err(saved);
         return -1;
     }
 #ifdef SO_NOSIGPIPE
     int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
     return fd;
 }
 
-int64_t bur_net_alloc(int fd, BurNetKind kind) {
+int64_t bur_net_alloc(intptr_t fd, BurNetKind kind) {
     if (bur_nnets == bur_netscap) {
         bur_netscap = bur_netscap * 2 + 16;
         bur_nets = (BurNet *)realloc(bur_nets, sizeof(BurNet) * (size_t)bur_netscap);
@@ -579,7 +768,7 @@ BurNet *bur_net_get(int64_t h, BurNetKind kind) {
     return &bur_nets[h];
 }
 
-void bur_net_cancel_waiters(int fd) {
+void bur_net_cancel_waiters(intptr_t fd) {
     for (int64_t i = 0; i < bur_nfibers; i++) {
         Fiber *f = bur_fibers[i];
         if (f->status != FBLOCKED_IO || f->io_fd != fd) continue;
@@ -608,19 +797,23 @@ Value nat_tcp_listen(Value *args, int argc) {
     int gai = getaddrinfo(hostn == 0 ? NULL : host, service, &hints, &addrs);
     if (gai != 0) return bur_net_err("tcp_listen", gai_strerror(gai));
 
-    int fd = -1, saved = EADDRNOTAVAIL;
+#ifdef _WIN32
+    intptr_t fd = -1; int saved = WSAEADDRNOTAVAIL;
+#else
+    intptr_t fd = -1; int saved = EADDRNOTAVAIL;
+#endif
     for (struct addrinfo *a = addrs; a; a = a->ai_next) {
         fd = bur_net_socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) { saved = errno; continue; }
+        if (fd < 0) { saved = bur_sock_err(); continue; }
         int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        if (bind(fd, a->ai_addr, a->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
-        saved = errno;
-        close(fd);
+        setsockopt((int)fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind((int)fd, a->ai_addr, a->ai_addrlen) == 0 && listen((int)fd, 128) == 0) break;
+        saved = bur_sock_err();
+        bur_sock_close(fd);
         fd = -1;
     }
     freeaddrinfo(addrs);
-    if (fd < 0) return bur_net_err("tcp_listen", strerror(saved));
+    if (fd < 0) return bur_net_err("tcp_listen", bur_sock_strerror(saved));
     return bur_ok(bur_int(bur_net_alloc(fd, BUR_NET_LISTENER)));
 }
 
@@ -631,24 +824,23 @@ Value nat_tcp_accept(Value *args, int argc) {
     for (;;) {
         BurNet *listener = bur_net_get(h, BUR_NET_LISTENER);
         if (!listener) return bur_net_err("tcp_accept", "invalid listener handle");
-        int fd = accept(listener->fd, NULL, NULL);
+        intptr_t fd = bur_sock_accept(listener->fd);
         if (fd >= 0) {
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
-                fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-                int saved = errno;
-                close(fd);
-                return bur_net_err("tcp_accept", strerror(saved));
+            if (bur_sock_prep(fd) < 0) {
+                int saved = bur_sock_err();
+                bur_sock_close(fd);
+                return bur_net_err("tcp_accept", bur_sock_strerror(saved));
             }
 #ifdef SO_NOSIGPIPE
             int one = 1;
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+            setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
             return bur_ok(bur_int(bur_net_alloc(fd, BUR_NET_CONN)));
         }
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-            return bur_net_err("tcp_accept", strerror(errno));
+        int err = bur_sock_err();
+        if (bur_sock_intr(err)) continue;
+        if (!bur_sock_would_block(err))
+            return bur_net_err("tcp_accept", bur_sock_strerror(err));
         bur_wait_current_fd(listener->fd, POLLIN);
     }
 }
@@ -671,22 +863,26 @@ Value nat_tcp_dial(Value *args, int argc) {
     int gai = getaddrinfo(host, service, &hints, &addrs);
     if (gai != 0) return bur_net_err("tcp_dial", gai_strerror(gai));
 
-    int fd = -1, saved = ECONNREFUSED;
+#ifdef _WIN32
+    intptr_t fd = -1; int saved = WSAECONNREFUSED;
+#else
+    intptr_t fd = -1; int saved = ECONNREFUSED;
+#endif
     for (struct addrinfo *a = addrs; a; a = a->ai_next) {
         fd = bur_net_socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) { saved = errno; continue; }
-        if (connect(fd, a->ai_addr, a->ai_addrlen) < 0) {
-            if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
-                saved = errno;
-                close(fd);
+        if (fd < 0) { saved = bur_sock_err(); continue; }
+        if (bur_sock_connect(fd, a->ai_addr, a->ai_addrlen) < 0) {
+            int err = bur_sock_err();
+            if (!bur_sock_would_block(err)) {
+                saved = err;
+                bur_sock_close(fd);
                 fd = -1;
                 continue;
             }
             bur_wait_current_fd(fd, POLLOUT);
-            socklen_t n = sizeof saved;
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &saved, &n) < 0) saved = errno;
+            saved = bur_sock_take_error(fd);
             if (saved != 0) {
-                close(fd);
+                bur_sock_close(fd);
                 fd = -1;
                 continue;
             }
@@ -694,7 +890,7 @@ Value nat_tcp_dial(Value *args, int argc) {
         break;
     }
     freeaddrinfo(addrs);
-    if (fd < 0) return bur_net_err("tcp_dial", strerror(saved));
+    if (fd < 0) return bur_net_err("tcp_dial", bur_sock_strerror(saved));
     return bur_ok(bur_int(bur_net_alloc(fd, BUR_NET_CONN)));
 }
 
@@ -708,17 +904,17 @@ Value nat_net_read(Value *args, int argc) {
     for (;;) {
         BurNet *conn = bur_net_get(h, BUR_NET_CONN);
         if (!conn) { free(buf); return bur_net_err("net_read", "invalid connection handle"); }
-        ssize_t n = recv(conn->fd, buf, (size_t)max, 0);
+        int n = bur_sock_recv(conn->fd, buf, (size_t)max);
         if (n >= 0) {
             Value res = bur_net_ok_str(buf, (int64_t)n);
             free(buf);
             return res;
         }
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            int saved = errno;
+        int err = bur_sock_err();
+        if (bur_sock_intr(err)) continue;
+        if (!bur_sock_would_block(err)) {
             free(buf);
-            return bur_net_err("net_read", strerror(saved));
+            return bur_net_err("net_read", bur_sock_strerror(err));
         }
         bur_wait_current_fd(conn->fd, POLLIN);
     }
@@ -733,16 +929,13 @@ Value nat_net_write(Value *args, int argc) {
     while (off < len) {
         BurNet *conn = bur_net_get(h, BUR_NET_CONN);
         if (!conn) return bur_net_err("net_write", "invalid connection handle");
-        int flags = 0;
-#ifdef MSG_NOSIGNAL
-        flags = MSG_NOSIGNAL;
-#endif
-        ssize_t n = send(conn->fd, data + off, (size_t)(len - off), flags);
+        int n = bur_sock_send(conn->fd, data + off, (size_t)(len - off));
         if (n > 0) { off += (int64_t)n; continue; }
         if (n == 0) return bur_net_err("net_write", "write returned zero bytes");
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-            return bur_net_err("net_write", strerror(errno));
+        int err = bur_sock_err();
+        if (bur_sock_intr(err)) continue;
+        if (!bur_sock_would_block(err))
+            return bur_net_err("net_write", bur_sock_strerror(err));
         bur_wait_current_fd(conn->fd, POLLOUT);
     }
     return bur_ok(bur_unit());
@@ -754,10 +947,10 @@ Value nat_net_close(Value *args, int argc) {
     int64_t h = args[0].u.i;
     if (h < 0 || h >= bur_nnets || !bur_nets[h].used)
         bur_trap("net_close: invalid or closed handle %lld", (long long)h);
-    int fd = bur_nets[h].fd;
+    intptr_t fd = bur_nets[h].fd;
     bur_nets[h].used = false;
     bur_net_cancel_waiters(fd);
-    close(fd);
+    bur_sock_close(fd);
     return bur_unit();
 }
 
@@ -775,28 +968,27 @@ Value nat_net_nb(Value *args, int argc) {
         BurNet *listener = bur_net_get(h, BUR_NET_LISTENER);
         if (!listener) return bur_net_err("tcp_accept", "invalid listener handle");
         for (;;) {
-            int fd = accept(listener->fd, NULL, NULL);
+            intptr_t fd = bur_sock_accept(listener->fd);
             if (fd >= 0) {
-                int flags = fcntl(fd, F_GETFL, 0);
-                if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
-                    fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-                    int saved = errno;
-                    close(fd);
-                    return bur_net_err("tcp_accept", strerror(saved));
+                if (bur_sock_prep(fd) < 0) {
+                    int saved = bur_sock_err();
+                    bur_sock_close(fd);
+                    return bur_net_err("tcp_accept", bur_sock_strerror(saved));
                 }
 #ifdef SO_NOSIGPIPE
                 int one = 1;
-                setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+                setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
                 int64_t ch = bur_net_alloc(fd, BUR_NET_CONN);
                 char buf[24];
                 int n = snprintf(buf, sizeof buf, "%lld", (long long)ch);
                 return bur_ok(bur_obj((Obj *)bur_new_string_n(buf, n)));
             }
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            int err = bur_sock_err();
+            if (bur_sock_intr(err)) continue;
+            if (bur_sock_would_block(err))
                 return bur_err_str("__eagain");
-            return bur_net_err("tcp_accept", strerror(errno));
+            return bur_net_err("tcp_accept", bur_sock_strerror(err));
         }
     }
     if (op == 1) { // read
@@ -807,20 +999,20 @@ Value nat_net_nb(Value *args, int argc) {
         for (;;) {
             BurNet *conn = bur_net_get(h, BUR_NET_CONN);
             if (!conn) { free(buf); return bur_net_err("net_read", "invalid connection handle"); }
-            ssize_t n = recv(conn->fd, buf, (size_t)max, 0);
+            int n = bur_sock_recv(conn->fd, buf, (size_t)max);
             if (n >= 0) {
                 Value res = bur_net_ok_str(buf, (int64_t)n);
                 free(buf);
                 return res;
             }
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int err = bur_sock_err();
+            if (bur_sock_intr(err)) continue;
+            if (bur_sock_would_block(err)) {
                 free(buf);
                 return bur_err_str("__eagain");
             }
-            int saved = errno;
             free(buf);
-            return bur_net_err("net_read", strerror(saved));
+            return bur_net_err("net_read", bur_sock_strerror(err));
         }
     }
     if (op == 2) { // write (single attempt, returns bytes written)
@@ -830,21 +1022,18 @@ Value nat_net_nb(Value *args, int argc) {
         BurNet *conn = bur_net_get(h, BUR_NET_CONN);
         if (!conn) return bur_net_err("net_write", "invalid connection handle");
         if (len == 0) return bur_net_ok_str("0", 1);
-        int flags = 0;
-#ifdef MSG_NOSIGNAL
-        flags = MSG_NOSIGNAL;
-#endif
         for (;;) {
-            ssize_t n = send(conn->fd, data, (size_t)len, flags);
+            int n = bur_sock_send(conn->fd, data, (size_t)len);
             if (n >= 0) {
                 char buf[24];
                 int sn = snprintf(buf, sizeof buf, "%lld", (long long)n);
                 return bur_ok(bur_obj((Obj *)bur_new_string_n(buf, sn)));
             }
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            int err = bur_sock_err();
+            if (bur_sock_intr(err)) continue;
+            if (bur_sock_would_block(err))
                 return bur_err_str("__eagain");
-            return bur_net_err("net_write", strerror(errno));
+            return bur_net_err("net_write", bur_sock_strerror(err));
         }
     }
     bur_trap("net_nb: invalid op %lld", (long long)op);
@@ -869,9 +1058,7 @@ Value nat_exit(Value *args, int argc) {
 }
 Value nat_clock(Value *args, int argc) {
     (void)args; (void)argc;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double s = (double)(now.tv_sec - bur_start_time.tv_sec) + (double)(now.tv_nsec - bur_start_time.tv_nsec) / 1e9;
+    double s = (double)(bur_mono_ns() - bur_start_ns) / 1e9;
     return bur_float(s);
 }
 Value nat_type_of(Value *args, int argc) { (void)argc; return bur_obj((Obj *)bur_new_string(bur_typename(args[0]))); }
@@ -958,9 +1145,36 @@ Value nat_sleep(Value *args, int argc) {
 void bur_stdin_nonblock(void) {
     static int done = 0;
     if (done) return;
+#ifndef _WIN32
     int flags = fcntl(0, F_GETFL, 0);
     if (flags >= 0) fcntl(0, F_SETFL, flags | O_NONBLOCK);
-    done = 1;
+#endif
+    done = 1; // Windows checks readiness per read via PeekNamedPipe instead
+}
+
+// one stdin read attempt; sets *again when data may still arrive later.
+// Console stdin on Windows has no non-blocking mode, so it reads blocking.
+static int64_t bur_stdin_try(char *buf, int64_t max, bool *again) {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    *again = false;
+    if (!h || h == INVALID_HANDLE_VALUE) return -1;
+    DWORD want = max > 8192 ? 8192 : (DWORD)max;
+    if (GetFileType(h) == FILE_TYPE_PIPE) { // spawned-with-pipes case (LSP)
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) return -1; // EOF
+        if (avail == 0) { *again = true; return -1; }
+        if (want > avail) want = avail;
+    }
+    DWORD got = 0;
+    if (!ReadFile(h, buf, want, &got, NULL)) return -1;
+    return got;
+#else
+    ssize_t n = read(0, buf, (size_t)max);
+    if (n >= 0) { *again = false; return n; }
+    *again = errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK;
+    return -1;
+#endif
 }
 
 Value nat_read_stdin(Value *args, int argc) {
@@ -971,19 +1185,25 @@ Value nat_read_stdin(Value *args, int argc) {
     bur_stdin_nonblock();
     char *buf = (char *)malloc((size_t)max);
     for (;;) {
-        ssize_t n = read(0, buf, (size_t)max);
+        bool again = false;
+        int64_t n = bur_stdin_try(buf, max, &again);
         if (n >= 0) {
             Value v = bur_obj((Obj *)bur_new_string_n(buf, (int64_t)n));
             free(buf);
             return v;
         }
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            int saved = errno;
+        if (!again) {
             free(buf);
-            bur_trap("read_stdin: %s", strerror(saved));
+            bur_trap("read_stdin: input error");
         }
+#ifdef _WIN32
+        // stdin cannot join the socket waitset; wake on a short timer and retry
+        bur_cur->wake_ns = bur_now_ns() + 1000000;
+        bur_ntimers++;
+        bur_park(FBLOCKED_TIMER);
+#else
         bur_wait_current_fd(0, POLLIN);
+#endif
     }
 }
 
@@ -994,7 +1214,8 @@ Value nat_stdin_nb(Value *args, int argc) {
     if (max <= 0) return bur_ok_str("", 0);
     bur_stdin_nonblock();
     char *buf = (char *)malloc((size_t)max);
-    ssize_t n = read(0, buf, (size_t)max);
+    bool again = false;
+    int64_t n = bur_stdin_try(buf, max, &again);
     if (n >= 0) {
         bur_push(bur_obj((Obj *)bur_new_string_n(buf, (int64_t)n)));
         Value res = bur_ok(bur_peek(0));
@@ -1003,9 +1224,12 @@ Value nat_stdin_nb(Value *args, int argc) {
         return res;
     }
     free(buf);
-    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-        return bur_err_str("__eagain");
+    if (again) return bur_err_str("__eagain");
+#ifdef _WIN32
+    return bur_err_str("stdin read failed");
+#else
     return bur_err_str(strerror(errno));
+#endif
 }
 
 Value nat_gc(Value *args, int argc) { (void)args; (void)argc; bur_gc_collect(); return bur_int(bur_gc_last_freed); }

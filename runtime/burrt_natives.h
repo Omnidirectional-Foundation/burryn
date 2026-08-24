@@ -2,7 +2,7 @@
 #define BURRT_NATIVES_H
 typedef enum { BUR_NET_LISTENER, BUR_NET_CONN } BurNetKind;
 typedef struct {
-    int fd;
+    intptr_t fd; // POSIX fd / Winsock SOCKET / process pipe HANDLE live here
     BurNetKind kind;
     bool used;
 } BurNet;
@@ -63,10 +63,10 @@ extern BurNet *bur_nets;
 extern int64_t bur_nnets, bur_netscap;
 extern Value bur_net_err(const char *op, const char *msg) ;
 extern Value bur_net_ok_str(const char *data, int64_t len) ;
-extern int bur_net_socket(int family, int socktype, int protocol) ;
-extern int64_t bur_net_alloc(int fd, BurNetKind kind) ;
+extern intptr_t bur_net_socket(int family, int socktype, int protocol) ;
+extern int64_t bur_net_alloc(intptr_t fd, BurNetKind kind) ;
 extern BurNet *bur_net_get(int64_t h, BurNetKind kind) ;
-extern void bur_net_cancel_waiters(int fd) ;
+extern void bur_net_cancel_waiters(intptr_t fd) ;
 extern Value nat_tcp_listen(Value *args, int argc) ;
 extern Value nat_tcp_accept(Value *args, int argc) ;
 extern Value nat_tcp_dial(Value *args, int argc) ;

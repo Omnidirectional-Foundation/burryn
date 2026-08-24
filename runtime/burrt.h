@@ -29,6 +29,21 @@
 #include <time.h>
 #include <ctype.h>
 #include <errno.h>
+
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600 // WSAPoll and friends
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h> // must precede windows.h
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -39,6 +54,30 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <ucontext.h>
+#endif
+
+// the scheduler context: ucontext on POSIX/macOS, a Win32 fiber handle on Windows
+#ifdef _WIN32
+typedef void *BurFiberCtx;
+#else
+typedef ucontext_t BurFiberCtx;
+#endif
+
+// CLOCK_MONOTONIC as nanoseconds; QueryPerformanceCounter-backed on Windows.
+// The split multiply keeps full precision without overflowing int64 uptime.
+static inline int64_t bur_mono_ns(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (int64_t)((uint64_t)c.QuadPart / (uint64_t)f.QuadPart * 1000000000ull +
+                     (uint64_t)c.QuadPart % (uint64_t)f.QuadPart * 1000000000ull / (uint64_t)f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
+}
 
 // ---- Value ------------------------------------------------------------
 
@@ -186,11 +225,12 @@ typedef struct {
 
 // ---- fibers & channels (concurrency core) -----------------------------
 //
-// Each fiber owns a ucontext and its own C stack; blocking a fiber means
-// swapcontext-ing its entire native call stack out to the scheduler, and
-// resuming means swapping it back. This mirrors the Go VM's cooperative,
-// single-threaded scheduler (vm.go): a FIFO ready queue, park/wake on
-// channels, and deterministic interleaving — never OS threads.
+// Each fiber owns a suspended native call stack of its own: swapcontext on
+// POSIX/macOS, a Win32 fiber on Windows. Blocking a fiber swaps its whole
+// native stack out to the scheduler, and resuming swaps it back. This
+// mirrors the Go VM's cooperative, single-threaded scheduler (vm.go): a
+// FIFO ready queue, park/wake on channels, and deterministic interleaving
+// — never OS threads.
 
 typedef struct OChannel OChannel;
 typedef struct OClosure OClosure; // full struct is defined above; alias needed here
@@ -217,15 +257,17 @@ struct Fiber {
     int budget;             // instructions remaining before a forced yield
     int64_t wake_ns;        // absolute CLOCK_MONOTONIC deadline while FBLOCKED_TIMER
     int64_t io_proc;        // process handle awaited while FBLOCKED_IO
-    int io_fd;              // descriptor awaited while FBLOCKED_IO
+    intptr_t io_fd;         // descriptor awaited while FBLOCKED_IO
     short io_events;        // poll events requested for io_fd
     bool io_ready;          // scheduler observed readiness for io_fd
 
     Value *defers;          // registered defer closures; frames delimit their
     int ndefers, defercap;  // slice by watermark and pop it LIFO on exit
 
-    ucontext_t ctx;
+    BurFiberCtx ctx;        // suspended fiber state (ucontext / Win32 fiber)
+#ifndef _WIN32
     char *cstack;           // heap-allocated native stack backing ctx
+#endif
 
     OChannel **selectChans; // channels this fiber waits on while parked in select
     int nselect, selectcap;
@@ -257,10 +299,10 @@ typedef struct Buf Buf;
 struct Buf { char *data; int64_t len, cap; };
 typedef struct { char *key; int64_t klen; Value val; bool used; } GlobalSlot;
 typedef struct {
-    pid_t pid;
-    int outfd, errfd, failfd;   // parent read ends, -1 once closed
-    Buf ob, eb;                 // collected stdout/stderr
-    int child_err;              // errno from a failed exec, via failfd
+    intptr_t pid;                  // child pid (POSIX) / process handle (Windows)
+    intptr_t outfd, errfd, failfd; // parent read ends, -1 once closed
+    Buf ob, eb;                    // collected stdout/stderr
+    int child_err;                 // errno from a failed exec, via failfd (POSIX)
     bool have_err;
     int code;                   // exit code once reaped
     bool complete;              // pipes drained + child reaped
@@ -269,7 +311,11 @@ typedef struct {
 } BurProc;
 typedef void (*BurWaitReadyFn)(int64_t owner, short revents);
 typedef struct {
+#ifdef _WIN32
+    WSAPOLLFD *fds;
+#else
     struct pollfd *fds;
+#endif
     int64_t *owners;
     BurWaitReadyFn *ready;
     int n, cap;
@@ -278,7 +324,7 @@ typedef struct {
 
 extern Fiber *bur_cur;
 extern Fiber *bur_main_fiber;
-extern ucontext_t bur_sched_ctx;
+extern BurFiberCtx bur_sched_ctx;
 extern Fiber **bur_fibers;
 extern int64_t bur_nfibers, bur_fiberscap;
 extern Fiber **bur_ready;
@@ -292,7 +338,7 @@ extern int64_t bur_gc_count, bur_gc_threshold, bur_gc_cycles, bur_gc_last_freed;
 extern bool bur_gc_ready;
 extern OClosure *bur_cur_closure;
 extern OEnumType *bur_opt_enum, *bur_res_enum, *bur_out_enum;
-extern struct timespec bur_start_time;
+extern int64_t bur_start_ns; // CLOCK_MONOTONIC at boot
 extern int bur_argc;
 extern char **bur_argv;
 extern void bur_trap(const char *fmt, ...) ;
@@ -402,7 +448,7 @@ extern bool chan_recv_ready(OChannel *ch) ;
 extern bool chan_send_ready(OChannel *ch) ;
 extern bool chan_try_recv(OChannel *ch, Value *out) ;
 extern void bur_park(FiberStatus st) ;
-extern void bur_wait_current_fd(int fd, short events) ;
+extern void bur_wait_current_fd(intptr_t fd, short events) ;
 extern void bur_switch_to_sched(void) ;
 extern void bur_preempt(void) ;
 extern OChannel *as_channel_opt(Value v) ;
@@ -413,7 +459,7 @@ extern BurProc *bur_procs;
 extern int64_t bur_nprocs, bur_procscap;
 extern BurWaitSet bur_waitset;
 extern void bur_wait_reset(void) ;
-extern void bur_wait_fd(int fd, short events, int64_t owner, BurWaitReadyFn ready) ;
+extern void bur_wait_fd(intptr_t fd, short events, int64_t owner, BurWaitReadyFn ready) ;
 extern void bur_wait_timer(int64_t deadline_ns) ;
 extern bool bur_proc_valid(int64_t h) ;
 extern void bur_proc_pump(BurProc *p) ;
