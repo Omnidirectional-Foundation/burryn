@@ -12,6 +12,11 @@
 #ifndef BURRT_H
 #define BURRT_H
 
+// macOS hides the deprecated ucontext routines unless _XOPEN_SOURCE is set.
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 600
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
