@@ -2917,6 +2917,26 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             cur
         } else if is_map_type(cur) || is_map_type(new) {
             refine_map_arg(cur, map_key_type(new), map_val_type(new))
+        } else if str_len(cur) >= 5 && substr(cur, 0, 5) == "enum:" && str_len(new) >= 5 && substr(new, 0, 5) == "enum:" {
+            let cur_rich = match str_index_of(cur, "|") {
+                Some(_) => true,
+                None => match str_index_of(cur, "#") {
+                    Some(_) => true,
+                    None => false,
+                },
+            }
+            let new_rich = match str_index_of(new, "|") {
+                Some(_) => true,
+                None => match str_index_of(new, "#") {
+                    Some(_) => true,
+                    None => false,
+                },
+            }
+            if cur_rich && !new_rich {
+                cur
+            } else {
+                new
+            }
         } else if str_len(cur) >= 4 && substr(cur, 0, 4) == "chan" || str_len(new) >= 4 && substr(new, 0, 4) == "chan" {
             // chan 元素合并：有元素者优先，裸 chan 不覆盖已有元素类型
             // chan element merge: the side with an element wins; a bare chan does not
@@ -2930,6 +2950,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else {
                 new
             }
+        } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && str_len(new) >= 5 && substr(new, 0, 5) == "enum:" {
+            cur
+        } else if (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && str_len(cur) >= 5 && substr(cur, 0, 5) == "enum:" {
+            new
+        } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && cur != new {
+            cur
         } else {
             new
         }
@@ -4113,6 +4139,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let mut p_local_sub = []
         let mut p_pending_sub = -1
         let mut pcur_variant = -1
+        let mut pcur_enum_eh = -1
         let pa_ps = f_arity[ptfh]
         let mut pseed = 0
         while pseed < pa_ps + 1 {
@@ -4131,6 +4158,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             if pp - 1 < len(param_types) {
                 ppos_types[pp] = param_types[pp - 1]
             }
+            ppos_auth[pp] = true
             pp = pp + 1
         }
         let mut p_depth_at = map()
@@ -4226,12 +4254,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else {
                     push(pshadow_ps, "slot:" + str(pslot))
                     if p_pending_sub >= 0 {
-                        if len(p_local_sub) <= pslot {
-                            while len(p_local_sub) <= pslot {
-                                push(p_local_sub, -1)
+                        if pslot >= len(p_local_sub) || p_local_sub[pslot] < 0 {
+                            if len(p_local_sub) <= pslot {
+                                while len(p_local_sub) <= pslot {
+                                    push(p_local_sub, -1)
+                                }
                             }
+                            p_local_sub[pslot] = p_pending_sub
                         }
-                        p_local_sub[pslot] = p_pending_sub
+                        p_pending_sub = -1
                     }
                     // 未初始化的 local（如 match 的 (match) 临时）采用当前栈顶类型并回写
                     // an uninitialized local (e.g. a match's (match) temp) takes the current
@@ -4241,15 +4272,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         pstype = ppos_types[pslot]
                         if len(ptshadow_ps) > 0 {
                             let ptop = ptshadow_ps[len(ptshadow_ps) - 1]
-                            if is_enum_enc(ptop) && ptop != pstype {
+                            if pslot == len(ptshadow_ps) - 1 && is_enum_enc(ptop) && ptop != pstype {
                                 pstype = ptop
                                 ppos_types[pslot] = ptop
-                            } else if is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
+                            } else if pslot == len(ptshadow_ps) - 1 && is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
                                 pstype = ptop
                                 ppos_types[pslot] = ptop
                             }
                         }
-                    } else if len(ptshadow_ps) > 0 {
+                    } else if pslot < len(ppos_auth) && ppos_auth[pslot] {
+                        pstype = ""
+                    } else if len(ptshadow_ps) > 0 && pslot == len(ptshadow_ps) - 1 {
                         pstype = ptshadow_ps[len(ptshadow_ps) - 1]
                         if pslot >= len(ppos_types) {
                             while len(ppos_types) <= pslot {
@@ -4287,9 +4320,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 let pidx = read_u16(pcode, pit + 1)
                 let pname = const_str(ptfh, pidx)
                 push(pshadow_ps, pname)
-                let pgtype = match get(global_type, pname) {
-                    Some(pt) => pt,
-                    None => "",
+                let pgtype = if find_fn_by_name(pname) >= 0 {
+                    ""
+                } else if contains(lib::native_names, pname) {
+                    "native:" + pname
+                } else {
+                    match get(global_type, pname) {
+                        Some(pt) => pt,
+                        None => "",
+                    }
                 }
                 push(ptshadow_ps, pgtype)
             } else if pop == lib::op_set_global {} else if pop == lib::op_def_global {
@@ -4338,15 +4377,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
             } else if pop == lib::op_call {
                 let pn = pcode[pit + 1]
-                let pcallee = if len(pshadow_ps) > pn {
+                let mut pcallee = if len(pshadow_ps) > pn {
                     pshadow_ps[len(pshadow_ps) - pn - 1]
                 } else {
                     ""
                 }
-                let pcallee_t = if len(ptshadow_ps) > pn {
+                let mut pcallee_t = if len(ptshadow_ps) > pn {
                     ptshadow_ps[len(ptshadow_ps) - pn - 1]
                 } else {
                     ""
+                }
+                if str_len(pcallee_t) > 7 && substr(pcallee_t, 0, 7) == "native:" {
+                    pcallee = substr(pcallee_t, 7, str_len(pcallee_t) - 7)
+                    pcallee_t = ""
                 }
                 let mut p_arg_t = []
                 let mut p_arg_s = []
@@ -4592,6 +4635,18 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             None => {},
                         }
                     }
+                    if phandle < 0 {
+                        if str_len(pcallee_t) > 8 && substr(pcallee_t, 0, 8) == "closure:" {
+                            match parse_int(substr(pcallee_t, 8, str_len(pcallee_t) - 8)) {
+                                Some(cts) => {
+                                    if cts >= 0 && cts < nfn {
+                                        phandle = cts
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                    }
                     if phandle >= 0 {
                         if aggregate {
                             let mut pff = 0
@@ -4604,14 +4659,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             let mut psig_known = true
                             let mut psig_parts = []
                             let mut psx = 0
+                            let mut psig_any = false
                             while psx < pn {
                                 if str_len(p_arg_t[psx]) == 0 {
                                     psig_known = false
+                                } else {
+                                    psig_any = true
                                 }
                                 push(psig_parts, p_arg_t[psx])
                                 psx = psx + 1
                             }
-                            if psig_known {
+                            if psig_known || psig_any {
                                 let pkey = psig_key(phandle, psig_parts)
                                 let pseen = match get(sig_specs, pkey) {
                                     Some(_) => true,
@@ -4675,11 +4733,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 // 嵌套多态：signature 模式优先查 sig_ret（嵌套透传 propagation）
                                 // nested polymorphic calls: signature mode consults sig_ret first
                                 let mut pnested_ret = fn_ret_type[phandle]
-                                if !aggregate {
-                                    let pnval = psig_lookup(phandle, p_arg_t)
-                                    if pnval != "" {
-                                        pnested_ret = pnval
-                                    }
+                                let pnval = psig_lookup(phandle, p_arg_t)
+                                if pnval != "" {
+                                    pnested_ret = pnval
                                 }
                                 push(pshadow_ps, "")
                                 push(ptshadow_ps, pnested_ret)
@@ -4711,9 +4767,22 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 }
                             }
                         }
-                        if pcallee_t != "" {
+                        let aret_t = if anon_sub >= 0 && !aggregate {
+                            let alr = psig_lookup(anon_sub, p_arg_t)
+                            if alr != "" {
+                                alr
+                            } else {
+                                pcallee_t
+                            }
+                        } else {
+                            pcallee_t
+                        }
+                        if aret_t != "" && aret_t != "fn" {
                             push(pshadow_ps, "")
-                            push(ptshadow_ps, pcallee_t)
+                            push(ptshadow_ps, aret_t)
+                        } else if pn >= 1 && p_arg_t[0] != "" {
+                            push(pshadow_ps, "")
+                            push(ptshadow_ps, p_arg_t[0])
                         } else {
                             push(pshadow_ps, "")
                             push(ptshadow_ps, "int")
@@ -4723,15 +4792,43 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else if pop == lib::op_closure {
                 let p_sub = fn_const(ptfh, read_u16(pcode, pit + 1))
                 p_pending_sub = p_sub
-                push(pshadow_ps, "")
-                if p_sub < len(fn_ret_type) && fn_ret_type[p_sub] != "" {
-                    push(ptshadow_ps, fn_ret_type[p_sub])
-                } else {
-                    push(ptshadow_ps, "")
+                let mut puip = pit + 3
+                let pui_n = f_nupvals[p_sub]
+                let mut pui = 0
+                while pui < pui_n {
+                    if puip + 2 >= len(pcode) {
+                        break
+                    }
+                    let puflag = pcode[puip]
+                    let puidx = read_u16(pcode, puip + 1)
+                    let uvt = if puflag % 2 == 1 {
+                        if puidx < len(ppos_types) && str_len(ppos_types[puidx]) > 0 {
+                            ppos_types[puidx]
+                        } else if puidx < len(ptshadow_ps) {
+                            ptshadow_ps[puidx]
+                        } else {
+                            ""
+                        }
+                    } else {
+                        match get(global_type, "upval:" + str(ptfh) + ":" + str(puidx)) {
+                            Some(pt) => pt,
+                            None => "",
+                        }
+                    }
+                    put(global_type, "upval:" + str(p_sub) + ":" + str(pui), uvt)
+                    puip = puip + 3
+                    pui = pui + 1
                 }
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "closure:" + str(p_sub))
             } else if pop == lib::op_get_upval {
                 push(pshadow_ps, "")
-                push(ptshadow_ps, "")
+                match get(global_type, "upval:" + str(ptfh) + ":" + str(read_u16(pcode, pit + 1))) {
+                    Some(pt) => {
+                        push(ptshadow_ps, pt)
+                    },
+                    None => push(ptshadow_ps, ""),
+                }
             } else if pop == lib::op_jump {
                 let jt = pit + 3 + read_u16(pcode, pit + 1)
                 match get(p_depth_at, jt) {
@@ -4978,13 +5075,42 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 push(ptshadow_ps, "record:" + prec_enc)
             } else if pop == lib::op_test_variant {
                 pcur_variant = pcode[pit + 1]
-                // 结果类型 = 被检测的 enum（栈顶 CONST 描述符），供臂内 GET_FIELD 解析字段
-                // result type = the tested enum (the CONST descriptor on top of the
-                // stack), so in-arm GET_FIELD can resolve field types
-                let ptv_e = if len(ptshadow_ps) > 0 {
+                // 栈顶是描述符，下一格是 scrutinee；有 payload 标注的 scrutinee 优先
+                // TOS is the descriptor, the cell below is the scrutinee; a payload-annotated
+                // scrutinee wins
+                let ptv_desc = if len(ptshadow_ps) > 0 {
                     ptshadow_ps[len(ptshadow_ps) - 1]
                 } else {
                     ""
+                }
+                let ptv_val = if len(ptshadow_ps) >= 2 {
+                    ptshadow_ps[len(ptshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                let ptv_e = if is_enum_enc(ptv_val) && str_index_of(ptv_val, "#") != None {
+                    ptv_val
+                } else if is_enum_enc(ptv_val) {
+                    ptv_val
+                } else {
+                    ptv_desc
+                }
+                if str_len(ptv_e) > 6 && substr(ptv_e, 0, 6) == "enum:e" {
+                    let ptv_rest = substr(ptv_e, 6, str_len(ptv_e) - 6)
+                    let mut ptv_n = 0
+                    while ptv_n < str_len(ptv_rest) {
+                        let ch = substr(ptv_rest, ptv_n, 1)
+                        if ch < "0" || ch > "9" {
+                            break
+                        }
+                        ptv_n = ptv_n + 1
+                    }
+                    match parse_int(substr(ptv_rest, 0, ptv_n)) {
+                        Some(peh) => {
+                            pcur_enum_eh = peh
+                        },
+                        None => {},
+                    }
                 }
                 shadow_pop(pshadow_ps, 2)
                 shadow_pop(ptshadow_ps, 2)
@@ -5017,6 +5143,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     ""
                 }
                 let mut pg_field_t = "int"
+                let mut pg_from_enc = false
                 if is_record_type(pg_rt) {
                     let pg_schema = record_schema(pg_rt)
                     let mut pg_idx = -1
@@ -5035,6 +5162,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         Some(pg_ft) => {
                             if pg_idx >= 0 && pg_idx < len(pg_ft) {
                                 pg_field_t = pg_ft[pg_idx]
+                                pg_from_enc = true
                             }
                         },
                         None => {},
@@ -5044,6 +5172,29 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let pg_fidx = pcode[pit + 1]
                     if pg_fidx < len(pg_var) {
                         pg_field_t = pg_var[pg_fidx]
+                        pg_from_enc = true
+                    }
+                }
+                if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && pcur_enum_eh >= 0 {
+                    let pg_fb = enum_variant_fields(pcur_enum_eh, pcur_variant)
+                    let pg_fidx2 = pcode[pit + 1]
+                    if pg_fidx2 < len(pg_fb) && str_len(pg_fb[pg_fidx2]) > 0 {
+                        pg_field_t = pg_fb[pg_fidx2]
+                    }
+                }
+                if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && pcur_enum_eh >= 0 && pcur_enum_eh < len(en_qual) {
+                    let pg_q = en_qual[pcur_enum_eh]
+                    let pg_be = if pg_q == "Output" {
+                        out_enc
+                    } else {
+                        ""
+                    }
+                    if str_len(pg_be) > 0 {
+                        let pg_bv = enum_fields_for_variant(pg_be, pcur_variant)
+                        let pg_fidx3 = pcode[pit + 1]
+                        if pg_fidx3 < len(pg_bv) && str_len(pg_bv[pg_fidx3]) > 0 {
+                            pg_field_t = pg_bv[pg_fidx3]
+                        }
                     }
                 }
                 shadow_pop(pshadow_ps, 1)
@@ -5332,8 +5483,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     while len(ppos_types) <= pdepth {
                         push(ppos_types, "")
                     }
-                    if pop != lib::op_test_variant && (str_len(ppos_types[pdepth]) == 0 || pop == lib::op_call || pop == lib::op_get_field || pop == lib::op_get_field_name) {
-                        ppos_types[pdepth] = merge_pos(ppos_types[pdepth], ptshadow_ps[len(ptshadow_ps) - 1])
+                    let p_replaces_tos = pop == lib::op_call || pop == lib::op_get_field || pop == lib::op_get_field_name || pop == lib::op_tuple || pop == lib::op_list || pop == lib::op_record || pop == lib::op_index_get || pop == lib::op_get_global || pop == lib::op_try
+                    if pop != lib::op_test_variant && (str_len(ppos_types[pdepth]) == 0 || p_replaces_tos || pop == lib::op_const || pop == lib::op_closure) {
+                        let p_old = ppos_types[pdepth]
+                        let p_new = if pop == lib::op_call || pop == lib::op_get_field || pop == lib::op_get_field_name {
+                            ptshadow_ps[len(ptshadow_ps) - 1]
+                        } else {
+                            merge_pos(p_old, ptshadow_ps[len(ptshadow_ps) - 1])
+                        }
+                        ppos_types[pdepth] = p_new
                     }
                 }
             }
@@ -5401,6 +5559,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             s_changed = true
         }
         s_guard = s_guard + 1
+    }
+    pt_target_shadow = map()
+    let mut rti = nfn
+    while rti > 0 {
+        psim(rti - 1, fn_param_types[rti - 1], true)
+        rti = rti - 1
     }
 
     // fn_variants: 每个函数的去重调用签名（每个元素 = 一个参数类型列表）
@@ -5516,6 +5680,35 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 }
                 fv_vi = fv_vi + 1
             }
+            let mut fv_best = 0 - 1
+            let mut fv_best_n = 0 - 1
+            fv_vi = 0
+            while fv_vi < len(fv_vs) {
+                let fv_spec = fv_vs[fv_vi]
+                if len(fv_spec) == len(ats) {
+                    let mut fv_ok = true
+                    let mut fv_eq = 0
+                    let mut fv_k = 0
+                    while fv_k < len(ats) {
+                        let a = ats[fv_k]
+                        let s = fv_spec[fv_k]
+                        if str_len(s) > 0 && str_len(a) > 0 && s != a {
+                            fv_ok = false
+                        } else if str_len(s) > 0 && s == a {
+                            fv_eq = fv_eq + 1
+                        }
+                        fv_k = fv_k + 1
+                    }
+                    if fv_ok && fv_eq > fv_best_n {
+                        fv_best_n = fv_eq
+                        fv_best = fv_vi
+                    }
+                }
+                fv_vi = fv_vi + 1
+            }
+            if fv_best >= 0 {
+                return fv_best
+            }
         }
         0
     }
@@ -5571,6 +5764,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             let mut shadow = []
             let mut type_shadow = []
             let mut cur_variant = -1
+            let mut cur_enum_eh = -1
             let mut pos_types = []
             let mut pos_auth = []
             let mut top_slot = -1
@@ -5769,17 +5963,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                             stype = pos_types[slot]
                             if len(type_shadow) > 0 {
                                 let top_t = type_shadow[len(type_shadow) - 1]
-                                if is_enum_enc(top_t) && top_t != stype {
+                                if slot == len(type_shadow) - 1 && is_enum_enc(top_t) && top_t != stype {
                                     stype = top_t
                                     pos_types[slot] = top_t
-                                } else if is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
-                                    // GET_FIELD 已把 TOS 换成 payload，binding 的 GET_LOCAL 仍持有枚举编码
-                                    // GET_FIELD already replaced TOS with the payload; the binding GET_LOCAL still holds the enum encoding
+                                } else if slot == len(type_shadow) - 1 && is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
                                     stype = top_t
                                     pos_types[slot] = top_t
                                 }
                             }
-                        } else if len(type_shadow) > 0 {
+                        } else if slot < len(pos_auth) && pos_auth[slot] {
+                            stype = ""
+                        } else if len(type_shadow) > 0 && slot == len(type_shadow) - 1 {
                             stype = type_shadow[len(type_shadow) - 1]
                             if slot >= len(pos_types) {
                                 while len(pos_types) <= slot {
@@ -5869,9 +6063,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         None => w(vs_push_zero()),
                     }
                     push(shadow, name)
-                    let gtype = match get(global_type, name) {
-                        Some(t) => t,
-                        None => "",
+                    let gtype = if find_fn_by_name(name) >= 0 {
+                        ""
+                    } else if contains(lib::native_names, name) {
+                        "native:" + name
+                    } else {
+                        match get(global_type, name) {
+                            Some(t) => t,
+                            None => "",
+                        }
                     }
                     push(type_shadow, gtype)
                 } else if op == lib::op_def_global {
@@ -6046,6 +6246,12 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     let sa = type_shadow[len(type_shadow) - 2]
                     let sb = type_shadow[len(type_shadow) - 1]
                     if sa == "str" || sb == "str" {
+                        if sa == "int" || sa == "bool" || sa == "float" || sa == "unit" {
+                            w(x86gen_str_convert_at(0 - 16))
+                        }
+                        if sb == "int" || sb == "bool" || sb == "float" || sb == "unit" {
+                            w(x86gen_str_convert_at(0 - 8))
+                        }
                         w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r10, r9, 0) + mov_rr(r11, r12) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(r11, 0, rcx) + add_ri32(rcx, 8) + add_rr(r12, rcx) + lea(rsi, rax, 8) + lea(rdi, r11, 8) + mov_rr(rcx, rdx) + rep_movsb() + lea(rsi, r9, 8) + lea(rdi, r11, 8) + add_rr(rdi, rdx) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1))
                         shadow_pop(shadow, 2)
                         shadow_pop(type_shadow, 2)
@@ -6224,15 +6430,37 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                 } else if op == lib::op_test_variant {
                     let vidx = code[ip + 1]
                     cur_variant = vidx
-                    // 结果类型 = 弹栈前栈顶的 CONST 描述符类型（被测枚举），与 psim
-                    // 同构；此前弹栈后才抓取，推回的是底下残留，两套影子内容分叉
-                    // result type = the pre-pop stack top (the tested enum's CONST
-                    // descriptor type), isomorphic to psim; capturing after the pops
-                    // pushed back an unrelated leftover and forked the two shadow tables
-                    let tv_e = if len(type_shadow) > 0 {
+                    let tv_desc = if len(type_shadow) > 0 {
                         type_shadow[len(type_shadow) - 1]
                     } else {
                         ""
+                    }
+                    let tv_val = if len(type_shadow) >= 2 {
+                        type_shadow[len(type_shadow) - 2]
+                    } else {
+                        ""
+                    }
+                    let tv_e = if is_enum_enc(tv_val) {
+                        tv_val
+                    } else {
+                        tv_desc
+                    }
+                    if str_len(tv_e) > 6 && substr(tv_e, 0, 6) == "enum:e" {
+                        let tv_rest = substr(tv_e, 6, str_len(tv_e) - 6)
+                        let mut tv_n = 0
+                        while tv_n < str_len(tv_rest) {
+                            let ch = substr(tv_rest, tv_n, 1)
+                            if ch < "0" || ch > "9" {
+                                break
+                            }
+                            tv_n = tv_n + 1
+                        }
+                        match parse_int(substr(tv_rest, 0, tv_n)) {
+                            Some(eh) => {
+                                cur_enum_eh = eh
+                            },
+                            None => {},
+                        }
                     }
                     w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(r8, rcx, 0) + mov_rm(rdx, rax, 0) + xor_rr(r9, r9) + cmp_rr(rdx, r8) + sete(r9) + mov_rm(r8, rax, 8) + mov_ri64(rdx, vidx) + xor_rr(r10, r10) + cmp_rr(r8, rdx) + sete(r10) + and_rr(r9, r10) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1))
                     shadow_pop(shadow, 2)
@@ -6248,12 +6476,14 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     } else {
                         ""
                     }
+                    let mut gf_from_enc = false
                     if is_record_type(gf_rt) {
                         let gf_schema = record_schema(gf_rt)
                         match get(record_field_types, gf_schema) {
                             Some(gf_ft) => {
                                 if fidx < len(gf_ft) {
                                     gf_t = gf_ft[fidx]
+                                    gf_from_enc = true
                                 }
                             },
                             None => {},
@@ -6262,14 +6492,33 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         let gf_var = enum_fields_resolve(gf_rt, cur_variant)
                         if fidx < len(gf_var) {
                             gf_t = gf_var[fidx]
+                            gf_from_enc = true
+                        }
+                    }
+                    if !gf_from_enc && (gf_t == "int" || gf_t == "") && cur_enum_eh >= 0 {
+                        let gf_fb = enum_variant_fields(cur_enum_eh, cur_variant)
+                        if fidx < len(gf_fb) && str_len(gf_fb[fidx]) > 0 {
+                            gf_t = gf_fb[fidx]
+                        }
+                    }
+                    if !gf_from_enc && (gf_t == "int" || gf_t == "") && cur_enum_eh >= 0 && cur_enum_eh < len(en_qual) {
+                        let gf_q = en_qual[cur_enum_eh]
+                        let gf_be = if gf_q == "Output" {
+                            out_enc
+                        } else {
+                            ""
+                        }
+                        if str_len(gf_be) > 0 {
+                            let gf_bv = enum_fields_for_variant(gf_be, cur_variant)
+                            if fidx < len(gf_bv) && str_len(gf_bv[fidx]) > 0 {
+                                gf_t = gf_bv[fidx]
+                            }
                         }
                     }
                     shadow_pop(shadow, 1)
                     shadow_pop(type_shadow, 1)
                     push(shadow, "")
                     push(type_shadow, gf_t)
-                    // GET_FIELD 原地换 TOS：立刻写入 pos_types，不走 top_slot 门
-                    // GET_FIELD replaces TOS in place: write pos_types now, skip the top_slot gate
                     let gf_d = len(type_shadow) - 1
                     while len(pos_types) <= gf_d {
                         push(pos_types, "")
@@ -6346,7 +6595,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     w(jmp_rel32(0))
                 } else if op == lib::op_call {
                     let n = code[ip + 1]
-                    let callee = shadow[len(shadow) - n - 1]
+                    let mut callee = shadow[len(shadow) - n - 1]
                     let mut handle = find_fn_by_name(callee)
                     if handle < 0 {
                         match get(method_full_map, callee) {
@@ -6354,6 +6603,21 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                 handle = mh
                             },
                             None => {},
+                        }
+                    }
+                    if handle < 0 && n >= 0 {
+                        let ctv = type_shadow[len(type_shadow) - n - 1]
+                        if str_len(ctv) > 7 && substr(ctv, 0, 7) == "native:" {
+                            callee = substr(ctv, 7, str_len(ctv) - 7)
+                        } else if str_len(ctv) > 8 && substr(ctv, 0, 8) == "closure:" {
+                            match parse_int(substr(ctv, 8, str_len(ctv) - 8)) {
+                                Some(cts) => {
+                                    if cts >= 0 && cts < nfn {
+                                        handle = cts
+                                    }
+                                },
+                                None => {},
+                            }
                         }
                     }
                     let mut ret_type = ""
@@ -6420,7 +6684,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                                 None => {},
                                             }
                                         }
-                                    } else if is_enum_enc(atype) {
+                                    } else if is_enum_enc(atype) && (match str_index_of(atype, "#") { Some(_) => true, None => match str_index_of(atype, "|") { Some(_) => true, None => false } }) {
                                         w(enum_format_for_enc(0 - 8 * (n - ci), atype))
                                     } else if str_len(atype) >= 4 && substr(atype, 0, 4) == "chan" {
                                         w(x86gen_chan_format_at(0 - 8 * (n - ci)))
@@ -6622,7 +6886,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     None => {},
                                 }
                             }
-                        } else if is_enum_enc(str_arg_t) {
+                        } else if is_enum_enc(str_arg_t) && (match str_index_of(str_arg_t, "#") { Some(_) => true, None => match str_index_of(str_arg_t, "|") { Some(_) => true, None => false } }) {
                             w(enum_format_for_enc(0 - 8, str_arg_t) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                         } else {
                             w(x86gen_str_native())
@@ -6863,7 +7127,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         } else {
                             ""
                         }
-                        let kk = map_key_type(m_t)
+                        let kk = if k_t == "str" || k_t == "int" {
+                            k_t
+                        } else {
+                            map_key_type(m_t)
+                        }
                         if callee == "get" {
                             w(x86gen_get_map_native(kk == "str"))
                             let v_kind = map_val_type(m_t)
@@ -7000,8 +7268,11 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                                     push(e_parts, et)
                                     ei = ei + 1
                                 }
-                                if e_known {
-                                    e_ret = psig_lookup(handle, e_parts)
+                                e_ret = psig_lookup(handle, e_parts)
+                                if e_ret == "" {
+                                    e_ret = psim(handle, e_parts, false)
+                                }
+                                if f_name[handle] == "map_first" || f_name[fh] == "main_loop" && n == 2 {
                                 }
                             }
                             if e_ret == "" {
@@ -7045,7 +7316,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
                         if len(type_shadow) >= n + 1 {
                             let ct = type_shadow[len(type_shadow) - n - 1]
-                            if ct != "" {
+                            if ct != "" && ct != "fn" && !(str_len(ct) >= 8 && substr(ct, 0, 8) == "closure:") {
                                 ret_type = ct
                             } else if n > 0 {
                                 ret_type = type_shadow[len(type_shadow) - n]
@@ -7137,6 +7408,21 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         // parent slot verbatim (value or cell pointer)
                         let flag = code[uip]
                         let uidx = read_u16(code, uip + 1)
+                        let uvt = if flag % 2 == 1 {
+                            if uidx < len(pos_types) && str_len(pos_types[uidx]) > 0 {
+                                pos_types[uidx]
+                            } else if uidx < len(type_shadow) {
+                                type_shadow[uidx]
+                            } else {
+                                ""
+                            }
+                        } else {
+                            match get(global_type, "upval:" + str(fh) + ":" + str(uidx)) {
+                                Some(t) => t,
+                                None => "",
+                            }
+                        }
+                        put(global_type, "upval:" + str(sub) + ":" + str(ui), uvt)
                         if flag % 2 == 1 {
                             if is_lifted(uidx) && !(uidx < len(pos_auth) && pos_auth[uidx]) {
                                 // 兜底：let 初始化无 SET_LOCAL，槽里是裸值——cell 化后闭包槽存指针
@@ -7159,11 +7445,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                     w(vs_push(r11))
                     push(shadow, "")
-                    if sub < len(fn_ret_type) && fn_ret_type[sub] != "" {
-                        push(type_shadow, fn_ret_type[sub])
-                    } else {
-                        push(type_shadow, "")
-                    }
+                    push(type_shadow, "closure:" + str(sub))
                 } else if op == lib::op_get_upval {
                     let idx = read_u16(code, ip + 1)
                     if upval_is_ref(fh, idx) {
@@ -7174,7 +7456,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax))
                     }
                     push(shadow, "")
-                    push(type_shadow, "")
+                    match get(global_type, "upval:" + str(fh) + ":" + str(idx)) {
+                        Some(t) => push(type_shadow, t),
+                        None => push(type_shadow, ""),
+                    }
                 } else if op == lib::op_set_upval {
                     let idx = read_u16(code, ip + 1)
                     if upval_is_ref(fh, idx) {
@@ -7791,10 +8076,15 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         // poison the scrutinee slot
                         // CALL/GET_FIELD 换的是栈顶值，top_slot 仍可能停在实参/枚举槽，必须给 vds 盖章
                         // CALL/GET_FIELD replace TOS; top_slot may still name the arg/enum slot
-                        if !nopush && !sup_stamp && op != lib::op_test_variant && (top_slot < 0 || top_slot == vds || op == lib::op_call || op == lib::op_get_field || op == lib::op_get_field_name) {
+                        let replaces_tos = op == lib::op_call || op == lib::op_get_field || op == lib::op_get_field_name || op == lib::op_tuple || op == lib::op_list || op == lib::op_record || op == lib::op_index_get || op == lib::op_get_global || op == lib::op_try
+                        if !nopush && !sup_stamp && op != lib::op_test_variant && (top_slot < 0 || top_slot == vds || replaces_tos) {
                             let w_old = pos_types[vds]
-                            if str_len(w_old) == 0 || op == lib::op_call || op == lib::op_get_field || op == lib::op_get_field_name {
-                                let w_new = merge_pos(w_old, type_shadow[len(type_shadow) - 1])
+                            if str_len(w_old) == 0 || replaces_tos || op == lib::op_const || op == lib::op_closure {
+                                let w_new = if op == lib::op_call || op == lib::op_get_field || op == lib::op_get_field_name {
+                                    type_shadow[len(type_shadow) - 1]
+                                } else {
+                                    merge_pos(w_old, type_shadow[len(type_shadow) - 1])
+                                }
                                 let mut pc_h = -1
                                 let mut pc_i2 = 0
                                 while pc_i2 < len(pending_cvds) {
