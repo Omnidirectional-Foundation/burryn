@@ -9,7 +9,7 @@ the day the window opened until the next seed-base tag. Latest first.
 版本号跟 `seed-base-N` tag（打 tag 后下一号为 `v0.(N+1)`），不走全局两日窗口。
 条目标题上的日期是该版本的跨度：从开窗到下一枚 seed-base 之前。最新在前。
 
-## v0.6 (2026-08-13 ~ 08-22)
+## v0.6 (2026-08-13 ~ 08-24)
 
 **Recorded IPC clauses, then settled them; landed capture and name-based records;
 stopped restating live status across docs** — SPEC keeps decisions, GOALS keeps
@@ -47,6 +47,20 @@ SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口
 - **Changed:** User-facing closure text in README and tutorial matches SPEC
   (copy-at-capture; `capture(ref)` for shared `mut`). grammar.md records
   shebang, labeled loops in `statement`, and `..` range in the expression EBNF.
+- **Fixed:** x86 pre-scan records `net_nb` as `Result<str,str>`; GET_FIELD
+  payload types stamp onto locals; link-slot seeding and enum payload merge;
+  `enum_mono` sentinel; `net_nb` would-block prints once.
+- **修复：** x86 预扫描把 `net_nb` 记成 `Result<str,str>`；GET_FIELD payload
+  类型盖到 local；链接槽种子与枚举 payload 合并；`enum_mono` 哨兵；`net_nb`
+  的 would-block 只打一行。
+- **Changed:** GitHub Actions L0 births `gen1` from `bur-base` cached by
+  `archive/go-host` SHA at `CC_OPT=-O1`; seed skipped on hit; seed-era
+  `runtime/*.h` overlay; testdata skips C three-gen fixpoint on push.
+- **变更：** GitHub Actions L0 用按 `archive/go-host` SHA 缓存的 `bur-base`
+  （`CC_OPT=-O1`）接生 `gen1`；命中则跳过 seed；覆盖 seed 世代 `runtime/*.h`；
+  testdata 在 push 上跳过 C 三代定点。
+- **Changed:** `exec_large` redirects `yes` stderr.
+- **变更：** `exec_large` 重定向 `yes` 的 stderr。
 - **Changed:** Split `docs/GOALS.md` (milestones and remaining completion lines)
   from `docs/SPEC.md` (retrospective decisions). Stage state no longer lives in
   SPEC §5; that section points at GOALS.
