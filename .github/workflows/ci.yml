@@ -265,6 +265,54 @@ jobs:
             ./gen1 test "std/$p"
           done
 
+  x86-pe-build:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: Build windows hello
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o hello.exe
+
+      - name: Upload hello.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-pe-hello
+          path: hello.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  x86-pe-run:
+    needs: x86-pe-build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download hello.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: x86-pe-hello
+
+      - name: Run and compare golden
+        shell: pwsh
+        run: |
+          cmd /c ".\hello.exe > actual.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/basics/hello.golden actual.txt
+
   runtime:
     needs: []
     runs-on: ${{ matrix.os }}

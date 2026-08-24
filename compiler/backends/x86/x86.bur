@@ -32,6 +32,47 @@ pub fn arg_regs() {
     [rdi, rsi, rdx, rcx, r8, r9]
 }
 
+// 目标 OS：linux | windows。main.bur 经 set_target_os 在 build 入口设定；
+// syscall()/装配尾据此分叉，ELF 路径字节零变化。
+// Target OS: linux | windows. main.bur sets it via set_target_os at build
+// entry; syscall()/the assembly tail branch on it, leaving ELF bytes intact.
+pub let mut target_os = "linux"
+
+pub fn set_target_os(os) {
+    target_os = os
+}
+
+// img_base 返回 runtime 槽区的绝对基址：ELF 在 base+120（头 64+56B）；
+// PE 头区占满首个 RVA 页，内容从 base+4096 起。所有绝对地址编码经此收口。
+// img_base returns the absolute base of the runtime slot area: ELF sits at
+// base+120 (64+56 bytes of headers); PE headers fill the first RVA page, so
+// content starts at base+4096. Every absolute encoding funnels through here.
+pub fn img_base() {
+    if target_os == "windows" {
+        base_addr + 4096
+    } else {
+        base_addr + 120
+    }
+}
+
+// rt_region_size 是 runtime 区长度：Windows 在区尾多一个 8B 分派器地址槽。
+// rt_region_size is the runtime area length: Windows appends one extra 8-byte
+// dispatcher-address slot at the end of the area.
+pub fn rt_region_size() {
+    if target_os == "windows" {
+        RUNTIME_SIZE + 8
+    } else {
+        RUNTIME_SIZE
+    }
+}
+
+// thunk_slot_abs 是 Windows 分派器地址槽的绝对地址（runtime 区首字节之后）。
+// thunk_slot_abs is the absolute address of the Windows dispatcher-address
+// slot (the first byte past the stock runtime area).
+pub fn thunk_slot_abs() {
+    img_base() + RUNTIME_SIZE
+}
+
 // GC runtime 槽（const_data 前的固定区，base_addr+120 起，每槽 8B）
 // GC runtime slots: fixed region before const_data (base_addr+120), 8 bytes each
 pub let rt_gc_cnt = 0
@@ -2241,7 +2282,7 @@ fn x86gen_range_native() {
 // rt_slot 返回 runtime 槽的绝对地址
 // rt_slot returns a runtime slot's absolute address
 pub fn rt_slot(off) {
-    base_addr + 120 + off
+    img_base() + off
 }
 
 // gc_rec 生成分配记录插桩（rdi=ptr 寄存器, size 立即数或寄存器；保存调用方 rdi/rsi）
@@ -2692,8 +2733,16 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr) {
     // ctx 保存：saved_rsp = fake frame 后（含两槽），rsp 下方的 prologue 由 resume 后函数自身建立
     let ctx_save = mov_rr(rcx, rsp) + mov_mr(r11, FB_RSP, rcx) + mov_rr(rcx, rbp) + mov_mr(r11, FB_RBP, rcx) + mov_rr(rcx, r14) + mov_mr(r11, FB_R14, rcx) + mov_rr(rcx, r15) + mov_mr(r11, FB_R15, rcx) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx)
     let ready_join = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + branch + empty_head + to_set + nonempty + set_tail
+    // 主纤程栈下探：Windows 只在距 rsp 一页内自动扩展栈，直接写 1MB 下方
+    // 会踩未提交的 guard 页；逐页触碰（每页 4096B，共 256 页）强制按序提交，
+    // 结束时 r15 = r14 = rsp - 1048576，与直减路径终态一致。
+    // Main-fiber stack probing: Windows only grows the stack within one page of
+    // rsp, so storing straight at rsp-1MB faults on an uncommitted guard page;
+    // touching page by page (4096B steps, 256 pages) commits them in order and
+    // leaves r15 = r14 = rsp - 1048576, matching the plain-subtract path.
+    let probe_body = sub_ri32(r15, 4096) + e1(65) + e1(198) + e1(7) + e1(0) + e1(77) + e1(57) + e1(247) + e1(117) + e1(240)
     let regs_set = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + sub_ri32(r15, 1048576) + mov_rr(r14, r15) + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
 }
 
 // x86gen_program_to_buf 是 x86 后端入口：字节码表 → x86-64 ELF 二进制字节
@@ -3921,7 +3970,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // const_addr 取常量地址 / const_addr returns a constant's address
     fn const_addr(f, i) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref waitset_add_bytes, ref waitset_add_addr, ref timer_add_bytes, ref timer_add_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match get(const_slot_map, const_slot_key(f, i)) {
-            Some(off) => base_addr + 120 + RUNTIME_SIZE + off,
+            Some(off) => img_base() + rt_region_size() + off,
             None => 0,
         }
     }
@@ -5714,13 +5763,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
 
     let gc_rec_bytes = x86gen_gc_record()
-    let gc_col = x86gen_gc_collect(n_globals, base_addr + 120 + RUNTIME_SIZE + const_data_len)
+    let gc_col = x86gen_gc_collect(n_globals, img_base() + rt_region_size() + const_data_len)
     let gc_mark = x86gen_mark_addr()
     // 调度器块（sched/yield/done）与 channel 子程序（schedule/wake_waiters/push_queue）在
     // funcs 头部、GC 子程序之后；地址编译期确定，供 _start / prologue 插桩 / spawn 的
     // fake frame / channel opcode 引用
     let sched_bytes = x86gen_sched_block()
-    let sched_addr = base_addr + 120 + RUNTIME_SIZE + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
+    let sched_addr = img_base() + rt_region_size() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
     let yield_bytes = x86gen_yield_block(sched_addr)
     let yield_addr = sched_addr + str_len(sched_bytes)
     let done_bytes = x86gen_fiber_done_block(sched_addr)
@@ -8200,20 +8249,20 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
-        jt_bytes = jt_bytes + e8(base_addr + 120 + RUNTIME_SIZE + const_data_len + func_offsets[jh])
+        jt_bytes = jt_bytes + e8(img_base() + rt_region_size() + const_data_len + func_offsets[jh])
         jh = jh + 1
     }
     // 多态函数的额外变体槽位（追加在默认表之后，按 fn_extra_base 定位）
     // Extra variant slots for polymorphic functions (appended after the default entries)
     let mut jx = 0
     while jx < len(variant_offsets) {
-        jt_bytes = jt_bytes + e8(base_addr + 120 + RUNTIME_SIZE + const_data_len + variant_offsets[jx])
+        jt_bytes = jt_bytes + e8(img_base() + rt_region_size() + const_data_len + variant_offsets[jx])
         jx = jx + 1
     }
     // 布局：runtime 区 + 常量区 + 函数体（GC 子程序在头部）+ 跳转表 + _start，装配 ELF
     // Layout: runtime slots + constants + function bodies (GC subroutines at the head)
     // + jump table + _start
-    let gc_rec_addr = base_addr + 120 + RUNTIME_SIZE + const_data_len
+    let gc_rec_addr = img_base() + rt_region_size() + const_data_len
     let gc_col_addr = gc_rec_addr + str_len(gc_rec_bytes)
     let gc_mark_addr = gc_col_addr + str_len(gc_col)
     // runtime 槽初始值：三个 GC 子程序地址编译期写入；waitset/timer 计数槽（16B）
@@ -8228,7 +8277,30 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         rzi = rzi + 1
     }
     let runtime_bytes = e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(gc_rec_addr) + e8(gc_col_addr) + e8(gc_mark_addr) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + rt_zero
-    let start_off = RUNTIME_SIZE + const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
+    let start_off = rt_region_size() + const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr)
-    emit_elf(runtime_bytes + const_data + funcs_bytes + jt_bytes + start_bytes, start_off)
+    if target_os == "windows" {
+        // PE 装配：runtime 区尾的 8B 槽填分派器绝对地址；分派器与 kernel32
+        // 导入表依次接在 _start 后。分派器长度与值无关，先以零地址测长，
+        // 再按真实 IAT 绝对址重发；槽值据此可算，无需回补。
+        // PE assembly: the 8-byte slot at the end of the runtime area holds
+        // the dispatcher's absolute address; the dispatcher and the kernel32
+        // import table follow _start. The dispatcher length is value-independent,
+        // so it is measured once with zero addresses and rebuilt with real IAT
+        // addresses; the slot value follows without backpatching.
+        let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency"]
+        // 分派器接在 _start 之后；槽与导入表 RVA 都从真实内容偏移算起
+        // The dispatcher follows _start; the slot and import RVAs derive from
+        // the true content offsets.
+        let disp_off = start_off + str_len(start_bytes)
+        let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0])
+        let idata_off = disp_off + str_len(disp_probe)
+        let iat_abs0 = img_base() + idata_off + pe_import_desc_size() + pe_ilt_size(len(import_names))
+        let dispatcher = pe_build_dispatcher([iat_abs0, iat_abs0 + 8, iat_abs0 + 16, iat_abs0 + 24, iat_abs0 + 32, iat_abs0 + 40])
+        let runtime_with_thunk = runtime_bytes + e8(img_base() + disp_off)
+        let imports = pe_build_imports(import_names, idata_off)
+        emit_pe(runtime_with_thunk + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports, start_off, idata_off, str_len(imports))
+    } else {
+        emit_elf(runtime_bytes + const_data + funcs_bytes + jt_bytes + start_bytes, start_off)
+    }
 }

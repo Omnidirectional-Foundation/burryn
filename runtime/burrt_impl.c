@@ -34,6 +34,7 @@ OClosure *bur_cur_closure;
 
 OEnumType *bur_opt_enum, *bur_res_enum, *bur_out_enum;
 struct timespec bur_start_time;
+int64_t bur_start_ns;           // CLOCK_MONOTONIC at boot
 int bur_argc;
 char **bur_argv;
 

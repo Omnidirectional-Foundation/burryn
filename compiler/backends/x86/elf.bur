@@ -49,10 +49,21 @@ pub fn emit_elf(code, entry_off) {
     elf_header(entry, 1) + phdr_load(0, base_addr, total, total) + code
 }
 
-// syscall 指令
-// syscall 发射 syscall 指令 / syscall emits the syscall instruction
+// syscall 发射 syscall 指令；Windows 无稳定裸 syscall，改为经 runtime 区尾的
+// 分派器槽间接调用：槽内是分派器指针，故 movabs 装载槽地址后用
+// call qword [rcx]（FF 11）解引用调用。rcx/r11 本就是 Linux syscall 契约的
+// 牺牲寄存器，调用点语义不变。
+// syscall emits the syscall instruction; Windows has no stable raw syscalls,
+// so it calls through the dispatcher pointer slot appended after the runtime
+// area: movabs loads the slot address, then call qword [rcx] (FF 11)
+// dereferences it. rcx/r11 die under the Linux contract anyway, keeping every
+// call site's semantics unchanged.
 pub fn syscall() {
-    byte_chr(15) + byte_chr(5)
+    if target_os == "windows" {
+        byte_chr(72) + byte_chr(185) + e8(thunk_slot_abs()) + byte_chr(255) + byte_chr(17)
+    } else {
+        byte_chr(15) + byte_chr(5)
+    }
 }
 
 // sys_mov_rax 装载 syscall 号到 rax / sys_mov_rax loads the syscall number into rax
