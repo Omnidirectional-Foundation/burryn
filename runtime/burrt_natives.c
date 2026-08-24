@@ -446,8 +446,13 @@ Value nat_file_exists(Value *args, int argc) {
     (void)argc;
     const char *path; int64_t pn;
     if (!nat_as_str(args[0], &path, &pn)) bur_trap("file_exists() needs a str, got %s", bur_typename(args[0]));
+#ifdef _WIN32
+    struct __stat64 st;
+    return bur_bool(_stat64(path, &st) == 0);
+#else
     struct stat st;
     return bur_bool(stat(path, &st) == 0);
+#endif
 }
 int nat_strcmp_qsort(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);

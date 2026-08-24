@@ -31,6 +31,9 @@
 #include <errno.h>
 
 #ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS // strerror and friends are fine here
+#endif
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600 // WSAPoll and friends
 #endif
@@ -43,6 +46,7 @@
 #include <winsock2.h> // must precede windows.h
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <sys/stat.h> // _stat64 for file_exists
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
