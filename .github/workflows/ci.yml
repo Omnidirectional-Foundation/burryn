@@ -1,0 +1,286 @@
+# L0 births gen1 as a tool (C midwife, not the CI product).
+# L0 接生 gen1 当工具（C 只接生，不是 CI 产物）。
+# bur-base is minted once per archive/go-host SHA at CC_OPT=-O1, fingerprinted,
+# and reused. Cache is a shortcut; identity is go-host SHA + sha256.
+# bur-base 按 archive/go-host SHA、CC_OPT=-O1 接生一次并打指纹后复用。
+# cache 是捷径，身份是 go-host SHA + sha256。
+# gen1 is born every push from current compiler/. Verify jobs download gen1.
+# gen1 每个 push 从当前 compiler/ 接生。验证 job 下载 gen1。
+# C three-gen fixpoint is not on push. x86 parity is non-blocking.
+# C 三代定点不进 push。x86 对照不阻断。
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev, "dev/**"]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gohost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.gohost.outputs.sha }}
+      hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Checkout Go seed
+        uses: actions/checkout@v4
+        with:
+          ref: archive/go-host
+          path: _go-host
+
+      - name: go-host SHA
+        id: gohost
+        run: echo "sha=$(git -C _go-host rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Probe bur-base cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bur-base
+          key: bur-base-${{ steps.gohost.outputs.sha }}-O1
+          lookup-only: true
+
+  seed:
+    needs: gohost
+    if: needs.gohost.outputs.hit != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Go seed
+        uses: actions/checkout@v4
+        with:
+          ref: archive/go-host
+          path: _go-host
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: _go-host/go.mod
+          cache: false
+
+      - name: Build bur-seed
+        run: |
+          set -euo pipefail
+          rm -f _go-host/program.c
+          (cd _go-host && go build -o "$GITHUB_WORKSPACE/bur-seed" .)
+
+      - name: Upload bur-seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: bur-seed
+          path: bur-seed
+          if-no-files-found: error
+          retention-days: 3
+
+  bur-base:
+    needs: [gohost, seed]
+    if: |
+      always() &&
+      needs.gohost.result == 'success' &&
+      (needs.seed.result == 'success' || needs.seed.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Go seed
+        uses: actions/checkout@v4
+        with:
+          ref: archive/go-host
+          path: _go-host
+
+      - name: Restore bur-base
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bur-base
+          key: bur-base-${{ needs.gohost.outputs.sha }}-O1
+
+      - name: Download bur-seed
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: bur-seed
+
+      - name: Build bur-base
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CC_OPT: "-O1"
+        run: |
+          set -euo pipefail
+          chmod +x bur-seed
+          echo "go-host ${{ needs.gohost.outputs.sha }}"
+          cc --version | head -n 1
+          echo "CC_OPT=$CC_OPT"
+          touch /tmp/bb-alive
+          (
+            while [ -f /tmp/bb-alive ]; do
+              sleep 45
+              echo "[bur-base still running $(date -u +%H:%M:%S)]"
+            done
+          ) &
+          echo $! > /tmp/bb-hb.pid
+          (cd _go-host && "$GITHUB_WORKSPACE/bur-seed" build burc -o "$GITHUB_WORKSPACE/bur-base")
+          rm -f /tmp/bb-alive
+          wait "$(cat /tmp/bb-hb.pid)" 2>/dev/null || true
+
+      - name: Fingerprint bur-base
+        run: |
+          set -euo pipefail
+          chmod +x bur-base
+          echo "go-host ${{ needs.gohost.outputs.sha }}"
+          echo "CC_OPT=-O1"
+          cc --version | head -n 1
+          sha256sum bur-base | tee bur-base.sha256
+
+      - name: Save bur-base cache
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: bur-base
+          key: bur-base-${{ needs.gohost.outputs.sha }}-O1
+
+      - name: Upload bur-base
+        uses: actions/upload-artifact@v4
+        with:
+          name: bur-base
+          path: |
+            bur-base
+            bur-base.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  gen1:
+    needs: bur-base
+    if: always() && needs['bur-base'].result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download bur-base
+        uses: actions/download-artifact@v4
+        with:
+          name: bur-base
+
+      - name: Checkout Go seed runtime
+        uses: actions/checkout@v4
+        with:
+          ref: archive/go-host
+          path: _go-host
+
+      - name: Birth gen1
+        run: |
+          set -euo pipefail
+          chmod +x bur-base
+          cp _go-host/runtime/burrt.h runtime/burrt.h
+          cp _go-host/runtime/burrt_natives.h runtime/burrt_natives.h
+          rm -f program.c
+          ./bur-base build compiler -o gen1
+          git checkout -- runtime/burrt.h runtime/burrt_natives.h
+          ./gen1 fmt --check compiler
+          ./gen1 check compiler
+
+      - name: Upload gen1
+        uses: actions/upload-artifact@v4
+        with:
+          name: gen1
+          path: gen1
+          if-no-files-found: error
+          retention-days: 7
+
+  testdata:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: testdata-verify
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          mv gen1 bur
+          SKIP_FIXPOINT=1 ./scripts/testdata-verify.sh
+
+  examples:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: examples-verify
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          mv gen1 bur
+          ./scripts/examples-verify.sh
+
+  std:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: std tests
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          for p in cli encoding json net path testing; do
+            ./gen1 test "std/$p"
+          done
+
+  x86:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: x86 parity
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          mv gen1 bur
+          ./scripts/multi-backend-verify.sh
