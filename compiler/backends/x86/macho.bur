@@ -208,12 +208,15 @@ pub fn emit_macho(text_content, entry_in_text, data_content) {
 // Contract mirrors Linux syscall: only rax/rcx/r11 die, everything else survives;
 // result returns in rax.
 // 直译表：1 write→BSD write(0x2000004)、60 exit→0x2000001、9 mmap→0x20000C5
-// （第 4 参 rcx，flags 0x1002）、228 clock_gettime→0x2000074（clk_id 6）；
+// （内核从 r10 取第 4 参——libc 桩为躲过 syscall 对 rcx 的破坏而走 r10——
+// 只需把 flags 值换成 0x1002）、228 clock_gettime→0x2000074（clk_id 6）；
 // 错误返回正 errno 且 CF=1，转回 Linux 式负值；其余 ud2 立即崩溃暴露缺口。
 // Translation table: 1 write→BSD write(0x2000004), 60 exit→0x2000001,
-// 9 mmap→0x20000C5 (4th arg in rcx, flags 0x1002), 228 clock_gettime→0x2000074
-// (clk_id 6); errors return positive errno with CF set, converted back to
-// Linux-style negatives; anything else hits ud2.
+// 9 mmap→0x20000C5 (the kernel reads the 4th arg from r10 — libc stubs route
+// rcx through r10 to survive syscall clobbering rcx — so only the flags value
+// changes to 0x1002), 228 clock_gettime→0x2000074 (clk_id 6); errors return
+// positive errno with CF set, converted back to Linux-style negatives;
+// anything else hits ud2.
 // 无导入无 API 调用，故帧只需保存六个输入寄存器（mmap 改写 r10、clock 改写 rdi，
 // 尾声弹回），无需影子空间与栈定位。
 // No imports and no API calls, so the frame only saves the six input registers
@@ -239,11 +242,12 @@ pub fn macho_build_dispatcher() {
     // exit(code=rdi): BSD exit never returns; int3 as a guard
     let exit_case = mov_ri64(rax, 33554433) + e1(15) + e1(5) + e1(204)
 
-    // mmap(addr=rdi, len=rsi, prot=rdx, flags=r10→rcx, fd, off)：MAP_ANON 换 0x1002，
-    // fd/off 由调用点已置 0；错误转负
-    // mmap(addr=rdi, len=rsi, prot=rdx, flags r10→rcx, fd, off): MAP_ANON becomes
-    // 0x1002, fd/off are already zeroed by the call site; errors convert negative
-    let mmap_case = mov_ri64(rax, 33554629) + mov_ri64(r11, 4098) + mov_rr(rcx, r11) + e1(15) + e1(5) + errno_tail
+    // mmap(addr=rdi, len=rsi, prot=rdx, flags=r10, fd, off)：第 4 参本就在
+    // r10，只换值为 MAP_ANON 0x1002（尾声弹回原 r10）；错误转负
+    // mmap(addr=rdi, len=rsi, prot=rdx, flags in r10, fd, off): the 4th arg is
+    // already in r10, so only its value changes to MAP_ANON 0x1002 (the
+    // epilogue restores the original r10); errors convert negative
+    let mmap_case = mov_ri64(rax, 33554629) + mov_ri64(r10, 4098) + e1(15) + e1(5) + errno_tail
 
     // clock_gettime(clk_id=rdi, tp=rsi)：CLOCK_MONOTONIC 1→6；timespec 内存布局同形
     // clock_gettime(clk_id=rdi, tp=rsi): CLOCK_MONOTONIC 1→6; the timespec memory layout matches
