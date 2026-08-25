@@ -49,20 +49,23 @@ pub fn emit_elf(code, entry_off) {
     elf_header(entry, 1) + phdr_load(0, base_addr, total, total) + code
 }
 
-// syscall 发射 syscall 指令；Windows 无稳定裸 syscall，改为经 runtime 区尾的
+// syscall 发射 syscall 指令；linux 直接裸 syscall。非 linux 目标无稳定裸 syscall
+// 契约（Windows 无裸面、darwin 号与 ABI 不同），统一改为经 runtime 区尾的
 // 分派器槽间接调用：槽内是分派器指针，故 movabs 装载槽地址后用
-// call qword [rcx]（FF 11）解引用调用。rcx/r11 本就是 Linux syscall 契约的
-// 牺牲寄存器，调用点语义不变。
-// syscall emits the syscall instruction; Windows has no stable raw syscalls,
-// so it calls through the dispatcher pointer slot appended after the runtime
-// area: movabs loads the slot address, then call qword [rcx] (FF 11)
-// dereferences it. rcx/r11 die under the Linux contract anyway, keeping every
-// call site's semantics unchanged.
+// call qword [rcx]（FF 11）解引用调用，由分派器完成契约直译。
+// rcx/r11 本就是 Linux syscall 契约的牺牲寄存器，调用点语义不变。
+// syscall emits the syscall instruction; linux issues the raw syscall directly.
+// Non-linux targets lack a stable raw-syscall contract (Windows has no raw
+// surface, darwin differs in numbers and ABI), so they uniformly call through
+// the dispatcher pointer slot appended after the runtime area: movabs loads
+// the slot address, then call qword [rcx] (FF 11) dereferences it, and the
+// dispatcher performs the contract translation. rcx/r11 die under the Linux
+// contract anyway, keeping every call site's semantics unchanged.
 pub fn syscall() {
-    if target_os == "windows" {
-        byte_chr(72) + byte_chr(185) + e8(thunk_slot_abs()) + byte_chr(255) + byte_chr(17)
-    } else {
+    if target_os == "linux" {
         byte_chr(15) + byte_chr(5)
+    } else {
+        byte_chr(72) + byte_chr(185) + e8(thunk_slot_abs()) + byte_chr(255) + byte_chr(17)
     }
 }
 

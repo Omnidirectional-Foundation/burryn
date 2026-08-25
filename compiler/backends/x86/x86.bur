@@ -42,35 +42,65 @@ pub fn set_target_os(os) {
     target_os = os
 }
 
-// img_base 返回 runtime 槽区的绝对基址：ELF 在 base+120（头 64+56B）；
-// PE 头区占满首个 RVA 页，内容从 base+4096 起。所有绝对地址编码经此收口。
-// img_base returns the absolute base of the runtime slot area: ELF sits at
+// img_base 返回代码/常量域的绝对基址：ELF 在 base+120（头 64+56B）；
+// PE 头区占满首个 RVA 页，内容从 base+4096 起；Mach-O 的 __TEXT 内容
+// 从 base+0x1000 起。所有绝对地址编码经此收口。
+// img_base returns the absolute base of the code/constants domain: ELF sits at
 // base+120 (64+56 bytes of headers); PE headers fill the first RVA page, so
-// content starts at base+4096. Every absolute encoding funnels through here.
+// content starts at base+4096; Mach-O __TEXT content starts at base+0x1000.
+// Every absolute encoding funnels through here.
 pub fn img_base() {
     if target_os == "windows" {
         base_addr + 4096
+    } else if target_os == "darwin" {
+        macho_base + MACHO_TEXT_OFF
     } else {
         base_addr + 120
     }
 }
 
-// rt_region_size 是 runtime 区长度：Windows 在区尾多一个 8B 分派器地址槽。
-// rt_region_size is the runtime area length: Windows appends one extra 8-byte
-// dispatcher-address slot at the end of the area.
-pub fn rt_region_size() {
-    if target_os == "windows" {
-        RUNTIME_SIZE + 8
+// code_origin 返回代码/常量内容的绝对起点：darwin 的 runtime 区已迁出 __TEXT，
+// 常量紧跟头区；其余目标的常量仍在 runtime 区之后。
+// code_origin returns the absolute start of code/constants content: on darwin
+// the runtime area has moved out of __TEXT so constants follow the headers
+// directly; other targets keep them after the runtime area.
+pub fn code_origin() {
+    if target_os == "darwin" {
+        img_base()
     } else {
-        RUNTIME_SIZE
+        img_base() + rt_region_size()
     }
 }
 
-// thunk_slot_abs 是 Windows 分派器地址槽的绝对地址（runtime 区首字节之后）。
-// thunk_slot_abs is the absolute address of the Windows dispatcher-address
-// slot (the first byte past the stock runtime area).
+// data_origin 返回可写 runtime 区的绝对基址：darwin 独立落在固定高 VA 的
+// __DATA 段（与 __TEXT 尺寸解耦），其余目标与代码同域。
+// data_origin returns the writable runtime area's absolute base: on darwin it
+// lives in a fixed-high-VA __DATA segment (decoupled from the __TEXT size);
+// other targets share the code domain.
+pub fn data_origin() {
+    if target_os == "darwin" {
+        macho_base + MACHO_DATA_VA_OFF
+    } else {
+        img_base()
+    }
+}
+
+// rt_region_size 是 runtime 区长度：非 linux 目标在区尾多一个 8B 分派器地址槽。
+// rt_region_size is the runtime area length: non-linux targets append one extra
+// 8-byte dispatcher-address slot at the end of the area.
+pub fn rt_region_size() {
+    if target_os == "linux" {
+        RUNTIME_SIZE
+    } else {
+        RUNTIME_SIZE + 8
+    }
+}
+
+// thunk_slot_abs 是分派器地址槽的绝对地址（runtime 区首字节之后）。
+// thunk_slot_abs is the absolute address of the dispatcher-address slot
+// (the first byte past the stock runtime area).
 pub fn thunk_slot_abs() {
-    img_base() + RUNTIME_SIZE
+    data_origin() + RUNTIME_SIZE
 }
 
 // GC runtime 槽（const_data 前的固定区，base_addr+120 起，每槽 8B）
@@ -2282,7 +2312,7 @@ fn x86gen_range_native() {
 // rt_slot 返回 runtime 槽的绝对地址
 // rt_slot returns a runtime slot's absolute address
 pub fn rt_slot(off) {
-    img_base() + off
+    data_origin() + off
 }
 
 // gc_rec 生成分配记录插桩（rdi=ptr 寄存器, size 立即数或寄存器；保存调用方 rdi/rsi）
@@ -3970,7 +4000,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // const_addr 取常量地址 / const_addr returns a constant's address
     fn const_addr(f, i) capture(ref f_name, ref _f_file, ref f_arity, ref f_nupvals, ref f_code, ref _f_spans, ref f_consts, ref en_qual, ref en_vnames, ref _en_varities, ref f2s_h, ref nfn, ref const_data, ref const_slot_map, ref enum_const_map, ref sf, ref _, ref record_encs, ref record_offs, ref rf, ref record_field_types, ref enum_field_types, ref enum_variant_types, ref out_enc, ref res_out_enc, ref res_int_enc, ref opt_res_enc, ref const_data_len, ref globals_map, ref n_globals, ref gf, ref method_full_map, ref mfi, ref fn_ret_type, ref fn_ret_param, ref fn_param_types, ref created_by, ref p_depth_maps, ref global_type, ref sig_specs, ref p_sig_grew, ref sig_ret, ref p_cur_depth, ref round, ref s_changed, ref s_guard, ref fn_variants, ref fv_alloc, ref fv_all, ref fv_i, ref fv_s, ref fn_extra_base, ref eb_alloc, ref n_extra, ref eb_i, ref gc_rec_bytes, ref gc_col, ref gc_mark, ref sched_bytes, ref sched_addr, ref yield_bytes, ref yield_addr, ref done_bytes, ref done_addr, ref chan_sched_bytes, ref chan_sched_addr, ref chan_wake_bytes, ref chan_wake_addr, ref chan_push_sendq_bytes, ref chan_push_sendq_addr, ref chan_push_recvq_bytes, ref chan_push_recvq_addr, ref chan_push_waiters_bytes, ref chan_push_waiters_addr, ref chan_remove_waiter_bytes, ref chan_remove_waiter_addr, ref waitset_add_bytes, ref waitset_add_addr, ref timer_add_bytes, ref timer_add_addr, ref funcs_bytes, ref func_offsets, ref variant_offsets, ref fh, ref jt_bytes, ref jh, ref jx, ref gc_rec_addr, ref gc_col_addr, ref gc_mark_addr, ref runtime_bytes, ref start_off, ref start_bytes) {
         match get(const_slot_map, const_slot_key(f, i)) {
-            Some(off) => img_base() + rt_region_size() + off,
+            Some(off) => code_origin() + off,
             None => 0,
         }
     }
@@ -5763,13 +5793,13 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     }
 
     let gc_rec_bytes = x86gen_gc_record()
-    let gc_col = x86gen_gc_collect(n_globals, img_base() + rt_region_size() + const_data_len)
+    let gc_col = x86gen_gc_collect(n_globals, code_origin() + const_data_len)
     let gc_mark = x86gen_mark_addr()
     // 调度器块（sched/yield/done）与 channel 子程序（schedule/wake_waiters/push_queue）在
     // funcs 头部、GC 子程序之后；地址编译期确定，供 _start / prologue 插桩 / spawn 的
     // fake frame / channel opcode 引用
     let sched_bytes = x86gen_sched_block()
-    let sched_addr = img_base() + rt_region_size() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
+    let sched_addr = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
     let yield_bytes = x86gen_yield_block(sched_addr)
     let yield_addr = sched_addr + str_len(sched_bytes)
     let done_bytes = x86gen_fiber_done_block(sched_addr)
@@ -8249,20 +8279,20 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
-        jt_bytes = jt_bytes + e8(img_base() + rt_region_size() + const_data_len + func_offsets[jh])
+        jt_bytes = jt_bytes + e8(code_origin() + const_data_len + func_offsets[jh])
         jh = jh + 1
     }
     // 多态函数的额外变体槽位（追加在默认表之后，按 fn_extra_base 定位）
     // Extra variant slots for polymorphic functions (appended after the default entries)
     let mut jx = 0
     while jx < len(variant_offsets) {
-        jt_bytes = jt_bytes + e8(img_base() + rt_region_size() + const_data_len + variant_offsets[jx])
+        jt_bytes = jt_bytes + e8(code_origin() + const_data_len + variant_offsets[jx])
         jx = jx + 1
     }
     // 布局：runtime 区 + 常量区 + 函数体（GC 子程序在头部）+ 跳转表 + _start，装配 ELF
     // Layout: runtime slots + constants + function bodies (GC subroutines at the head)
     // + jump table + _start
-    let gc_rec_addr = img_base() + rt_region_size() + const_data_len
+    let gc_rec_addr = code_origin() + const_data_len
     let gc_col_addr = gc_rec_addr + str_len(gc_rec_bytes)
     let gc_mark_addr = gc_col_addr + str_len(gc_col)
     // runtime 槽初始值：三个 GC 子程序地址编译期写入；waitset/timer 计数槽（16B）
@@ -8300,6 +8330,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let runtime_with_thunk = runtime_bytes + e8(img_base() + disp_off)
         let imports = pe_build_imports(import_names, idata_off)
         emit_pe(runtime_with_thunk + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports, start_off, idata_off, str_len(imports))
+    } else if target_os == "darwin" {
+        // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
+        // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），
+        // 分派器长度与值无关，单次构建即可。
+        // Mach-O assembly: __TEXT carries constants/code/dispatcher while the
+        // writable runtime area lives in a fixed-high-VA __DATA; the slot holds
+        // the dispatcher's absolute address (right after _start), whose length
+        // is value-independent, so a single build suffices.
+        let entry_in_text = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
+        let dispatcher = macho_build_dispatcher()
+        let dispatcher_va = img_base() + entry_in_text + str_len(start_bytes)
+        let runtime_with_thunk = runtime_bytes + e8(dispatcher_va)
+        emit_macho(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher, entry_in_text, runtime_with_thunk)
     } else {
         emit_elf(runtime_bytes + const_data + funcs_bytes + jt_bytes + start_bytes, start_off)
     }

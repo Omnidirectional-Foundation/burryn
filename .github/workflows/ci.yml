@@ -314,6 +314,75 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/hello.golden actual.txt
 
+  x86-macho-build:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: Build darwin hello
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o hello-mac
+
+      - name: Upload hello-mac
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-macho-hello
+          path: hello-mac
+          if-no-files-found: error
+          retention-days: 7
+
+  x86-macho-run:
+    needs: x86-macho-build
+    if: always() && needs.x86-macho-build.result == 'success'
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download hello-mac
+        uses: actions/download-artifact@v4
+        with:
+          name: x86-macho-hello
+
+      - name: Run and compare golden
+        run: |
+          set -euo pipefail
+          codesign -f -s - hello-mac
+          codesign --verify --strict --verbose=2 hello-mac
+          chmod +x hello-mac
+          xattr -cr hello-mac 2>/dev/null || true
+          echo "--- spctl:"
+          spctl --assess --type execute -vvv hello-mac || true
+          echo "--- unsigned control:"
+          cp hello-mac hello-unsigned
+          codesign --remove-signature hello-unsigned || true
+          ./hello-unsigned && echo "UNSIGNED RUNS" || echo "unsigned rc=$?"
+          echo "--- signed run:"
+          if ./hello-mac > actual.txt; then
+            diff examples/basics/hello.golden actual.txt
+          else
+            rc=$?
+            echo "hello-mac exited $rc"
+            echo "--- kernel denials:"
+            log show --last 5m --style compact --predicate 'sender == "kernel"' 2>/dev/null | command grep -Ei "hello-mac|cs_invalid|code sign|AMFI.*deny|macos_policy" | tail -30 || true
+            echo "--- latest crash reports:"
+            ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -3
+            for f in $(ls -t ~/Library/Logs/DiagnosticReports/hello-mac*.ips 2>/dev/null | head -1); do cat "$f"; done
+            exit "$rc"
+          fi
+
   runtime:
     needs: []
     runs-on: ${{ matrix.os }}

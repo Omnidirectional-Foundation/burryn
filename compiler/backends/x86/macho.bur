@@ -1,0 +1,260 @@
+// macho.bur — 手写 Mach-O x86_64 可执行文件生成器（macOS，无链接器依赖）。
+// Hand-written Mach-O x86_64 executable emitter (macOS, no linker dependency).
+// 形态对齐现代 ld/dyld 产物（LC_UNIXTHREAD 静态形态会被 AMFI 拒绝）：
+// __PAGEZERO + __TEXT(R-X，含 __text 节，fileoff 0 从头区盖起) +
+// __DATA(R-W，承载可写 runtime 区，VA 固定在 DATA_VA_OFF 高位槽) +
+// 空 __LINKEDIT 终止到文件尾（codesign 严格校验要求 fileoff+filesize==长度）+
+// LC_UUID / LC_MAIN / LC_BUILD_VERSION / LC_DYLINKER / LC_LOAD_DYLIB(libSystem)。
+// 头区命令块定长 556B，__TEXT 内容从文件与 VA 的 0x1000 处开始；
+// 无重定位：MH_NOPIE（flags 不含 PIE），内核不施 slide，绝对地址直用。
+// dyld 只跑 libc 初始化后即跳 LC_MAIN 入口，程序本体不引任何 libc 符号。
+// syscall 经 runtime 区尾分派器槽直译 BSD 契约。
+// Shape mirrors modern ld/dyld output (the static LC_UNIXTHREAD form is
+// rejected by AMFI): __PAGEZERO + __TEXT (R-X, one __text section, fileoff 0
+// covering the headers onward) + __DATA (R-W, carrying the writable runtime
+// area at a fixed high DATA_VA_OFF) + an empty __LINKEDIT terminating at EOF
+// (codesign's strict validation requires fileoff+filesize == length) +
+// LC_UUID / LC_MAIN / LC_BUILD_VERSION / LC_DYLINKER / LC_LOAD_DYLIB(libSystem).
+// The command block is a fixed 556 bytes and __TEXT content starts at file and
+// VA offset 0x1000; no relocations: MH_NOPIE (no PIE flag), so the kernel
+// applies no slide and absolute addresses are used directly. dyld only runs
+// libc initialization before jumping to the LC_MAIN entry; the program body
+// references no libc symbols. Syscalls go through the dispatcher-address slot
+// at the end of the runtime area, translating onto BSD contracts.
+
+pub let macho_base = 4294967296
+
+// MACHO_DATA_VA_OFF 是 __DATA 段相对镜像基址的固定偏移：与 __TEXT 尺寸解耦，
+// 使 rt_slot 等地址公式在文本长度确定前即可求值；两段之间为未映射 VA 空洞。
+// MACHO_DATA_VA_OFF is the __DATA segment's fixed offset from the image base,
+// decoupled from the __TEXT size so address formulas resolve before the text
+// length is known; an unmapped VA hole sits between the segments.
+pub let MACHO_DATA_VA_OFF = 16777216
+
+// MACHO_TEXT_OFF 是 __TEXT 内容在文件与 VM 中的起点（头区命令块之后的首页）
+// MACHO_TEXT_OFF is where __TEXT content starts in both file and VM (the first
+// page after the command block)
+pub let MACHO_TEXT_OFF = 4096
+
+// macho_hdr_size 是命令块总长：32B mach_header_64 之后接九条命令
+// （PAGEZERO/TEXT+节/DATA/LINKEDIT 四段 368B、UUID 24、MAIN 24、
+// BUILD_VERSION 24、DYLINKER 28、LOAD_DYLIB 56）
+// macho_hdr_size is the command-block length: a 32-byte mach_header_64
+// followed by nine commands (four segments PAGEZERO/TEXT+section/DATA/
+// LINKEDIT at 368B total, UUID 24, MAIN 24, BUILD_VERSION 24, DYLINKER 28,
+// LOAD_DYLIB 56)
+pub fn macho_hdr_size() {
+    572
+}
+
+// macho_header 生成 mach_header_64 / macho_header builds the mach_header_64
+fn macho_header(ncmds, sizeofcmds) {
+    // 0xFEEDFACF · CPU_TYPE_X86_64 · CPU_SUBTYPE_X86_64_LIB64 · MH_EXECUTE ·
+    // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL（无 MH_PIE：不施 slide，绝对地址直用）
+    u32(4277009103) + u32(16777223) + u32(2147483651) + u32(2) + u32(ncmds) + u32(sizeofcmds) + u32(133) + u32(0)
+}
+
+// macho_seg_name 补齐 16B 段名 / macho_seg_name pads a segment name to 16 bytes
+fn macho_seg_name(name) {
+    let mut out = name
+    let mut ni = str_len(name)
+    while ni < 16 {
+        out = out + byte_chr(0)
+        ni = ni + 1
+    }
+    out
+}
+
+// macho_pagezero 生成空 PAGEZERO，盖住低 4GB 空指针
+// macho_pagezero builds the empty PAGEZERO covering the low 4GB null region
+fn macho_pagezero() {
+    u32(25) + u32(72) + macho_seg_name("__PAGEZERO") + u64(0) + u64(macho_base) + u64(0) + u64(0) + u32(0) + u32(0) + u32(0) + u32(0)
+}
+
+// macho_text_segment 生成 __TEXT：fileoff 0 从头区盖起，maxprot/initprot R-X，
+// 内含一个 __text 纯指令节
+// macho_text_segment builds __TEXT: fileoff 0 covering the headers onward,
+// maxprot/initprot R-X, carrying a single __text pure-instructions section
+fn macho_text_segment(text_len) {
+    let sect = macho_seg_name("__text") + macho_seg_name("__TEXT") + u64(macho_base + MACHO_TEXT_OFF) + u64(text_len) + u32(MACHO_TEXT_OFF) + u32(6) + u32(0) + u32(0) + u32(2147483648) + u32(0) + u32(0) + u32(0)
+    u32(25) + u32(152) + macho_seg_name("__TEXT") + u64(macho_base) + u64(pe_align(MACHO_TEXT_OFF + text_len, 4096)) + u64(0) + u64(MACHO_TEXT_OFF + text_len) + u32(5) + u32(5) + u32(1) + u32(0) + sect
+}
+
+// macho_data_segment 生成 __DATA：固定高 VA 槽，文件紧随 __TEXT 页界之后，R-W
+// macho_data_segment builds __DATA: the fixed high VA slot, file body right
+// after the __TEXT page boundary, R-W
+fn macho_data_segment(data_fileoff, data_len) {
+    u32(25) + u32(72) + macho_seg_name("__DATA") + u64(macho_base + MACHO_DATA_VA_OFF) + u64(pe_align(data_len, 4096)) + u64(data_fileoff) + u64(data_len) + u32(3) + u32(3) + u32(0) + u32(0)
+}
+
+// macho_linkedit_segment 生成 __LINKEDIT：内容为 80B 零导入链式修复元数据，
+// fileoff+filesize 恰到文件尾，满足 codesign 严格校验；签名时由 codesign 扩写
+// macho_linkedit_segment builds __LINKEDIT: its content is the 80-byte
+// zero-import chained-fixups metadata and fileoff+filesize lands exactly at
+// EOF, satisfying codesign's strict rule; codesign rewrites it when signing
+fn macho_linkedit_segment(linkedit_off, payload_len) {
+    u32(25) + u32(72) + macho_seg_name("__LINKEDIT") + u64(macho_base + linkedit_off) + u64(pe_align(payload_len, 4096)) + u64(linkedit_off) + u64(payload_len) + u32(1) + u32(1) + u32(0) + u32(32)
+}
+
+// macho_linkedit_payload 生成链式修复元数据：32B 头 + 20B image starts +
+// 24B segment starts（仅 __DATA 有表，页起点 NONE）+ 对齐垫，共 80B，
+// 导入与符号表均为空
+// macho_linkedit_payload builds the chained-fixups metadata: a 32B header +
+// 20B image starts + 24B segment starts (only __DATA has a table with page
+// starts NONE) + alignment padding, 80 bytes total, with empty import and
+// symbol tables
+fn macho_linkedit_payload() {
+    let payload = u32(0) + u32(32) + u32(80) + u32(80) + u32(0) + u32(1) + u32(0) + u32(0)
+    let starts_in_image = u32(4) + u32(0) + u32(0) + u32(20) + u32(0)
+    // PageSize 4096 与 PointerFormat 6（PTR_64_OFFSET）合入一个 u32；
+    // PageCount 1 与页起点 NONE（0xFFFF）合入末尾 u32
+    let starts_in_segment = u32(24) + u32(397312) + u64(MACHO_DATA_VA_OFF) + u32(0) + u32(4294901761)
+    let mut out = payload + starts_in_image + starts_in_segment
+    while str_len(out) % 16 != 0 {
+        out = out + byte_chr(0)
+    }
+    out
+}
+
+// macho_chained_fixups 生成 LC_DYLD_CHAINED_FIXUPS 指向 __LINKEDIT 内的元数据
+// macho_chained_fixups builds LC_DYLD_CHAINED_FIXUPS pointing at the metadata
+// inside __LINKEDIT
+fn macho_chained_fixups(dataoff, datasize) {
+    u32(2147483700) + u32(16) + u32(dataoff) + u32(datasize)
+}
+
+// macho_uuid 生成 LC_UUID（占位全零即可被接受）
+// macho_uuid builds LC_UUID (an all-zero placeholder is accepted)
+fn macho_uuid() {
+    u32(27) + u32(24) + u32(0) + u32(0) + u32(0) + u32(0)
+}
+
+// macho_main 生成 LC_MAIN：entryoff 为文件偏移，栈大小交内核默认
+// macho_main builds LC_MAIN: entryoff is a file offset; the stack size stays
+// at the kernel default
+fn macho_main(entryoff) {
+    u32(2147483688) + u32(24) + u64(entryoff) + u64(0)
+}
+
+// macho_build_version 生成 LC_BUILD_VERSION：macOS 12.0 平台基准
+// macho_build_version builds LC_BUILD_VERSION pinned to the macOS 12.0 baseline
+fn macho_build_version() {
+    u32(50) + u32(24) + u32(1) + u32(786432) + u32(786432) + u32(0)
+}
+
+// macho_pad8 把字符串补齐到 8 的倍数（load command 内字符串的对齐要求）
+// macho_pad8 pads a string to a multiple of 8 (the alignment load-command
+// strings must keep)
+fn macho_pad8(name) {
+    let mut out = name
+    while str_len(out) % 8 != 0 {
+        out = out + byte_chr(0)
+    }
+    out
+}
+
+// macho_dylinker 生成 LC_DYLINKER 指向 /usr/lib/dyld
+// macho_dylinker builds LC_DYLINKER pointing at /usr/lib/dyld
+fn macho_dylinker() {
+    let name = macho_pad8("/usr/lib/dyld")
+    u32(14) + u32(12 + str_len(name)) + u32(12) + name
+}
+
+// macho_dylib 生成 LC_LOAD_DYLIB 挂载 libSystem（dyld 要求至少一条 dylib）
+// macho_dylib builds LC_LOAD_DYLIB pulling in libSystem (dyld expects at least
+// one dylib)
+fn macho_dylib() {
+    let name = macho_pad8("/usr/lib/libSystem.B.dylib")
+    u32(12) + u32(24 + str_len(name)) + u32(24) + u32(0) + u32(0) + u32(0) + name
+}
+
+// emit_macho 装配 Mach-O：命令块(548B) + 垫零至 0x1000 + __TEXT 内容 +
+// 垫零至页界 + __DATA 内容 + 垫零至页界后的空 __LINKEDIT；入口在 __TEXT 内容内
+// entry_in_text 处
+// emit_macho assembles the Mach-O: command block (548B) + zero padding to
+// 0x1000 + __TEXT content + padding to the page boundary + __DATA content +
+// an empty __LINKEDIT after padding to the next page boundary; the entry sits
+// at entry_in_text within the __TEXT content
+pub fn emit_macho(text_content, entry_in_text, data_content) {
+    let text_end = MACHO_TEXT_OFF + str_len(text_content)
+    let data_fileoff = pe_align(text_end, 4096)
+    let linkedit_off = pe_align(data_fileoff + str_len(data_content), 4096)
+    let payload = macho_linkedit_payload()
+    let hdrs = macho_header(10, 524 + 16) + macho_pagezero() + macho_text_segment(str_len(text_content)) + macho_data_segment(data_fileoff, str_len(data_content)) + macho_linkedit_segment(linkedit_off, str_len(payload)) + macho_uuid() + macho_main(MACHO_TEXT_OFF + entry_in_text) + macho_build_version() + macho_dylinker() + macho_dylib() + macho_chained_fixups(linkedit_off, str_len(payload))
+    let mut head_pad = ""
+    let mut pi = macho_hdr_size()
+    while pi < MACHO_TEXT_OFF {
+        head_pad = head_pad + byte_chr(0)
+        pi = pi + 1
+    }
+    let mut mid_pad = ""
+    pi = MACHO_TEXT_OFF + str_len(text_content)
+    while pi < data_fileoff {
+        mid_pad = mid_pad + byte_chr(0)
+        pi = pi + 1
+    }
+    let mut tail = ""
+    let mut ti = data_fileoff + str_len(data_content)
+    while ti < linkedit_off {
+        tail = tail + byte_chr(0)
+        ti = ti + 1
+    }
+    hdrs + head_pad + text_content + mid_pad + data_content + tail + payload
+}
+
+// macho_build_dispatcher 生成 darwin syscall 兼容分派器。
+// macho_build_dispatcher emits the darwin syscall shim dispatcher.
+// 契约对齐 Linux syscall：只破坏 rax/rcx/r11，保全其余寄存器；结果走 rax。
+// Contract mirrors Linux syscall: only rax/rcx/r11 die, everything else survives;
+// result returns in rax.
+// 直译表：1 write→BSD write(0x2000004)、60 exit→0x2000001、9 mmap→0x20000C5
+// （第 4 参 rcx，flags 0x1002）、228 clock_gettime→0x2000074（clk_id 6）；
+// 错误返回正 errno 且 CF=1，转回 Linux 式负值；其余 ud2 立即崩溃暴露缺口。
+// Translation table: 1 write→BSD write(0x2000004), 60 exit→0x2000001,
+// 9 mmap→0x20000C5 (4th arg in rcx, flags 0x1002), 228 clock_gettime→0x2000074
+// (clk_id 6); errors return positive errno with CF set, converted back to
+// Linux-style negatives; anything else hits ud2.
+// 无导入无 API 调用，故帧只需保存六个输入寄存器（mmap 改写 r10、clock 改写 rdi，
+// 尾声弹回），无需影子空间与栈定位。
+// No imports and no API calls, so the frame only saves the six input registers
+// (mmap rewrites r10, clock rewrites rdi, both restored by the epilogue); no
+// shadow space or frame pointer needed.
+pub fn macho_build_dispatcher() {
+    let head = e1(87) + e1(86) + e1(82) + e1(65) + e1(80) + e1(65) + e1(81) + e1(65) + e1(82)
+    let cmp_write = e1(72) + e1(61) + e4(1) + e1(15) + e1(132)
+    let cmp_exit = e1(72) + e1(61) + e4(60) + e1(15) + e1(132)
+    let cmp_mmap = e1(72) + e1(61) + e4(9) + e1(15) + e1(132)
+    let cmp_clock = e1(72) + e1(61) + e4(228) + e1(15) + e1(132)
+    let default_case = e1(15) + e1(11)
+    let arm = str_len(cmp_write) + 4
+    let dispatch_end = 4 * arm + str_len(default_case)
+    let epilogue = e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(195)
+    let errno_tail = e1(115) + e1(3) + e1(72) + e1(247) + e1(216)
+
+    // write(fd=rdi, buf=rsi, len=rdx)：参数寄存器与 Linux 完全同形，任意 fd 直通
+    // write(fd=rdi, buf=rsi, len=rdx): argument registers match Linux exactly; every fd passes through
+    let write_case = mov_ri64(rax, 33554436) + e1(15) + e1(5) + errno_tail
+
+    // exit(code=rdi)：BSD exit 不返回；int3 兜底
+    // exit(code=rdi): BSD exit never returns; int3 as a guard
+    let exit_case = mov_ri64(rax, 33554433) + e1(15) + e1(5) + e1(204)
+
+    // mmap(addr=rdi, len=rsi, prot=rdx, flags=r10→rcx, fd, off)：MAP_ANON 换 0x1002，
+    // fd/off 由调用点已置 0；错误转负
+    // mmap(addr=rdi, len=rsi, prot=rdx, flags r10→rcx, fd, off): MAP_ANON becomes
+    // 0x1002, fd/off are already zeroed by the call site; errors convert negative
+    let mmap_case = mov_ri64(rax, 33554629) + mov_ri64(r11, 4098) + mov_rr(rcx, r11) + e1(15) + e1(5) + errno_tail
+
+    // clock_gettime(clk_id=rdi, tp=rsi)：CLOCK_MONOTONIC 1→6；timespec 内存布局同形
+    // clock_gettime(clk_id=rdi, tp=rsi): CLOCK_MONOTONIC 1→6; the timespec memory layout matches
+    let clock_case = mov_ri64(rdi, 6) + mov_ri64(rax, 33554548) + e1(15) + e1(5) + errno_tail
+
+    let write_off = dispatch_end
+    let exit_off = write_off + str_len(write_case) + 5
+    let mmap_off = exit_off + str_len(exit_case)
+    let clock_off = mmap_off + str_len(mmap_case) + 5
+    let epi_off = clock_off + str_len(clock_case)
+    let jmp_epi_after_write = e1(233) + e4(epi_off - exit_off)
+    let jmp_epi_after_mmap = e1(233) + e4(epi_off - clock_off)
+    head + cmp_write + e4(write_off - arm) + cmp_exit + e4(exit_off - 2 * arm) + cmp_mmap + e4(mmap_off - 3 * arm) + cmp_clock + e4(clock_off - 4 * arm) + default_case + write_case + jmp_epi_after_write + exit_case + mmap_case + jmp_epi_after_mmap + clock_case + epilogue
+}
