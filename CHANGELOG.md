@@ -30,6 +30,12 @@ SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口
   higher-order calls skip aggregate param/`sig_specs` pollution.
 - **修复：** x86 select 臂不再叠全部 recv 值类型；槽持闭包调用解析返回类型；一元
   neg/not 替换栈顶类型；间接高阶调用跳过聚合轮形参/`sig_specs` 污染。
+- **Fixed:** x86 `compose`/`double_then_str` and `map_first(str, …)` — bind closure
+  handles on `CLOSURE` (not a later `GET_LOCAL`), keep single-signature concrete
+  param types, and select polymorphic variants on dynamic closure calls.
+- **修复：** x86 `compose`/`double_then_str` 与 `map_first(str, …)` — 在 `CLOSURE`
+  时绑定闭包 handle（不拖到后续 `GET_LOCAL`），保留单签名具体实参类型，动态闭包
+  调用按实参选多态变体。
 - **Added:** SPEC `§6.3` formal clauses — `exec_start`/`exec_poll` pipe and
   collect-at-exit behavior (stdin inherited, no streaming), TCP loopback as the
   only bidirectional IPC with measured numbers (231 µs in-process, 1350–1550 µs

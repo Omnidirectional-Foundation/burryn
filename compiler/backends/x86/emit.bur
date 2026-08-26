@@ -1584,7 +1584,42 @@ fn emit_inst(ip, in_dead) capture(ref cur_variant, ref shadow, ref type_shadow, 
             }
         } else {
             let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + mov_rr(r9, r12) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + add_ri32(r12, 16 + 8 * n) + mov_mr(r15, 0 - 8 * (n + 1), r9) + vs_pop_n(n)
-            let closure_path = mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
+            // 闭包动态调用：若编译期知 closure:N 与实参类型，走多态变体槽；
+            // 否则仍按对象内 handle 调默认体。这样 map_first(str, …) 等
+            // native 实参能进 specialized body（静态 native: 分派），避免
+            // 默认体把 get_global 推入的 0 当闭包解引用。
+            // dynamic closure calls: when compile-time knows closure:N and the
+            // arg types, use the polymorphic variant slot; otherwise call the
+            // default body via the object's handle. Lets map_first(str, …) hit
+            // a specialized body (static native: dispatch) instead of the
+            // default body deref'ing the 0 that get_global pushes for natives.
+            let mut clos_h = 0 - 1
+            let mut clos_vidx = 0
+            if len(type_shadow) >= n + 1 {
+                let ct0 = type_shadow[len(type_shadow) - n - 1]
+                if str_len(ct0) >= 8 && substr(ct0, 0, 8) == "closure:" {
+                    match parse_int(substr(ct0, 8, str_len(ct0) - 8)) {
+                        Some(cts0) => {
+                            if cts0 >= 0 && cts0 < nfn {
+                                clos_h = cts0
+                                let mut call_at0 = []
+                                let mut cai0 = 0
+                                while cai0 < n {
+                                    push(call_at0, type_shadow[len(type_shadow) - n + cai0])
+                                    cai0 = cai0 + 1
+                                }
+                                clos_vidx = variant_index(ctx, clos_h, call_at0)
+                            }
+                        },
+                        None => {},
+                    }
+                }
+            }
+            let closure_path = if clos_h >= 0 && clos_vidx > 0 && clos_h < len(fn_extra_base) {
+                mov_rm(rax, r13, 8 * (nfn + fn_extra_base[clos_h] + clos_vidx - 1)) + call_r(rax)
+            } else {
+                mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
+            }
             w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
             if len(type_shadow) >= n + 1 {
                 let ct = type_shadow[len(type_shadow) - n - 1]
@@ -1606,6 +1641,9 @@ fn emit_inst(ip, in_dead) capture(ref cur_variant, ref shadow, ref type_shadow, 
                                         ei = ei + 1
                                     }
                                     e_ret = psig_lookup(ctx, cts, e_parts)
+                                    if e_ret == "" {
+                                        e_ret = psim(ctx, cts, e_parts, false, pt_target_shadow, pd_sink)
+                                    }
                                 }
                                 if e_ret != "" {
                                     ret_type = e_ret
