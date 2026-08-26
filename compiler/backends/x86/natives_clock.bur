@@ -1,0 +1,39 @@
+// natives_clock.bur — clock / exec poll。
+// natives_clock.bur — clock / exec poll.
+
+
+
+// x86gen_clock_native 内联 clock：CLOCK_MONOTONIC 减去启动时刻，返回相对启动的秒（float 盒）
+// x86gen_clock_native inlines clock: CLOCK_MONOTONIC minus the startup instant, seconds since
+// start (float box)
+// clock inline: monotonic since startup (startup timestamp lives at [rbx + 8*n_globals])
+fn x86gen_clock_native(n_globals) {
+    let ts = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall()
+    let diff_sec = mov_rm(rax, rsp, 0) + mov_rm(rdx, rcx, 0) + sub_rr(rax, rdx) + cvtsi2sd_xmm(0, rax)
+    let diff_nsec = mov_rm(rax, rsp, 8) + mov_rm(rdx, rcx, 8) + sub_rr(rax, rdx) + cvtsi2sd_xmm(1, rax)
+    let frac = mov_ri64(rax, 0x41CDCD6500000000) + movq_xmm_gpr(2, rax) + divsd_xmm(1, 2) + addsd_xmm(0, 1)
+    let fin = movq_gpr_xmm(rax, 0) + add_ri32(rsp, 16)
+    let box = mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8)
+    let ret = mov_mr(r15, 0 - 8, r11)
+    ts + lea(rcx, rbx, 8 * n_globals) + diff_sec + diff_nsec + frac + fin + box + ret
+}
+
+// x86gen_exec_poll_native 内联 exec_poll：单次排空，未完成 → None，完成 → Some(Result)
+// x86gen_exec_poll_native inlines exec_poll: one drain, None when incomplete, Some(Result) when
+// complete
+// exec_poll inline: single pump, None or Some(Result); invalid or consumed handle exits 4
+fn x86gen_exec_poll_native() {
+    let invalid = sys_mov_rdi(4) + sys_mov_rax(60) + syscall()
+    let pump = x86gen_proc_pump()
+    let result = x86gen_proc_result_inst()
+    let some_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_rr(rax, rcx)
+    let none_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_rr(rax, rcx)
+    let store = mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let none_tail = none_inst + store + jmp_rel32(str_len(invalid))
+    let some_tail = result + some_inst + jmp_rel32(str_len(none_inst))
+    let comp_check = mov_rm(rax, r9, proc_complete) + test_rr(rax, rax) + je_rel32(str_len(some_tail))
+    let setup = mov_rr(r9, rax)
+    let consumed = mov_rm(rdx, rax, proc_consumed) + test_rr(rdx, rdx) + jne_rel32(str_len(setup) + str_len(pump) + str_len(comp_check) + str_len(some_tail) + str_len(none_tail))
+    let head = mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + jle_rel32(str_len(consumed) + str_len(setup) + str_len(pump) + str_len(comp_check) + str_len(some_tail) + str_len(none_tail) + str_len(invalid))
+    head + consumed + setup + pump + comp_check + some_tail + none_tail + invalid
+}

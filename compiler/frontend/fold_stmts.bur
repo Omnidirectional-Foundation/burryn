@@ -1,0 +1,101 @@
+// fold_stmts.bur — 语句列表折叠。
+// fold_stmts.bur — stmt-list folding.
+
+
+
+// fr_stmts 折叠语句列表 / fr_stmts folds a statement list
+fn fr_stmts(stmts, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    let mut out = []
+    for s in stmts {
+        push(out, fr_stmt(s, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp))
+    }
+    out
+}
+
+// fr_stmt 折叠单条语句：把 const 声明替换为折叠后的字面量声明
+// fr_stmt folds one statement: replaces const declarations with their folded literal forms
+fn fr_stmt(s, aliases, penv, qenv, mut env_names, mut env_vals, mut diags, mut dfiles, disp) {
+    // 语句重写：const 换折叠字面量，绑定入环境，其余递归
+    // Statement rewriting: consts become folded literals, bindings enter the env, the rest recurse
+    match s {
+        ConstDecl(name, nsp, is_pub, ty, init, sp) => {
+            let mut adiags = []
+            let r = fc_eval(init, aliases, penv, qenv, map(), env_names, env_vals, adiags)
+            match r {
+                FRVal(v) => {
+                    push(env_names, name)
+                    push(env_vals, v)
+                    LetStmt(name, nsp, false, is_pub, ty, fc_lit(v, span_of(init)), sp)
+                },
+                FRErr => {
+                    for d in adiags {
+                        push(diags, d)
+                        push(dfiles, disp)
+                    }
+                    let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                    push(env_names, name)
+                    push(env_vals, FVPoison)
+                    LetStmt(name, nsp, false, is_pub, ty, init2, sp)
+                },
+                _ => {
+                    let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                    push(env_names, name)
+                    push(env_vals, FVPoison)
+                    LetStmt(name, nsp, false, is_pub, ty, init2, sp)
+                },
+            }
+        },
+        DestructLet(names, nspans, is_mut, init, sp) => {
+            let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            for n in names {
+                fr_mask(n, env_names, env_vals)
+            }
+            DestructLet(names, nspans, is_mut, init2, sp)
+        },
+        LetStmt(name, nsp, is_mut, is_pub, ty, init, sp) => {
+            let init2 = fr_expr(init, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            fr_mask(name, env_names, env_vals)
+            LetStmt(name, nsp, is_mut, is_pub, ty, init2, sp)
+        },
+        FnDecl(name, nsp, is_pub, lit, sp) => {
+            fr_mask(name, env_names, env_vals)
+            FnDecl(name, nsp, is_pub, fr_expr(lit, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp)
+        },
+        AssignStmt(target, val, sp) => AssignStmt(fr_expr(target, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(val, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        ExprStmt(e, sp) => ExprStmt(fr_expr(e, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        WhileStmt(cond, body, sp) => WhileStmt(fr_expr(cond, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        ForStmt(v, vsp, idx, isp, iter, isch, body, sp) => {
+            let iter2 = fr_expr(iter, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            let mark = len(env_names)
+            fr_mask(v, env_names, env_vals)
+            let body2 = fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+            fr_trunc(mark, env_names, env_vals)
+            ForStmt(v, vsp, idx, isp, iter2, isch, body2, sp)
+        },
+        ReturnStmt(v, sp) => ReturnStmt(fr_expr(v, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        SpawnStmt(call, sp) => SpawnStmt(fr_expr(call, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        DeferStmt(body, crefs, sp) => DeferStmt(fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), crefs, sp),
+        SelectStmt(arms, has_def, def, dsp, sp) => {
+            let mut arms2 = []
+            for arm in arms {
+                match arm {
+                    SelectArm(is_send, bind, bsp, ch, val, body, asp) => {
+                        let ch2 = fr_expr(ch, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        let val2 = fr_expr(val, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        let mark = len(env_names)
+                        if !is_send && bind != "" {
+                            fr_mask(bind, env_names, env_vals)
+                        }
+                        let body2 = fr_expr(body, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp)
+                        fr_trunc(mark, env_names, env_vals)
+                        push(arms2, SelectArm(is_send, bind, bsp, ch2, val2, body2, asp))
+                    },
+                    other => push(arms2, other),
+                }
+            }
+            SelectStmt(arms2, has_def, fr_expr(def, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), dsp, sp)
+        },
+        SendStmt(ch, val, sp) => SendStmt(fr_expr(ch, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), fr_expr(val, aliases, penv, qenv, env_names, env_vals, diags, dfiles, disp), sp),
+        other => other,
+    }
+}

@@ -1,0 +1,107 @@
+// parse_typedecl.bur — fn/enum/alias 声明解析。
+// parse_typedecl.bur — fn/enum/alias decl parsing.
+
+import "burryn.dev/compiler/lib"
+
+// p_fn_rest 解析函数体（参数/返回类型/体；interface 模式只取签名）
+// p_fn_rest parses the function body (params/return/body; interface mode takes the signature only)
+fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
+    // 参数列表：可选 mut 与类型标注；interface 模式强制标注
+    // Parameters: optional mut and annotations; interface mode requires annotations
+    match p_expect(toks, pos, t_lparen, "'(' after fn") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let mut params = []
+    let mut muts = []
+    let mut pspans = []
+    let mut param_tys = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rparen) {
+        let is_mut = p_match(toks, pos, t_mut)
+        let ptok = match p_expect(toks, pos, t_ident, "parameter name") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        push(params, tok_lex(ptok))
+        push(muts, is_mut)
+        push(pspans, sp_of_tok(ptok))
+        let pty = if p_match(toks, pos, t_colon) {
+            match p_type_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else if interface_only {
+            return perr("E1101", "interface parameters require explicit types", "expected ':' after interface parameter `" + tok_lex(ptok) + "`", sp_of_tok(ptok))
+            NoNode
+        } else {
+            NoNode
+        }
+        push(param_tys, pty)
+        if !p_match(toks, pos, t_comma) {
+            break
+        }
+        p_skip_semis(toks, pos)
+    }
+    p_skip_semis(toks, pos)
+    let rp = match p_expect(toks, pos, t_rparen, "')' after parameters") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let ret_ty = if p_match(toks, pos, t_thin_arrow) {
+        match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    } else if interface_only {
+        return perr("E1101", "interface functions require an explicit return type", "expected '->' after interface parameters", sp_of_tok(rp))
+        NoNode
+    } else {
+        NoNode
+    }
+    let crefs = if !interface_only && p_match(toks, pos, t_capture) {
+        match p_capture_list(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                []
+            },
+        }
+    } else {
+        []
+    }
+    if interface_only {
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, NoNode, name, [], sp_union(fn_sp, span_of(ret_ty))))
+    } else {
+        let body = match p_block(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        Ok(FnLit(params, muts, pspans, param_tys, ret_ty, body, name, crefs, sp_union(fn_sp, span_of(body))))
+    }
+}
+
+

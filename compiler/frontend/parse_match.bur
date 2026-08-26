@@ -1,0 +1,99 @@
+// parse_match.bur — if/match/插值/模式。
+// parse_match.bur — if/match/interpolation/pattern.
+
+import "burryn.dev/compiler/lib"
+
+
+// p_match_expr 解析 match 表达式：穷尽性由 checker 做，这里解析分支（模式 + 可选 guard + 体）
+// p_match_expr parses match: exhaustiveness is the checker's job; here we parse arms
+// (pattern + optional guard + body)
+fn p_match_expr(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    // match：scrutinee 后解析模式臂（or-pattern 展开 + 可选 guard）
+    // Match: scrutinee, then pattern arms (or-patterns expand, optional guards)
+    let scrut = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after match scrutinee") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let mut arms = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
+        let pat = match p_pattern(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        let mut pats = [pat]
+        while p_match(toks, pos, t_bar) {
+            let p2 = match p_pattern(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            push(pats, p2)
+        }
+        let has_guard = p_match(toks, pos, t_if)
+        let guard = if has_guard {
+            match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else {
+            NoNode
+        }
+        match p_expect(toks, pos, t_arrow, if has_guard {
+            "'=>' after pattern"
+        } else {
+            "'=>' after match guard"
+        }) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        p_skip_semis(toks, pos)
+        let body = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        for p in pats {
+            push(arms, MatchArm(p, guard, body, sp_union(span_of(p), span_of(body))))
+        }
+        if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
+            return perr("E1104", "", "expected ',' or newline between match arms", sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}' after match arms") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let sp = sp_union(sp_of_tok(tok), sp_of_tok(rb))
+    if len(arms) == 0 {
+        return perr("E1110", "", "match must have at least one arm", sp)
+    }
+    Ok(MatchExpr(scrut, arms, sp))
+}
+

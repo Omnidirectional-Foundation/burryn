@@ -1,0 +1,50 @@
+// natives_net.bur — x86 TCP/网络原生。
+// natives_net.bur — x86 TCP/net natives.
+
+// x86gen_parse_ip_at 解析 [r15+off] 的 str 为 IPv4 四字节（内存序）到 [rsp+0..3]
+// 成功 rax=0，失败 rax=-1。寄存器：rsi 字符指针、rdi 结束、r8 移位数(0/8/16/24)、r9 累加、r10 段值、r11 段位数
+// x86gen_parse_ip_at parses the str at [r15+off] as four IPv4 bytes (memory order) into [rsp]
+// Returns rax=0 on success, rax=-1 on failure
+fn x86gen_parse_ip_at(off) {
+    let fail = mov_ri64(rax, -1)
+    let s0 = xor_rr(r10, r10) + xor_rr(r11, r11)
+    let d1cmp = cmp_rr(rsi, rdi)
+    let d2a1 = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 48) + cmp_rr(rax, rcx)
+    let d2b1 = sub_ri32(rax, 48) + mov_ri64(rcx, 9) + cmp_rr(rax, rcx)
+    let d3a = mov_ri64(rcx, 10) + imul_rr(r10, rcx) + add_rr(r10, rax) + add_ri32(r11, 1) + mov_ri64(rcx, 3) + cmp_rr(r11, rcx)
+    let d4add = add_ri32(rsi, 1)
+    let s1t = test_rr(r11, r11)
+    let s2 = mov_ri64(rcx, 255) + cmp_rr(r10, rcx)
+    let s3a = mov_rr(rcx, r8) + mov_rr(rax, r10) + shl_rcl(rax) + or_rr(r9, rax) + add_ri32(r8, 8)
+    let s3cmp = cmp_rr(rsi, rdi)
+    let s4a1 = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 46) + cmp_rr(rax, rcx)
+    let s4b1 = add_ri32(rsi, 1) + mov_ri64(rcx, 32) + cmp_rr(r8, rcx)
+    let f1succ = mov_mr(rsp, 0, r9) + xor_rr(rax, rax) + jmp_rel32(str_len(fail))
+    let f1jne = mov_ri64(rcx, 32) + cmp_rr(r8, rcx) + jne_rel32(str_len(f1succ))
+    let d1jae = jae_rel32(str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d2ajl = jl_rel32(str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d2bja = ja_rel32(str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d4jmp = jmp_rel32(0 - (str_len(d1cmp) + 6 + str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5))
+    let s1je = je_rel32(str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s2ja = ja_rel32(str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s3je = je_rel32(str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5)
+    let s4ajne = jne_rel32(str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s4bjae = jae_rel32(5 + str_len(f1jne) + str_len(f1succ))
+    let s5jmp = jmp_rel32(0 - (str_len(s0) + str_len(d1cmp) + 6 + str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5 + str_len(s1t) + 6 + str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5))
+    let d3ja = ja_rel32(str_len(d4add) + 5 + str_len(s1t) + 6 + str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let head = mov_rm(r9, r15, off) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rm(rdi, r9, 0) + add_rr(rdi, rsi) + xor_rr(r8, r8) + xor_rr(r9, r9) + s0 + d1cmp + d1jae + d2a1 + d2ajl + d2b1 + d2bja + d3a + d3ja + d4add + d4jmp + s1t + s1je + s2 + s2ja + s3a + s3cmp + s3je + s4a1 + s4ajne + s4b1 + s4bjae + s5jmp + f1jne + f1succ + fail
+    head
+}
+
+// x86gen_sockaddr_at 构建 sockaddr_in（AF_INET）到 [rsp+16..31]：r9 = port、[rsp+0..3] = IP 四字节
+// x86gen_sockaddr_at builds an AF_INET sockaddr_in at [rsp+16..31]: r9 = port, [rsp+0..3] = four
+// IP bytes
+fn x86gen_sockaddr_at() {
+    let f1 = mov_ri64(rax, 2) + mov_mr(rsp, 16, rax)
+    let f2 = mov_rr(rax, r9) + mov_ri64(rcx, 8) + mov_rr(rdx, rax) + shr_rcl(rdx) + mov_ri64(rcx, 255) + and_rr(rdx, rcx) + and_rr(rax, rcx) + mov_ri64(rcx, 8) + shl_rcl(rdx) + or_rr(rax, rdx) + mov_mr(rsp, 18, rax)
+    let f3 = mov_rm(rax, rsp, 0) + mov_mr(rsp, 20, rax)
+    let f4 = xor_rr(rax, rax) + mov_mr(rsp, 24, rax)
+    f1 + f2 + f3 + f4
+}
+
+

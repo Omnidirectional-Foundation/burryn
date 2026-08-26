@@ -1,0 +1,44 @@
+// emit_list_fmt.bur — list 元素格式码。
+// emit_list_fmt.bur — list elem format code.
+
+import "burryn.dev/compiler/lib"
+
+// list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）
+// list_elem_format_code emits the element formatter code for a list element type
+// ("" for str/int/float, which use inline handlers)
+fn list_elem_format_code(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, et, ff_h) {
+    if et == "str" || et == "int" || et == "float" {
+        ""
+    } else if et == "bool" {
+        x86gen_bool_convert_at(0 - 8)
+    } else if et == "unit" {
+        x86gen_unit_convert_at(0 - 8)
+    } else if is_list_type(et) {
+        let iet = list_elem_type(et)
+        x86gen_list_format_at(0 - 8, iet, list_elem_format_code(ctx, iet, ff_h), ff_h)
+    } else if is_map_type(et) {
+        x86gen_map_format_at(0 - 8, map_key_type(et) == "str", map_val_type(et) == "str", map_val_type(et) == "float", ff_h)
+    } else if is_record_type(et) {
+        let ets = record_schema(et)
+        if str_len(ets) > 0 {
+            match get(ctx.record_field_types, ets) {
+                Some(etf) => {
+                    if len(etf) > 0 {
+                        x86gen_record_format_at(0 - 8, enc_names(ets), etf, ff_h)
+                    } else {
+                        ""
+                    }
+                },
+                None => "",
+            }
+        } else {
+            ""
+        }
+    } else if is_enum_enc(et) {
+        enum_format_for_enc(ctx, 0 - 8, et)
+    } else if str_len(et) > 4 && substr(et, 0, 4) == "tup:" {
+        x86gen_tuple_format_at(ctx, 0 - 8, tup_elems(et), ff_h)
+    } else {
+        ""
+    }
+}

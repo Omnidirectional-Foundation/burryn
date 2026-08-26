@@ -1,0 +1,37 @@
+// mod_fetch.bur — git fetch / 缓存。
+// mod_fetch.bur — git fetch / cache.
+
+
+
+// mod_fetch 把模块 clone 进缓存（vX 标签） / mod_fetch git-clones a module into the cache (tagged vX)
+pub fn mod_fetch(path, version) {
+    let dest = cache_root() + "/" + path + "@" + version
+    if file_exists(dest + "/bur.mod") {
+        return Ok(dest)
+    }
+    let tmp = dest + ".tmp"
+    let _ = exec("rm", ["-rf", tmp])
+    exec_ok("mkdir", ["-p", parent_dir(dest)], "mkdir " + parent_dir(dest))?
+    match exec("git", ["-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1", "--branch", version, mod_git_base() + path, tmp]) {
+        Ok(o) => match o {
+            Output(code, _, se) => {
+                if code != 0 {
+                    let _ = exec("rm", ["-rf", tmp])
+                    return Err("cannot fetch " + path + "@" + version + " (is tag " + version + " published? from `require " + path + " " + version + "`): " + trim(se))
+                }
+            },
+        },
+        Err(m) => {
+            return Err("git clone: " + m)
+        },
+    }
+    exec_ok("rm", ["-rf", tmp + "/.git"], "strip .git")?
+    if !file_exists(tmp + "/bur.mod") {
+        let _ = exec("rm", ["-rf", tmp])
+        return Err("fetched " + path + "@" + version + " has no bur.mod at its root")
+    }
+    exec_ok("mv", [tmp, dest], "mv into cache")?
+    Ok(dest)
+}
+
+

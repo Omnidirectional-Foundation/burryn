@@ -1,0 +1,103 @@
+// fold_type_eval.bur — 类型表达式折叠。
+// fold_type_eval.bur — type-expr folding.
+
+
+// fc_type 折叠表达式的类型：const 的类型在编译期解析（行变量/记录类型同样折叠）
+// fc_type folds an expression's type: a const's type resolves at compile time
+// (row vars and record types fold the same way)
+fn fc_type(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
+    // 常量类型折叠：字面量直返类型，运算按操作符判定合法性
+    // Constant type folding: literals return their type, operators gate legality
+    match e {
+        IntLit(_, _) => FTType(0),
+        FloatLit(_, _) => FTType(1),
+        StrLit(_, _) => FTType(2),
+        BoolLit(_, _) => FTType(3),
+        Ident(n, sp) => {
+            let mut hit = -1
+            let mut i = len(env_names) - 1
+            while i >= 0 {
+                if hit < 0 && env_names[i] == n {
+                    hit = i
+                }
+                i = i - 1
+            }
+            if hit >= 0 {
+                fc_type_val(env_vals[hit], n, sp, adiags)
+            } else {
+                match get(penv, n) {
+                    Some(v) => fc_type_val(v, n, sp, adiags),
+                    None => match get(pending, n) {
+                        Some(p) => if p {
+                            FTBlocked(n)
+                        } else {
+                            let _ = fc_not_const(n, sp, adiags)
+                            FTErr
+                        },
+                        None => {
+                            let _ = fc_not_const(n, sp, adiags)
+                            FTErr
+                        },
+                    },
+                }
+            }
+        },
+        VariantAccess(en, vn, sp) => match get(aliases, en) {
+            Some(path) => match get(qenv, path + "." + vn) {
+                Some(v) => fc_type_val(v, en + "." + vn, sp, adiags),
+                None => {
+                    let _ = fc_not_const(en + "." + vn, sp, adiags)
+                    FTErr
+                },
+            },
+            None => {
+                let _ = fc_shape(sp, adiags)
+                FTErr
+            },
+        },
+        Unary(op, rhs, _) => match fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags) {
+            FTType(t) => if op == t_minus && (t == 0 || t == 1) {
+                FTType(t)
+            } else if op == t_bang && t == 3 {
+                FTType(3)
+            } else {
+                FTSoft
+            },
+            FTBlocked(n) => FTBlocked(n),
+            FTSoft => FTSoft,
+            FTErr => FTErr,
+        },
+        Binary(op, lhs, rhs, _) => {
+            let lt = fc_type(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            let rt = fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            fc_type_combine(lt, rt, op)
+        },
+        Logical(_, lhs, rhs, _) => {
+            let lt = fc_type(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            let rt = fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            match lt {
+                FTType(l) => match rt {
+                    FTType(r) => if l == 3 && r == 3 {
+                        FTType(3)
+                    } else {
+                        FTSoft
+                    },
+                    FTBlocked(n) => FTBlocked(n),
+                    FTSoft => FTSoft,
+                    FTErr => FTErr,
+                },
+                FTBlocked(n) => FTBlocked(n),
+                FTErr => FTErr,
+                FTSoft => match rt {
+                    FTBlocked(n) => FTBlocked(n),
+                    FTErr => FTErr,
+                    _ => FTSoft,
+                },
+            }
+        },
+        _ => {
+            let _ = fc_shape(span_of(e), adiags)
+            FTErr
+        },
+    }
+}

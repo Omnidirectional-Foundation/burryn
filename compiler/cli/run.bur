@@ -1,0 +1,74 @@
+// cli/run.bur — run/check 路径与折叠。
+// cli/run.bur — run/check paths and folding.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/bytecode"
+
+// dispatch 把文件或目录分派到 run/check/dis
+// dispatch sends a file or dir to run/check/dis
+pub fn dispatch(path, mode, argv) {
+    if is_dir(path) {
+        run_module(path, mode, argv)
+    } else {
+        run_file(path, mode, argv)
+    }
+}
+
+
+// run_file 单文件管线：lex→parse→check→compile→run
+// run_file runs the single-file pipeline: lex, parse, check, compile, run
+fn run_file(path, mode, argv) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, binds, chan_fors, _) => {
+                            if mode == mode_check {
+                                if run_check(cdiags, path, binds) {
+                                    exit(exit_static)
+                                }
+                                return
+                            }
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                                    if mode == mode_dis {
+                                        tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, lib::line_starts(src))
+                                    } else {
+                                        bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, [""], [path], [lib::line_starts(src)])
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+
+

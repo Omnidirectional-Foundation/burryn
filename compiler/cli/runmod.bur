@@ -1,0 +1,56 @@
+// cli/runmod.bur — 跑模块。
+// cli/runmod.bur — run module.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/bytecode"
+import "burryn.dev/compiler/module"
+
+// run_module 模块管线（目录入口） / run_module runs the module pipeline (directory entry)
+fn run_module(dir0, mode, argv) {
+    let dir = strip_trailing_slash(dir0)
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, binds, chan_fors, _) => {
+                    if mode == mode_check {
+                        if run_check_f(cdiags, cfiles, binds) {
+                            exit(exit_static)
+                        }
+                        return
+                    }
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
+                            exit(exit_static)
+                        },
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                            if mode == mode_dis {
+                                tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, [])
+                            } else {
+                                bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, ls_files, ls_files, ls_tables)
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}

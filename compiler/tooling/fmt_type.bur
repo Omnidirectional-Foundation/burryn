@@ -1,0 +1,117 @@
+// fmt_type.bur — 类型/变体格式化。
+// fmt_type.bur — type/variant formatting.
+
+import "burryn.dev/compiler/frontend"
+
+// fmt_variant 枚举变体格式化 / fmt_variant formats an enum variant
+fn fmt_variant(n, mut buf) {
+    match n {
+        frontend::Node::EnumVariantDecl(name, arity, vtypes, _) => {
+            push(buf, name)
+            if arity > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(vtypes) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_type(vtypes[i], buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        _ => fmt_internal("enum variant is not an EnumVariantDecl"),
+    }
+}
+
+// fmt_type 类型表达式格式化 / fmt_type formats a type expression
+fn fmt_type(n, mut buf) {
+    // 类型表达式格式化：list/record/tuple/fn 签名/具名
+    // Type-expression formatting: list, record, tuple, fn signatures, named
+    match n {
+        frontend::Node::TEName(pkg, name, constraint, targs, _) => {
+            if pkg != "" {
+                push(buf, pkg)
+                push(buf, "::")
+            }
+            push(buf, name)
+            if constraint != "" {
+                push(buf, ":")
+                push(buf, constraint)
+            }
+            if len(targs) > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(targs) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_type(targs[i], buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        frontend::Node::TEList(el, _) => {
+            push(buf, "[")
+            fmt_type(el, buf)
+            push(buf, "]")
+        },
+        frontend::Node::TEFn(params, ret, _) => {
+            push(buf, "fn(")
+            let mut i = 0
+            while i < len(params) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_type(params[i], buf)
+                i = i + 1
+            }
+            push(buf, ") -> ")
+            fmt_type(ret, buf)
+        },
+        frontend::Node::TETuple(ets, _) => {
+            push(buf, "(")
+            let mut i = 0
+            while i < len(ets) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_type(ets[i], buf)
+                i = i + 1
+            }
+            push(buf, ")")
+        },
+        frontend::Node::TERecord(fnames, ftypes, row, _) => {
+            push(buf, "record ")
+            push(buf, chr(123))
+            let mut i = 0
+            while i < len(fnames) {
+                if i > 0 {
+                    push(buf, ",")
+                }
+                push(buf, " ")
+                push(buf, fnames[i])
+                push(buf, ": ")
+                fmt_type(ftypes[i], buf)
+                i = i + 1
+            }
+            match row {
+                frontend::Node::NoNode => {},
+                _ => {
+                    if len(fnames) > 0 {
+                        push(buf, ",")
+                    }
+                    push(buf, " | ")
+                    fmt_type(row, buf)
+                },
+            }
+            if len(fnames) > 0 {
+                push(buf, " ")
+            }
+            push(buf, chr(125))
+        },
+        _ => fmt_internal("unhandled type expression node"),
+    }
+}

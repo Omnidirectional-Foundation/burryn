@@ -1,0 +1,166 @@
+// fmt_expr_compound.bur — record/list/call/block/match/if 排版。
+// fmt_expr_compound.bur — record/list/call/block/match/if formatting.
+
+import "burryn.dev/compiler/frontend"
+
+fn fmt_pipe(lhs, target, args, sp, src, comments, mut cc, indent, mut buf) {
+    fmt_child(lhs, 1, src, comments, cc, indent, buf)
+    push(buf, " |> ")
+    fmt_expr(target, src, comments, cc, indent, buf)
+    if len(args) > 0 || span_end(target) < span_end2(sp) {
+        push(buf, "(")
+        let mut i = 0
+        while i < len(args) {
+            if i > 0 {
+                push(buf, ", ")
+            }
+            fmt_expr(args[i], src, comments, cc, indent, buf)
+            i = i + 1
+        }
+        push(buf, ")")
+    }
+}
+
+fn fmt_record_lit(names, vals, src, comments, mut cc, indent, mut buf) {
+    push(buf, "record ")
+    push(buf, chr(123))
+    let mut i = 0
+    while i < len(names) {
+        if i > 0 {
+            push(buf, ",")
+        }
+        push(buf, " ")
+        push(buf, names[i])
+        push(buf, ": ")
+        fmt_expr(vals[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    if len(names) > 0 {
+        push(buf, " ")
+    }
+    push(buf, chr(125))
+}
+
+fn fmt_record_update(base, names, vals, src, comments, mut cc, indent, mut buf) {
+    push(buf, "record ")
+    push(buf, chr(123))
+    push(buf, " ")
+    fmt_expr(base, src, comments, cc, indent, buf)
+    push(buf, " |")
+    let mut i = 0
+    while i < len(names) {
+        push(buf, " ")
+        push(buf, names[i])
+        push(buf, ": ")
+        fmt_expr(vals[i], src, comments, cc, indent, buf)
+        if i < len(names) - 1 {
+            push(buf, ",")
+        }
+        i = i + 1
+    }
+    push(buf, " ")
+    push(buf, chr(125))
+}
+
+fn fmt_list_lit(elems, src, comments, mut cc, indent, mut buf) {
+    push(buf, "[")
+    let mut i = 0
+    while i < len(elems) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        fmt_expr(elems[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    push(buf, "]")
+}
+
+fn fmt_tuple_lit(elems, src, comments, mut cc, indent, mut buf) {
+    push(buf, "(")
+    let mut i = 0
+    while i < len(elems) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        fmt_expr(elems[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    push(buf, ")")
+}
+
+fn fmt_call_expr(callee, cargs, src, comments, mut cc, indent, mut buf) {
+    fmt_child(callee, 9, src, comments, cc, indent, buf)
+    push(buf, "(")
+    let mut i = 0
+    while i < len(cargs) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        fmt_expr(cargs[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    push(buf, ")")
+}
+
+fn fmt_block_expr(stmts, sp, src, comments, mut cc, indent, mut buf) {
+    if len(stmts) == 0 && !comment_inside(comments, cc, span_end2(sp)) {
+        push(buf, "" + chr(123) + "}")
+    } else {
+        push(buf, "" + chr(123) + "\n")
+        let deeper = indent + 4
+        let mut i = 0
+        let mut pe = 0
+        while i < len(stmts) {
+            pe = flush_comments(comments, cc, span_start(stmts[i]), src, deeper, pe, buf)
+            if pe > 0 && src_blank_between(src, pe, span_start(stmts[i])) {
+                push(buf, "\n")
+            }
+            push_indent(buf, deeper)
+            fmt_stmt(stmts[i], src, comments, cc, deeper, buf)
+            pe = try_trailing(comments, cc, span_end(stmts[i]), src, buf)
+            push(buf, "\n")
+            i = i + 1
+        }
+        let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
+        push_indent(buf, indent)
+        push(buf, "}")
+    }
+}
+
+fn fmt_if_expr(cond, then, els, src, comments, mut cc, indent, mut buf) {
+    push(buf, "if ")
+    fmt_expr(cond, src, comments, cc, indent, buf)
+    push(buf, " ")
+    fmt_expr(then, src, comments, cc, indent, buf)
+    match els {
+        frontend::Node::NoNode => {},
+        _ => {
+            push(buf, " else ")
+            fmt_expr(els, src, comments, cc, indent, buf)
+        },
+    }
+}
+
+fn fmt_match_expr(scrut, arms, sp, src, comments, mut cc, indent, mut buf) {
+    push(buf, "match ")
+    fmt_expr(scrut, src, comments, cc, indent, buf)
+    push(buf, " " + chr(123) + "\n")
+    let deeper = indent + 4
+    let mut i = 0
+    let mut pe = 0
+    while i < len(arms) {
+        pe = flush_comments(comments, cc, span_start(arms[i]), src, deeper, pe, buf)
+        if pe > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+            push(buf, "\n")
+        }
+        push_indent(buf, deeper)
+        fmt_arm(arms[i], src, comments, cc, deeper, buf)
+        push(buf, ",")
+        pe = try_trailing(comments, cc, span_end(arms[i]), src, buf)
+        push(buf, "\n")
+        i = i + 1
+    }
+    let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
+    push_indent(buf, indent)
+    push(buf, "}")
+}

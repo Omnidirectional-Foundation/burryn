@@ -1,0 +1,98 @@
+// cli/dis.bur — disasm / emit C。
+// cli/dis.bur — disasm / emit C.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/backends/c"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/bytecode"
+
+// dev_dis 处理 dev dis / dev_dis handles dev dis
+// dev_dis 处理 dev dis / dev_dis handles dev dis
+fn dev_dis(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
+                                        }
+                                        if !errs {
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => tooling::dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib::line_starts(src)),
+                                            }
+                                        }
+                                    },
+                                },
+                                None => {},
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// dev_emit_c 处理 dev emit-c / dev_emit_c handles dev emit-c
+// dev_emit_c 处理 dev emit-c / dev_emit_c handles dev emit-c
+fn dev_emit_c(src, path) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
+                                        }
+                                        if !errs {
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(c::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)])),
+                                            }
+                                        }
+                                    },
+                                },
+                                None => {},
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}

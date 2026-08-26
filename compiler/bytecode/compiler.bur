@@ -64,451 +64,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     let mut c_lbl_pending = [""]
     let mut cur_file = ""
 
-    // new_func 构造函数记录 / new_func builds a function record
-    fn new_func(name, file, arity) {
-        push(f_name, name)
-        push(f_file, file)
-        push(f_arity, arity)
-        push(f_nupvals, 0)
-        push(f_code, [])
-        push(f_spans, [])
-        push(f_consts, [])
-        len(f_name) - 1
-    }
-    // new_compiler 构造编译上下文 / new_compiler builds a compile context
-    fn new_compiler(enc, fh) {
-        push(c_enclosing, enc)
-        push(c_fn, fh)
-        push(c_scope_depth, 0)
-        push(c_temps, 0)
-        push(c_l_name, [])
-        push(c_l_depth, [])
-        push(c_l_slot, [])
-        push(c_l_mut, [])
-        push(c_l_captured, [])
-        push(c_l_tempsbelow, [])
-        push(c_u_index, [])
-        push(c_u_islocal, [])
-        push(c_u_mut, [])
-        push(c_u_name, [])
-        push(c_lp_base, [])
-        push(c_lp_contto, [])
-        push(c_lp_breaks, [])
-        push(c_lp_conts, [])
-        push(c_lp_labels, [])
-        push(c_lbl_pending, "")
-        len(c_fn) - 1
-    }
-    // push_local 压入局部变量记录 / push_local records a local
-    fn push_local(ch, name, depth, slot, is_mut, tempsbelow) {
-        push(c_l_name[ch], name)
-        push(c_l_depth[ch], depth)
-        push(c_l_slot[ch], slot)
-        push(c_l_mut[ch], is_mut)
-        push(c_l_captured[ch], false)
-        push(c_l_tempsbelow[ch], tempsbelow)
-    }
-    // pop_local 弹出局部变量记录 / pop_local removes a local
-    fn pop_local(ch) {
-        let _ = pop(c_l_name[ch])
-        let _ = pop(c_l_depth[ch])
-        let _ = pop(c_l_slot[ch])
-        let _ = pop(c_l_mut[ch])
-        let _ = pop(c_l_captured[ch])
-        let _ = pop(c_l_tempsbelow[ch])
-    }
-    // n_locals 取局部变量数 / n_locals counts locals
-    fn n_locals(ch) {
-        len(c_l_name[ch])
-    }
+    let emit_ctx = record { f_code: f_code, f_spans: f_spans, f_consts: f_consts, c_fn: c_fn, c_l_name: c_l_name, c_l_depth: c_l_depth, c_l_slot: c_l_slot, c_l_mut: c_l_mut, c_l_captured: c_l_captured, c_l_tempsbelow: c_l_tempsbelow, c_scope_depth: c_scope_depth, c_lp_base: c_lp_base, c_lp_contto: c_lp_contto, c_lp_breaks: c_lp_breaks, c_lp_conts: c_lp_conts, c_lp_labels: c_lp_labels, c_lbl_pending: c_lbl_pending, c_temps: c_temps, c_u_index: c_u_index, c_u_islocal: c_u_islocal, c_u_mut: c_u_mut, c_u_name: c_u_name, c_enclosing: c_enclosing, f_nupvals: f_nupvals, f_name: f_name, f_file: f_file, f_arity: f_arity }
 
-    // qualify 限定名字（跨包）/ qualify qualifies a name (cross-package)
-    fn qualify(name) capture(ref cur_pkg) {
-        if cur_pkg == "" {
-            name
-        } else {
-            cur_pkg + "." + name
-        }
-    }
-    // alias_path 解析 import 别名 / alias_path resolves an import alias
-    fn alias_path(name) capture(ref cur_aliases) {
-        match get(cur_aliases, name) {
-            Some(p) => p,
-            None => "",
-        }
-    }
-    // mangle_if_decl 对已声明名字做改写 / mangle_if_decl mangles declared names
-    fn mangle_if_decl(name) capture(ref pkg_decls) {
-        let hit = match get(pkg_decls, name) {
-            Some(_) => true,
-            None => false,
-        }
-        if hit {
-            qualify(name)
-        } else {
-            name
-        }
-    }
 
-    // declare_enum 注册枚举 / declare_enum registers an enum
-    fn declare_enum(qual, prefix, vnames, varities) {
-        push(en_qual, qual)
-        push(en_vnames, vnames)
-        push(en_varities, varities)
-        push(en_prefix, prefix)
-        put(enum_by, qual, len(en_qual) - 1)
-        put(global_mut, qual, false)
-        len(en_qual) - 1
-    }
-    // find_variant 查找变体 / find_variant finds a variant
-    fn find_variant(name) capture(ref cur_pkg) {
-        let mut found = -1
-        let mut idx = -1
-        let mut amb = false
-        for q in keys(enum_by) {
-            match get(enum_by, q) {
-                Some(eh) => {
-                    if en_prefix[eh] == cur_pkg || en_prefix[eh] == "" {
-                        let mut i = 0
-                        while i < len(en_vnames[eh]) {
-                            if en_vnames[eh][i] == name {
-                                if found >= 0 {
-                                    amb = true
-                                }
-                                found = eh
-                                idx = i
-                            }
-                            i = i + 1
-                        }
-                    }
-                },
-                None => {},
-            }
-        }
-        if amb {
-            [-2, -1]
-        } else {
-            [found, idx]
-        }
-    }
-    // local_enum 查找本地枚举 / local_enum finds a local enum
-    fn local_enum(name) {
-        match get(enum_by, qualify(name)) {
-            Some(eh) => eh,
-            None => {
-                match get(enum_by, name) {
-                    Some(eh) => if en_prefix[eh] == "" {
-                        eh
-                    } else {
-                        -1
-                    },
-                    None => -1,
-                }
-            },
-        }
-    }
-
-    // emit 发射一个字节（带诊断区间）/ emit emits one byte with a diagnostic span
-    fn emit(ch, b, sp) {
-        push(f_code[c_fn[ch]], b)
-        push(f_spans[c_fn[ch]], sp)
-    }
-    // emit_u16 发射 u16 / emit_u16 emits a u16
-    // Emit a u16
-    fn emit_u16(ch, v, sp) {
-        emit(ch, v / 256, sp)
-        emit(ch, v % 256, sp)
-    }
-    // code_len 取当前代码长度 / code_len returns the current code length
-    fn code_len(ch) {
-        len(f_code[c_fn[ch]])
-    }
-    // add_const 添加常量（去重）/ add_const adds a constant (dedup)
-    fn add_const(ch, cv) {
-        push(f_consts[c_fn[ch]], cv)
-        len(f_consts[c_fn[ch]]) - 1
-    }
-    // emit_const 发射常量加载 / emit_const emits a constant load
-    fn emit_const(ch, cv, sp) {
-        let idx = add_const(ch, cv)
-        emit(ch, lib::op_const, sp)
-        emit_u16(ch, idx, sp)
-    }
-    // emit_jump 发射跳转并记录回填点 / emit_jump emits a jump and remembers the patch point
-    fn emit_jump(ch, op, sp) {
-        emit(ch, op, sp)
-        emit_u16(ch, 65535, sp)
-        code_len(ch) - 2
-    }
-    // patch_jump 回填跳转偏移 / patch_jump patches a jump offset
-    fn patch_jump(ch, at) {
-        let dist = code_len(ch) - (at + 2)
-        if dist > 65535 {
-            return frontend::perr("E2001", "", "jump too large", frontend::SpanT::Sp(0, 0))
-        }
-        f_code[c_fn[ch]][at] = dist / 256
-        f_code[c_fn[ch]][at + 1] = dist % 256
-        Ok(true)
-    }
-    // emit_loop 发射循环回边 / emit_loop emits a loop back-edge
-    fn emit_loop(ch, to, sp) {
-        emit(ch, lib::op_loop, sp)
-        let dist = code_len(ch) + 2 - to
-        if dist > 65535 {
-            return frontend::perr("E2002", "", "loop body too large", sp)
-        }
-        emit_u16(ch, dist, sp)
-        Ok(true)
-    }
-
-    // next_slot 取下一个空闲槽位 / next_slot returns the next free slot
-    fn next_slot(ch) {
-        let n = n_locals(ch)
-        if n > 0 {
-            c_l_slot[ch][n - 1] + 1 + (c_temps[ch] - c_l_tempsbelow[ch][n - 1])
-        } else {
-            c_temps[ch]
-        }
-    }
-    // declare_local 声明局部变量（分配槽位）/ declare_local declares a local (allocates a slot)
-    fn declare_local(ch, name, is_mut, sp) {
-        let slot = next_slot(ch)
-        if slot > 65534 {
-            return frontend::perr("E2003", "", "too many locals", sp)
-        }
-        push_local(ch, name, c_scope_depth[ch], slot, is_mut, c_temps[ch])
-        Ok(true)
-    }
-    // begin_scope 进入作用域（记录局部计数）/ begin_scope begins a scope (local counter)
-    fn begin_scope(ch) {
-        c_scope_depth[ch] = c_scope_depth[ch] + 1
-    }
-    // end_scope 结束作用域（弹局部、关 upvalue）/ end_scope ends a scope (pop locals, close upvalues)
-    fn end_scope(ch, sp) {
-        c_scope_depth[ch] = c_scope_depth[ch] - 1
-        while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
-            if c_l_captured[ch][n_locals(ch) - 1] {
-                emit(ch, lib::op_close_upvalue, sp)
-            } else {
-                emit(ch, lib::op_pop, sp)
-            }
-            pop_local(ch)
-        }
-    }
-    // end_scope_expr 表达式位置的块结束 / end_scope_expr ends a block in expression position
-    fn end_scope_expr(ch, sp) {
-        c_scope_depth[ch] = c_scope_depth[ch] - 1
-        let mut n = 0
-        while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
-            n = n + 1
-            pop_local(ch)
-        }
-        if n > 0 {
-            if n > 255 {
-                return frontend::perr("E2003", "", "too many locals in block", sp)
-            }
-            emit(ch, lib::op_end_block, sp)
-            emit(ch, n, sp)
-        }
-        Ok(true)
-    }
-    // resolve_local 解析局部变量 / resolve_local resolves a local
-    fn resolve_local(ch, name) {
-        let mut i = n_locals(ch) - 1
-        let mut hit = -1
-        while i >= 0 && hit < 0 {
-            if c_l_name[ch][i] == name {
-                hit = i
-            }
-            i = i - 1
-        }
-        hit
-    }
-    // add_upvalue 添加 upvalue（开启时记 (fiber, slot)，fiber 切换安全）
-    // add_upvalue adds an upvalue ((fiber, slot) while open, safe across fiber switches)
-    fn add_upvalue(ch, index, is_local, is_mut, name, sp) {
-        let mut i = 0
-        while i < len(c_u_index[ch]) {
-            if c_u_index[ch][i] == index && c_u_islocal[ch][i] == is_local {
-                return Ok(i)
-            }
-            i = i + 1
-        }
-        if len(c_u_index[ch]) >= 255 {
-            return frontend::perr("E2004", "", "too many captured variables", sp)
-        }
-        push(c_u_index[ch], index)
-        push(c_u_islocal[ch], is_local)
-        push(c_u_mut[ch], is_mut)
-        push(c_u_name[ch], name)
-        f_nupvals[c_fn[ch]] = len(c_u_index[ch])
-        Ok(len(c_u_index[ch]) - 1)
-    }
-    // resolve_upvalue 解析 upvalue / resolve_upvalue resolves an upvalue
-    fn resolve_upvalue(ch, name, sp) {
-        if c_enclosing[ch] < 0 {
-            return Ok(-1)
-        }
-        let enc = c_enclosing[ch]
-        let li = resolve_local(enc, name)
-        if li >= 0 {
-            c_l_captured[enc][li] = true
-            return add_upvalue(ch, c_l_slot[enc][li], true, c_l_mut[enc][li], name, sp)
-        }
-        let ui = match resolve_upvalue(enc, name, sp) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                0
-            },
-        }
-        if ui >= 0 {
-            return add_upvalue(ch, ui, false, c_u_mut[enc][ui], name, sp)
-        }
-        Ok(-1)
-    }
-
-    // emit_variant 发射变体构造 / emit_variant emits variant construction
-    fn emit_variant(ch, eh, idx, sp) {
-        if en_varities[eh][idx] == 0 {
-            emit_const(ch, lib::CVal::CSingleton(eh, idx), sp)
-        } else {
-            emit_const(ch, lib::CVal::CCtor(eh, idx), sp)
-        }
-    }
-    // emit_variant_of 按名字构造变体 / emit_variant_of constructs a variant by name
-    fn emit_variant_of(ch, eh, variant, sp) {
-        let mut i = 0
-        while i < len(en_vnames[eh]) {
-            if en_vnames[eh][i] == variant {
-                emit_variant(ch, eh, i, sp)
-                return Ok(true)
-            }
-            i = i + 1
-        }
-        frontend::perr("E2016", "", "enum \"" + en_qual[eh] + "\" has no variant \"" + variant + "\"", sp)
-    }
-    // emit_variant_test 发射变体身份测试 / emit_variant_test emits a variant identity test
-    fn emit_variant_test(ch, eh, idx, scrut_slot, sp) {
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, scrut_slot, sp)
-        emit_const(ch, lib::CVal::CEnumType(eh), sp)
-        emit(ch, lib::op_test_variant, sp)
-        emit(ch, idx, sp)
-        Ok(emit_jump(ch, lib::op_jump_if_false_pop, sp))
-    }
-
-    // define_global 定义全局变量 / define_global defines a global
-    fn define_global(ch, name, is_mut, sp) {
-        let qual = qualify(name)
-        let exists = match get(global_mut, qual) {
-            Some(_) => true,
-            None => false,
-        }
-        if exists {
-            let is_enum = match get(enum_by, qual) {
-                Some(_) => true,
-                None => false,
-            }
-            if is_enum {
-                return frontend::perr("E2007", "", "cannot redeclare enum \"" + name + "\"", sp)
-            }
-        }
-        put(global_mut, qual, is_mut)
-        let idx = add_const(ch, lib::CVal::CStr(qual))
-        emit(ch, lib::op_def_global, sp)
-        emit_u16(ch, idx, sp)
-        Ok(true)
-    }
-
-    // register_enum_decl 注册枚举声明 / register_enum_decl registers an enum declaration
-    fn register_enum_decl(_ch, name, variants, sp) capture(ref cur_pkg) {
-        let qual = qualify(name)
-        let exists = match get(enum_by, qual) {
-            Some(_) => true,
-            None => false,
-        }
-        if exists {
-            return frontend::perr("E2007", "", "enum \"" + name + "\" is already declared", sp)
-        }
-        let mut seen = map()
-        let mut vnames = []
-        let mut varities = []
-        for vd in variants {
-            match vd {
-                frontend::Node::EnumVariantDecl(vn, arity, _, _) => {
-                    let dup = match get(seen, vn) {
-                        Some(_) => true,
-                        None => false,
-                    }
-                    if dup {
-                        return frontend::perr("E2009", "", "duplicate variant \"" + vn + "\" in enum \"" + name + "\"", sp)
-                    }
-                    put(seen, vn, true)
-                    push(vnames, vn)
-                    push(varities, arity)
-                },
-                _ => {},
-            }
-        }
-        Ok(declare_enum(qual, cur_pkg, vnames, varities))
-    }
-
-    // push_loop 压入循环上下文 / push_loop pushes a loop context
-    fn push_loop(ch, base, cont_to) {
-        push(c_lp_base[ch], base)
-        push(c_lp_contto[ch], cont_to)
-        push(c_lp_breaks[ch], [])
-        push(c_lp_conts[ch], [])
-        push(c_lp_labels[ch], c_lbl_pending[ch])
-    }
-    // pop_loop 弹出循环上下文 / pop_loop pops a loop context
-    fn pop_loop(ch) {
-        let _ = pop(c_lp_base[ch])
-        let _ = pop(c_lp_contto[ch])
-        let _ = pop(c_lp_breaks[ch])
-        let _ = pop(c_lp_conts[ch])
-        let _ = pop(c_lp_labels[ch])
-    }
-    // labeled_loop 注册带标签的循环 / labeled_loop registers a labeled loop
-    fn labeled_loop(ch, lb, sp) {
-        let mut li = len(c_lp_labels[ch]) - 1
-        while li >= 0 {
-            if c_lp_labels[ch][li] == lb {
-                let base = c_lp_base[ch][li]
-                let mut i = n_locals(ch) - 1
-                while i >= 0 && c_l_slot[ch][i] >= base {
-                    if c_l_captured[ch][i] {
-                        emit(ch, lib::op_close_upvalue, sp)
-                    } else {
-                        emit(ch, lib::op_pop, sp)
-                    }
-                    i = i - 1
-                }
-                return Ok(li)
-            }
-            li = li - 1
-        }
-        frontend::perr("E2018", "", "no loop labeled `" + lb + "` in scope", sp)
-    }
-    // unwind_to_loop 生成 break/continue 回边 / unwind_to_loop emits break/continue back-edges
-    fn unwind_to_loop(ch, sp) {
-        if len(c_lp_base[ch]) == 0 {
-            return frontend::perr("E2013", "", "break/continue outside of a loop", sp)
-        }
-        let li = len(c_lp_base[ch]) - 1
-        let base = c_lp_base[ch][li]
-        let mut i = n_locals(ch) - 1
-        while i >= 0 && c_l_slot[ch][i] >= base {
-            if c_l_captured[ch][i] {
-                emit(ch, lib::op_close_upvalue, sp)
-            } else {
-                emit(ch, lib::op_pop, sp)
-            }
-            i = i - 1
-        }
-        Ok(li)
-    }
 
     let mut cp_expr_ref = fn(_c, _e) {
         Ok(true)
@@ -517,1332 +75,64 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         Ok(true)
     }
 
-    // cp_ident 标识符代码生成 / cp_ident codegens an identifier
-    fn cp_ident(ch, name, sp) {
-        let li = resolve_local(ch, name)
-        if li >= 0 {
-            emit(ch, lib::op_get_local, sp)
-            emit_u16(ch, c_l_slot[ch][li], sp)
-            return Ok(true)
-        }
-        let ui = match resolve_upvalue(ch, name, sp) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                0
-            },
-        }
-        if ui >= 0 {
-            emit(ch, lib::op_get_upval, sp)
-            emit_u16(ch, ui, sp)
-            return Ok(true)
-        }
-        let gname = mangle_if_decl(name)
-        let declared = match get(global_mut, gname) {
-            Some(_) => true,
-            None => false,
-        }
-        if !declared {
-            let fv = find_variant(name)
-            if fv[0] == -2 {
-                return frontend::perr("E2014", "qualify it as Enum." + name, "variant \"" + name + "\" exists in several enums", sp)
-            }
-            if fv[1] >= 0 {
-                emit_variant(ch, fv[0], fv[1], sp)
-                return Ok(true)
-            }
-        }
-        let idx = add_const(ch, lib::CVal::CStr(gname))
-        emit(ch, lib::op_get_global, sp)
-        emit_u16(ch, idx, sp)
-        Ok(true)
-    }
 
-    // cp_assign 赋值代码生成 / cp_assign codegens an assignment
-    fn cp_assign(ch, target, val, sp) capture(ref cp_expr_ref, ref cp_stmt_ref) {
-        match target {
-            frontend::Node::Ident(name, _) => {
-                match cp_expr_ref(ch, val) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                let li = resolve_local(ch, name)
-                if li >= 0 {
-                    if !c_l_mut[ch][li] {
-                        return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
-                    }
-                    emit(ch, lib::op_set_local, sp)
-                    emit_u16(ch, c_l_slot[ch][li], sp)
-                } else {
-                    let ui = match resolve_upvalue(ch, name, sp) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            0
-                        },
-                    }
-                    if ui >= 0 {
-                        if !c_u_mut[ch][ui] {
-                            return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
-                        }
-                        emit(ch, lib::op_set_upval, sp)
-                        emit_u16(ch, ui, sp)
-                    } else {
-                        match get(global_mut, mangle_if_decl(name)) {
-                            Some(is_mut) => {
-                                if !is_mut {
-                                    return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
-                                }
-                                let idx = add_const(ch, lib::CVal::CStr(mangle_if_decl(name)))
-                                emit(ch, lib::op_set_global, sp)
-                                emit_u16(ch, idx, sp)
-                            },
-                            None => {
-                                return frontend::perr("E2011", "", "cannot assign to undeclared variable \"" + name + "\"", sp)
-                            },
-                        }
-                    }
-                }
-                emit(ch, lib::op_pop, sp)
-                Ok(true)
-            },
-            frontend::Node::Index(itarget, iidx, _) => {
-                match cp_expr_ref(ch, itarget) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] + 1
-                match cp_expr_ref(ch, iidx) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] + 1
-                match cp_expr_ref(ch, val) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] - 2
-                emit(ch, lib::op_index_set, sp)
-                Ok(true)
-            },
-            _ => frontend::perr("E2012", "", "invalid assignment target", sp),
-        }
-    }
 
-    // cp_block_stmts 块内语句代码生成 / cp_block_stmts codegens block statements
-    fn cp_block_stmts(ch, blk) capture(ref cp_stmt_ref) {
-        begin_scope(ch)
-        match blk {
-            frontend::Node::Block(ss, bsp) => {
-                for s in ss {
-                    match cp_stmt_ref(ch, s) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                }
-                end_scope(ch, bsp)
-            },
-            _ => {},
-        }
-        Ok(true)
-    }
 
-    // cp_block_expr 块表达式：作用域退出时对齐值栈
-    // cp_block_expr codegens a block expression: align the value stack with scope exit
-    fn cp_block_expr(ch, blk) capture(ref cp_expr_ref, ref cp_stmt_ref) {
-        begin_scope(ch)
-        match blk {
-            frontend::Node::Block(ss, bsp) => {
-                let n = len(ss)
-                let mut produced = false
-                let mut i = 0
-                while i < n {
-                    let s = ss[i]
-                    let last_expr = if i == n - 1 {
-                        match s {
-                            frontend::Node::ExprStmt(_, _) => true,
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                    if last_expr {
-                        match s {
-                            frontend::Node::ExprStmt(e, _) => {
-                                match cp_expr_ref(ch, e) {
-                                    Ok(_) => {},
-                                    Err(d) => {
-                                        return Err(d)
-                                    },
-                                }
-                                produced = true
-                            },
-                            _ => {},
-                        }
-                    } else {
-                        match cp_stmt_ref(ch, s) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                    }
-                    i = i + 1
-                }
-                if !produced {
-                    // 块尾是发散语句（break/return 已转移控制流）时不补块值：
-                    // 补 UNIT 会生成死代码，x86 后端线性静态模拟会把它算入影子栈。
-                    // Skip the block value when the block ends in a diverging statement
-                    // (break/return already transferred control); a padding UNIT would be
-                    // dead code that the x86 linear shadow simulation would count.
-                    let last_diverges = if n > 0 {
-                        match ss[n - 1] {
-                            frontend::Node::BreakStmt(_, _) => true,
-                            frontend::Node::ReturnStmt(_, _) => true,
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                    if !last_diverges {
-                        emit(ch, lib::op_unit, bsp)
-                    }
-                }
-                end_scope_expr(ch, bsp)
-            },
-            _ => Ok(true),
-        }
-    }
 
-    // cp_function 函数字面量代码生成 / cp_function codegens a function literal
-    fn cp_function(ch, lit) capture(ref cur_file) {
-        match lit {
-            // 函数字面量：编译为独立函数表项，闭包捕获外层局部
-            // Function literals: compile to a separate function-table entry;
-            // closures capture outer locals
-            frontend::Node::FnLit(params, muts, _, _, _, body, name, crefs, lsp) => {
-                let fh = new_func(name, cur_file, len(params))
-                let sub = new_compiler(ch, fh)
-                begin_scope(sub)
-                push_local(sub, name, c_scope_depth[sub], 0, false, 0)
-                if len(params) > 255 {
-                    return frontend::perr("E2019", "", "too many parameters", lsp)
-                }
-                let mut seen = map()
-                let mut i = 0
-                while i < len(params) {
-                    let dup = match get(seen, params[i]) {
-                        Some(_) => true,
-                        None => false,
-                    }
-                    if dup {
-                        return frontend::perr("E2020", "", "duplicate parameter \"" + params[i] + "\"", lsp)
-                    }
-                    put(seen, params[i], true)
-                    push_local(sub, params[i], c_scope_depth[sub], c_l_slot[sub][n_locals(sub) - 1] + 1, muts[i], 0)
-                    i = i + 1
-                }
-                match cp_block_expr(sub, body) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                emit(sub, lib::op_return, lsp)
 
-                let idx = add_const(ch, lib::CVal::CFn(fh))
-                emit(ch, lib::op_closure, lsp)
-                emit_u16(ch, idx, lsp)
-                let mut u = 0
-                while u < len(c_u_index[sub]) {
-                    // 描述符标志：bit0=islocal，bit1=ref（capture(ref name) 声明）
-                    // descriptor flags: bit0=islocal, bit1=ref (declared via capture(ref name))
-                    let mut flag = 0
-                    if c_u_islocal[sub][u] {
-                        flag = flag + 1
-                    }
-                    let mut ri = 0
-                    while ri < len(crefs) {
-                        if c_u_name[sub][u] == crefs[ri] {
-                            flag = flag + 2
-                        }
-                        ri = ri + 1
-                    }
-                    emit(ch, flag, lsp)
-                    emit_u16(ch, c_u_index[sub][u], lsp)
-                    u = u + 1
-                }
-                Ok(true)
-            },
-            _ => Ok(true),
-        }
-    }
 
-    // cp_if if 代码生成 / cp_if codegens if
-    fn cp_if(ch, cond, then, els, sp) capture(ref cp_expr_ref) {
-        match cp_expr_ref(ch, cond) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let else_j = emit_jump(ch, lib::op_jump_if_false_pop, sp)
-        match cp_block_expr(ch, then) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let end_j = emit_jump(ch, lib::op_jump, sp)
-        match patch_jump(ch, else_j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match els {
-            frontend::Node::NoNode => emit(ch, lib::op_unit, sp),
-            frontend::Node::Block(_, _) => {
-                match cp_block_expr(ch, els) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-            },
-            frontend::Node::IfExpr(c2, t2, e2, sp2) => {
-                match cp_if(ch, c2, t2, e2, sp2) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-            },
-            _ => {
-                return frontend::perr("E2018", "", "invalid else branch", sp)
-            },
-        }
-        patch_jump(ch, end_j)
-    }
 
-    // cp_while while 代码生成 / cp_while codegens while
-    fn cp_while(ch, cond, body, sp) capture(ref cp_expr_ref) {
-        let start = code_len(ch)
-        push_loop(ch, next_slot(ch), start)
-        match cp_expr_ref(ch, cond) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let exit_j = emit_jump(ch, lib::op_jump_if_false_pop, sp)
-        match cp_block_stmts(ch, body) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match emit_loop(ch, start, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match patch_jump(ch, exit_j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let li = len(c_lp_breaks[ch]) - 1
-        for j in c_lp_breaks[ch][li] {
-            match patch_jump(ch, j) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        pop_loop(ch)
-        Ok(true)
-    }
 
-    // cp_for for 代码生成 / cp_for codegens the for statement
-    fn cp_for(ch, v, idx, iter, body, sp) capture(ref cp_expr_ref, ref cp_stmt_ref) {
-        begin_scope(ch)
-        match cp_expr_ref(ch, iter) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match declare_local(ch, "(iter)", false, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let iter_slot = c_l_slot[ch][n_locals(ch) - 1]
-        emit_const(ch, lib::CVal::CInt(0), sp)
-        match declare_local(ch, "(idx)", false, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let idx_slot = c_l_slot[ch][n_locals(ch) - 1]
 
-        push_loop(ch, next_slot(ch), -1)
 
-        let cond_start = code_len(ch)
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, idx_slot, sp)
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, iter_slot, sp)
-        emit(ch, lib::op_len, sp)
-        emit(ch, lib::op_lt, sp)
-        let exit_j = emit_jump(ch, lib::op_jump_if_false_pop, sp)
 
-        begin_scope(ch)
-        if idx != "" {
-            emit(ch, lib::op_get_local, sp)
-            emit_u16(ch, idx_slot, sp)
-            match declare_local(ch, idx, false, sp) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, iter_slot, sp)
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, idx_slot, sp)
-        emit(ch, lib::op_index_get, sp)
-        match declare_local(ch, v, false, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match body {
-            frontend::Node::Block(ss, _) => {
-                for s in ss {
-                    match cp_stmt_ref(ch, s) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                }
-            },
-            _ => {},
-        }
-        end_scope(ch, sp)
 
-        let li = len(c_lp_conts[ch]) - 1
-        for j in c_lp_conts[ch][li] {
-            match patch_jump(ch, j) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, idx_slot, sp)
-        emit_const(ch, lib::CVal::CInt(1), sp)
-        emit(ch, lib::op_add, sp)
-        emit(ch, lib::op_set_local, sp)
-        emit_u16(ch, idx_slot, sp)
-        emit(ch, lib::op_pop, sp)
-        match emit_loop(ch, cond_start, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
 
-        match patch_jump(ch, exit_j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        for j in c_lp_breaks[ch][li] {
-            match patch_jump(ch, j) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        pop_loop(ch)
-        end_scope(ch, sp)
-        Ok(true)
-    }
-
-    // cp_for_chan channel 的 for-in 排空 / cp_for_chan codegens the channel for-in drain
-    fn cp_for_chan(ch, v, iter, body, sp) capture(ref cp_expr_ref, ref cp_stmt_ref) {
-        begin_scope(ch)
-        match cp_expr_ref(ch, iter) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match declare_local(ch, "(chan)", false, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let chan_slot = c_l_slot[ch][n_locals(ch) - 1]
-
-        let cond_start = code_len(ch)
-        push_loop(ch, next_slot(ch), cond_start)
-
-        emit(ch, lib::op_get_local, sp)
-        emit_u16(ch, chan_slot, sp)
-        let exit_j = emit_jump(ch, lib::op_chan_next, sp)
-
-        begin_scope(ch)
-        match declare_local(ch, v, false, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match body {
-            frontend::Node::Block(ss, _) => {
-                for s in ss {
-                    match cp_stmt_ref(ch, s) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                }
-            },
-            _ => {},
-        }
-        end_scope(ch, sp)
-
-        match emit_loop(ch, cond_start, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-
-        match patch_jump(ch, exit_j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let li = len(c_lp_breaks[ch]) - 1
-        for j in c_lp_breaks[ch][li] {
-            match patch_jump(ch, j) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        pop_loop(ch)
-        end_scope(ch, sp)
-        Ok(true)
-    }
-
-    // cp_select select 代码生成 / cp_select codegens select
-    fn cp_select(ch, arms, has_default, dflt, dsp, sp) capture(ref cp_expr_ref) {
-        let base_temps = c_temps[ch]
-        for arm in arms {
-            match arm {
-                frontend::Node::SelectArm(is_send, _, _, cch, val, _, _) => {
-                    match cp_expr_ref(ch, cch) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    c_temps[ch] = c_temps[ch] + 1
-                    if is_send {
-                        match cp_expr_ref(ch, val) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        c_temps[ch] = c_temps[ch] + 1
-                    }
-                },
-                _ => {},
-            }
-        }
-        c_temps[ch] = base_temps
-
-        if len(arms) > 255 {
-            return frontend::perr("E2021", "", "too many select arms", sp)
-        }
-        emit(ch, lib::op_select, sp)
-        emit(ch, len(arms), sp)
-        emit(ch, if has_default {
-            1
-        } else {
-            0
-        }, sp)
-        let mut arm_slots = []
-        for arm in arms {
-            match arm {
-                frontend::Node::SelectArm(is_send, _, _, _, _, _, _) => {
-                    emit(ch, if is_send {
-                        1
-                    } else {
-                        0
-                    }, sp)
-                    emit_u16(ch, 65535, sp)
-                    push(arm_slots, code_len(ch) - 2)
-                },
-                _ => {},
-            }
-        }
-        let mut def_slot = -1
-        if has_default {
-            emit_u16(ch, 65535, sp)
-            def_slot = code_len(ch) - 2
-        }
-
-        let mut end_jumps = []
-        let mut i = 0
-        for arm in arms {
-            match arm {
-                frontend::Node::SelectArm(is_send, bind, _, _, _, body, asp) => {
-                    match patch_jump(ch, arm_slots[i]) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    begin_scope(ch)
-                    if is_send {
-                        match cp_expr_ref(ch, body) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        emit(ch, lib::op_pop, asp)
-                    } else if bind != "" && bind != "_" {
-                        match declare_local(ch, bind, false, asp) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        // recv 值在栈顶（select exec 留槽），拷入臂变量槽，让 x86 后端拿到权威类型
-                        // the recv value sits on the stack top (select exec leaves the slot);
-                        // copy it into the arm-variable slot so the x86 backend records an
-                        // authoritative type instead of guessing from a polluted stack top
-                        emit(ch, lib::op_set_local, asp)
-                        emit_u16(ch, c_l_slot[ch][len(c_l_slot[ch]) - 1], asp)
-                        match cp_expr_ref(ch, body) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        emit(ch, lib::op_pop, asp)
-                    } else {
-                        emit(ch, lib::op_pop, asp)
-                        match cp_expr_ref(ch, body) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        emit(ch, lib::op_pop, asp)
-                    }
-                    end_scope(ch, asp)
-                    push(end_jumps, emit_jump(ch, lib::op_jump, asp))
-                },
-                _ => {},
-            }
-            i = i + 1
-        }
-        if has_default {
-            match patch_jump(ch, def_slot) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-            begin_scope(ch)
-            match cp_expr_ref(ch, dflt) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-            emit(ch, lib::op_pop, dsp)
-            end_scope(ch, dsp)
-            push(end_jumps, emit_jump(ch, lib::op_jump, dsp))
-        }
-        for j in end_jumps {
-            match patch_jump(ch, j) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        Ok(true)
-    }
-
-    // cp_match match 代码生成：变体测试（枚举身份 + tag）与字段提取，无哈希、无反射
-    // cp_match codegens match: variant tests (enum identity + tag) and field
-    // extraction, no hashing, no reflection
-    fn cp_match(ch, scrut, arms, msp) capture(ref cp_expr_ref) {
-        begin_scope(ch)
-        match cp_expr_ref(ch, scrut) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match declare_local(ch, "(match)", false, msp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let scrut_slot = c_l_slot[ch][n_locals(ch) - 1]
-
-        let mut end_jumps = []
-        for arm in arms {
-            match arm {
-                frontend::Node::MatchArm(pat, guard, body, asp) => {
-                    let mut fail_j = -1
-                    let mut guard_fail_j = -1
-                    begin_scope(ch)
-                    let mut arm_locals = 0
-
-                    match pat {
-                        frontend::Node::PatWildcard(_) => {},
-                        frontend::Node::PatLiteral(v, _) => {
-                            emit(ch, lib::op_get_local, asp)
-                            emit_u16(ch, scrut_slot, asp)
-                            c_temps[ch] = c_temps[ch] + 1
-                            match cp_expr_ref(ch, v) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
-                            c_temps[ch] = c_temps[ch] - 1
-                            emit(ch, lib::op_eq, asp)
-                            fail_j = emit_jump(ch, lib::op_jump_if_false_pop, asp)
-                        },
-                        frontend::Node::PatBinding(name, _) => {
-                            let fv = find_variant(name)
-                            if fv[0] == -2 {
-                                return frontend::perr("E2014", "qualify it as Enum." + name, "variant \"" + name + "\" exists in several enums", asp)
-                            } else if fv[1] >= 0 && en_varities[fv[0]][fv[1]] == 0 {
-                                fail_j = match emit_variant_test(ch, fv[0], fv[1], scrut_slot, asp) {
-                                    Ok(v) => v,
-                                    Err(d) => {
-                                        return Err(d)
-                                        0
-                                    },
-                                }
-                            } else if fv[1] >= 0 {
-                                return frontend::perr("E2017", "bind them: " + name + "(...)", "variant \"" + name + "\" has " + str(en_varities[fv[0]][fv[1]]) + " field(s)", asp)
-                            } else {
-                                emit(ch, lib::op_get_local, asp)
-                                emit_u16(ch, scrut_slot, asp)
-                                match declare_local(ch, name, false, asp) {
-                                    Ok(_) => {},
-                                    Err(d) => {
-                                        return Err(d)
-                                    },
-                                }
-                                arm_locals = arm_locals + 1
-                            }
-                        },
-                        frontend::Node::PatVariant(ppkg, penum, pvar, binds, _) => {
-                            let mut eh = -1
-                            let mut idx = -1
-                            if ppkg != "" {
-                                let apath = alias_path(ppkg)
-                                let full = if apath != "" {
-                                    apath + "." + penum
-                                } else {
-                                    ppkg + "." + penum
-                                }
-                                eh = match get(enum_by, full) {
-                                    Some(h) => h,
-                                    None => -1,
-                                }
-                                if eh < 0 {
-                                    return frontend::perr("E2015", "", "unknown enum \"" + full + "\"", asp)
-                                }
-                                let mut i = 0
-                                while i < len(en_vnames[eh]) {
-                                    if en_vnames[eh][i] == pvar {
-                                        idx = i
-                                    }
-                                    i = i + 1
-                                }
-                                if idx < 0 {
-                                    return frontend::perr("E2016", "", "enum \"" + full + "\" has no variant \"" + pvar + "\"", asp)
-                                }
-                            } else if penum != "" {
-                                eh = local_enum(penum)
-                                if eh < 0 {
-                                    return frontend::perr("E2015", "", "unknown enum \"" + penum + "\"", asp)
-                                }
-                                let mut i = 0
-                                while i < len(en_vnames[eh]) {
-                                    if en_vnames[eh][i] == pvar {
-                                        idx = i
-                                    }
-                                    i = i + 1
-                                }
-                                if idx < 0 {
-                                    return frontend::perr("E2016", "", "enum \"" + penum + "\" has no variant \"" + pvar + "\"", asp)
-                                }
-                            } else {
-                                let fv = find_variant(pvar)
-                                if fv[0] == -2 {
-                                    return frontend::perr("E2014", "qualify it as Enum." + pvar, "variant \"" + pvar + "\" exists in several enums", asp)
-                                }
-                                if fv[1] < 0 {
-                                    return frontend::perr("E2016", "", "unknown variant \"" + pvar + "\"", asp)
-                                }
-                                eh = fv[0]
-                                idx = fv[1]
-                            }
-                            let arity = en_varities[eh][idx]
-                            if len(binds) != arity {
-                                return frontend::perr("E2017", "", "variant " + pvar + " has " + str(arity) + " field(s), pattern binds " + str(len(binds)), asp)
-                            }
-                            fail_j = match emit_variant_test(ch, eh, idx, scrut_slot, asp) {
-                                Ok(v) => v,
-                                Err(d) => {
-                                    return Err(d)
-                                    0
-                                },
-                            }
-                            let mut i = 0
-                            while i < len(binds) {
-                                let bname = match binds[i] {
-                                    frontend::Node::PatBinding(bn, _) => bn,
-                                    _ => "_",
-                                }
-                                if bname != "_" {
-                                    emit(ch, lib::op_get_local, asp)
-                                    emit_u16(ch, scrut_slot, asp)
-                                    emit(ch, lib::op_get_field, asp)
-                                    emit(ch, i, asp)
-                                    match declare_local(ch, bname, false, asp) {
-                                        Ok(_) => {},
-                                        Err(d) => {
-                                            return Err(d)
-                                        },
-                                    }
-                                    arm_locals = arm_locals + 1
-                                }
-                                i = i + 1
-                            }
-                        },
-                        frontend::Node::PatRecord(names, _) => {
-                            for fname in names {
-                                emit(ch, lib::op_get_local, asp)
-                                emit_u16(ch, scrut_slot, asp)
-                                let cidx = add_const(ch, lib::CVal::CStr(fname))
-                                emit(ch, lib::op_get_field_name, asp)
-                                emit_u16(ch, cidx, asp)
-                                match declare_local(ch, fname, false, asp) {
-                                    Ok(_) => {},
-                                    Err(d) => {
-                                        return Err(d)
-                                    },
-                                }
-                                arm_locals = arm_locals + 1
-                            }
-                        },
-                        _ => {},
-                    }
-
-                    match guard {
-                        frontend::Node::NoNode => {},
-                        _ => {
-                            match cp_expr_ref(ch, guard) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
-                            guard_fail_j = emit_jump(ch, lib::op_jump_if_false_pop, frontend::span_of(guard))
-                        },
-                    }
-                    match cp_expr_ref(ch, body) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    if arm_locals > 0 {
-                        emit(ch, lib::op_end_block, asp)
-                        emit(ch, arm_locals, asp)
-                    }
-                    c_scope_depth[ch] = c_scope_depth[ch] - 1
-                    while n_locals(ch) > 0 && c_l_depth[ch][n_locals(ch) - 1] > c_scope_depth[ch] {
-                        pop_local(ch)
-                    }
-                    push(end_jumps, emit_jump(ch, lib::op_jump, asp))
-                    if guard_fail_j >= 0 {
-                        match patch_jump(ch, guard_fail_j) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        if arm_locals > 0 {
-                            emit(ch, lib::op_unit, asp)
-                            emit(ch, lib::op_end_block, asp)
-                            emit(ch, arm_locals, asp)
-                            emit(ch, lib::op_pop, asp)
-                        }
-                    }
-                    if fail_j >= 0 {
-                        match patch_jump(ch, fail_j) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                    }
-                },
-                _ => {},
-            }
-        }
-        emit(ch, lib::op_no_match, msp)
-        for j in end_jumps {
-            match patch_jump(ch, j) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-        }
-        c_scope_depth[ch] = c_scope_depth[ch] - 1
-        pop_local(ch)
-        emit(ch, lib::op_end_block, msp)
-        emit(ch, 1, msp)
-        Ok(true)
-    }
 
     // cp_expr 表达式代码生成（带临时槽跟踪）/ cp_expr codegens an expression with temp tracking
-    // field_sort_order 返回字段名按字典序排序后的下标排列 /
-    // field_sort_order returns field indices sorted by name (lexicographic)
-    fn field_sort_order(names) {
-        let mut ord = []
-        let mut oi = 0
-        while oi < len(names) {
-            push(ord, oi)
-            oi = oi + 1
-        }
-        let mut k = 1
-        while k < len(ord) {
-            let key = ord[k]
-            let mut j = k - 1
-            while j >= 0 && names[ord[j]] > names[key] {
-                ord[j + 1] = ord[j]
-                j = j - 1
-            }
-            ord[j + 1] = key
-            k = k + 1
-        }
-        ord
-    }
-
-    fn cp_expr(ch, e) capture(ref cur_file) {
+    fn cp_expr(ch, e) capture(ref cur_file, ref cp_expr_ref, ref cp_stmt_ref) {
         // 表达式编译：按形态发射字节码，临时槽跟踪栈深度
         // Expression compilation: emit per shape, temp tracking mirrors the value stack
         match e {
-            frontend::Node::IntLit(v, sp) => {
-                emit_const(ch, lib::CVal::CInt(v), sp)
-                Ok(true)
-            },
-            frontend::Node::FloatLit(v, sp) => {
-                emit_const(ch, lib::CVal::CFloat(v), sp)
-                Ok(true)
-            },
-            frontend::Node::StrLit(v, sp) => {
-                emit_const(ch, lib::CVal::CStr(v), sp)
-                Ok(true)
-            },
-            frontend::Node::BoolLit(v, sp) => {
-                emit(ch, if v {
-                    lib::op_true
-                } else {
-                    lib::op_false
-                }, sp)
-                Ok(true)
-            },
-            frontend::Node::Ident(name, sp) => cp_ident(ch, name, sp),
-            frontend::Node::Unary(op, rhs, sp) => {
-                match cp_expr(ch, rhs) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                emit(ch, if op == frontend::t_minus {
-                    lib::op_neg
-                } else {
-                    lib::op_not
-                }, sp)
-                Ok(true)
-            },
-            frontend::Node::Binary(op, lhs, rhs, sp) => {
-                match cp_expr(ch, lhs) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] + 1
-                match cp_expr(ch, rhs) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] - 1
-                let bop = if op == frontend::t_plus {
-                    lib::op_add
-                } else if op == frontend::t_minus {
-                    lib::op_sub
-                } else if op == frontend::t_star {
-                    lib::op_mul
-                } else if op == frontend::t_slash {
-                    lib::op_div
-                } else if op == frontend::t_percent {
-                    lib::op_mod
-                } else if op == frontend::t_eq_eq {
-                    lib::op_eq
-                } else if op == frontend::t_bang_eq {
-                    lib::op_neq
-                } else if op == frontend::t_gt {
-                    lib::op_gt
-                } else if op == frontend::t_gt_eq {
-                    lib::op_gt_eq
-                } else if op == frontend::t_lt {
-                    lib::op_lt
-                } else {
-                    lib::op_lt_eq
-                }
-                emit(ch, bop, sp)
-                Ok(true)
-            },
-            frontend::Node::Logical(op, lhs, rhs, sp) => {
-                match cp_expr(ch, lhs) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                let end = emit_jump(ch, if op == frontend::t_and_and {
-                    lib::op_jump_if_false
-                } else {
-                    lib::op_jump_if_true
-                }, sp)
-                emit(ch, lib::op_pop, sp)
-                match cp_expr(ch, rhs) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                patch_jump(ch, end)
-            },
-            frontend::Node::Call(callee, cargs, sp) => {
-                let mut m_obj = frontend::Node::NoNode
-                let mpath = match callee {
-                    frontend::Node::FieldAccess(obj, _, _) => {
-                        m_obj = obj
-                        let cend = match sp {
-                            frontend::SpanT::Sp(_, ce) => ce,
-                        }
-                        match get(method_calls, cur_file + ":" + str(cend)) {
-                            Some(p) => Some(p),
-                            None => None,
-                        }
-                    },
-                    _ => None,
-                }
-                match mpath {
-                    Some(p) => {
-                        let gidx = add_const(ch, lib::CVal::CStr(p))
-                        emit(ch, lib::op_get_global, sp)
-                        emit_u16(ch, gidx, sp)
-                        match cp_expr(ch, m_obj) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        c_temps[ch] = c_temps[ch] + 1
-                        for a in cargs {
-                            match cp_expr(ch, a) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
-                            c_temps[ch] = c_temps[ch] + 1
-                        }
-                        c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
-                        if len(cargs) + 1 > 255 {
-                            return frontend::perr("E2005", "", "too many arguments", sp)
-                        }
-                        emit(ch, lib::op_call, sp)
-                        emit(ch, len(cargs) + 1, sp)
-                        Ok(true)
-                    },
-                    None => {
-                        match cp_expr(ch, callee) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        c_temps[ch] = c_temps[ch] + 1
-                        for a in cargs {
-                            match cp_expr(ch, a) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
-                            c_temps[ch] = c_temps[ch] + 1
-                        }
-                        c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
-                        if len(cargs) > 255 {
-                            return frontend::perr("E2005", "", "too many arguments", sp)
-                        }
-                        emit(ch, lib::op_call, sp)
-                        emit(ch, len(cargs), sp)
-                        Ok(true)
-                    },
-                }
-            },
+            frontend::Node::IntLit(v, sp) => cp_int_lit(emit_ctx, ch, v, sp),
+            frontend::Node::FloatLit(v, sp) => cp_float_lit(emit_ctx, ch, v, sp),
+            frontend::Node::StrLit(v, sp) => cp_str_lit(emit_ctx, ch, v, sp),
+            frontend::Node::BoolLit(v, sp) => cp_bool_lit(emit_ctx, ch, v, sp),
+            frontend::Node::Ident(name, sp) => cp_ident(emit_ctx, en_varities, en_vnames, en_qual, en_prefix, enum_by, global_mut, pkg_decls, cur_pkg, ch, name, sp),
+            frontend::Node::Unary(op, rhs, sp) => cp_unary(emit_ctx, ch, op, rhs, sp, cp_expr_ref),
+            frontend::Node::Binary(op, lhs, rhs, sp) => cp_binary(emit_ctx, ch, op, lhs, rhs, sp, cp_expr_ref),
+            frontend::Node::Logical(op, lhs, rhs, sp) => cp_logical(emit_ctx, ch, op, lhs, rhs, sp, cp_expr_ref),
+            frontend::Node::Call(callee, cargs, sp) => cp_call(emit_ctx, method_calls, cur_file, ch, callee, cargs, sp, cp_expr_ref),
             // 索引：target 与下标入栈后 INDEX_GET
             // Indexing: push the target and index, then INDEX_GET
-            frontend::Node::Index(target, idx, sp) => {
-                match cp_expr(ch, target) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] + 1
-                match cp_expr(ch, idx) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] - 1
-                emit(ch, lib::op_index_get, sp)
-                Ok(true)
-            },
-            frontend::Node::TupleLit(elems, sp) => {
-                for el in elems {
-                    match cp_expr(ch, el) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    c_temps[ch] = c_temps[ch] + 1
-                }
-                c_temps[ch] = c_temps[ch] - len(elems)
-                if len(elems) > 255 {
-                    return frontend::perr("E2006", "", "tuple literal too large", sp)
-                }
-                emit(ch, lib::op_tuple, sp)
-                emit(ch, len(elems), sp)
-                Ok(true)
-            },
-            frontend::Node::ListLit(elems, sp) => {
-                for el in elems {
-                    match cp_expr(ch, el) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    c_temps[ch] = c_temps[ch] + 1
-                }
-                c_temps[ch] = c_temps[ch] - len(elems)
-                if len(elems) > 65535 {
-                    return frontend::perr("E2006", "", "list literal too large", sp)
-                }
-                emit(ch, lib::op_list, sp)
-                emit_u16(ch, len(elems), sp)
-                Ok(true)
-            },
-            frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => cp_function(ch, e),
-            frontend::Node::Block(_, _) => cp_block_expr(ch, e),
+            frontend::Node::Index(target, idx, sp) => cp_index(emit_ctx, ch, target, idx, sp, cp_expr_ref),
+            frontend::Node::TupleLit(elems, sp) => cp_tuple_lit(emit_ctx, ch, elems, sp, cp_expr_ref),
+            frontend::Node::ListLit(elems, sp) => cp_list_lit(emit_ctx, ch, elems, sp, cp_expr_ref),
+            frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => cp_function(emit_ctx, cur_file, ch, e, cp_expr_ref, cp_stmt_ref),
+            frontend::Node::Block(_, _) => cp_block_expr(emit_ctx, ch, e, cp_expr_ref, cp_stmt_ref),
             // if/while/for 走各自的专用编译路径
             // if/while/for dispatch to their own compilers
-            frontend::Node::IfExpr(cond, then, els, sp) => cp_if(ch, cond, then, els, sp),
+            frontend::Node::IfExpr(cond, then, els, sp) => cp_if(emit_ctx, ch, cond, then, els, sp, cp_expr_ref, cp_stmt_ref),
             // match：变体 tag 测试链，字段提取后绑定臂局部
             // Match: a chain of variant tag tests, field extraction binds arm locals
-            frontend::Node::MatchExpr(scrut, arms, sp) => cp_match(ch, scrut, arms, sp),
-            frontend::Node::VariantAccess(en, vr, sp) => {
-                let apath = alias_path(en)
-                if apath != "" {
-                    let idx = add_const(ch, lib::CVal::CStr(apath + "." + vr))
-                    emit(ch, lib::op_get_global, sp)
-                    emit_u16(ch, idx, sp)
-                    Ok(true)
-                } else {
-                    let eh = local_enum(en)
-                    if eh < 0 {
-                        frontend::perr("E2017", "", "cannot find enum `" + en + "`", sp)
-                    } else {
-                        emit_variant_of(ch, eh, vr, sp)
-                    }
-                }
-            },
-            frontend::Node::PkgAccess(pkg, name, sp) => {
-                let idx = add_const(ch, lib::CVal::CStr(pkg + "." + name))
-                emit(ch, lib::op_get_global, sp)
-                emit_u16(ch, idx, sp)
-                Ok(true)
-            },
-            frontend::Node::QualVariantAccess(pkg, en, vr, sp) => {
-                let apath = alias_path(pkg)
-                let full = if apath != "" {
-                    apath + "." + en
-                } else {
-                    pkg + "." + en
-                }
-                let eh = match get(enum_by, full) {
-                    Some(h) => h,
-                    None => -1,
-                }
-                if eh < 0 {
-                    return frontend::perr("E2015", "", "unknown enum \"" + full + "\"", sp)
-                }
-                emit_variant_of(ch, eh, vr, sp)
-            },
-            frontend::Node::TryExpr(inner, sp) => {
-                match cp_expr(ch, inner) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                emit(ch, lib::op_try, sp)
-                Ok(true)
-            },
-            frontend::Node::RecvExpr(cch, sp) => {
-                match cp_expr(ch, cch) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                emit(ch, lib::op_recv, sp)
-                Ok(true)
-            },
+            frontend::Node::MatchExpr(scrut, arms, sp) => cp_match(emit_ctx, enum_by, en_prefix, en_vnames, en_varities, cur_pkg, cur_aliases, ch, scrut, arms, sp, cp_expr_ref),
+            frontend::Node::VariantAccess(en, vr, sp) => cp_variant_access(emit_ctx, enum_by, en_prefix, en_vnames, en_qual, en_varities, cur_pkg, cur_aliases, ch, en, vr, sp),
+            frontend::Node::PkgAccess(pkg, name, sp) => cp_pkg_access(emit_ctx, ch, pkg, name, sp),
+            frontend::Node::QualVariantAccess(pkg, en, vr, sp) => cp_qual_variant_access(emit_ctx, enum_by, en_vnames, en_qual, en_varities, cur_aliases, ch, pkg, en, vr, sp),
+            frontend::Node::TryExpr(inner, sp) => cp_try_expr(emit_ctx, ch, inner, sp, cp_expr_ref),
+            frontend::Node::RecvExpr(cch, sp) => cp_recv_expr(emit_ctx, ch, cch, sp, cp_expr_ref),
             // record 字面量：字段值入栈后构造对象
             // Record literals: push field values, then build the object
-            frontend::Node::RecordLit(names, vals, sp) => {
-                // 字段按字典序入栈并编码：三端按下标即按名，字段顺序不进入对象身份
-                // Fields pushed and encoded in lexicographic order so index comparison is name comparison
-                let ord = field_sort_order(names)
-                for k in ord {
-                    match cp_expr(ch, vals[k]) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                }
-                let mut enc = ""
-                for k in ord {
-                    enc = enc + names[k] + "\n"
-                }
-                let cidx = add_const(ch, lib::CVal::CStr(enc))
-                emit(ch, lib::op_record, sp)
-                emit(ch, len(names), sp)
-                emit_u16(ch, cidx, sp)
-                Ok(true)
-            },
-            frontend::Node::RecordUpdate(base, names, vals, sp) => {
-                match cp_expr(ch, base) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                // 字段按字典序入栈并编码：与 op_record 同一约定
-                // Fields pushed and encoded in lexicographic order, same convention as op_record
-                let ord = field_sort_order(names)
-                for k in ord {
-                    match cp_expr(ch, vals[k]) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                }
-                let mut enc = ""
-                for k in ord {
-                    enc = enc + names[k] + "\n"
-                }
-                let cidx = add_const(ch, lib::CVal::CStr(enc))
-                emit(ch, lib::op_record_update, sp)
-                emit(ch, len(names), sp)
-                emit_u16(ch, cidx, sp)
-                Ok(true)
-            },
-            frontend::Node::FieldAccess(base, field, sp) => {
-                match cp_expr(ch, base) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                let cidx = add_const(ch, lib::CVal::CStr(field))
-                emit(ch, lib::op_get_field_name, sp)
-                emit_u16(ch, cidx, sp)
-                Ok(true)
-            },
+            frontend::Node::RecordLit(names, vals, sp) => cp_record_lit(emit_ctx, ch, names, vals, sp, cp_expr_ref),
+            frontend::Node::RecordUpdate(base, names, vals, sp) => cp_record_update(emit_ctx, ch, base, names, vals, sp, cp_expr_ref),
+            frontend::Node::FieldAccess(base, field, sp) => cp_field_access(emit_ctx, ch, base, field, sp, cp_expr_ref),
             _ => Ok(true),
         }
     }
     cp_expr_ref = cp_expr
 
     // cp_stmt 语句代码生成 / cp_stmt codegens a statement
-    fn cp_stmt(ch, s) capture(ref cur_pkg, ref cur_file, ref cp_stmt_ref) {
+    fn cp_stmt(ch, s) capture(ref cur_pkg, ref cur_file, ref cp_expr_ref, ref cp_stmt_ref) {
         match s {
             frontend::Node::DestructLet(names, nspans, is_mut, init, sp) => {
                 match cp_expr(ch, init) {
@@ -1851,38 +141,28 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         return Err(d)
                     },
                 }
-                let tslot = if c_scope_depth[ch] == 0 {
-                    match declare_local(ch, "(dtmp)", false, sp) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    c_l_slot[ch][n_locals(ch) - 1]
-                } else {
-                    match declare_local(ch, "(dtmp)", false, sp) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    c_l_slot[ch][n_locals(ch) - 1]
+                match declare_local(emit_ctx, ch, "(dtmp)", false, sp) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
                 }
+                let tslot = c_l_slot[ch][n_locals(c_l_name, ch) - 1]
                 let mut i = 0
                 while i < len(names) {
-                    emit(ch, lib::op_get_local, sp)
-                    emit_u16(ch, tslot, sp)
-                    emit_const(ch, lib::CVal::CInt(i), sp)
-                    emit(ch, lib::op_index_get, sp)
+                    emit(emit_ctx, ch, lib::op_get_local, sp)
+                    emit_u16(emit_ctx, ch, tslot, sp)
+                    emit_const(emit_ctx, ch, lib::CVal::CInt(i), sp)
+                    emit(emit_ctx, ch, lib::op_index_get, sp)
                     if c_scope_depth[ch] == 0 {
-                        match define_global(ch, names[i], is_mut, sp) {
+                        match define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, names[i], is_mut, sp) {
                             Ok(_) => {},
                             Err(d) => {
                                 return Err(d)
                             },
                         }
                     } else {
-                        match declare_local(ch, names[i], is_mut, sp) {
+                        match declare_local(emit_ctx, ch, names[i], is_mut, sp) {
                             Ok(_) => {},
                             Err(d) => {
                                 return Err(d)
@@ -1892,8 +172,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     i = i + 1
                 }
                 if c_scope_depth[ch] == 0 {
-                    emit(ch, lib::op_pop, sp)
-                    let _ = pop_local(ch)
+                    emit(emit_ctx, ch, lib::op_pop, sp)
+                    let _ = pop_local(emit_ctx, ch)
                 }
                 Ok(true)
             },
@@ -1905,20 +185,20 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     },
                 }
                 if c_scope_depth[ch] == 0 {
-                    define_global(ch, name, is_mut, sp)
+                    define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, name, is_mut, sp)
                 } else {
-                    declare_local(ch, name, is_mut, sp)
+                    declare_local(emit_ctx, ch, name, is_mut, sp)
                 }
             },
             frontend::Node::MethodDecl(rt, name, _, lit, sp) => {
                 if c_scope_depth[ch] == 0 {
-                    match cp_function(ch, lit) {
+                    match cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref) {
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
                         },
                     }
-                    define_global(ch, rt + "." + name, false, sp)
+                    define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, rt + "." + name, false, sp)
                 } else {
                     return frontend::perr("E2019", "", "methods must be declared at the top level", sp)
                     Ok(true)
@@ -1926,32 +206,32 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             },
             frontend::Node::FnDecl(name, _, _, lit, sp) => {
                 if c_scope_depth[ch] == 0 {
-                    match cp_function(ch, lit) {
+                    match cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref) {
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
                         },
                     }
-                    define_global(ch, name, false, sp)
+                    define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, name, false, sp)
                 } else {
-                    emit(ch, lib::op_unit, sp)
-                    match declare_local(ch, name, true, sp) {
+                    emit(emit_ctx, ch, lib::op_unit, sp)
+                    match declare_local(emit_ctx, ch, name, true, sp) {
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
                         },
                     }
-                    match cp_function(ch, lit) {
+                    match cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref) {
                         Ok(_) => {},
                         Err(d) => {
                             return Err(d)
                         },
                     }
-                    let slot = c_l_slot[ch][resolve_local(ch, name)]
-                    emit(ch, lib::op_set_local, sp)
-                    emit_u16(ch, slot, sp)
-                    emit(ch, lib::op_pop, sp)
-                    c_l_mut[ch][resolve_local(ch, name)] = false
+                    let slot = c_l_slot[ch][resolve_local(c_l_name, c_l_slot, ch, name)]
+                    emit(emit_ctx, ch, lib::op_set_local, sp)
+                    emit_u16(emit_ctx, ch, slot, sp)
+                    emit(emit_ctx, ch, lib::op_pop, sp)
+                    c_l_mut[ch][resolve_local(c_l_name, c_l_slot, ch, name)] = false
                     Ok(true)
                 }
             },
@@ -1959,7 +239,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 if c_scope_depth[ch] > 0 {
                     return frontend::perr("E2008", "", "enum declarations are only allowed at top level", sp)
                 }
-                let qual = qualify(name)
+                let qual = qualify(cur_pkg, name)
                 let pre = match get(enum_by, qual) {
                     Some(h) => h,
                     None => -1,
@@ -1967,7 +247,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 let eh = if pre >= 0 && cur_pkg != "" {
                     pre
                 } else {
-                    match register_enum_decl(ch, name, variants, sp) {
+                    match register_enum_decl(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, cur_pkg, ch, name, variants, sp) {
                         Ok(v) => v,
                         Err(d) => {
                             return Err(d)
@@ -1975,168 +255,24 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         },
                     }
                 }
-                emit_const(ch, lib::CVal::CEnumType(eh), sp)
-                let idx = add_const(ch, lib::CVal::CStr(qual))
-                emit(ch, lib::op_def_global, sp)
-                emit_u16(ch, idx, sp)
+                emit_const(emit_ctx, ch, lib::CVal::CEnumType(eh), sp)
+                let idx = add_const(emit_ctx, ch, lib::CVal::CStr(qual))
+                emit(emit_ctx, ch, lib::op_def_global, sp)
+                emit_u16(emit_ctx, ch, idx, sp)
                 Ok(true)
             },
-            frontend::Node::ExprStmt(e, sp) => {
-                match cp_expr(ch, e) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                emit(ch, lib::op_pop, sp)
-                Ok(true)
-            },
-            frontend::Node::AssignStmt(target, val, sp) => cp_assign(ch, target, val, sp),
-            frontend::Node::ReturnStmt(val, sp) => {
-                match val {
-                    frontend::Node::NoNode => emit(ch, lib::op_unit, sp),
-                    _ => {
-                        match cp_expr(ch, val) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                    },
-                }
-                emit(ch, lib::op_return, sp)
-                Ok(true)
-            },
-            frontend::Node::WhileStmt(cond, body, sp) => cp_while(ch, cond, body, sp),
-            frontend::Node::ForStmt(v, _, idx, _, iter, _, body, sp) => {
-                let fstart = match sp {
-                    frontend::SpanT::Sp(fs, _) => fs,
-                }
-                if contains(chan_fors, cur_file + ":" + str(fstart)) {
-                    cp_for_chan(ch, v, iter, body, sp)
-                } else {
-                    cp_for(ch, v, idx, iter, body, sp)
-                }
-            },
-            frontend::Node::BreakStmt(lb, sp) => {
-                let li = if lb == "" {
-                    match unwind_to_loop(ch, sp) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            0
-                        },
-                    }
-                } else {
-                    match labeled_loop(ch, lb, sp) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            0
-                        },
-                    }
-                }
-                push(c_lp_breaks[ch][li], emit_jump(ch, lib::op_jump, sp))
-                Ok(true)
-            },
-            frontend::Node::ContinueStmt(lb, sp) => {
-                let li = if lb == "" {
-                    match unwind_to_loop(ch, sp) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            0
-                        },
-                    }
-                } else {
-                    match labeled_loop(ch, lb, sp) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            0
-                        },
-                    }
-                }
-                if c_lp_contto[ch][li] >= 0 {
-                    emit_loop(ch, c_lp_contto[ch][li], sp)
-                } else {
-                    push(c_lp_conts[ch][li], emit_jump(ch, lib::op_jump, sp))
-                    Ok(true)
-                }
-            },
-            frontend::Node::LabelStmt(lb, inner, _) => {
-                let saved = c_lbl_pending[ch]
-                c_lbl_pending[ch] = lb
-                match cp_stmt_ref(ch, inner) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_lbl_pending[ch] = saved
-                Ok(true)
-            },
-            frontend::Node::SpawnStmt(call, sp) => {
-                match call {
-                    // 调用：callee 与实参入栈后 CALL
-                    // Calls: push the callee and args, then CALL
-                    frontend::Node::Call(callee, cargs, _) => {
-                        match cp_expr(ch, callee) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
-                        c_temps[ch] = c_temps[ch] + 1
-                        for a in cargs {
-                            match cp_expr(ch, a) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
-                            c_temps[ch] = c_temps[ch] + 1
-                        }
-                        c_temps[ch] = c_temps[ch] - (len(cargs) + 1)
-                        if len(cargs) > 255 {
-                            return frontend::perr("E2005", "", "too many arguments", sp)
-                        }
-                        emit(ch, lib::op_spawn, sp)
-                        emit(ch, len(cargs), sp)
-                        Ok(true)
-                    },
-                    _ => Ok(true),
-                }
-            },
-            frontend::Node::DeferStmt(body, crefs, sp) => {
-                match cp_function(ch, frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, body, "<defer>", crefs, sp)) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                emit(ch, lib::op_defer, sp)
-                Ok(true)
-            },
-            frontend::Node::SendStmt(cch, val, sp) => {
-                match cp_expr(ch, cch) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] + 1
-                match cp_expr(ch, val) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                c_temps[ch] = c_temps[ch] - 1
-                emit(ch, lib::op_send, sp)
-                Ok(true)
-            },
-            frontend::Node::SelectStmt(arms, has_default, dflt, dsp, sp) => cp_select(ch, arms, has_default, dflt, dsp, sp),
+            frontend::Node::ExprStmt(e, sp) => cp_expr_stmt(emit_ctx, ch, e, sp, cp_expr_ref),
+            frontend::Node::AssignStmt(target, val, sp) => cp_assign(emit_ctx, global_mut, pkg_decls, cur_pkg, ch, target, val, sp, cp_expr_ref),
+            frontend::Node::ReturnStmt(val, sp) => cp_return_stmt(emit_ctx, ch, val, sp, cp_expr_ref),
+            frontend::Node::WhileStmt(cond, body, sp) => cp_while(emit_ctx, ch, cond, body, sp, cp_expr_ref, cp_stmt_ref),
+            frontend::Node::ForStmt(v, _, idx, _, iter, _, body, sp) => cp_for_stmt(emit_ctx, chan_fors, cur_file, ch, v, idx, iter, body, sp, cp_expr_ref, cp_stmt_ref),
+            frontend::Node::BreakStmt(lb, sp) => cp_break_stmt(emit_ctx, ch, lb, sp),
+            frontend::Node::ContinueStmt(lb, sp) => cp_continue_stmt(emit_ctx, ch, lb, sp),
+            frontend::Node::LabelStmt(lb, inner, _) => cp_label_stmt(emit_ctx, ch, lb, inner, cp_stmt_ref),
+            frontend::Node::SpawnStmt(call, sp) => cp_spawn_stmt(emit_ctx, ch, call, sp, cp_expr_ref),
+            frontend::Node::DeferStmt(body, crefs, sp) => cp_defer_stmt(emit_ctx, cur_file, ch, body, crefs, sp, cp_expr_ref, cp_stmt_ref),
+            frontend::Node::SendStmt(cch, val, sp) => cp_send_stmt(emit_ctx, ch, cch, val, sp, cp_expr_ref),
+            frontend::Node::SelectStmt(arms, has_default, dflt, dsp, sp) => cp_select(emit_ctx, ch, arms, has_default, dflt, dsp, sp, cp_expr_ref),
             _ => Ok(true),
         }
     }
@@ -2144,9 +280,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
 
     // 内建枚举与 native 预注册：Option/Result/Output + 全局名表
     // Builtin enums and native pre-registration: Option/Result/Output plus the global name table
-    declare_enum("Option", "", ["Some", "None"], [1, 0])
-    declare_enum("Result", "", ["Ok", "Err"], [1, 1])
-    declare_enum("Output", "", ["Output"], [3])
+    declare_enum(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, "Option", "", ["Some", "None"], [1, 0])
+    declare_enum(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, "Result", "", ["Ok", "Err"], [1, 1])
+    declare_enum(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, "Output", "", ["Output"], [3])
     for n in lib::native_names {
         put(global_mut, n, false)
     }
@@ -2155,9 +291,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     // Package mode: a <module> frame, per-package enum registration, then
     // top-level compilation in dependency order
     if is_pkg {
-        let module_fn = new_func("<module>", "", 0)
-        let c0 = new_compiler(-1, module_fn)
-        push_local(c0, "", 0, 0, false, 0)
+        let module_fn = new_func(emit_ctx, "<module>", "", 0)
+        let c0 = new_compiler(emit_ctx, -1, module_fn)
+        push_local(emit_ctx, c0, "", 0, 0, false, 0)
         let n_pkgs = len(pkgs_stmts)
         let mut pi = 0
         while pi < n_pkgs {
@@ -2189,7 +325,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 for s in files_stmts[fi] {
                     match s {
                         frontend::Node::EnumDecl(name, _, variants, _, sp) => {
-                            match register_enum_decl(c0, name, variants, sp) {
+                            match register_enum_decl(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, cur_pkg, c0, name, variants, sp) {
                                 Ok(_) => {},
                                 Err(d) => {
                                     return CompileFailed(d, cur_file)
@@ -2205,9 +341,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             while fi < n_files {
                 cur_file = file_paths[fi]
                 cur_aliases = frontend::aliases_of(file_imports[fi])
-                let sub_fn = new_func("<init>", cur_file, 0)
-                let sub = new_compiler(-1, sub_fn)
-                push_local(sub, "", 0, 0, false, 0)
+                let sub_fn = new_func(emit_ctx, "<init>", cur_file, 0)
+                let sub = new_compiler(emit_ctx, -1, sub_fn)
+                push_local(emit_ctx, sub, "", 0, 0, false, 0)
                 for s in files_stmts[fi] {
                     match cp_stmt(sub, s) {
                         Ok(_) => {},
@@ -2216,14 +352,14 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                         },
                     }
                 }
-                emit(sub, lib::op_unit, frontend::SpanT::Sp(0, 0))
-                emit(sub, lib::op_return, frontend::SpanT::Sp(0, 0))
-                let idx = add_const(c0, lib::CVal::CFn(sub_fn))
-                emit(c0, lib::op_closure, frontend::SpanT::Sp(0, 0))
-                emit_u16(c0, idx, frontend::SpanT::Sp(0, 0))
-                emit(c0, lib::op_call, frontend::SpanT::Sp(0, 0))
-                emit(c0, 0, frontend::SpanT::Sp(0, 0))
-                emit(c0, lib::op_pop, frontend::SpanT::Sp(0, 0))
+                emit(emit_ctx, sub, lib::op_unit, frontend::SpanT::Sp(0, 0))
+                emit(emit_ctx, sub, lib::op_return, frontend::SpanT::Sp(0, 0))
+                let idx = add_const(emit_ctx, c0, lib::CVal::CFn(sub_fn))
+                emit(emit_ctx, c0, lib::op_closure, frontend::SpanT::Sp(0, 0))
+                emit_u16(emit_ctx, c0, idx, frontend::SpanT::Sp(0, 0))
+                emit(emit_ctx, c0, lib::op_call, frontend::SpanT::Sp(0, 0))
+                emit(emit_ctx, c0, 0, frontend::SpanT::Sp(0, 0))
+                emit(emit_ctx, c0, lib::op_pop, frontend::SpanT::Sp(0, 0))
                 fi = fi + 1
             }
             cur_aliases = map()
@@ -2231,18 +367,18 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
         cur_file = ""
         cur_pkg = ""
-        let idx = add_const(c0, lib::CVal::CStr(pkg_paths[n_pkgs - 1] + ".main"))
-        emit(c0, lib::op_get_global, frontend::SpanT::Sp(0, 0))
-        emit_u16(c0, idx, frontend::SpanT::Sp(0, 0))
-        emit(c0, lib::op_call, frontend::SpanT::Sp(0, 0))
-        emit(c0, 0, frontend::SpanT::Sp(0, 0))
-        emit(c0, lib::op_pop, frontend::SpanT::Sp(0, 0))
-        emit(c0, lib::op_unit, frontend::SpanT::Sp(0, 0))
-        emit(c0, lib::op_return, frontend::SpanT::Sp(0, 0))
+        let idx = add_const(emit_ctx, c0, lib::CVal::CStr(pkg_paths[n_pkgs - 1] + ".main"))
+        emit(emit_ctx, c0, lib::op_get_global, frontend::SpanT::Sp(0, 0))
+        emit_u16(emit_ctx, c0, idx, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, lib::op_call, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, 0, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, lib::op_pop, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, lib::op_unit, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, lib::op_return, frontend::SpanT::Sp(0, 0))
     } else {
-        let script_fn = new_func("<script>", "", 0)
-        let c0 = new_compiler(-1, script_fn)
-        push_local(c0, "", 0, 0, false, 0)
+        let script_fn = new_func(emit_ctx, "<script>", "", 0)
+        let c0 = new_compiler(emit_ctx, -1, script_fn)
+        push_local(emit_ctx, c0, "", 0, 0, false, 0)
         for s in pkgs_stmts[0][0] {
             match cp_stmt(c0, s) {
                 Ok(_) => {},
@@ -2251,8 +387,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 },
             }
         }
-        emit(c0, lib::op_unit, frontend::SpanT::Sp(0, 0))
-        emit(c0, lib::op_return, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, lib::op_unit, frontend::SpanT::Sp(0, 0))
+        emit(emit_ctx, c0, lib::op_return, frontend::SpanT::Sp(0, 0))
     }
 
     Compiled(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities)

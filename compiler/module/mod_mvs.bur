@@ -1,0 +1,114 @@
+// mod_mvs.bur — MVS 依赖解析。
+// mod_mvs.bur — MVS dependency resolution.
+
+import "burryn.dev/compiler/lib"
+
+// mvs_walk 做 MVS 遍历：自底向上最大版本选择
+// mvs_walk runs the MVS walk: bottom-up maximal version selection
+// mvs_walk 自底向上遍历依赖树，每个模块取最大需求版本
+// mvs_walk walks the dependency tree bottom-up, picking the maximal required version per module
+// mvs_walk 自底向上遍历依赖树，每个模块取最大需求版本
+// mvs_walk walks the dependency tree bottom-up, picking the maximal required version per module
+fn mvs_walk(dir, fetch) {
+    // 自底向上遍历依赖树，每个模块取最大需求版本
+    // Walk the dependency tree bottom-up, picking the maximal required version per module
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod not found in " + dir + ": " + m)
+            ""
+        },
+    }
+    let mut qp = match modgraph_parse(text) {
+        Ok(mi) => {
+            match mi {
+                MI(_, rp, _) => rp,
+            }
+        },
+        Err(m) => {
+            return Err(dir + "/bur.mod: " + m)
+            []
+        },
+    }
+    let mut qv = match modgraph_parse(text) {
+        Ok(mi) => {
+            match mi {
+                MI(_, _, rv) => rv,
+            }
+        },
+        Err(m) => {
+            return Err(dir + "/bur.mod: " + m)
+            []
+        },
+    }
+    let root = cache_root()
+    let mut sel = map()
+    let mut seen = map()
+    let mut qi = 0
+    while qi < len(qp) {
+        let p = qp[qi]
+        let v = qv[qi]
+        qi = qi + 1
+        if p == "std" || lib::str_has_prefix(p, "std/") {
+            return Err("std ships with the toolchain; drop `require " + p + "`")
+        }
+        let key = p + "@" + v
+        match get(seen, key) {
+            Some(_) => {},
+            None => {
+                put(seen, key, 1)
+                let take = match get(sel, p) {
+                    Some(cur) => ver_cmp(v, cur) > 0,
+                    None => true,
+                }
+                if take {
+                    put(sel, p, v)
+                }
+                let mdir = root + "/" + key
+                if fetch && !file_exists(mdir + "/bur.mod") {
+                    match mod_fetch(p, v) {
+                        Ok(_) => {},
+                        Err(m) => {
+                            return Err(m)
+                        },
+                    }
+                }
+                let mtext = match read_file(mdir + "/bur.mod") {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err("module " + key + " not in cache (" + mdir + "); fetch it with `bur mod download`")
+                        ""
+                    },
+                }
+                match modgraph_parse(mtext) {
+                    Ok(sub) => match sub {
+                        MI(subpath, srp, srv) => {
+                            if subpath != p {
+                                return Err("cache corruption: " + mdir + " declares module " + subpath)
+                            }
+                            let mut k = 0
+                            while k < len(srp) {
+                                push(qp, srp[k])
+                                push(qv, srv[k])
+                                k = k + 1
+                            }
+                        },
+                    },
+                    Err(m) => {
+                        return Err("bad bur.mod in " + mdir + ": " + m)
+                    },
+                }
+            },
+        }
+    }
+    let spaths = sorted_strs(keys(sel))
+    let mut svers = []
+    for p in spaths {
+        match get(sel, p) {
+            Some(v) => push(svers, v),
+            None => push(svers, ""),
+        }
+    }
+    Ok(MP(spaths, svers))
+}
+

@@ -1,0 +1,61 @@
+// compile_global.bur — 全局定义/枚举注册。
+// compile_global.bur — global def / enum register.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// define_global 定义全局变量 / define_global defines a global
+fn define_global(emit_ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, mut global_mut, c_fn, enum_by, cur_pkg, ch, name, is_mut, sp) {
+    let qual = qualify(cur_pkg, name)
+    let exists = match get(global_mut, qual) {
+        Some(_) => true,
+        None => false,
+    }
+    if exists {
+        let is_enum = match get(enum_by, qual) {
+            Some(_) => true,
+            None => false,
+        }
+        if is_enum {
+            return frontend::perr("E2007", "", "cannot redeclare enum \"" + name + "\"", sp)
+        }
+    }
+    put(global_mut, qual, is_mut)
+    let idx = add_const(emit_ctx, ch, lib::CVal::CStr(qual))
+    emit(emit_ctx, ch, lib::op_def_global, sp)
+    emit_u16(emit_ctx, ch, idx, sp)
+    Ok(true)
+}
+
+// register_enum_decl 注册枚举声明 / register_enum_decl registers an enum declaration
+fn register_enum_decl(mut en_qual, mut en_vnames, mut en_varities, mut en_prefix, mut enum_by, mut global_mut, cur_pkg, _ch, name, variants, sp) {
+    let qual = qualify(cur_pkg, name)
+    let exists = match get(enum_by, qual) {
+        Some(_) => true,
+        None => false,
+    }
+    if exists {
+        return frontend::perr("E2007", "", "enum \"" + name + "\" is already declared", sp)
+    }
+    let mut seen = map()
+    let mut vnames = []
+    let mut varities = []
+    for vd in variants {
+        match vd {
+            frontend::Node::EnumVariantDecl(vn, arity, _, _) => {
+                let dup = match get(seen, vn) {
+                    Some(_) => true,
+                    None => false,
+                }
+                if dup {
+                    return frontend::perr("E2009", "", "duplicate variant \"" + vn + "\" in enum \"" + name + "\"", sp)
+                }
+                put(seen, vn, true)
+                push(vnames, vn)
+                push(varities, arity)
+            },
+            _ => {},
+        }
+    }
+    Ok(declare_enum(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, qual, cur_pkg, vnames, varities))
+}

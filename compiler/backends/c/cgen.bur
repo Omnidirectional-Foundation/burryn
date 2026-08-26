@@ -10,220 +10,6 @@
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
-// hex_digit 把 0-15 转 16 进制字符 / hex_digit renders 0-15 as a hex character
-fn hex_digit(n) {
-    if n < 10 {
-        chr(48 + n)
-    } else {
-        chr(65 + n - 10)
-    }
-}
-
-// dec_add 逐位十进制字符串加法（常量折叠用，避免浮点误差）
-// dec_add adds decimal strings digit by digit (const folding, avoids float error)
-fn dec_add(a, b) {
-    let mut out = []
-    let mut i = str_len(a) - 1
-    let mut j = str_len(b) - 1
-    let mut carry = 0
-    while i >= 0 || j >= 0 || carry > 0 {
-        let da = if i >= 0 {
-            ord(char_at(a, i)) - 48
-        } else {
-            0
-        }
-        let db = if j >= 0 {
-            ord(char_at(b, j)) - 48
-        } else {
-            0
-        }
-        let s = da + db + carry
-        push(out, chr(48 + s % 10))
-        carry = s / 10
-        i = i - 1
-        j = j - 1
-    }
-    let mut rev = []
-    let mut k = len(out) - 1
-    while k >= 0 {
-        push(rev, out[k])
-        k = k - 1
-    }
-    join(rev, "")
-}
-
-// dec_uint64 把 u64 转十进制字符串 / dec_uint64 renders a u64 as decimal
-fn dec_uint64(v) {
-    if v >= 0 {
-        str(v)
-    } else {
-        dec_add("9223372036854775808", str(v + 9223372036854775807 + 1))
-    }
-}
-
-// c_str 转义 C 字符串字面量 / c_str escapes a C string literal
-fn c_str(s) {
-    let mut parts = ["\""]
-    let mut seg = 0
-    let mut i = 0
-    while i < str_len(s) {
-        let o = byte_at(s, i)
-        let esc = if o == 34 {
-            "\\\""
-        } else if o == 92 {
-            "\\\\"
-        } else if o >= 32 && o < 127 {
-            ""
-        } else {
-            "\\" + str(o / 64 % 8) + str(o / 8 % 8) + str(o % 8)
-        }
-        if esc != "" {
-            push(parts, substr(s, seg, i - seg))
-            push(parts, esc)
-            seg = i + 1
-        }
-        i = i + 1
-    }
-    push(parts, substr(s, seg, str_len(s) - seg))
-    push(parts, "\"")
-    join(parts, "")
-}
-
-// c_float 生成 C 浮点字面量 / c_float renders a C float literal
-fn c_float(f) {
-    // 手工拆 IEEE 754 位模式（int64 域内），避免浮点格式化误差
-    // Manually decompose the IEEE 754 bit pattern (int64-safe) to dodge float formatting errors
-    let bits = float_bits(f)
-    let neg = bits < 0
-    let low63 = if neg {
-        bits + 9223372036854775807 + 1
-    } else {
-        bits
-    }
-    let exp = low63 / 4503599627370496
-    let mant = low63 % 4503599627370496
-    // 特殊值：无穷与 NaN
-    // Specials: infinities and NaN
-    if exp == 2047 {
-        if mant == 0 {
-            if neg {
-                "-INFINITY"
-            } else {
-                "INFINITY"
-            }
-        } else {
-            "NAN"
-        }
-    } else {
-        let sign = if neg {
-            "-"
-        } else {
-            ""
-        }
-        // 常规值：16 进制科学计数（C 十六进制浮点字面量）
-        // Regulars: hexadecimal scientific form (C hex float literals)
-        if exp == 0 && mant == 0 {
-            sign + "0x0p+00"
-        } else {
-            let mut nibbles = []
-            let mut m = mant
-            let mut i = 0
-            while i < 13 {
-                push(nibbles, m % 16)
-                m = m / 16
-                i = i + 1
-            }
-            let mut hi = 12
-            let mut first = 0
-            let mut found = false
-            let mut j = 0
-            while j < 13 {
-                if nibbles[j] != 0 && !found {
-                    first = j
-                    found = true
-                }
-                j = j + 1
-            }
-            let mut digits = ""
-            if found {
-                let mut k = 12
-                while k >= first {
-                    digits = digits + hex_digit(nibbles[k])
-                    k = k - 1
-                }
-            }
-            let _ = hi
-            let lead = if exp == 0 {
-                "0x0"
-            } else {
-                "0x1"
-            }
-            let e10 = if exp == 0 {
-                -1022
-            } else {
-                exp - 1023
-            }
-            let esign = if e10 < 0 {
-                "-"
-            } else {
-                "+"
-            }
-            let eabs = if e10 < 0 {
-                -e10
-            } else {
-                e10
-            }
-            let edig = if eabs < 10 {
-                "0" + str(eabs)
-            } else {
-                str(eabs)
-            }
-            if digits == "" {
-                sign + lead + "p" + esign + edig
-            } else {
-                sign + lead + "." + digits + "p" + esign + edig
-            }
-        }
-    }
-}
-
-// cgen_program_to_buf 是 C 后端入口：整程序字节码表 → 一个可编译的 C 源文件（cc 落成原生二进制）
-// cgen_program_to_buf is the entry: whole-program bytecode tables to one
-// compilable C file (cc turns it into a native binary)
-// seg_copy 复制 list 区间并拼接为字符串 / seg_copy joins a list slice into a string
-fn seg_copy(src, from, to) {
-    let mut r = []
-    let mut i = from
-    while i < to {
-        push(r, src[i])
-        i = i + 1
-    }
-    join(r, "")
-}
-
-// unit_of 由源文件路径派生存放单元名（空路径归 main）/ unit_of derives the
-// storage unit name from the source path (empty paths go to the main unit)
-fn unit_of(f) {
-    if f == "" {
-        "main"
-    } else {
-        let mut start = 0
-        let mut i = 0
-        while i < str_len(f) {
-            if char_at(f, i) == "/" {
-                start = i + 1
-            }
-            i = i + 1
-        }
-        let base = substr(f, start, str_len(f) - start)
-        let bl = str_len(base)
-        if bl >= 4 && substr(base, bl - 4, 4) == ".bur" {
-            substr(base, 0, bl - 4)
-        } else {
-            base
-        }
-    }
-}
 
 // cgen_program_to_buf 是 C 后端入口：整程序字节码表 → 一个可编译的 C 源文件（cc 落成原生二进制）
 // cgen_program_to_buf is the entry: whole-program bytecode tables to one
@@ -241,32 +27,6 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         push(out, s)
     }
 
-    // line_of_off 字节偏移转源行号（#line 用）/ line_of_off maps a byte offset to a source line (for #line)
-    fn line_of_off(table, off) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        let mut lo = 0
-        let mut hi = len(table) - 1
-        while lo < hi {
-            let mid = (lo + hi + 1) / 2
-            if table[mid] <= off {
-                lo = mid
-            } else {
-                hi = mid - 1
-            }
-        }
-        lo + 1
-    }
-
-    // ls_index 查行起始表 / ls_index looks up the line-start table
-    fn ls_index(file) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        let mut i = 0
-        while i < len(ls_files) {
-            if ls_files[i] == file {
-                return i
-            }
-            i = i + 1
-        }
-        -1
-    }
 
     let mut o_kind = []
     let mut o_str = []
@@ -287,20 +47,10 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         len(o_kind) - 1
     }
 
-    // reg_key 生成常量注册键 / reg_key keys a constant registration
-    fn reg_key(cv) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        match cv {
-            lib::CVal::CFn(fh) => "f:" + str(fh),
-            lib::CVal::CEnumType(eh) => "e:" + str(eh),
-            lib::CVal::CSingleton(eh, i) => "s:" + str(eh) + ":" + str(i),
-            lib::CVal::CCtor(eh, i) => "c:" + str(eh) + ":" + str(i),
-            _ => "",
-        }
-    }
 
     // register 注册常量并分配 id / register allocates a constant id
     fn register(cv) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        let key = reg_key(cv)
+        let key = cgen_reg_key(cv)
         if key != "" {
             match get(ids, key) {
                 Some(id) => {
@@ -405,112 +155,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         }
     }
 
-    // const_str 生成字符串常量 C 文本 / const_str renders string constant C text
-    fn const_str(fh, idx) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        match f_consts[fh][idx] {
-            lib::CVal::CStr(s) => s,
-            _ => "",
-        }
-    }
 
-    // fn_const 生成函数常量 C 文本 / fn_const renders function constant C text
-    fn fn_const(fh, idx) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        match f_consts[fh][idx] {
-            lib::CVal::CFn(sub) => sub,
-            _ => 0,
-        }
-    }
-
-    // read_u16 读 u16 操作数 / read_u16 reads a u16 operand
-    // Read a u16 operand
-    fn read_u16(code, at) {
-        code[at] * 256 + code[at + 1]
-    }
-
-    // inst_len 取指令长度 / inst_len returns the instruction length
-    fn inst_len(fh, code, ip) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        let op = code[ip]
-        if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
-            3
-        } else if op == lib::op_pop_n || op == lib::op_call || op == lib::op_spawn || op == lib::op_end_block || op == lib::op_test_variant || op == lib::op_get_field {
-            2
-        } else if op == lib::op_record || op == lib::op_record_update {
-            4
-        } else if op == lib::op_closure {
-            3 + f_nupvals[fn_const(fh, read_u16(code, ip + 1))] * 3
-        } else if op == lib::op_select {
-            let n_arms = code[ip + 1]
-            let has_default = code[ip + 2] != 0
-            3 + n_arms * 3 + (if has_default {
-                2
-            } else {
-                0
-            })
-        } else {
-            1
-        }
-    }
-
-    // jump_targets 构建跳转目标表 / jump_targets builds the jump target table
-    fn jump_targets(fh) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        let code = f_code[fh]
-        let mut targets = map()
-        let mut ip = 0
-        while ip < len(code) {
-            let op = code[ip]
-            if op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop {
-                put(targets, ip + 3 + read_u16(code, ip + 1), true)
-                ip = ip + 3
-            } else if op == lib::op_loop {
-                put(targets, ip + 3 - read_u16(code, ip + 1), true)
-                ip = ip + 3
-            } else if op == lib::op_chan_next {
-                put(targets, ip + 3 + read_u16(code, ip + 1), true)
-                ip = ip + 3
-            } else if op == lib::op_select {
-                let mut p = ip + 1
-                let n_arms = code[p]
-                let has_default = code[p + 1] != 0
-                p = p + 2
-                let mut i = 0
-                while i < n_arms {
-                    p = p + 1
-                    put(targets, p + 2 + read_u16(code, p), true)
-                    p = p + 2
-                    i = i + 1
-                }
-                if has_default {
-                    put(targets, p + 2 + read_u16(code, p), true)
-                    p = p + 2
-                }
-                ip = p
-            } else {
-                ip = ip + inst_len(fh, code, ip)
-            }
-        }
-        targets
-    }
-
-    // is_target 判断是否为跳转目标 / is_target tells whether an ip is a jump target
-    fn is_target(targets, ip) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        match get(targets, ip) {
-            Some(_) => true,
-            None => false,
-        }
-    }
-
-    // fn_has_defer 判断函数是否有 defer / fn_has_defer tells whether the function has defers
-    fn fn_has_defer(fh) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
-        let code = f_code[fh]
-        let mut ip = 0
-        while ip < len(code) {
-            if code[ip] == lib::op_defer {
-                return true
-            }
-            ip = ip + inst_len(fh, code, ip)
-        }
-        false
-    }
 
     // emit_inst 把单条指令转 C / emit_inst translates one instruction to C
     // 单条指令 → C
@@ -520,7 +165,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
     fn emit_inst(id, fh, code, ip, hd) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref fconst_ids, ref opt_id, ref res_id, ref out_id, ref entry, ref fun_ids, ref fun_fhs, ref oi, ref fi, ref bi) {
         let op = code[ip]
         if op == lib::op_const {
-            w("\tbur_push(bur_consts_" + str(id) + "[" + str(read_u16(code, ip + 1)) + "]);\n")
+            w("\tbur_push(bur_consts_" + str(id) + "[" + str(cgen_read_u16(code, ip + 1)) + "]);\n")
             ip + 3
         } else if op == lib::op_unit {
             w("\tbur_push(bur_unit());\n")
@@ -545,28 +190,28 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             w("\t" + chr(123) + " Value v = bur_pop(); bur_close_upvalues(bur_cur->top - " + n + "); bur_cur->top -= " + n + "; bur_push(v); }\n")
             ip + 2
         } else if op == lib::op_get_local {
-            w("\tbur_push(bur_cur->stack[base + " + str(read_u16(code, ip + 1)) + "]);\n")
+            w("\tbur_push(bur_cur->stack[base + " + str(cgen_read_u16(code, ip + 1)) + "]);\n")
             ip + 3
         } else if op == lib::op_set_local {
-            w("\tbur_cur->stack[base + " + str(read_u16(code, ip + 1)) + "] = bur_peek(0);\n")
+            w("\tbur_cur->stack[base + " + str(cgen_read_u16(code, ip + 1)) + "] = bur_peek(0);\n")
             ip + 3
         } else if op == lib::op_get_global {
-            let n = const_str(fh, read_u16(code, ip + 1))
+            let n = cgen_const_str(fh, cgen_read_u16(code, ip + 1), f_consts)
             w("\tbur_push(bur_get_global(" + c_str(n) + ", " + str(str_len(n)) + "));\n")
             ip + 3
         } else if op == lib::op_def_global {
-            let n = const_str(fh, read_u16(code, ip + 1))
+            let n = cgen_const_str(fh, cgen_read_u16(code, ip + 1), f_consts)
             w("\t" + chr(123) + " Value v = bur_pop(); bur_globals_put(" + c_str(n) + ", " + str(str_len(n)) + ", v); }\n")
             ip + 3
         } else if op == lib::op_set_global {
-            let n = const_str(fh, read_u16(code, ip + 1))
+            let n = cgen_const_str(fh, cgen_read_u16(code, ip + 1), f_consts)
             w("\tbur_set_global(" + c_str(n) + ", " + str(str_len(n)) + ", bur_peek(0));\n")
             ip + 3
         } else if op == lib::op_get_upval {
-            w("\tbur_push(upvalue_get(self->upvals[" + str(read_u16(code, ip + 1)) + "]));\n")
+            w("\tbur_push(upvalue_get(self->upvals[" + str(cgen_read_u16(code, ip + 1)) + "]));\n")
             ip + 3
         } else if op == lib::op_set_upval {
-            w("\tupvalue_set(self->upvals[" + str(read_u16(code, ip + 1)) + "], bur_peek(0));\n")
+            w("\tupvalue_set(self->upvals[" + str(cgen_read_u16(code, ip + 1)) + "], bur_peek(0));\n")
             ip + 3
         } else if op == lib::op_eq {
             w("\t" + chr(123) + " Value r = bur_bool(bur_eq(bur_peek(1), bur_peek(0))); bur_cur->top -= 2; bur_push(r); }\n")
@@ -608,27 +253,27 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             w("\t" + chr(123) + " Value v = bur_pop(); bur_push(bur_not(v)); }\n")
             ip + 1
         } else if op == lib::op_jump {
-            w("\tgoto L" + str(ip + 3 + read_u16(code, ip + 1)) + ";\n")
+            w("\tgoto L" + str(ip + 3 + cgen_read_u16(code, ip + 1)) + ";\n")
             ip + 3
         } else if op == lib::op_jump_if_false {
-            w("\t" + chr(123) + " Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); if (!c.u.b) goto L" + str(ip + 3 + read_u16(code, ip + 1)) + "; }\n")
+            w("\t" + chr(123) + " Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); if (!c.u.b) goto L" + str(ip + 3 + cgen_read_u16(code, ip + 1)) + "; }\n")
             ip + 3
         } else if op == lib::op_jump_if_true {
-            w("\t" + chr(123) + " Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); if (c.u.b) goto L" + str(ip + 3 + read_u16(code, ip + 1)) + "; }\n")
+            w("\t" + chr(123) + " Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); if (c.u.b) goto L" + str(ip + 3 + cgen_read_u16(code, ip + 1)) + "; }\n")
             ip + 3
         } else if op == lib::op_jump_if_false_pop {
-            w("\t" + chr(123) + " Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); bool t = c.u.b; bur_pop(); if (!t) goto L" + str(ip + 3 + read_u16(code, ip + 1)) + "; }\n")
+            w("\t" + chr(123) + " Value c = bur_peek(0); if (c.t != VBOOL) bur_trap(\"condition must be a bool, got %s\", bur_typename(c)); bool t = c.u.b; bur_pop(); if (!t) goto L" + str(ip + 3 + cgen_read_u16(code, ip + 1)) + "; }\n")
             ip + 3
         } else if op == lib::op_loop {
             w("\tif (--bur_cur->budget <= 0) bur_preempt();\n")
-            w("\tgoto L" + str(ip + 3 - read_u16(code, ip + 1)) + ";\n")
+            w("\tgoto L" + str(ip + 3 - cgen_read_u16(code, ip + 1)) + ";\n")
             ip + 3
         } else if op == lib::op_call {
             w("\tbur_call(" + str(code[ip + 1]) + ");\n")
             ip + 2
         } else if op == lib::op_closure {
-            let fn_c = read_u16(code, ip + 1)
-            let sub = fn_const(fh, fn_c)
+            let fn_c = cgen_read_u16(code, ip + 1)
+            let sub = cgen_fn_const(fh, fn_c, f_consts)
             let mut p = ip + 3
             w("\t" + chr(123) + " OClosure *cl = bur_new_closure((OFunc *)bur_consts_" + str(id) + "[" + str(fn_c) + "].u.o); bur_push(bur_obj((Obj *)cl));\n")
             let mut i = 0
@@ -637,7 +282,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
                 // descriptor: bit0=islocal, bit1=ref (capture(ref name) declaration)
                 let flag = code[p]
                 p = p + 1
-                let uidx = read_u16(code, p)
+                let uidx = cgen_read_u16(code, p)
                 p = p + 2
                 if flag % 2 == 1 {
                     if flag >= 2 {
@@ -665,7 +310,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             }
             ip + 1
         } else if op == lib::op_list {
-            let n = str(read_u16(code, ip + 1))
+            let n = str(cgen_read_u16(code, ip + 1))
             w("\t" + chr(123) + " OList *l = bur_new_list(&bur_cur->stack[bur_cur->top - " + n + "], " + n + "); bur_cur->top -= " + n + "; bur_push(bur_obj((Obj *)l)); }\n")
             ip + 3
         } else if op == lib::op_index_get {
@@ -710,7 +355,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             w("\t" + chr(123) + " Value v = bur_recv(bur_peek(0)); bur_pop(); bur_push(v); }\n")
             ip + 1
         } else if op == lib::op_chan_next {
-            w("\t" + chr(123) + " Value v; if (bur_chan_next(bur_peek(0), &v)) " + chr(123) + " bur_pop(); bur_push(v); } else " + chr(123) + " bur_pop(); goto L" + str(ip + 3 + read_u16(code, ip + 1)) + "; } }\n")
+            w("\t" + chr(123) + " Value v; if (bur_chan_next(bur_peek(0), &v)) " + chr(123) + " bur_pop(); bur_push(v); } else " + chr(123) + " bur_pop(); goto L" + str(ip + 3 + cgen_read_u16(code, ip + 1)) + "; } }\n")
             ip + 3
         } else if op == lib::op_select {
             let mut p = ip + 1
@@ -723,13 +368,13 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             while i < n_arms {
                 push(kinds, code[p])
                 p = p + 1
-                push(tgts, p + 2 + read_u16(code, p))
+                push(tgts, p + 2 + cgen_read_u16(code, p))
                 p = p + 2
                 i = i + 1
             }
             let mut default_target = -1
             if has_default {
-                default_target = p + 2 + read_u16(code, p)
+                default_target = p + 2 + cgen_read_u16(code, p)
                 p = p + 2
             }
             let mut ks = []
@@ -754,17 +399,17 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             ip + 2
         } else if op == lib::op_record {
             let n = code[ip + 1]
-            let cidx = read_u16(code, ip + 2)
-            w("\tbur_record_make(" + str(n) + ", " + c_str(const_str(fh, cidx)) + ");\n")
+            let cidx = cgen_read_u16(code, ip + 2)
+            w("\tbur_record_make(" + str(n) + ", " + c_str(cgen_const_str(fh, cidx, f_consts)) + ");\n")
             ip + 4
         } else if op == lib::op_get_field_name {
-            let cidx = read_u16(code, ip + 1)
-            w("\tbur_record_get(" + c_str(const_str(fh, cidx)) + ");\n")
+            let cidx = cgen_read_u16(code, ip + 1)
+            w("\tbur_record_get(" + c_str(cgen_const_str(fh, cidx, f_consts)) + ");\n")
             ip + 3
         } else if op == lib::op_record_update {
             let n = code[ip + 1]
-            let cidx = read_u16(code, ip + 2)
-            w("\tbur_record_update(" + str(n) + ", " + c_str(const_str(fh, cidx)) + ");\n")
+            let cidx = cgen_read_u16(code, ip + 2)
+            w("\tbur_record_update(" + str(n) + ", " + c_str(cgen_const_str(fh, cidx, f_consts)) + ");\n")
             ip + 4
         } else {
             ip + 1
@@ -776,14 +421,14 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         let id = fun_ids[bi]
         let fh = fun_fhs[bi]
         let code = f_code[fh]
-        let targets = jump_targets(fh)
-        let li = ls_index(f_file[fh])
+        let targets = cgen_jump_targets(fh, f_code, f_nupvals, f_consts)
+        let li = cgen_ls_index(f_file[fh], ls_files)
         // line_dir 生成 #line 指令 / line_dir emits a #line directive
         fn line_dir(ip, with_ln) {
             if li >= 0 && ip < len(f_spans[fh]) {
                 match f_spans[fh][ip] {
                     frontend::SpanT::Sp(s0, _) => {
-                        let ln = line_of_off(ls_tables[li], s0)
+                        let ln = cgen_line_of_off(ls_tables[li], s0)
                         if with_ln {
                             w("\tBUR_LN(" + str(ln) + ");\n")
                         }
@@ -793,7 +438,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             }
         }
         line_dir(0, false)
-        let hd = fn_has_defer(fh)
+        let hd = cgen_fn_has_defer(fh, f_code, f_nupvals, f_consts)
         if true {
             push(mark_units, unit_of(f_file[fh]))
             push(mark_starts, len(out))
@@ -807,13 +452,13 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         w("\tif (--bur_cur->budget <= 0) bur_preempt();\n")
         let mut ip = 0
         while ip < len(code) {
-            if is_target(targets, ip) {
+            if cgen_is_target(targets, ip) {
                 w("L" + str(ip) + ":;\n")
             }
             line_dir(ip, true)
             ip = emit_inst(id, fh, code, ip, hd)
         }
-        if is_target(targets, len(code)) {
+        if cgen_is_target(targets, len(code)) {
             w("L" + str(len(code)) + ":;\n")
         }
         w("}\n\n")
@@ -880,7 +525,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
             } else {
                 "NULL"
             }
-            let fli = ls_index(f_file[fh])
+            let fli = cgen_ls_index(f_file[fh], ls_files)
             let file = if fli >= 0 {
                 c_str(ls_names[fli])
             } else if f_file[fh] != "" {

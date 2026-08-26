@@ -1,0 +1,57 @@
+// fmt_interp.bur — 字符串插值格式化。
+// fmt_interp.bur — string interpolation formatting.
+
+import "burryn.dev/compiler/frontend"
+
+// fmt_interp_parts 格式化插值各部分 / fmt_interp_parts formats interpolation parts
+fn fmt_interp_parts(n, src, comments, mut cc, indent, mut buf) {
+    match n {
+        frontend::Node::StrLit(seg, _) => fmt_interp_segment(seg, buf),
+        frontend::Node::Binary(op, with_expr, rhs, _) => match rhs {
+            frontend::Node::StrLit(seg, _) => match with_expr {
+                frontend::Node::Binary(op2, prefix, inner, _) => {
+                    if op != frontend::t_plus || op2 != frontend::t_plus {
+                        fmt_internal("malformed interpolation concat chain")
+                    }
+                    fmt_interp_parts(prefix, src, comments, cc, indent, buf)
+                    push(buf, "" + chr(123) + "")
+                    fmt_expr(inner, src, comments, cc, indent, buf)
+                    push(buf, "}")
+                    fmt_interp_segment(seg, buf)
+                },
+                _ => fmt_internal("malformed interpolation expression link"),
+            },
+            _ => fmt_internal("malformed interpolation segment link"),
+        },
+        _ => fmt_internal("malformed interpolation segment link"),
+    }
+}
+
+// fmt_interp_segment 格式化单个插值片段 / fmt_interp_segment formats one interpolation segment
+fn fmt_interp_segment(s, mut buf) {
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        let esc = if c == "\\" {
+            "\\\\"
+        } else if c == "\n" {
+            "\\n"
+        } else if c == "\t" {
+            "\\t"
+        } else if c == "\"" {
+            "\\\""
+        } else if c == "" + chr(123) + "" {
+            "" + chr(123) + "" + chr(123) + ""
+        } else {
+            ""
+        }
+        if esc != "" {
+            push(buf, substr(s, seg, i - seg))
+            push(buf, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(buf, substr(s, seg, str_len(s) - seg))
+}

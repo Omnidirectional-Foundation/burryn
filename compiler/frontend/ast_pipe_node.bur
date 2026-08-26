@@ -1,0 +1,57 @@
+// ast_pipe_node.bur — 管道节点降级。
+// ast_pipe_node.bur — pipe node lowering.
+
+
+
+// lower_pipe_nodes 对节点列表脱糖 / lower_pipe_nodes desugars a node list
+fn lower_pipe_nodes(nodes) {
+    let mut out = []
+    for n in nodes {
+        push(out, lower_pipe_node(n))
+    }
+    out
+}
+
+// lower_pipe_node 对单个节点脱糖 / lower_pipe_node desugars one node
+fn lower_pipe_node(n) {
+    match n {
+        Unary(op, rhs, sp) => Unary(op, lower_pipe_node(rhs), sp),
+        Binary(op, lhs, rhs, sp) => Binary(op, lower_pipe_node(lhs), lower_pipe_node(rhs), sp),
+        Logical(op, lhs, rhs, sp) => Logical(op, lower_pipe_node(lhs), lower_pipe_node(rhs), sp),
+        Call(callee, args, sp) => Call(lower_pipe_node(callee), lower_pipe_nodes(args), sp),
+        Pipe(lhs, target, args, sp) => {
+            let mut call_args = [lower_pipe_node(lhs)]
+            for a in args {
+                push(call_args, lower_pipe_node(a))
+            }
+            Call(lower_pipe_node(target), call_args, sp)
+        },
+        Index(target, idx, sp) => Index(lower_pipe_node(target), lower_pipe_node(idx), sp),
+        ListLit(elems, sp) => ListLit(lower_pipe_nodes(elems), sp),
+        FnLit(params, muts, pspans, param_tys, ret_ty, body, name, crefs, sp) => FnLit(params, muts, pspans, param_tys, ret_ty, lower_pipe_node(body), name, crefs, sp),
+        Block(stmts, sp) => Block(lower_pipe_nodes(stmts), sp),
+        IfExpr(cond, then, els, sp) => IfExpr(lower_pipe_node(cond), lower_pipe_node(then), lower_pipe_node(els), sp),
+        MatchExpr(scrut, arms, sp) => MatchExpr(lower_pipe_node(scrut), lower_pipe_nodes(arms), sp),
+        MatchArm(pat, guard, body, sp) => MatchArm(pat, lower_pipe_node(guard), lower_pipe_node(body), sp),
+        TryExpr(inner, sp) => TryExpr(lower_pipe_node(inner), sp),
+        RecvExpr(ch, sp) => RecvExpr(lower_pipe_node(ch), sp),
+        LetStmt(name, nsp, is_mut, is_pub, ty, init, sp) => LetStmt(name, nsp, is_mut, is_pub, ty, lower_pipe_node(init), sp),
+        ConstDecl(name, nsp, is_pub, ty, init, sp) => ConstDecl(name, nsp, is_pub, ty, lower_pipe_node(init), sp),
+        AssignStmt(target, val, sp) => AssignStmt(lower_pipe_node(target), lower_pipe_node(val), sp),
+        ExprStmt(e, sp) => ExprStmt(lower_pipe_node(e), sp),
+        WhileStmt(cond, body, sp) => WhileStmt(lower_pipe_node(cond), lower_pipe_node(body), sp),
+        ForStmt(name, nsp, idx, isp, iter, is_chan, body, sp) => ForStmt(name, nsp, idx, isp, lower_pipe_node(iter), is_chan, lower_pipe_node(body), sp),
+        ReturnStmt(val, sp) => ReturnStmt(lower_pipe_node(val), sp),
+        FnDecl(name, nsp, is_pub, lit, sp) => FnDecl(name, nsp, is_pub, lower_pipe_node(lit), sp),
+        SpawnStmt(call, sp) => SpawnStmt(lower_pipe_node(call), sp),
+        SelectStmt(arms, has_default, dflt, dsp, sp) => SelectStmt(lower_pipe_nodes(arms), has_default, lower_pipe_node(dflt), dsp, sp),
+        SelectArm(is_send, bind, bsp, ch, val, body, sp) => SelectArm(is_send, bind, bsp, lower_pipe_node(ch), lower_pipe_node(val), lower_pipe_node(body), sp),
+        SendStmt(ch, val, sp) => SendStmt(lower_pipe_node(ch), lower_pipe_node(val), sp),
+        DeferStmt(body, crefs, sp) => DeferStmt(lower_pipe_node(body), crefs, sp),
+        RecordLit(names, vals, sp) => RecordLit(names, lower_pipe_nodes(vals), sp),
+        RecordUpdate(base, names, vals, sp) => RecordUpdate(lower_pipe_node(base), names, lower_pipe_nodes(vals), sp),
+        FieldAccess(base, field, sp) => FieldAccess(lower_pipe_node(base), field, sp),
+        TypeAliasDecl(name, te, is_pub, sp) => TypeAliasDecl(name, te, is_pub, sp),
+        _ => n,
+    }
+}

@@ -1,0 +1,111 @@
+// parse_postfix.bur — 后缀表达式。
+// parse_postfix.bur — postfix expressions.
+
+import "burryn.dev/compiler/lib"
+
+// p_postfix 解析后缀：调用/索引/字段访问/成员选择，含 record 更新与 tuple 解构
+// p_postfix parses postfix: calls, indexing, field and member access,
+// record updates, tuple destructuring
+fn p_postfix(toks, mut pos) {
+    let mut e = match p_primary(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    // 后缀链：调用/索引/try/:: 限定/字段访问
+    // Postfix chain: calls, indexing, try, :: qualification, field access
+    let mut going = true
+    while going {
+        if p_check(toks, pos, t_lparen) {
+            p_advance(toks, pos)
+            let mut cargs = []
+            p_skip_semis(toks, pos)
+            while !p_check(toks, pos, t_rparen) {
+                let a = match p_expression(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        NoNode
+                    },
+                }
+                push(cargs, a)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+                p_skip_semis(toks, pos)
+            }
+            p_skip_semis(toks, pos)
+            let rp = match p_expect(toks, pos, t_rparen, "')' after arguments") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            e = Call(e, cargs, sp_union(span_of(e), sp_of_tok(rp)))
+        } else if p_check(toks, pos, t_lbracket) {
+            p_advance(toks, pos)
+            let idx = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            let rb = match p_expect(toks, pos, t_rbracket, "']' after index") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            e = Index(e, idx, sp_union(span_of(e), sp_of_tok(rb)))
+        } else if p_check(toks, pos, t_question) {
+            let q = p_advance(toks, pos)
+            e = TryExpr(e, sp_union(span_of(e), sp_of_tok(q)))
+        } else if p_check(toks, pos, t_colon_colon) {
+            let _ = p_advance(toks, pos)
+            e = match e {
+                Ident(name, hsp) => {
+                    let v = match p_expect(toks, pos, t_ident, "a name after '::'") {
+                        Ok(x) => x,
+                        Err(dg) => {
+                            return Err(dg)
+                            lib::Token::Tok(0, "", 0, 0)
+                        },
+                    }
+                    VariantAccess(name, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
+                },
+                VariantAccess(en, vr, hsp) => {
+                    let v = match p_expect(toks, pos, t_ident, "a name after '::'") {
+                        Ok(x) => x,
+                        Err(dg) => {
+                            return Err(dg)
+                            lib::Token::Tok(0, "", 0, 0)
+                        },
+                    }
+                    QualVariantAccess(en, vr, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
+                },
+                _ => {
+                    return perr("E1120", "`::` qualifies a package or enum name; write `pkg::name` or `Shape::Variant`", "'::' cannot follow this expression", sp_of_tok(p_peek(toks, pos)))
+                    NoNode
+                },
+            }
+        } else if p_check(toks, pos, t_dot) {
+            let _ = p_advance(toks, pos)
+            let v = match p_expect(toks, pos, t_ident, "a field name after '.'") {
+                Ok(x) => x,
+                Err(dg) => {
+                    return Err(dg)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            e = FieldAccess(e, tok_lex(v), sp_union(span_of(e), sp_of_tok(v)))
+        } else {
+            going = false
+        }
+    }
+    Ok(e)
+}

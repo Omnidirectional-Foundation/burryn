@@ -1,0 +1,128 @@
+// parse_enum.bur — enum/type-alias 声明。
+// parse_enum.bur — enum/type-alias decls.
+
+import "burryn.dev/compiler/lib"
+
+// p_enum_decl 解析枚举声明：变体可带类型字段，支持泛型参数表
+// p_enum_decl parses an enum: typed variant fields, optional type parameters
+fn p_enum_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let name = match p_expect(toks, pos, t_ident, "enum name") {
+        // 枚举：可选泛型参数表 + 变体列表（变体可带类型字段）
+        // Enums: optional type parameters plus variants (variants may carry typed fields)
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let mut params = []
+    if p_match(toks, pos, t_lparen) {
+        while !p_check(toks, pos, t_rparen) {
+            let ptok = match p_expect(toks, pos, t_ident, "type parameter") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            push(params, tok_lex(ptok))
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+        }
+        match p_expect(toks, pos, t_rparen, "')' after type parameters") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+    }
+    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after enum name") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let mut variants = []
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) {
+        let vname = match p_expect(toks, pos, t_ident, "variant name") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        let mut vtypes = []
+        let mut vsp = sp_of_tok(vname)
+        if p_match(toks, pos, t_lparen) {
+            while !p_check(toks, pos, t_rparen) {
+                let vt = match p_type_expr(toks, pos) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        NoNode
+                    },
+                }
+                push(vtypes, vt)
+                if !p_match(toks, pos, t_comma) {
+                    break
+                }
+            }
+            let vrp = match p_expect(toks, pos, t_rparen, "')' after variant field types") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            vsp = sp_union(vsp, sp_of_tok(vrp))
+        }
+        push(variants, EnumVariantDecl(tok_lex(vname), len(vtypes), vtypes, vsp))
+        if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
+            return perr("E1104", "", "expected ',' or newline between enum variants", sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}' after enum variants") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    Ok(EnumDecl(tok_lex(name), params, variants, false, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
+}
+
+// p_type_alias_decl 解析类型别名声明 / p_type_alias_decl parses a type alias declaration
+fn p_type_alias_decl(toks, mut pos, is_pub) {
+    let tok = p_advance(toks, pos)
+    let name = match p_expect(toks, pos, t_ident, "type alias name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    match p_expect(toks, pos, t_eq, "'=' after type alias name") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let te = match p_type_expr(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    Ok(TypeAliasDecl(tok_lex(name), te, is_pub, sp_union(sp_of_tok(tok), span_of(te))))
+}

@@ -1,0 +1,78 @@
+// parse_ctrl.bur — 循环/spawn/defer/select 语句。
+// parse_ctrl.bur — loop/spawn/defer/select statements.
+
+import "burryn.dev/compiler/lib"
+
+
+// p_while_stmt 解析 while 语句 / p_while_stmt parses a while statement
+fn p_while_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let cond = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    let body = match p_block(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    Ok(WhileStmt(cond, body, sp_union(sp_of_tok(tok), span_of(body))))
+}
+
+// p_for_stmt 解析 for 语句：值遍历或带索引形式（channel 拒绝索引）
+// p_for_stmt parses for: value iteration, optional index form (channels reject the index form)
+fn p_for_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let first = match p_expect(toks, pos, t_ident, "loop variable") {
+        Ok(x) => x,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let mut v = tok_lex(first)
+    let mut vsp = sp_of_tok(first)
+    let mut idx = ""
+    let mut isp = Sp(0, 0)
+    if p_match(toks, pos, t_comma) {
+        idx = v
+        isp = vsp
+        let e = match p_expect(toks, pos, t_ident, "element variable after ','") {
+            Ok(x) => x,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        v = tok_lex(e)
+        vsp = sp_of_tok(e)
+    }
+    match p_expect(toks, pos, t_in, "'in' in for loop") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let iter = match p_expression(toks, pos) {
+        Ok(x) => x,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    let body = match p_block(toks, pos) {
+        Ok(x) => x,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    Ok(ForStmt(v, vsp, idx, isp, iter, false, body, sp_union(sp_of_tok(tok), span_of(body))))
+}
+
+

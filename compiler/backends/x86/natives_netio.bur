@@ -1,0 +1,75 @@
+// natives_netio.bur — net read/write/close/nb。
+// natives_netio.bur — net read/write/close/nb.
+
+
+
+// x86gen_net_read_native 内联 net_read：read syscall 进新 str，返回 Result<str, str>。
+// fd 非阻塞：EAGAIN → waitset 注册 POLLIN → park；唤醒后重试；EINTR 直接重试
+// x86gen_net_read_native inlines net_read: a read syscall into a fresh str, returning Result<str,
+// str>. The fd is non-blocking: EAGAIN registers POLLIN on the waitset and parks; on wake it
+// retries; EINTR retries directly
+fn x86gen_net_read_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    // alloc_seq 先按 max 分配 str（len 头 + 字节区），root 存 [r15-24]；park 后 GC 会更新 root，
+    // retry_seq 从 root 重载 buf 指针（r8 在 park 间不可靠）
+    // alloc_seq allocates the str for max bytes (len header plus byte area), rooting it at
+    // [r15-24]; GC updates the root across a park, so retry_seq reloads the buf pointer from it
+    // (r8 is unreliable across a park)
+    let alloc_seq = mov_rr(r8, r12) + mov_mr(r8, 0, r11) + add_ri32(r12, 8) + add_rr(r12, r11) + mov_mr(r15, 0 - 24, r8)
+    let retry_seq = mov_rm(rdi, r15, 0 - 16) + mov_rm(r8, r15, 0 - 24) + lea(rsi, r8, 8) + mov_rm(rdx, r15, 0 - 8) + sys_mov_rax(0) + syscall() + test_rr(rax, rax)
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 1)
+    // zero_ok：max == 0 → Ok("")（VM 语义：立即返回空串，不进系统调用）
+    // zero_ok: max == 0 yields Ok("") (VM semantics: an immediate empty string, no syscall)
+    let zero_ok = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(fail))
+    // ok_path：n >= 0（含 0 = EOF）→ Ok(str)，落 len 后跳 END（跳过 zero_ok + fail）
+    // ok_path: n >= 0 (0 is EOF) yields Ok(str); after storing the length it jumps to END (past
+    // zero_ok and fail)
+    let ok_path = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(zero_ok) + str_len(fail))
+    let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path) + str_len(zero_ok))
+    let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
+    let max_check = mov_rm(r11, r15, 0 - 8) + test_rr(r11, r11) + jl_rel32(6 + str_len(alloc_seq) + str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + str_len(retry_back) + str_len(ok_path) + str_len(zero_ok)) + je_rel32(str_len(alloc_seq) + str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + str_len(retry_back) + str_len(ok_path))
+    max_check + alloc_seq + retry_seq + err_check + fd_park + retry_back + ok_path + zero_ok + fail
+}
+
+// x86gen_net_write_native 内联 net_write：循环 write syscall 直到写完，返回 Result<unit, str>。
+// fd 非阻塞：EAGAIN → waitset 注册 POLLOUT → park；唤醒后跳回 loop_check 重试；
+// 偏移累加存 [r15-24]（syscall 毁 rcx，w_adv 从内存重载）
+// x86gen_net_write_native inlines net_write: looping write syscalls until done, returning
+// Result<unit, str>. The fd is non-blocking: EAGAIN registers POLLOUT on the waitset and parks;
+// on wake it jumps back to loop_check to retry. The byte offset accumulates in [r15-24] (syscall
+// clobbers rcx, so w_adv reloads it from memory)
+fn x86gen_net_write_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    let done = ok_inst + jmp_rel32(str_len(fail))
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 4)
+    // w_adv：off += n；随后的 w_adv_jmp 跳回 loop_check（两处 5 = 各自 jmp_rel32 长度）
+    // w_adv: off += n; the following w_adv_jmp jumps back to loop_check (the two 5s are the
+    // jmp_rel32 lengths of w_adv_jmp and fd_park_jmp)
+    let w_adv = mov_rm(rcx, r15, 0 - 24) + add_rr(rcx, rax) + mov_mr(r15, 0 - 24, rcx)
+    // w_err_len 是 w_err 的固定长度（neg/mov/cmp/je/je/jmp），供 loop_check/w2/w_adv_jmp/
+    // fd_park_jmp 前向引用破环；内含 6 = je_rel32 长度、5 = jmp_rel32 长度
+    // w_err_len is the fixed length of w_err (neg/mov/cmp/je/je/jmp), used by loop_check/w2/
+    // w_adv_jmp/fd_park_jmp to break forward-reference cycles; it embeds 6 for je_rel32 and 5
+    // for jmp_rel32
+    let w_err_len = str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))
+    let w1 = mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, r9, 0) + mov_rm(rcx, r15, 0 - 24) + sub_rr(rdx, rcx) + mov_rm(rdi, r15, 0 - 16) + mov_rr(rsi, r9) + add_rr(rsi, rcx) + add_ri32(rsi, 8) + sys_mov_rax(1) + syscall() + test_rr(rax, rax)
+    // w2：n > 0 → w_adv；n == 0 → fail（VM 语义：write returned zero bytes）
+    // w2: n > 0 goes to w_adv; n == 0 fails (VM semantics: write returned zero bytes)
+    let w2 = jg_rel32(6 + w_err_len) + je_rel32(w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done) + str_len(fail))
+    let loop_check = mov_rm(r9, r15, 0 - 8) + mov_rm(rax, r9, 0) + mov_rm(rcx, r15, 0 - 24) + cmp_rr(rcx, rax) + jae_rel32(str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5)
+    let w_err = neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(w_adv) + 5) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + 6 + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(w1) + str_len(w2) + str_len(loop_check))) + jmp_rel32(str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done))
+    let w_adv_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5))
+    let fd_park_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5))
+    // head：off 清零存 [r15-24]，jmp 进 loop_check（同 net_loopback 的 off 槽用法）
+    // head: zeroes off into [r15-24] and jumps into loop_check (same off-slot usage as
+    // net_loopback)
+    let head = xor_rr(rcx, rcx) + mov_mr(r15, 0 - 24, rcx) + jmp_rel32(0)
+    head + loop_check + w1 + w2 + w_err + w_adv + w_adv_jmp + fd_park + fd_park_jmp + done + fail
+}
+

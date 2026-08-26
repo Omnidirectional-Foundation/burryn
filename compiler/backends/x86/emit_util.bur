@@ -1,0 +1,33 @@
+// emit_util.bur — x86 发射杂项（merge/cp_ps/record/psig/variant_index）。
+// emit_util.bur — x86 emit odds and ends (merge/cp_ps/record/psig/variant_index).
+
+import "burryn.dev/compiler/lib"
+
+fn const_addr(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, f, i) {
+    match get(ctx.const_slot_map, const_slot_key(f, i)) {
+        Some(off) => code_origin() + off,
+        None => 0,
+    }
+}
+
+// upval_is_ref 沿透传链判定 upvalue 槽是否为 cell（ref 捕获或透传自 ref）
+// upval_is_ref decides whether an upvalue slot is a cell (ref capture, or
+// inherited from a ref), following the inheritance chain statically
+fn upval_is_ref(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, fh, ui) {
+    match get(ctx.created_by, fh) {
+        Some(cb) => {
+            let cfh = cb[0]
+            let cip = cb[1]
+            let flag = ctx.f_code[cfh][cip + 3 + 3 * ui]
+            if flag % 2 == 1 {
+                flag >= 2
+            } else if flag >= 2 {
+                upval_is_ref(ctx, fn_const(ctx, cfh, read_u16(ctx.f_code[cfh], cip + 1)), read_u16(ctx.f_code[cfh], cip + 4 + 3 * ui))
+            } else {
+                false
+            }
+        },
+        None => false,
+    }
+}
+

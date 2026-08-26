@@ -1,0 +1,77 @@
+// parse_if.bur — 插值与 if 表达式。
+// parse_if.bur — interpolation and if expr.
+
+import "burryn.dev/compiler/lib"
+
+// p_interpolated 解析插值字符串：把片段与表达式拼成 + 链
+// p_interpolated parses interpolated strings: segments and expressions become a + chain
+fn p_interpolated(toks, mut pos) {
+    let start = p_advance(toks, pos)
+    let mut out = StrLit(tok_lex(start), sp_of_tok(start))
+    let mut done = false
+    while !done {
+        let inner = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        out = Binary(t_plus, out, inner, sp_union(span_of(out), span_of(inner)))
+        p_skip_semis(toks, pos)
+        let next = p_peek(toks, pos)
+        let nt = tok_type(next)
+        let part = if nt == t_interp_mid || nt == t_interp_end {
+            p_advance(toks, pos)
+        } else {
+            return perr("E1101", "close the interpolation with '}'", "expected the end of a string interpolation, got \"" + tok_lex(next) + "\"", sp_of_tok(next))
+            lib::Token::Tok(0, "", 0, 0)
+        }
+        out = Binary(t_plus, out, StrLit(tok_lex(part), sp_of_tok(part)), sp_union(sp_of_tok(start), sp_of_tok(part)))
+        done = nt == t_interp_end
+    }
+    Ok(out)
+}
+
+// p_if_expr 解析 if 表达式：条件 + then/else 块（值位置 else 必须）
+// p_if_expr parses if: condition with then/else blocks (else required when used as a value)
+fn p_if_expr(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let cond = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    let then = match p_block(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    let mut sp = sp_union(sp_of_tok(tok), span_of(then))
+    let mut els = NoNode
+    if p_match(toks, pos, t_else) {
+        els = if p_check(toks, pos, t_if) {
+            match p_if_expr(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else {
+            match p_block(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        }
+        sp = sp_union(sp, span_of(els))
+    }
+    Ok(IfExpr(cond, then, els, sp))
+}

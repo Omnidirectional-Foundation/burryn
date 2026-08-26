@@ -1,0 +1,83 @@
+// compile_assign.bur — 赋值代码生成（CompileCtx）。
+// compile_assign.bur — assignment codegen (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+fn cp_assign(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, global_mut, pkg_decls, cur_pkg, ch, target, val, sp, cp_expr) {
+    match target {
+        frontend::Node::Ident(name, _) => {
+            match cp_expr(ch, val) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            let li = resolve_local(ctx.c_l_name, ctx.c_l_slot, ch, name)
+            if li >= 0 {
+                if !ctx.c_l_mut[ch][li] {
+                    return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
+                }
+                emit(ctx, ch, lib::op_set_local, sp)
+                emit_u16(ctx, ch, ctx.c_l_slot[ch][li], sp)
+            } else {
+                let ui = match resolve_upvalue(ctx, ch, name, sp) {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        0
+                    },
+                }
+                if ui >= 0 {
+                    if !ctx.c_u_mut[ch][ui] {
+                        return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
+                    }
+                    emit(ctx, ch, lib::op_set_upval, sp)
+                    emit_u16(ctx, ch, ui, sp)
+                } else {
+                    match get(global_mut, mangle_if_decl(pkg_decls, cur_pkg, name)) {
+                        Some(is_mut) => {
+                            if !is_mut {
+                                return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
+                            }
+                            let idx = add_const(ctx, ch, lib::CVal::CStr(mangle_if_decl(pkg_decls, cur_pkg, name)))
+                            emit(ctx, ch, lib::op_set_global, sp)
+                            emit_u16(ctx, ch, idx, sp)
+                        },
+                        None => {
+                            return frontend::perr("E2011", "", "cannot assign to undeclared variable \"" + name + "\"", sp)
+                        },
+                    }
+                }
+            }
+            emit(ctx, ch, lib::op_pop, sp)
+            Ok(true)
+        },
+        frontend::Node::Index(itarget, iidx, _) => {
+            match cp_expr(ch, itarget) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+            match cp_expr(ch, iidx) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+            match cp_expr(ch, val) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            ctx.c_temps[ch] = ctx.c_temps[ch] - 2
+            emit(ctx, ch, lib::op_index_set, sp)
+            Ok(true)
+        },
+        _ => frontend::perr("E2012", "", "invalid assignment target", sp),
+    }
+}

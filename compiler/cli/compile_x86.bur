@@ -1,0 +1,84 @@
+// cli/compile_x86.bur — 编译到 x86。
+// cli/compile_x86.bur — compile to x86.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/backends/x86"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/bytecode"
+
+// compile_to_x86 编译为 x86 ELF / compile_to_x86 compiles to an x86 ELF
+fn compile_to_x86(input) {
+    if is_dir(input) {
+        eprintln("error: x86 backend does not support modules yet")
+        exit(exit_static)
+    } else {
+        compile_file_to_x86(input)
+    }
+}
+
+// compile_file_to_x86 单文件转 x86 二进制
+// compile_file_to_x86 compiles a single file to an x86 binary
+fn compile_file_to_x86(path) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    // 注入 float 运行时（dtoa/strtod 大整数核心），供 parse_float / float 格式化使用。
+    // 注入源码必须排在用户源码之前：float_rt 的顶层常量（TWO_52 等）经 def_global
+    // 初始化，x86 的 float 格式化在运行期调用 format_float，若常量尚未定义则读到 0
+    // 并触发除法陷阱（idiv by zero）。C/VM 的 println 走 runtime native 不依赖注入，
+    // 但注入顺序对三者统一无害。
+    // inject the float runtime (bigint dtoa/strtod core) for parse_float / float
+    // formatting. The injected source must precede user code: float_rt's top-level
+    // constants (TWO_52 etc.) are initialized via def_global, and x86 float formatting
+    // calls format_float at runtime; reading a not-yet-defined constant yields 0 and
+    // triggers an idiv trap. C/VM println goes through runtime natives and does not
+    // depend on the injection, but the ordering is harmless for all three.
+    let injected = match read_file("compiler/lib/float_rt.bur") {
+        Ok(s) => s,
+        Err(_) => "",
+    }
+    // 首行 shebang 只在文本偏移 1 处被识别（lexer.bur），注入把用户代码推到中间；
+    // 编译产物是 ELF 不需要 shebang，把 #! 换为 // 注释以保持行号与列偏移。
+    // The first-line shebang is only recognized at text offset 1 (lexer.bur), and
+    // injection pushes user code to the middle; the ELF output needs no shebang,
+    // so #! becomes a // comment, keeping line and column offsets intact.
+    let src2 = if str_len(src) >= 2 && substr(src, 0, 2) == "#!" {
+        "//" + substr(src, 2, str_len(src) - 2)
+    } else {
+        src
+    }
+    match frontend::lex(injected + src2) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => x86::x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}

@@ -1,0 +1,52 @@
+// natives_accept.bur — accept/dial。
+// natives_accept.bur — accept/dial.
+
+
+
+// x86gen_tcp_accept_native 内联 tcp_accept：accept syscall + O_NONBLOCK + EAGAIN/EINTR 重试，
+// 返回 Result<int, str>。fd 非阻塞：EAGAIN → waitset 注册 POLLIN → park；唤醒后重试
+// x86gen_tcp_accept_native inlines tcp_accept: the accept syscall with O_NONBLOCK and
+// EAGAIN/EINTR retry, returning Result<int, str>. The fd is non-blocking: EAGAIN registers
+// POLLIN on the waitset and parks; on wake it retries
+fn x86gen_tcp_accept_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 8)
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 8, 1)
+    let retry_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall()
+    let ok_path = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path))
+    let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
+    sub_ri32(rsp, 8) + retry_seq + err_check + fd_park + retry_back + ok_path + fail
+}
+
+// x86gen_tcp_dial_native 内联 tcp_dial：socket/connect/getsockopt syscalls，返回 Result<int, str>。
+// fd 非阻塞：EINPROGRESS/EAGAIN → waitset 注册 POLLOUT → park；唤醒后 getsockopt(SO_ERROR) 验连通
+// x86gen_tcp_dial_native inlines tcp_dial: socket/connect/getsockopt syscalls, returning
+// Result<int, str>. The fd is non-blocking: EINPROGRESS/EAGAIN registers POLLOUT on the waitset
+// and parks; on wake, getsockopt(SO_ERROR) confirms the connection
+fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 32)
+    // park 后 r9 不可靠：fd 一律从 [rsp+8] 重载（VM 语义：fd 是 int，不参与 GC 指针更新）
+    // r9 is unreliable after park: reload the fd from [rsp+8] everywhere (VM semantics: an fd is
+    // an int, so GC pointer updates never apply)
+    let close_ops = mov_rm(rdi, rsp, 8) + sys_mov_rax(3) + syscall()
+    let fail_close = close_ops + fail
+    let sockaddr = x86gen_sockaddr_at()
+    let connect_ok = mov_rm(rax, rsp, 8) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    // sockcheck：getsockopt(SO_ERROR) == 0 才算连通；失败走 fail_close
+    // sockcheck: getsockopt(SO_ERROR) == 0 confirms the connection; failures go to fail_close
+    let sockcheck = mov_rm(rdi, rsp, 8) + mov_ri64(rsi, 1) + mov_ri64(rdx, 4) + lea(r10, rsp, 12) + lea(r8, rsp, 4) + mov_ri32(rcx, 4) + mov_mr32(rsp, 4, rcx) + sys_mov_rax(55) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(mov_rm32(rcx, rsp, 12)) + str_len(test_rr(rcx, rcx)) + str_len(je_rel32(0)) + str_len(connect_ok)) + mov_rm32(rcx, rsp, 12) + test_rr(rcx, rcx) + jne_rel32(str_len(connect_ok))
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, rsp, 8, 4)
+    let connect_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 115)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + str_len(sockcheck)) + neg_r(rax) + mov_ri64(rdx, 115) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0))) + jmp_rel32(str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
+    let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
+    head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close
+}

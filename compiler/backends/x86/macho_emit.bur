@@ -1,0 +1,99 @@
+// macho_emit.bur — emit_macho / dispatcher。
+// macho_emit.bur — emit_macho / dispatcher.
+
+
+
+// emit_macho 装配 Mach-O：命令块(548B) + 垫零至 0x1000 + __TEXT 内容 +
+// 垫零至页界 + __DATA 内容 + 垫零至页界后的空 __LINKEDIT；入口在 __TEXT 内容内
+// entry_in_text 处
+// emit_macho assembles the Mach-O: command block (548B) + zero padding to
+// 0x1000 + __TEXT content + padding to the page boundary + __DATA content +
+// an empty __LINKEDIT after padding to the next page boundary; the entry sits
+// at entry_in_text within the __TEXT content
+pub fn emit_macho(text_content, entry_in_text, data_content) {
+    let text_end = MACHO_TEXT_OFF + str_len(text_content)
+    let data_fileoff = pe_align(text_end, 4096)
+    let linkedit_off = pe_align(data_fileoff + str_len(data_content), 4096)
+    let payload = macho_linkedit_payload()
+    let hdrs = macho_header(10, 524 + 16) + macho_pagezero() + macho_text_segment(str_len(text_content)) + macho_data_segment(data_fileoff, str_len(data_content)) + macho_linkedit_segment(linkedit_off, str_len(payload)) + macho_uuid() + macho_main(MACHO_TEXT_OFF + entry_in_text) + macho_build_version() + macho_dylinker() + macho_dylib() + macho_chained_fixups(linkedit_off, str_len(payload))
+    let mut head_pad = ""
+    let mut pi = macho_hdr_size()
+    while pi < MACHO_TEXT_OFF {
+        head_pad = head_pad + byte_chr(0)
+        pi = pi + 1
+    }
+    let mut mid_pad = ""
+    pi = MACHO_TEXT_OFF + str_len(text_content)
+    while pi < data_fileoff {
+        mid_pad = mid_pad + byte_chr(0)
+        pi = pi + 1
+    }
+    let mut tail = ""
+    let mut ti = data_fileoff + str_len(data_content)
+    while ti < linkedit_off {
+        tail = tail + byte_chr(0)
+        ti = ti + 1
+    }
+    hdrs + head_pad + text_content + mid_pad + data_content + tail + payload
+}
+
+// macho_build_dispatcher 生成 darwin syscall 兼容分派器。
+// macho_build_dispatcher emits the darwin syscall shim dispatcher.
+// 契约对齐 Linux syscall：只破坏 rax/rcx/r11，保全其余寄存器；结果走 rax。
+// Contract mirrors Linux syscall: only rax/rcx/r11 die, everything else survives;
+// result returns in rax.
+// 直译表：1 write→BSD write(0x2000004)、60 exit→0x2000001、9 mmap→0x20000C5
+// （内核从 r10 取第 4 参——libc 桩为躲过 syscall 对 rcx 的破坏而走 r10——
+// 只需把 flags 值换成 0x1002）、228 clock_gettime→0x2000074（clk_id 6）；
+// 错误返回正 errno 且 CF=1，转回 Linux 式负值；其余 ud2 立即崩溃暴露缺口。
+// Translation table: 1 write→BSD write(0x2000004), 60 exit→0x2000001,
+// 9 mmap→0x20000C5 (the kernel reads the 4th arg from r10 — libc stubs route
+// rcx through r10 to survive syscall clobbering rcx — so only the flags value
+// changes to 0x1002), 228 clock_gettime→0x2000074 (clk_id 6); errors return
+// positive errno with CF set, converted back to Linux-style negatives;
+// anything else hits ud2.
+// 无导入无 API 调用，故帧只需保存六个输入寄存器（mmap 改写 r10、clock 改写 rdi，
+// 尾声弹回），无需影子空间与栈定位。
+// No imports and no API calls, so the frame only saves the six input registers
+// (mmap rewrites r10, clock rewrites rdi, both restored by the epilogue); no
+// shadow space or frame pointer needed.
+pub fn macho_build_dispatcher() {
+    let head = e1(87) + e1(86) + e1(82) + e1(65) + e1(80) + e1(65) + e1(81) + e1(65) + e1(82)
+    let cmp_write = e1(72) + e1(61) + e4(1) + e1(15) + e1(132)
+    let cmp_exit = e1(72) + e1(61) + e4(60) + e1(15) + e1(132)
+    let cmp_mmap = e1(72) + e1(61) + e4(9) + e1(15) + e1(132)
+    let cmp_clock = e1(72) + e1(61) + e4(228) + e1(15) + e1(132)
+    let default_case = e1(15) + e1(11)
+    let arm = str_len(cmp_write) + 4
+    let dispatch_end = 4 * arm + str_len(default_case)
+    let epilogue = e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(195)
+    let errno_tail = e1(115) + e1(3) + e1(72) + e1(247) + e1(216)
+
+    // write(fd=rdi, buf=rsi, len=rdx)：参数寄存器与 Linux 完全同形，任意 fd 直通
+    // write(fd=rdi, buf=rsi, len=rdx): argument registers match Linux exactly; every fd passes through
+    let write_case = mov_ri64(rax, 33554436) + e1(15) + e1(5) + errno_tail
+
+    // exit(code=rdi)：BSD exit 不返回；int3 兜底
+    // exit(code=rdi): BSD exit never returns; int3 as a guard
+    let exit_case = mov_ri64(rax, 33554433) + e1(15) + e1(5) + e1(204)
+
+    // mmap(addr=rdi, len=rsi, prot=rdx, flags=r10, fd, off)：第 4 参本就在
+    // r10，只换值为 MAP_ANON 0x1002（尾声弹回原 r10）；错误转负
+    // mmap(addr=rdi, len=rsi, prot=rdx, flags in r10, fd, off): the 4th arg is
+    // already in r10, so only its value changes to MAP_ANON 0x1002 (the
+    // epilogue restores the original r10); errors convert negative
+    let mmap_case = mov_ri64(rax, 33554629) + mov_ri64(r10, 4098) + e1(15) + e1(5) + errno_tail
+
+    // clock_gettime(clk_id=rdi, tp=rsi)：CLOCK_MONOTONIC 1→6；timespec 内存布局同形
+    // clock_gettime(clk_id=rdi, tp=rsi): CLOCK_MONOTONIC 1→6; the timespec memory layout matches
+    let clock_case = mov_ri64(rdi, 6) + mov_ri64(rax, 33554548) + e1(15) + e1(5) + errno_tail
+
+    let write_off = dispatch_end
+    let exit_off = write_off + str_len(write_case) + 5
+    let mmap_off = exit_off + str_len(exit_case)
+    let clock_off = mmap_off + str_len(mmap_case) + 5
+    let epi_off = clock_off + str_len(clock_case)
+    let jmp_epi_after_write = e1(233) + e4(epi_off - exit_off)
+    let jmp_epi_after_mmap = e1(233) + e4(epi_off - clock_off)
+    head + cmp_write + e4(write_off - arm) + cmp_exit + e4(exit_off - 2 * arm) + cmp_mmap + e4(mmap_off - 3 * arm) + cmp_clock + e4(clock_off - 4 * arm) + default_case + write_case + jmp_epi_after_write + exit_case + mmap_case + jmp_epi_after_mmap + clock_case + epilogue
+}

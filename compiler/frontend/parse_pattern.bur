@@ -1,0 +1,145 @@
+// parse_pattern.bur — 模式解析。
+// parse_pattern.bur — pattern parsing.
+
+import "burryn.dev/compiler/lib"
+
+// p_pattern 解析模式：通配/字面量/绑定/变体/record 模式
+// p_pattern parses patterns: wildcard, literal, binding, variant, record
+fn p_pattern(toks, mut pos) {
+    // 模式分派：record 模式/字面量/负数字面量/标识符（绑定、变体、通配）
+    // Pattern dispatch: record, literals, negated literals, identifiers
+    // (binding, variant, wildcard)
+    let tok = p_peek(toks, pos)
+    let t = tok_type(tok)
+    if t == t_record {
+        let rk = p_advance(toks, pos)
+        match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after record pattern") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        let mut names = []
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rbrace) {
+            let fname = match p_expect(toks, pos, t_ident, "field name in record pattern") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            push(names, tok_lex(fname))
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        let rb = match p_expect(toks, pos, t_rbrace, "'}' after record pattern fields") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        Ok(PatRecord(names, sp_union(sp_of_tok(rk), sp_of_tok(rb))))
+    } else if t == t_int || t == t_float || t == t_string || t == t_true || t == t_false {
+        let lit = match p_primary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        Ok(PatLiteral(lit, span_of(lit)))
+    } else if t == t_minus {
+        p_advance(toks, pos)
+        let lit = match p_primary(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match lit {
+            IntLit(n, lsp) => Ok(PatLiteral(IntLit(-n, lsp), sp_union(sp_of_tok(tok), lsp))),
+            FloatLit(f, lsp) => Ok(PatLiteral(FloatLit(-f, lsp), sp_union(sp_of_tok(tok), lsp))),
+            _ => perr("E1111", "", "'-' in pattern must precede a number", sp_of_tok(tok)),
+        }
+    } else if t == t_ident {
+        // 标识符模式：_ 通配；:: 限定变体；() 后接字段绑定
+        // Identifier patterns: _ wildcard; :: qualified variants; () binds fields
+        p_advance(toks, pos)
+        if tok_lex(tok) == "_" {
+            Ok(PatWildcard(sp_of_tok(tok)))
+        } else {
+            let mut pkg = ""
+            let mut enum_name = ""
+            let mut variant = tok_lex(tok)
+            let mut sp = sp_of_tok(tok)
+            if p_match(toks, pos, t_colon_colon) {
+                enum_name = tok_lex(tok)
+                let vtok = match p_expect(toks, pos, t_ident, "variant name after '::'") {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        lib::Token::Tok(0, "", 0, 0)
+                    },
+                }
+                variant = tok_lex(vtok)
+                sp = sp_union(sp, sp_of_tok(vtok))
+                if p_match(toks, pos, t_colon_colon) {
+                    pkg = enum_name
+                    enum_name = variant
+                    let vtok2 = match p_expect(toks, pos, t_ident, "variant name after '::'") {
+                        Ok(v) => v,
+                        Err(d) => {
+                            return Err(d)
+                            lib::Token::Tok(0, "", 0, 0)
+                        },
+                    }
+                    variant = tok_lex(vtok2)
+                    sp = sp_union(sp, sp_of_tok(vtok2))
+                }
+            }
+            if p_match(toks, pos, t_lparen) {
+                let mut binds = []
+                while !p_check(toks, pos, t_rparen) {
+                    let sub = match p_pattern(toks, pos) {
+                        Ok(v) => v,
+                        Err(d) => {
+                            return Err(d)
+                            NoNode
+                        },
+                    }
+                    let ok_sub = match sub {
+                        PatBinding(_, _) => true,
+                        PatWildcard(_) => true,
+                        _ => false,
+                    }
+                    if !ok_sub {
+                        return perr("E1112", "", "variant fields may only bind names or use '_'", span_of(sub))
+                    }
+                    push(binds, sub)
+                    if !p_match(toks, pos, t_comma) {
+                        break
+                    }
+                }
+                let rp = match p_expect(toks, pos, t_rparen, "')' after variant pattern") {
+                    Ok(v) => v,
+                    Err(d) => {
+                        return Err(d)
+                        lib::Token::Tok(0, "", 0, 0)
+                    },
+                }
+                Ok(PatVariant(pkg, enum_name, variant, binds, sp_union(sp, sp_of_tok(rp))))
+            } else if enum_name != "" {
+                Ok(PatVariant(pkg, enum_name, variant, [], sp))
+            } else {
+                Ok(PatBinding(variant, sp))
+            }
+        }
+    } else {
+        perr("E1113", "", "invalid pattern \"" + tok_lex(tok) + "\"", sp_of_tok(tok))
+    }
+}

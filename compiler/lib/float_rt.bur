@@ -7,6 +7,7 @@ let frt_TWO_52 = 4503599627370496
 let frt_INF_BITS = 9218868437227405312
 let frt_SIGN_BIT = 0 - 9223372036854775807 - 1
 
+
 fn frt_bi_zero() {
     let mut a = []
     let mut i = 0
@@ -312,189 +313,6 @@ fn frt_bi_to_u64(a) {
     a[0] + a[1] * frt_BASE
 }
 
-fn frt_pow10_int(k) {
-    let mut v = 1
-    let mut i = 0
-    while i < k {
-        v = v * 10
-        i = i + 1
-    }
-    v
-}
-
-fn frt_i64_decstr(v) {
-    if v == 0 {
-        return "0"
-    }
-    let mut s = ""
-    let mut x = v
-    while x > 0 {
-        s = chr(48 + x % 10) + s
-        x = x / 10
-    }
-    s
-}
-
-fn frt_zeros(n) {
-    let mut s = ""
-    let mut i = 0
-    while i < n {
-        s = s + "0"
-        i = i + 1
-    }
-    s
-}
-
-fn frt_rstrip_zeros(s) {
-    let mut n = str_len(s)
-    while n > 0 && char_at(s, n - 1) == "0" {
-        n = n - 1
-    }
-    substr(s, 0, n)
-}
-
-// ---- 十进制度量 ----
-
-// 比较 10^k 与 m*2^e：返回 frt_bi_cmp 语义（-1/0/1）
-fn frt_pow10_vs(m, e, k) {
-    let mut res = 0
-    if k >= 0 {
-        let mut p = frt_bi_pow10(k)
-        if e >= 0 {
-            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
-            frt_bi_shl_bits(v, e)
-            res = frt_bi_cmp(p, v)
-        } else {
-            frt_bi_shl_bits(p, 0 - e)
-            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
-            res = frt_bi_cmp(p, v)
-        }
-    } else {
-        let nk = 0 - k
-        if e >= 0 {
-            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
-            let mut i = 0
-            while i < nk {
-                frt_bi_mul_small(v, 10)
-                i = i + 1
-            }
-            frt_bi_shl_bits(v, e)
-            res = frt_bi_cmp(frt_bi_set_u64(frt_bi_zero(), 1), v)
-        } else {
-            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
-            let mut i = 0
-            while i < nk {
-                frt_bi_mul_small(v, 10)
-                i = i + 1
-            }
-            let mut d = frt_bi_set_u64(frt_bi_zero(), 1)
-            frt_bi_shl_bits(d, 0 - e)
-            res = frt_bi_cmp(d, v)
-        }
-    }
-    res
-}
-
-fn frt_exp10_of(m, e) {
-    let mut bl = 0
-    let mut v = m
-    while v > 0 {
-        v = v / 2
-        bl = bl + 1
-    }
-    let mut exp10 = (bl + e - 1) * 30103 / 100000
-    while frt_pow10_vs(m, e, exp10) == 1 {
-        exp10 = exp10 - 1
-    }
-    while frt_pow10_vs(m, e, exp10 + 1) == 0 - 1 {
-        exp10 = exp10 + 1
-    }
-    exp10
-}
-
-// ---- 有理数 → double bits（单次四舍五入，含次正规数）----
-fn frt_bi_rational_to_bits(num, den) {
-    if frt_bi_is_zero(num) == 1 {
-        return 0
-    }
-    let Ln = frt_bi_bitlen(num)
-    let Ld = frt_bi_bitlen(den)
-    let mut sh = 55 + Ld - Ln
-    let mut num2 = frt_bi_copy(num)
-    let mut den2 = frt_bi_copy(den)
-    if sh > 0 {
-        frt_bi_shl_bits(num2, sh)
-        {}
-    } else {
-        if sh < 0 {
-            frt_bi_shl_bits(den2, 0 - sh)
-            {}
-        }
-    }
-    let mut q = frt_bi_zero()
-    let r = frt_bi_divmod(num2, den2, q)
-    let bl = frt_bi_bitlen(q)
-    let e2 = bl - 1 - sh
-    if e2 >= 1024 {
-        return frt_INF_BITS
-    }
-    let mut target_bits = 53
-    let mut target_exp = e2 - 52
-    if e2 < 0 - 1022 {
-        if e2 + 1075 <= 0 {
-            let mut nb = frt_bi_copy(num)
-            frt_bi_shl_bits(nb, 1075)
-            if frt_bi_cmp(nb, den) > 0 {
-                return 1
-            }
-            return 0
-        }
-        target_bits = e2 + 1075
-        target_exp = 0 - 1074
-    }
-    let drop = bl - target_bits
-    let round_bit = frt_bi_bit(q, drop - 1)
-    let mut sticky = frt_bi_has_low_bits(q, drop - 1)
-    if frt_bi_is_zero(r) == 0 {
-        sticky = 1
-    }
-    let mut S = frt_bi_copy(q)
-    frt_bi_shr_bits(S, drop)
-    let mut up = 0
-    if round_bit == 1 {
-        if sticky == 1 {
-            up = 1
-        } else {
-            if frt_bi_bit(S, 0) == 1 {
-                up = 1
-            }
-        }
-    }
-    if up == 1 {
-        frt_bi_add_small(S, 1)
-        if frt_bi_bitlen(S) > target_bits {
-            frt_bi_shr_bits(S, 1)
-            target_exp = target_exp + 1
-            if target_exp == 0 - 1073 {
-                return 1 * frt_TWO_52
-            }
-        }
-    }
-    let mut out = 0
-    if target_exp >= 0 - 1022 {
-        if target_exp + 1075 >= 2047 {
-            out = frt_INF_BITS
-        } else {
-            let mant = frt_bi_to_u64(S) - frt_TWO_52
-            out = (target_exp + 1075) * frt_TWO_52 + mant
-        }
-    } else {
-        out = frt_bi_to_u64(S)
-    }
-    out
-}
-
-// ---- 解析字符串 → double bits ----
 fn frt_parse_float_bits(s) {
     let mut i = 0
     let mut j = str_len(s)
@@ -833,6 +651,189 @@ fn frt_assemble(digits, exp10, p, neg) {
     }
     out
 }
+
+fn frt_pow10_int(k) {
+    let mut v = 1
+    let mut i = 0
+    while i < k {
+        v = v * 10
+        i = i + 1
+    }
+    v
+}
+
+fn frt_i64_decstr(v) {
+    if v == 0 {
+        return "0"
+    }
+    let mut s = ""
+    let mut x = v
+    while x > 0 {
+        s = chr(48 + x % 10) + s
+        x = x / 10
+    }
+    s
+}
+
+fn frt_zeros(n) {
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        s = s + "0"
+        i = i + 1
+    }
+    s
+}
+
+fn frt_rstrip_zeros(s) {
+    let mut n = str_len(s)
+    while n > 0 && char_at(s, n - 1) == "0" {
+        n = n - 1
+    }
+    substr(s, 0, n)
+}
+
+// ---- 十进制度量 ----
+
+// 比较 10^k 与 m*2^e：返回 frt_bi_cmp 语义（-1/0/1）
+fn frt_pow10_vs(m, e, k) {
+    let mut res = 0
+    if k >= 0 {
+        let mut p = frt_bi_pow10(k)
+        if e >= 0 {
+            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
+            frt_bi_shl_bits(v, e)
+            res = frt_bi_cmp(p, v)
+        } else {
+            frt_bi_shl_bits(p, 0 - e)
+            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
+            res = frt_bi_cmp(p, v)
+        }
+    } else {
+        let nk = 0 - k
+        if e >= 0 {
+            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
+            let mut i = 0
+            while i < nk {
+                frt_bi_mul_small(v, 10)
+                i = i + 1
+            }
+            frt_bi_shl_bits(v, e)
+            res = frt_bi_cmp(frt_bi_set_u64(frt_bi_zero(), 1), v)
+        } else {
+            let mut v = frt_bi_set_u64(frt_bi_zero(), m)
+            let mut i = 0
+            while i < nk {
+                frt_bi_mul_small(v, 10)
+                i = i + 1
+            }
+            let mut d = frt_bi_set_u64(frt_bi_zero(), 1)
+            frt_bi_shl_bits(d, 0 - e)
+            res = frt_bi_cmp(d, v)
+        }
+    }
+    res
+}
+
+fn frt_exp10_of(m, e) {
+    let mut bl = 0
+    let mut v = m
+    while v > 0 {
+        v = v / 2
+        bl = bl + 1
+    }
+    let mut exp10 = (bl + e - 1) * 30103 / 100000
+    while frt_pow10_vs(m, e, exp10) == 1 {
+        exp10 = exp10 - 1
+    }
+    while frt_pow10_vs(m, e, exp10 + 1) == 0 - 1 {
+        exp10 = exp10 + 1
+    }
+    exp10
+}
+
+// ---- 有理数 → double bits（单次四舍五入，含次正规数）----
+fn frt_bi_rational_to_bits(num, den) {
+    if frt_bi_is_zero(num) == 1 {
+        return 0
+    }
+    let Ln = frt_bi_bitlen(num)
+    let Ld = frt_bi_bitlen(den)
+    let mut sh = 55 + Ld - Ln
+    let mut num2 = frt_bi_copy(num)
+    let mut den2 = frt_bi_copy(den)
+    if sh > 0 {
+        frt_bi_shl_bits(num2, sh)
+        {}
+    } else {
+        if sh < 0 {
+            frt_bi_shl_bits(den2, 0 - sh)
+            {}
+        }
+    }
+    let mut q = frt_bi_zero()
+    let r = frt_bi_divmod(num2, den2, q)
+    let bl = frt_bi_bitlen(q)
+    let e2 = bl - 1 - sh
+    if e2 >= 1024 {
+        return frt_INF_BITS
+    }
+    let mut target_bits = 53
+    let mut target_exp = e2 - 52
+    if e2 < 0 - 1022 {
+        if e2 + 1075 <= 0 {
+            let mut nb = frt_bi_copy(num)
+            frt_bi_shl_bits(nb, 1075)
+            if frt_bi_cmp(nb, den) > 0 {
+                return 1
+            }
+            return 0
+        }
+        target_bits = e2 + 1075
+        target_exp = 0 - 1074
+    }
+    let drop = bl - target_bits
+    let round_bit = frt_bi_bit(q, drop - 1)
+    let mut sticky = frt_bi_has_low_bits(q, drop - 1)
+    if frt_bi_is_zero(r) == 0 {
+        sticky = 1
+    }
+    let mut S = frt_bi_copy(q)
+    frt_bi_shr_bits(S, drop)
+    let mut up = 0
+    if round_bit == 1 {
+        if sticky == 1 {
+            up = 1
+        } else {
+            if frt_bi_bit(S, 0) == 1 {
+                up = 1
+            }
+        }
+    }
+    if up == 1 {
+        frt_bi_add_small(S, 1)
+        if frt_bi_bitlen(S) > target_bits {
+            frt_bi_shr_bits(S, 1)
+            target_exp = target_exp + 1
+            if target_exp == 0 - 1073 {
+                return 1 * frt_TWO_52
+            }
+        }
+    }
+    let mut out = 0
+    if target_exp >= 0 - 1022 {
+        if target_exp + 1075 >= 2047 {
+            out = frt_INF_BITS
+        } else {
+            let mant = frt_bi_to_u64(S) - frt_TWO_52
+            out = (target_exp + 1075) * frt_TWO_52 + mant
+        }
+    } else {
+        out = frt_bi_to_u64(S)
+    }
+    out
+}
+
 
 fn frt_format_g(m, e, p, neg) {
     let exp10 = frt_exp10_of(m, e)

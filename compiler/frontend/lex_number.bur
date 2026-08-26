@@ -1,0 +1,83 @@
+// lex_number.bur — 数字词法。
+// lex_number.bur — number lexing.
+
+
+
+// lex_number 扫描数字字面量：hex/二进制前缀 0x 0b（lexeme 原样保留，parser 端转换）、
+// 下划线分隔符（_ 后必须跟数字）、浮点小数点与指数（前瞻判断，避免吞掉标识符如 1e、1ex）。
+// lex_number scans number literals: hex/binary prefixes 0x 0b (lexeme kept verbatim,
+// converted by the parser),
+// underscore separators (a digit must follow '_'), float point and exponents
+// (lookahead so 1e/1ex stays an identifier).
+fn lex_number(src, mut st, mut toks, mut diags) {
+    let c0 = substr(src, st[1] - 1, 1)
+    let c1 = lex_peek(src, st)
+    if c0 == "0" && (c1 == "x" || c1 == "X" || c1 == "b" || c1 == "B") {
+        let is_hex = c1 == "x" || c1 == "X"
+        lex_bump(st)
+        let mut any = false
+        while true {
+            let ch = lex_peek(src, st)
+            if ch == "_" {
+                if !(is_hex && lex_is_hex(lex_peek2(src, st)) || !is_hex && (lex_peek2(src, st) == "0" || lex_peek2(src, st) == "1")) {
+                    lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+                }
+                lex_bump(st)
+            } else if is_hex && lex_is_hex(ch) || !is_hex && (ch == "0" || ch == "1") {
+                any = true
+                lex_bump(st)
+            } else {
+                break
+            }
+        }
+        if !any {
+            lex_fail(diags, st[0], st[1], "E1005", "write digits after the prefix, e.g. `0xFF`", "expected digits after " + substr(src, st[1] - 2, 2))
+        }
+        lex_emit(st, toks, t_int, substr(src, st[0], st[1] - st[0]))
+        return
+    }
+    while lex_is_digit(lex_peek(src, st)) || lex_peek(src, st) == "_" {
+        if lex_peek(src, st) == "_" {
+            if !lex_is_digit(lex_peek2(src, st)) {
+                lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+            }
+        }
+        lex_bump(st)
+    }
+    let mut is_float = false
+    if lex_peek(src, st) == "." && lex_is_digit(lex_peek2(src, st)) {
+        is_float = true
+        lex_bump(st)
+        while lex_is_digit(lex_peek(src, st)) || lex_peek(src, st) == "_" {
+            if lex_peek(src, st) == "_" && !lex_is_digit(lex_peek2(src, st)) {
+                lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+            }
+            lex_bump(st)
+        }
+    }
+    let ec = lex_peek(src, st)
+    if ec == "e" || ec == "E" {
+        let p1 = lex_peek2(src, st)
+        let p2 = substr(src, st[1] + 2, 1)
+        let exp = (p1 == "+" || p1 == "-") && lex_is_digit(p2) || lex_is_digit(p1)
+        if exp {
+            is_float = true
+            lex_bump(st)
+            if lex_peek(src, st) == "+" || lex_peek(src, st) == "-" {
+                lex_bump(st)
+            }
+            while lex_is_digit(lex_peek(src, st)) || lex_peek(src, st) == "_" {
+                if lex_peek(src, st) == "_" && !lex_is_digit(lex_peek2(src, st)) {
+                    lex_fail(diags, st[0], st[1], "E1005", "a digit must follow '_' in a number literal", "bad '_' in number")
+                }
+                lex_bump(st)
+            }
+        }
+    }
+    let word = substr(src, st[0], st[1] - st[0])
+    if is_float {
+        lex_emit(st, toks, t_float, word)
+    } else {
+        lex_emit(st, toks, t_int, word)
+    }
+}

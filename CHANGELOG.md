@@ -9,7 +9,7 @@ the day the window opened until the next seed-base tag. Latest first.
 版本号跟 `seed-base-N` tag（打 tag 后下一号为 `v0.(N+1)`），不走全局两日窗口。
 条目标题上的日期是该版本的跨度：从开窗到下一枚 seed-base 之前。最新在前。
 
-## v0.6 (2026-08-13 ~ 08-24)
+## v0.6 (2026-08-13 ~ 08-26)
 
 **Recorded IPC clauses, then settled them; landed capture and name-based records;
 stopped restating live status across docs** — SPEC keeps decisions, GOALS keeps
@@ -20,6 +20,16 @@ roadmap.
 SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口，README/tutorial
 跟可观察语义，CLAUDE.md 管闸门而不是第二份路线图。
 
+- **Changed:** Compiler sources split by concern under `frontend/`, `bytecode/`,
+  `backends/{c,x86}/`, `module/`, `tooling/`, and `lib/`; CLI helpers move to
+  `compiler/cli/` with a thin `main.bur` entry.
+- **变更：** 编译器按职责拆到 `frontend/`、`bytecode/`、`backends/{c,x86}/`、
+  `module/`、`tooling/`、`lib/`；CLI 辅助迁入 `compiler/cli/`，`main.bur` 只留入口。
+- **Fixed:** x86 select arm typing no longer stacks every recv value type; slot-held
+  closure calls resolve return types; unary neg/not replace the stack top; indirect
+  higher-order calls skip aggregate param/`sig_specs` pollution.
+- **修复：** x86 select 臂不再叠全部 recv 值类型；槽持闭包调用解析返回类型；一元
+  neg/not 替换栈顶类型；间接高阶调用跳过聚合轮形参/`sig_specs` 污染。
 - **Added:** SPEC `§6.3` formal clauses — `exec_start`/`exec_poll` pipe and
   collect-at-exit behavior (stdin inherited, no streaming), TCP loopback as the
   only bidirectional IPC with measured numbers (231 µs in-process, 1350–1550 µs
@@ -47,9 +57,13 @@ SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口
 - **Changed:** User-facing closure text in README and tutorial matches SPEC
   (copy-at-capture; `capture(ref)` for shared `mut`). grammar.md records
   shebang, labeled loops in `statement`, and `..` range in the expression EBNF.
-- **Fixed:** x86 pre-scan records `net_nb` as `Result<str,str>`; GET_FIELD
-  payload types stamp onto locals; link-slot seeding and enum payload merge;
-  `enum_mono` sentinel; `net_nb` would-block prints once.
+- **Fixed:** C runtime defines `bur_start_ns` (monotonic origin used by `clock`).
+- **修复：** C runtime 补上 `bur_start_ns` 定义（`clock` 用的单调时钟原点）。
+- **Fixed:** x86 PE shim calls `[dispatcher slot]`, emits one import descriptor per
+  DLL, keeps Win64 shadow space below saved registers, and fills GetStdHandle /
+  WriteFile / QPC arguments in the Win64 registers.
+- **修复：** x86 PE shim 经分派器槽间接调用；每个 DLL 一条导入描述符；Win64
+  影子空间在保存寄存器之下；GetStdHandle / WriteFile / QPC 按 Win64 填参。
 - **修复：** x86 预扫描把 `net_nb` 记成 `Result<str,str>`；GET_FIELD payload
   类型盖到 local；链接槽种子与枚举 payload 合并；`enum_mono` 哨兵；`net_nb`
   的 would-block 只打一行。

@@ -1,0 +1,47 @@
+// compile_upval.bur — upvalue 解析（CompileCtx）。
+// compile_upval.bur — upvalue resolution (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+
+fn add_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, index, is_local, is_mut, name, sp) {
+    let mut i = 0
+    while i < len(ctx.c_u_index[ch]) {
+        if ctx.c_u_index[ch][i] == index && ctx.c_u_islocal[ch][i] == is_local {
+            return Ok(i)
+        }
+        i = i + 1
+    }
+    if len(ctx.c_u_index[ch]) >= 255 {
+        return frontend::perr("E2004", "", "too many captured variables", sp)
+    }
+    push(ctx.c_u_index[ch], index)
+    push(ctx.c_u_islocal[ch], is_local)
+    push(ctx.c_u_mut[ch], is_mut)
+    push(ctx.c_u_name[ch], name)
+    ctx.f_nupvals[ctx.c_fn[ch]] = len(ctx.c_u_index[ch])
+    Ok(len(ctx.c_u_index[ch]) - 1)
+}
+fn resolve_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, name, sp) {
+    if ctx.c_enclosing[ch] < 0 {
+        return Ok(-1)
+    }
+    let enc = ctx.c_enclosing[ch]
+    let li = resolve_local(ctx.c_l_name, ctx.c_l_slot, enc, name)
+    if li >= 0 {
+        ctx.c_l_captured[enc][li] = true
+        return add_upvalue(ctx, ch, ctx.c_l_slot[enc][li], true, ctx.c_l_mut[enc][li], name, sp)
+    }
+    let ui = match resolve_upvalue(ctx, enc, name, sp) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            0
+        },
+    }
+    if ui >= 0 {
+        return add_upvalue(ctx, ch, ui, false, ctx.c_u_mut[enc][ui], name, sp)
+    }
+    Ok(-1)
+}

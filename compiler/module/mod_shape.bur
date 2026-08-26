@@ -1,0 +1,98 @@
+// mod_shape.bur — 包形状检查。
+// mod_shape.bur — package shape check.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// check_pkg_shape 包形状检查：pub 导出与 import 匹配
+// check_pkg_shape checks the package shape: pub exports match imports
+// check_pkg_shape 校验包形状：pub 导出与 import 使用一致
+// check_pkg_shape verifies the package shape: pub exports match imports
+fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
+    // 收集 pub 声明后与 import 引用对账
+    // Collect pub declarations, then reconcile against import references
+    let mut declared = map()
+    let mut declared_s = map()
+    let mut declared_e = map()
+    let mut fi = 0
+    while fi < len(files_stmts) {
+        let disp = file_paths[fi]
+        for s in files_stmts[fi] {
+            let mut name = ""
+            let mut name_sp = frontend::SpanT::Sp(0, 0)
+            match s {
+                frontend::Node::FnDecl(n, nsp, _, _, _) => {
+                    name = n
+                    name_sp = nsp
+                },
+                frontend::Node::EnumDecl(n, _, _, _, esp) => {
+                    name = n
+                    name_sp = esp
+                },
+                frontend::Node::ConstDecl(n, nsp, _, _, _, _) => {
+                    name = n
+                    name_sp = nsp
+                },
+                frontend::Node::LetStmt(n, nsp, _, _, _, init, _) => {
+                    name = n
+                    name_sp = nsp
+                    if !is_const_expr(init) {
+                        match frontend::span_of(init) {
+                            frontend::SpanT::Sp(is0, ie0) => {
+                                push(diags, lib::DiagT::Diag(true, "E0802", "package-level `let` must be initialized with a constant expression", "package-level `let` allows literals, arithmetic on literals, list literals, and `fn` literals; compute anything else inside a function", is0, ie0))
+                                push(dfiles, disp)
+                            },
+                        }
+                    }
+                },
+                _ => {
+                    match frontend::span_of(s) {
+                        frontend::SpanT::Sp(ss0, se0) => {
+                            push(diags, lib::DiagT::Diag(true, "E0801", "only declarations are allowed at the top level of a package file", "executable code lives inside functions; the program starts at `fn main`", ss0, se0))
+                            push(dfiles, disp)
+                        },
+                    }
+                },
+            }
+            if name != "" {
+                match get(declared, name) {
+                    Some(prev) => {
+                        let where_part = if prev != disp {
+                            " (first declared in " + prev + ")"
+                        } else {
+                            ""
+                        }
+                        let ps = match get(declared_s, name) {
+                            Some(x) => x,
+                            None => 0,
+                        }
+                        let pe = match get(declared_e, name) {
+                            Some(x) => x,
+                            None => 0,
+                        }
+                        match name_sp {
+                            frontend::SpanT::Sp(ns0, ne0) => {
+                                if prev == disp {
+                                    push(diags, lib::DiagT::DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [lib::LabelT::Lab(ps, pe, "first declared here")], []))
+                                } else {
+                                    push(diags, lib::DiagT::Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
+                                }
+                                push(dfiles, disp)
+                            },
+                        }
+                    },
+                    None => {
+                        put(declared, name, disp)
+                        match name_sp {
+                            frontend::SpanT::Sp(ns0, ne0) => {
+                                put(declared_s, name, ns0)
+                                put(declared_e, name, ne0)
+                            },
+                        }
+                    },
+                }
+            }
+        }
+        fi = fi + 1
+    }
+}

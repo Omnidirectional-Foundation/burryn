@@ -1,0 +1,51 @@
+// mod_parse.bur — bur.mod 解析。
+// mod_parse.bur — bur.mod parsing.
+
+import "burryn.dev/compiler/lib"
+
+// parse_bur_mod 解析 bur.mod 清单（模块路径 + 依赖）
+// parse_bur_mod parses a bur.mod manifest (module path + deps)
+fn parse_bur_mod(file, src, mut diags, mut dfiles) {
+    let mut path = ""
+    let mut off = 0
+    for line0 in split(src, "\n") {
+        let line_off = off
+        off = off + str_len(line0) + 1
+        let text = match str_index_of(line0, "//") {
+            Some(i) => substr(line0, 0, i),
+            None => line0,
+        }
+        let fields = str_fields(text)
+        if len(fields) > 0 {
+            let sp_start = line_off
+            let sp_end = line_off + str_len(text)
+            if fields[0] == "module" {
+                if len(fields) != 2 {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "malformed module directive", "write `module <path>`, e.g. `module example.com/you/hello`", sp_start, sp_end))
+                    push(dfiles, file)
+                } else if path != "" {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "duplicate module directive", "", sp_start, sp_end))
+                    push(dfiles, file)
+                } else if !valid_import_path(fields[1]) {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "invalid module path \"" + fields[1] + "\"", "", sp_start, sp_end))
+                    push(dfiles, file)
+                } else {
+                    path = fields[1]
+                }
+            } else if fields[0] == "require" {
+                if len(fields) != 3 || !valid_import_path(fields[1]) || !lib::str_has_prefix(fields[2], "v") {
+                    push(diags, lib::DiagT::Diag(true, "E0432", "malformed require directive", "write `require <path> <version>`", sp_start, sp_end))
+                    push(dfiles, file)
+                }
+            } else {
+                push(diags, lib::DiagT::Diag(true, "E0432", "unknown directive \"" + fields[0] + "\"", "bur.mod knows the directives `module` and `require`", sp_start, sp_end))
+                push(dfiles, file)
+            }
+        }
+    }
+    if path == "" && len(diags) == 0 {
+        push(diags, lib::DiagT::Diag(true, "E0432", "missing module directive in " + file, "add a module directive, e.g. `module example.com/you/hello`", 0, 0))
+        push(dfiles, file)
+    }
+    path
+}

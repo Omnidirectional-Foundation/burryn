@@ -1,0 +1,54 @@
+// pe_build_imp.bur — 构建导入表。
+// pe_build_imp.bur — build import table.
+
+
+
+// pe_build_imports 生成导入 blob；idata_off 是 blob 在内容内的起点
+// pe_build_imports builds the import blob; idata_off is the blob's content offset
+pub fn pe_build_imports(fns, idata_off) {
+    let n = len(fns)
+    let desc_sz = pe_import_desc_size(n)
+    let ilt_off = desc_sz
+    let iat_off = ilt_off + pe_ilt_size(n)
+    let hints_off = iat_off + pe_iat_size(n)
+    let dll_off = hints_off + pe_hints_size(fns)
+    let r = fn(off) {
+        e4(pe_content_rva(idata_off + off))
+    }
+    // hint/name 各项的 blob 内偏移 / per-entry hint/name offsets inside the blob
+    let mut hn = []
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        push(hn, hints_off + acc)
+        let raw = 2 + str_len(fns[i]) + 1
+        acc = acc + raw + raw % 2
+        i = i + 1
+    }
+    let mut blob = r(ilt_off) + e4(0) + e4(0) + r(dll_off) + r(iat_off)
+    blob = blob + e4(0) + e4(0) + e4(0) + e4(0) + e4(0)
+    let mut ii = 0
+    while ii < n {
+        blob = blob + e8(pe_content_rva(idata_off + hn[ii]))
+        ii = ii + 1
+    }
+    blob = blob + e8(0)
+    let mut ai = 0
+    while ai < n {
+        blob = blob + e8(pe_content_rva(idata_off + hn[ai]))
+        ai = ai + 1
+    }
+    blob = blob + e8(0)
+    let mut hi = 0
+    while hi < n {
+        let nm = fns[hi]
+        let raw = 2 + str_len(nm) + 1
+        blob = blob + e2(0) + nm + byte_chr(0)
+        if raw % 2 == 1 {
+            blob = blob + byte_chr(0)
+        }
+        hi = hi + 1
+    }
+    blob = blob + "kernel32.dll" + byte_chr(0) + byte_chr(0)
+    blob
+}

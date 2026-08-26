@@ -1,0 +1,38 @@
+// runtime_chan.bur — channel 调度块。
+// runtime_chan.bur — channel schedule blocks.
+
+
+
+// x86gen_chan_schedule_block 生成 schedule 子程序（rax=fiber → status=READY + ready 队尾入队）
+// x86gen_chan_schedule_block emits the schedule subroutine (rax=fiber -> status=READY and
+// append to the ready queue tail)
+fn x86gen_chan_schedule_block() {
+    // 入队段序 branch+EMPTY+jmpSET+NONEMPTY+SET（与 spawn 的 enqueue 同构）
+    let enq_set = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
+    let enq_nonempty = mov_mr(rcx, FB_READY_NEXT, rax)
+    let enq_to_set = jmp_rel32(str_len(enq_nonempty))
+    let enq_empty = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
+    let enq_branch = test_rr(rcx, rcx) + jne_rel32(str_len(enq_empty) + str_len(enq_to_set))
+    let set_ready = mov_ri64(rcx, FB_READY) + mov_mr(rax, FB_STATUS, rcx) + xor_rr(rcx, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
+    set_ready + mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0) + enq_branch + enq_empty + enq_to_set + enq_nonempty + enq_set + ret()
+}
+
+// x86gen_chan_wake_waiters_block 生成 wake_waiters 子程序（rax=ch → 遍历 waiters，
+// FBLOCKED_SELECT 的 schedule；结束后 nwait 清零；保留 rsi/rdi/rdx，毁 rax/rcx/r8/r9/r10）
+// x86gen_chan_wake_waiters_block emits the wake_waiters subroutine (rax=ch -> walk the
+// waiters, schedule every FBLOCKED_SELECT one, clear nwait afterwards; preserves
+// rsi/rdi/rdx, clobbers rax/rcx/r8/r9/r10)
+fn x86gen_chan_wake_waiters_block(sched_addr) {
+    let w_done = xor_rr(rcx, rcx) + mov_mr(rax, CH_NWAIT, rcx) + ret()
+    let w_adv = add_ri32(rsi, 8) + sub_ri32(rdi, 1)
+    let w_wake = mov_rr(rax, rdx) + mov_ri64(r8, sched_addr) + call_r(r8)
+    // 匹配（FB_BLOCKED_SELECT）顺序执行 w_wake；不匹配 jne 跳过 w_wake 落 w_adv
+    // a matching (FB_BLOCKED_SELECT) waiter falls through into w_wake; a non-matching
+    // one jumps over w_wake into w_adv
+    let w_check = mov_rm(rdx, rsi, 0) + mov_rm(rcx, rdx, FB_STATUS) + mov_ri64(r9, FB_BLOCKED_SELECT) + cmp_rr(rcx, r9) + jne_rel32(str_len(w_wake))
+    let w_loop = test_rr(rdi, rdi) + je_rel32(str_len(w_check) + str_len(w_wake) + str_len(w_adv) + 5) + w_check + w_wake + w_adv + jmp_rel32(0 - (str_len(w_check) + str_len(w_wake) + str_len(w_adv) + 13))
+    let w_init = mov_rm(rsi, rax, CH_WAITERS) + mov_rm(rdi, rax, CH_NWAIT)
+    w_init + w_loop + w_done
+}
+
+

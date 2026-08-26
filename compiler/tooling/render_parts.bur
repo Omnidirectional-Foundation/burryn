@@ -1,0 +1,56 @@
+// render_parts.bur — 诊断拼装。
+// render_parts.bur — diag assembly.
+
+import "burryn.dev/compiler/lib"
+
+// render_parts 渲染诊断各部分 / render_parts renders diagnostic parts
+fn render_parts(is_err, code, msg, help, s, e, file, labs, fixes) {
+    let mut parts = []
+    let kind = if is_err {
+        "error"
+    } else {
+        "warning"
+    }
+    push(parts, kind + "[" + code + "]: " + msg + "\n")
+    match read_file(file) {
+        Ok(src) => {
+            let starts = lib::line_starts(src)
+            snippet(parts, src, starts, file, s, e, "")
+            for lab in labs {
+                match lab {
+                    lib::LabelT::Lab(ls, le, ltext) => {
+                        push(parts, "note:\n")
+                        snippet(parts, src, starts, file, ls, le, ltext)
+                    },
+                }
+            }
+        },
+        Err(_) => {
+            push(parts, "  --> " + file + ":" + str(s) + ".." + str(e) + " (source unavailable)\n")
+        },
+    }
+    if help != "" {
+        push(parts, "  = help: " + help + "\n")
+    }
+    for fx in fixes {
+        match fx {
+            lib::FixT::Fix(_, _, rep, desc) => {
+                if rep == "" {
+                    push(parts, "  = fix: " + desc + "\n")
+                } else {
+                    push(parts, "  = fix: " + desc + ": `" + rep + "`\n")
+                }
+            },
+        }
+    }
+    join(parts, "")
+}
+
+// render_diag 是诊断渲染入口 / render_diag is the diagnostic render entry
+pub fn render_diag(d, file) {
+    let out = match d {
+        lib::DiagT::Diag(ie, code, msg, help, s, e) => render_parts(ie, code, msg, help, s, e, file, [], []),
+        lib::DiagT::DiagX(ie, code, msg, help, s, e, labs, fixes) => render_parts(ie, code, msg, help, s, e, file, labs, fixes),
+    }
+    substr(out, 0, str_len(out) - 1)
+}

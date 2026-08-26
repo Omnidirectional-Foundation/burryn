@@ -1,0 +1,249 @@
+// compile_match_arms.bur — match 臂代码生成（CompileCtx）。
+// compile_match_arms.bur — match-arm codegen (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// cp_match match 代码生成：变体测试（枚举身份 + tag）与字段提取，无哈希、无反射
+// cp_match codegens match: variant tests (enum identity + tag) and field
+// extraction, no hashing, no reflection
+fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, enum_by, en_prefix, en_vnames, en_varities, cur_pkg, cur_aliases, ch, scrut, arms, msp, cp_expr) {
+    begin_scope(ctx, ch)
+    match cp_expr(ch, scrut) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    match declare_local(ctx, ch, "(match)", false, msp) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let scrut_slot = ctx.c_l_slot[ch][n_locals(ctx.c_l_name, ch) - 1]
+
+    let mut end_jumps = []
+    for arm in arms {
+        match arm {
+            frontend::Node::MatchArm(pat, guard, body, asp) => {
+                let mut fail_j = -1
+                let mut guard_fail_j = -1
+                begin_scope(ctx, ch)
+                let mut arm_locals = 0
+
+                match pat {
+                    frontend::Node::PatWildcard(_) => {},
+                    frontend::Node::PatLiteral(v, _) => {
+                        emit(ctx, ch, lib::op_get_local, asp)
+                        emit_u16(ctx, ch, scrut_slot, asp)
+                        ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+                        match cp_expr(ch, v) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                        ctx.c_temps[ch] = ctx.c_temps[ch] - 1
+                        emit(ctx, ch, lib::op_eq, asp)
+                        fail_j = emit_jump(ctx, ch, lib::op_jump_if_false_pop, asp)
+                    },
+                    frontend::Node::PatBinding(name, _) => {
+                        let fv = find_variant(enum_by, en_prefix, en_vnames, cur_pkg, name)
+                        if fv[0] == -2 {
+                            return frontend::perr("E2014", "qualify it as Enum." + name, "variant \"" + name + "\" exists in several enums", asp)
+                        } else if fv[1] >= 0 && en_varities[fv[0]][fv[1]] == 0 {
+                            fail_j = match emit_variant_test(ctx, ch, fv[0], fv[1], scrut_slot, asp) {
+                                Ok(v) => v,
+                                Err(d) => {
+                                    return Err(d)
+                                    0
+                                },
+                            }
+                        } else if fv[1] >= 0 {
+                            return frontend::perr("E2017", "bind them: " + name + "(...)", "variant \"" + name + "\" has " + str(en_varities[fv[0]][fv[1]]) + " field(s)", asp)
+                        } else {
+                            emit(ctx, ch, lib::op_get_local, asp)
+                            emit_u16(ctx, ch, scrut_slot, asp)
+                            match declare_local(ctx, ch, name, false, asp) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return Err(d)
+                                },
+                            }
+                            arm_locals = arm_locals + 1
+                        }
+                    },
+                    frontend::Node::PatVariant(ppkg, penum, pvar, binds, _) => {
+                        let mut eh = -1
+                        let mut idx = -1
+                        if ppkg != "" {
+                            let apath = alias_path(cur_aliases, ppkg)
+                            let full = if apath != "" {
+                                apath + "." + penum
+                            } else {
+                                ppkg + "." + penum
+                            }
+                            eh = match get(enum_by, full) {
+                                Some(h) => h,
+                                None => -1,
+                            }
+                            if eh < 0 {
+                                return frontend::perr("E2015", "", "unknown enum \"" + full + "\"", asp)
+                            }
+                            let mut i = 0
+                            while i < len(en_vnames[eh]) {
+                                if en_vnames[eh][i] == pvar {
+                                    idx = i
+                                }
+                                i = i + 1
+                            }
+                            if idx < 0 {
+                                return frontend::perr("E2016", "", "enum \"" + full + "\" has no variant \"" + pvar + "\"", asp)
+                            }
+                        } else if penum != "" {
+                            eh = local_enum(enum_by, en_prefix, cur_pkg, penum)
+                            if eh < 0 {
+                                return frontend::perr("E2015", "", "unknown enum \"" + penum + "\"", asp)
+                            }
+                            let mut i = 0
+                            while i < len(en_vnames[eh]) {
+                                if en_vnames[eh][i] == pvar {
+                                    idx = i
+                                }
+                                i = i + 1
+                            }
+                            if idx < 0 {
+                                return frontend::perr("E2016", "", "enum \"" + penum + "\" has no variant \"" + pvar + "\"", asp)
+                            }
+                        } else {
+                            let fv = find_variant(enum_by, en_prefix, en_vnames, cur_pkg, pvar)
+                            if fv[0] == -2 {
+                                return frontend::perr("E2014", "qualify it as Enum." + pvar, "variant \"" + pvar + "\" exists in several enums", asp)
+                            }
+                            if fv[1] < 0 {
+                                return frontend::perr("E2016", "", "unknown variant \"" + pvar + "\"", asp)
+                            }
+                            eh = fv[0]
+                            idx = fv[1]
+                        }
+                        let arity = en_varities[eh][idx]
+                        if len(binds) != arity {
+                            return frontend::perr("E2017", "", "variant " + pvar + " has " + str(arity) + " field(s), pattern binds " + str(len(binds)), asp)
+                        }
+                        fail_j = match emit_variant_test(ctx, ch, eh, idx, scrut_slot, asp) {
+                            Ok(v) => v,
+                            Err(d) => {
+                                return Err(d)
+                                0
+                            },
+                        }
+                        let mut i = 0
+                        while i < len(binds) {
+                            let bname = match binds[i] {
+                                frontend::Node::PatBinding(bn, _) => bn,
+                                _ => "_",
+                            }
+                            if bname != "_" {
+                                emit(ctx, ch, lib::op_get_local, asp)
+                                emit_u16(ctx, ch, scrut_slot, asp)
+                                emit(ctx, ch, lib::op_get_field, asp)
+                                emit(ctx, ch, i, asp)
+                                match declare_local(ctx, ch, bname, false, asp) {
+                                    Ok(_) => {},
+                                    Err(d) => {
+                                        return Err(d)
+                                    },
+                                }
+                                arm_locals = arm_locals + 1
+                            }
+                            i = i + 1
+                        }
+                    },
+                    frontend::Node::PatRecord(names, _) => {
+                        for fname in names {
+                            emit(ctx, ch, lib::op_get_local, asp)
+                            emit_u16(ctx, ch, scrut_slot, asp)
+                            let cidx = add_const(ctx, ch, lib::CVal::CStr(fname))
+                            emit(ctx, ch, lib::op_get_field_name, asp)
+                            emit_u16(ctx, ch, cidx, asp)
+                            match declare_local(ctx, ch, fname, false, asp) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return Err(d)
+                                },
+                            }
+                            arm_locals = arm_locals + 1
+                        }
+                    },
+                    _ => {},
+                }
+
+                match guard {
+                    frontend::Node::NoNode => {},
+                    _ => {
+                        match cp_expr(ch, guard) {
+                            Ok(_) => {},
+                            Err(d) => {
+                                return Err(d)
+                            },
+                        }
+                        guard_fail_j = emit_jump(ctx, ch, lib::op_jump_if_false_pop, frontend::span_of(guard))
+                    },
+                }
+                match cp_expr(ch, body) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                if arm_locals > 0 {
+                    emit(ctx, ch, lib::op_end_block, asp)
+                    emit(ctx, ch, arm_locals, asp)
+                }
+                ctx.c_scope_depth[ch] = ctx.c_scope_depth[ch] - 1
+                while n_locals(ctx.c_l_name, ch) > 0 && ctx.c_l_depth[ch][n_locals(ctx.c_l_name, ch) - 1] > ctx.c_scope_depth[ch] {
+                    pop_local(ctx, ch)
+                }
+                push(end_jumps, emit_jump(ctx, ch, lib::op_jump, asp))
+                if guard_fail_j >= 0 {
+                    match patch_jump(ctx, ch, guard_fail_j) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    if arm_locals > 0 {
+                        emit(ctx, ch, lib::op_unit, asp)
+                        emit(ctx, ch, lib::op_end_block, asp)
+                        emit(ctx, ch, arm_locals, asp)
+                        emit(ctx, ch, lib::op_pop, asp)
+                    }
+                }
+                if fail_j >= 0 {
+                    match patch_jump(ctx, ch, fail_j) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    emit(ctx, ch, lib::op_no_match, msp)
+    for j in end_jumps {
+        match patch_jump(ctx, ch, j) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+    }
+    ctx.c_scope_depth[ch] = ctx.c_scope_depth[ch] - 1
+    pop_local(ctx, ch)
+    emit(ctx, ch, lib::op_end_block, msp)
+    emit(ctx, ch, 1, msp)
+    Ok(true)
+}

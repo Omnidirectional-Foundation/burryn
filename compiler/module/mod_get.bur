@@ -1,0 +1,67 @@
+// mod_get.bur — mod edit-require / get。
+// mod_get.bur — mod edit-require / get.
+
+import "burryn.dev/compiler/lib"
+
+// mod_edit_require 编辑 require 行 / mod_edit_require edits a require line
+pub fn mod_edit_require(text, path, version) {
+    let mut out = []
+    let mut hit = false
+    for line in split(text, "\n") {
+        let f = str_fields(line)
+        if len(f) >= 2 && f[0] == "require" && f[1] == path {
+            if !hit {
+                push(out, "require " + path + " " + version)
+                hit = true
+            }
+        } else {
+            push(out, line)
+        }
+    }
+    if !hit {
+        while len(out) > 0 && out[len(out) - 1] == "" {
+            let _ = pop(out)
+        }
+        push(out, "require " + path + " " + version)
+        push(out, "")
+    }
+    join(out, "\n")
+}
+
+// mod_get 添加依赖 / mod_get adds a dependency
+pub fn mod_get(dir, spec) {
+    let at = match str_index_of(spec, "@") {
+        Some(ix) => ix,
+        None => {
+            return Err("usage: bur get <path>@<version> (an explicit version is required)")
+            0
+        },
+    }
+    let path = substr(spec, 0, at)
+    let version = substr(spec, at + 1, str_len(spec) - at - 1)
+    if !valid_import_path(path) {
+        return Err("invalid module path \"" + path + "\"")
+    }
+    if !lib::str_has_prefix(version, "v") {
+        return Err("version must look like v1.2.3, got \"" + version + "\"")
+    }
+    if path == "std" || lib::str_has_prefix(path, "std/") {
+        return Err("std ships with the toolchain; it is never fetched")
+    }
+    let text = match read_file(dir + "/bur.mod") {
+        Ok(s) => s,
+        Err(m) => {
+            return Err("bur.mod: " + m)
+            ""
+        },
+    }
+    write_file(dir + "/bur.mod", mod_edit_require(text, path, version))?
+    match mvs_resolve_fetch(dir) {
+        Ok(_) => {},
+        Err(m) => {
+            let _ = write_file(dir + "/bur.mod", text)
+            return Err(m)
+        },
+    }
+    mod_sum_sync(dir)
+}

@@ -1,0 +1,77 @@
+// compile_for_chan.bur — channel for-in（CompileCtx）。
+// compile_for_chan.bur — channel for-in (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+fn cp_for_chan(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, iter, body, sp, cp_expr, cp_stmt) {
+    begin_scope(ctx, ch)
+    match cp_expr(ch, iter) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    match declare_local(ctx, ch, "(chan)", false, sp) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let chan_slot = ctx.c_l_slot[ch][n_locals(ctx.c_l_name, ch) - 1]
+
+    let cond_start = code_len(ctx, ch)
+    push_loop(ctx, ch, next_slot(ctx, ch), cond_start)
+
+    emit(ctx, ch, lib::op_get_local, sp)
+    emit_u16(ctx, ch, chan_slot, sp)
+    let exit_j = emit_jump(ctx, ch, lib::op_chan_next, sp)
+
+    begin_scope(ctx, ch)
+    match declare_local(ctx, ch, v, false, sp) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    match body {
+        frontend::Node::Block(ss, _) => {
+            for s in ss {
+                match cp_stmt(ch, s) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+            }
+        },
+        _ => {},
+    }
+    end_scope(ctx, ch, sp)
+
+    match emit_loop(ctx, ch, cond_start, sp) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+
+    match patch_jump(ctx, ch, exit_j) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let li = len(ctx.c_lp_breaks[ch]) - 1
+    for j in ctx.c_lp_breaks[ch][li] {
+        match patch_jump(ctx, ch, j) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+    }
+    pop_loop(ctx, ch)
+    end_scope(ctx, ch, sp)
+    Ok(true)
+}

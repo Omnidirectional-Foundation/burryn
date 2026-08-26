@@ -1,0 +1,136 @@
+// emit_enum_fmt.bur — 枚举格式化发射。
+// emit_enum_fmt.bur — enum format emit.
+
+import "burryn.dev/compiler/lib"
+
+// x86gen_enum_format_at 生成枚举格式化：variant 名 + 字段（str 加引号）
+// x86gen_enum_format_at emits enum formatting: variant name plus fields (str quoted)
+fn x86gen_enum_format_at(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, off, eh, vts) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    // pass 1: 按运行时 variant 索引计算长度（每个 variant 独立块 + 分发链）
+    // pass 1: compute the length for the runtime variant index
+    // (per-variant blocks plus a dispatch chain)
+    let mut lblocks = []
+    let mut vi1 = 0
+    while vi1 < len(vts) {
+        let vname = enum_variant_name(ctx, eh, vi1)
+        let fts = vts[vi1]
+        let mut lb = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+        if len(fts) == 0 {
+            lb = lb + mov_ri64(rcx, str_len(vname))
+        } else {
+            lb = lb + mov_ri64(rcx, 2 + str_len(vname))
+        }
+        let mut fi1 = 0
+        while fi1 < len(fts) {
+            if fi1 > 0 {
+                lb = lb + add_ri32(rcx, 2)
+            }
+            if fts[fi1] == "str" {
+                lb = lb + mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+            } else if fts[fi1] == "float" {
+                // float 字段长度 = 调用注入的 format_float(bits) 所得 str 的长度；保存 r10/r11/rcx 现场
+                // float field length comes from the injected format_float(bits) result;
+                // preserve r10/r11/rcx
+                lb = lb + push_r(r10) + push_r(r11) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r10) + add_rr(rcx, rsi)
+            } else {
+                let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+                let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+                lb = lb + mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+            }
+            lb = lb + add_ri32(r10, 8)
+            fi1 = fi1 + 1
+        }
+        push(lblocks, lb)
+        vi1 = vi1 + 1
+    }
+    // 长度分发链：每块 = [jne skip][lb][jmp end]；alloc 跟在最后块后
+    // length dispatch: each block = [jne skip][lb][jmp end]; alloc follows the last block
+    let mut lchain = ""
+    let mut li = 0
+    while li < len(lblocks) {
+        let mut ltail = 0
+        let mut lj = li + 1
+        while lj < len(lblocks) {
+            ltail = ltail + 10 + 3 + 6 + str_len(lblocks[lj]) + 5
+            lj = lj + 1
+        }
+        lchain = lchain + mov_ri64(rdx, li) + cmp_rr(r11, rdx) + jne_rel32(str_len(lblocks[li]) + 5) + lblocks[li] + jmp_rel32(ltail)
+        li = li + 1
+    }
+    // 分配缓冲
+    // allocate the buffer
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9)
+    // pass 2: 按运行时 variant 索引写对应文本
+    // pass 2: write the text for the runtime variant index
+    let mut p2 = ""
+    let mut wblocks = []
+    let mut vi2 = 0
+    while vi2 < len(vts) {
+        let vname = enum_variant_name(ctx, eh, vi2)
+        let fts = vts[vi2]
+        let mut wb = ""
+        let mut nb2 = 0
+        while nb2 < str_len(vname) {
+            wb = wb + mb(byte_at(vname, nb2)) + add_ri32(rdi, 1)
+            nb2 = nb2 + 1
+        }
+        wb = wb + mb(40) + add_ri32(rdi, 1)
+        let mut fi2 = 0
+        while fi2 < len(fts) {
+            if fi2 > 0 {
+                wb = wb + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+            }
+            if fts[fi2] == "str" {
+                wb = wb + mov_rm(rax, r10, 0) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+            } else if fts[fi2] == "float" {
+                // float 字段：调用 format_float(bits) 得 str，拷入输出缓冲；保存 r10/r11/rdi 现场
+                // float field: call format_float(bits), copy the str into the output buffer;
+                // preserve r10/r11/rdi
+                wb = wb + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + rep_movsb()
+            } else {
+                wb = wb + mov_rm(rdx, r10, 0) + int_write
+            }
+            wb = wb + add_ri32(r10, 8)
+            fi2 = fi2 + 1
+        }
+        wb = wb + mb(41) + add_ri32(rdi, 1)
+        if len(fts) == 0 {
+            wb = wb + sub_ri32(rdi, 2)
+        }
+        push(wblocks, wb)
+        vi2 = vi2 + 1
+    }
+    // 拼接：variant 索引分发（[jne skip][block][jmp end][skip:] 链）
+    // dispatch on the variant index ([jne skip][block][jmp end][skip:] chain)
+    let load_v = mov_rm(rax, r15, off) + mov_rm(r11, rax, 8)
+    let mut wchain = ""
+    let mut wi = 0
+    while wi < len(wblocks) {
+        // 计算本块之后所有后续块的完整长度（每个后续块 = mov(10) + cmp(3) + jne(6) + block + jmp(5)）
+        // tail length after this block: each later block contributes mov(10) + cmp(3) + jne(6)
+        // + block + jmp(5)
+        let mut wtail = 0
+        let mut wj = wi + 1
+        while wj < len(wblocks) {
+            wtail = wtail + 10 + 3 + 6 + str_len(wblocks[wj]) + 5
+            wj = wj + 1
+        }
+        wchain = wchain + mov_ri64(rdx, wi) + cmp_rr(r11, rdx) + jne_rel32(str_len(wblocks[wi]) + 5) + wblocks[wi] + jmp_rel32(wtail)
+        wi = wi + 1
+    }
+    let p2h = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+    let p2t = pop_r(r9) + mov_mr(r15, off, r9)
+    load_v + lchain + alloc + p2h + wchain + p2t
+}
+
+

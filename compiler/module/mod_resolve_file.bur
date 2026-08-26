@@ -1,0 +1,55 @@
+// mod_resolve_file.bur — 文件级类型解析。
+// mod_resolve_file.bur — file-level type resolve.
+
+import "burryn.dev/compiler/frontend"
+
+// resolve_file_tes 解析文件中的类型表达式 / resolve_file_tes resolves type expressions in a file
+fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
+    let mut out = []
+    for s in stmts {
+        match s {
+            frontend::Node::EnumDecl(name, params, variants, is_pub, sp) => {
+                let mut rvars = []
+                for vd in variants {
+                    match vd {
+                        frontend::Node::EnumVariantDecl(vn, ar, vtypes, vsp) => {
+                            let mut rts = []
+                            for te in vtypes {
+                                push(rts, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                            }
+                            push(rvars, frontend::Node::EnumVariantDecl(vn, ar, rts, vsp))
+                        },
+                        _ => push(rvars, vd),
+                    }
+                }
+                push(out, frontend::Node::EnumDecl(name, params, rvars, is_pub, sp))
+            },
+            frontend::Node::FnDecl(name, nsp, is_pub, lit, sp) => {
+                match lit {
+                    frontend::Node::FnLit(params, muts, pspans, param_tys, ret_ty, body, fname, crefs, lsp) => {
+                        let mut rparam_tys = []
+                        for te in param_tys {
+                            push(rparam_tys, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                        }
+                        let rret_ty = match ret_ty {
+                            frontend::Node::NoNode => frontend::Node::NoNode,
+                            te => resolve_te(te, aliases, mod_path, disp, diags, dfiles),
+                        }
+                        push(out, frontend::Node::FnDecl(name, nsp, is_pub, frontend::Node::FnLit(params, muts, pspans, rparam_tys, rret_ty, body, fname, crefs, lsp), sp))
+                    },
+                    _ => push(out, s),
+                }
+            },
+            frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, init, sp) => {
+                match init {
+                    frontend::Node::TEName(_, _, _, _, _) => push(out, frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend::Node::TEList(_, _) => push(out, frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    frontend::Node::TEFn(_, _, _) => push(out, frontend::Node::LetStmt(name, nsp, is_mut, is_pub, ty, resolve_te(init, aliases, mod_path, disp, diags, dfiles), sp)),
+                    _ => push(out, s),
+                }
+            },
+            _ => push(out, s),
+        }
+    }
+    out
+}

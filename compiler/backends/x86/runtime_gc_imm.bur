@@ -1,0 +1,32 @@
+// runtime_gc_imm.bur — gc_rec_imm/record。
+// runtime_gc_imm.bur — gc_rec_imm/record.
+
+
+
+// gc_rec_imm 立即数版本 / gc_rec_imm is the immediate-size variant
+fn gc_rec_imm(ptr_reg, size) {
+    gc_rec(ptr_reg, mov_ri64(rsi, size))
+}
+
+// x86gen_gc_record 生成 gc_record 子程序（rdi=ptr, rsi=size，写入分配表，超阈值触发回收）
+// x86gen_gc_record emits the gc_record subroutine (rdi=ptr, rsi=size; appends to the alloc table,
+// collects past the threshold)
+fn x86gen_gc_record() {
+    // 保存 r10/r11：阈值触发的 gc_collect 会经 mark_addr 改写 r11（返回 size），分配点跨调用存活的
+    // 对象指针常驻 r11；保存全部被 collect 破坏的寄存器，调用方无需关心
+    let push3 = push_r(rdx) + push_r(rdi) + push_r(rsi) + push_r(rax) + push_r(rcx) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11)
+    let load_cnt = mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rax, rax, 0)
+    let recs_base = mov_ri64(rcx, rt_slot(rt_gc_recs)) + mov_rm(rcx, rcx, 0) + mov_rr(r9, rcx)
+    let rec_idx = mov_rr(r8, rax) + add_rr(r8, r8) + add_rr(r8, rax) + mov_ri32(rcx, 3) + shl_rcl(r8) + mov_rr(rcx, r9) + add_rr(rcx, r8)
+    let rec_write = mov_mr(rcx, 0, rdi) + mov_mr(rcx, 8, rsi) + xor_rr(r9, r9) + mov_mr(rcx, 16, r9)
+    let cnt_inc = add_ri32(rax, 1) + mov_ri64(rcx, rt_slot(rt_gc_cnt)) + mov_mr(rcx, 0, rax)
+    let rec_body = recs_base + rec_idx + rec_write + cnt_inc
+    let ret_path = pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rcx) + pop_r(rax) + pop_r(rsi) + pop_r(rdi) + pop_r(rdx) + ret()
+    let cc_load = mov_rm(rdi, rsp, 56) + mov_rm(rsi, rsp, 48)
+    let cc_call = mov_ri64(r8, rt_slot(rt_gc_collect_fn)) + mov_rm(r8, r8, 0) + call_r(r8)
+    let cc_mov2 = mov_rm(rdi, rsp, 56) + mov_rm(rsi, rsp, 48)
+    let thr_check = mov_ri64(rcx, rt_slot(rt_gc_threshold)) + mov_rm(r9, rcx, 0) + cmp_rr(rax, r9) + jg_rel32(str_len(ret_path))
+    let cap_check = mov_ri64(rcx, GC_RECS_CAP) + cmp_rr(rax, rcx) + jae_rel32(str_len(rec_body) + str_len(thr_check) + str_len(ret_path))
+    let cc_retry = cc_mov2 + jmp_rel32(0 - (str_len(load_cnt) + str_len(cap_check) + str_len(rec_body) + str_len(thr_check) + str_len(ret_path) + str_len(cc_load) + str_len(cc_call) + str_len(cc_mov2) + 5))
+    push3 + load_cnt + cap_check + rec_body + thr_check + ret_path + cc_load + cc_call + cc_retry
+}

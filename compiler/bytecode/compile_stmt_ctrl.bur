@@ -1,0 +1,77 @@
+// compile_stmt_ctrl.bur — for / break / continue / label（CompileCtx）。
+// compile_stmt_ctrl.bur — for/break/continue/label (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+fn cp_for_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, chan_fors, cur_file, ch, v, idx, iter, body, sp, cp_expr, cp_stmt) {
+    let fstart = match sp {
+        frontend::SpanT::Sp(fs, _) => fs,
+    }
+    if contains(chan_fors, cur_file + ":" + str(fstart)) {
+        cp_for_chan(ctx, ch, v, iter, body, sp, cp_expr, cp_stmt)
+    } else {
+        cp_for(ctx, ch, v, idx, iter, body, sp, cp_expr, cp_stmt)
+    }
+}
+
+fn cp_break_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
+    let li = if lb == "" {
+        match unwind_to_loop(ctx, ch, sp) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                0
+            },
+        }
+    } else {
+        match labeled_loop(ctx, ch, lb, sp) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                0
+            },
+        }
+    }
+    push(ctx.c_lp_breaks[ch][li], emit_jump(ctx, ch, lib::op_jump, sp))
+    Ok(true)
+}
+
+fn cp_continue_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
+    let li = if lb == "" {
+        match unwind_to_loop(ctx, ch, sp) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                0
+            },
+        }
+    } else {
+        match labeled_loop(ctx, ch, lb, sp) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                0
+            },
+        }
+    }
+    if ctx.c_lp_contto[ch][li] >= 0 {
+        emit_loop(ctx, ch, ctx.c_lp_contto[ch][li], sp)
+    } else {
+        push(ctx.c_lp_conts[ch][li], emit_jump(ctx, ch, lib::op_jump, sp))
+        Ok(true)
+    }
+}
+
+fn cp_label_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, inner, cp_stmt) {
+    let saved = ctx.c_lbl_pending[ch]
+    ctx.c_lbl_pending[ch] = lb
+    match cp_stmt(ch, inner) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    ctx.c_lbl_pending[ch] = saved
+    Ok(true)
+}

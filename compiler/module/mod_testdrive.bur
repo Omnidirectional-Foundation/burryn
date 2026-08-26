@@ -1,0 +1,65 @@
+// mod_testdrive.bur — 测试发现与加载。
+// mod_testdrive.bur — test discovery and loading.
+
+import "burryn.dev/compiler/frontend"
+
+// load_module_test 是测试加载入口 / load_module_test is the test load entry
+pub fn load_module_test(dir0, rel, test_fn) {
+    match load_module_opts(dir0, rel) {
+        ModFailed(d, f) => ModFailed(d, f),
+        ModLoaded(ld, lf, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let ei = len(pkgs_stmts) - 1
+            let mut np_stmts = []
+            let mut np_fpaths = []
+            let mut np_imports = []
+            let mut np_lstarts = []
+            let mut pi = 0
+            while pi < len(pkgs_stmts) {
+                if pi == ei {
+                    let mut fstmts = []
+                    let mut fpaths = []
+                    let mut fimps = []
+                    let mut flstarts = []
+                    let mut fi = 0
+                    while fi < len(pkgs_stmts[pi]) {
+                        let mut kept = []
+                        for s in pkgs_stmts[pi][fi] {
+                            match s {
+                                frontend::Node::FnDecl(n, _, _, _, _) => {
+                                    if n != "main" {
+                                        push(kept, s)
+                                    }
+                                },
+                                _ => push(kept, s),
+                            }
+                        }
+                        push(fstmts, kept)
+                        push(fpaths, pkgs_fpaths[pi][fi])
+                        push(fimps, pkgs_imports[pi][fi])
+                        push(flstarts, pkgs_lstarts[pi][fi])
+                        fi = fi + 1
+                    }
+                    let z = frontend::SpanT::Sp(0, 0)
+                    let call = frontend::Node::ExprStmt(frontend::Node::Call(frontend::Node::Ident(test_fn, z), [], z), z)
+                    let lit = frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, frontend::Node::Block([call], z), "main", [], z)
+                    push(fstmts, [frontend::Node::FnDecl("main", z, false, lit, z)])
+                    push(fpaths, "<test:" + test_fn + ">")
+                    push(fimps, [])
+                    push(flstarts, [0])
+                    push(np_stmts, fstmts)
+                    push(np_fpaths, fpaths)
+                    push(np_imports, fimps)
+                    push(np_lstarts, flstarts)
+                } else {
+                    push(np_stmts, pkgs_stmts[pi])
+                    push(np_fpaths, pkgs_fpaths[pi])
+                    push(np_imports, pkgs_imports[pi])
+                    push(np_lstarts, pkgs_lstarts[pi])
+                }
+                pi = pi + 1
+            }
+            ModLoaded(ld, lf, pkg_paths, np_stmts, np_fpaths, np_imports, pkg_ids, np_lstarts)
+        },
+    }
+}
+

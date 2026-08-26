@@ -1,0 +1,35 @@
+// runtime_start.bur — 调度启动。
+// runtime_start.bur — scheduler start.
+
+
+
+// x86gen_start 生成 _start：mmap 堆 + 设置寄存器约定 + 建主 fiber（fake frame + 入队）+
+// 进入调度器；main 从 jtable[0] 弹出 / x86gen_start emits _start: mmap the heap, set the
+// register conventions, build the main fiber (fake frame + enqueue), enter the scheduler;
+// main is popped from jtable[0]
+fn x86gen_start(nfn, n_globals, sched_addr, done_addr) {
+    // 队列入队段序：jne+EMPTY+jmpSET+NONEMPTY+SET；jne 目标 NONEMPTY = len(EMPTY)+len(jmpSET)
+    let set_tail = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_mr(rax, 0, r11)
+    let nonempty = mov_mr(rax, FB_READY_NEXT, r11)
+    let to_set = jmp_rel32(str_len(nonempty))
+    let empty_head = mov_ri64(rax, rt_slot(rt_ready_head)) + mov_mr(rax, 0, r11)
+    let branch = test_rr(rax, rax) + jne_rel32(str_len(empty_head) + str_len(to_set))
+    // fake frame：[rsp]=main 入口（jtable[0]），[rsp+8]=done 块；保存的 saved_rsp 含此两槽，
+    // resume 后第一次 ret 弹 main 入口，main 返回时 ret 弹 done 块
+    let fake_frame = sub_ri32(rsp, 16) + mov_ri64(rax, done_addr) + mov_mr(rsp, 8, rax) + mov_rm(rax, r13, 0) + mov_mr(rsp, 0, rax)
+    // fb 建设：r11 = fb（gc_rec 保护 r11），bump r12；status 清零为 READY
+    let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + gc_rec(r11, mov_ri32(rsi, FB_SIZE)) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx)
+    // ctx 保存：saved_rsp = fake frame 后（含两槽），rsp 下方的 prologue 由 resume 后函数自身建立
+    let ctx_save = mov_rr(rcx, rsp) + mov_mr(r11, FB_RSP, rcx) + mov_rr(rcx, rbp) + mov_mr(r11, FB_RBP, rcx) + mov_rr(rcx, r14) + mov_mr(r11, FB_R14, rcx) + mov_rr(rcx, r15) + mov_mr(r11, FB_R15, rcx) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx)
+    let ready_join = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + branch + empty_head + to_set + nonempty + set_tail
+    // 主纤程栈下探：Windows 只在距 rsp 一页内自动扩展栈，直接写 1MB 下方
+    // 会踩未提交的 guard 页；逐页触碰（每页 4096B，共 256 页）强制按序提交，
+    // 结束时 r15 = r14 = rsp - 1048576，与直减路径终态一致。
+    // Main-fiber stack probing: Windows only grows the stack within one page of
+    // rsp, so storing straight at rsp-1MB faults on an uncommitted guard page;
+    // touching page by page (4096B steps, 256 pages) commits them in order and
+    // leaves r15 = r14 = rsp - 1048576, matching the plain-subtract path.
+    let probe_body = sub_ri32(r15, 4096) + e1(65) + e1(198) + e1(7) + e1(0) + e1(77) + e1(57) + e1(247) + e1(117) + e1(240)
+    let regs_set = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
+}

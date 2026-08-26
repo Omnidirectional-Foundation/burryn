@@ -1,0 +1,34 @@
+// natives_sleep.bur — sleep / stdin / nonblock。
+// natives_sleep.bur — sleep / stdin / nonblock.
+
+
+
+// x86gen_sleep_native 内联 sleep：nanosleep syscall，毫秒精度
+// x86gen_sleep_native inlines sleep: the nanosleep syscall, millisecond precision
+// sleep inline: timer-table park with a deadline; sleep(0) is a plain yield (matching
+// the C runtime's bur_schedule + bur_switch_to_sched)
+fn x86gen_sleep_native(sched_addr, timer_add_addr) {
+    let unit_ret = xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let park_save = mov_mr(rdi, FB_RSP, rsp) + mov_mr(rdi, FB_RBP, rbp) + mov_mr(rdi, FB_R14, r14) + mov_mr(rdi, FB_R15, r15)
+    let park_tail = mov_ri64(r8, sched_addr) + jmp_r(r8)
+    let park_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(park_save) + str_len(park_tail)) + push_r(r8)
+    let set_status = mov_ri64(r8, FB_BLOCKED_TIMER) + mov_mr(rdi, FB_STATUS, r8)
+    let timer_add_call = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_ri64(r8, timer_add_addr) + call_r(r8)
+    let timer_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rcx, rsp, 0) + mov_ri64(r8, 1000000000) + imul_rr(rcx, r8) + mov_rm(r8, rsp, 8) + add_rr(rcx, r8) + add_rr(rdx, rcx) + mov_rr(rax, rdx) + add_ri32(rsp, 16)
+    let timer_deadline = mov_rr(rax, r9) + mov_ri64(rcx, 1000000) + imul_rr(rax, rcx) + mov_rr(rdx, rax)
+    let timer_path = timer_deadline + timer_now + timer_add_call + set_status + park_push + park_save + park_tail
+    let y_join = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
+    let y_first = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
+    let y_to_join = jmp_rel32(str_len(y_join))
+    let y_tail_link = mov_mr(rcx, FB_READY_NEXT, rax)
+    let y_branch = test_rr(rcx, rcx) + je_rel32(str_len(y_tail_link) + str_len(y_to_join))
+    let y_tail = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0)
+    let y_set_ready = xor_rr(rcx, rcx) + mov_mr(rax, FB_STATUS, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
+    let y_cur = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0)
+    let y_save = mov_mr(rax, FB_RSP, rsp) + mov_mr(rax, FB_RBP, rbp) + mov_mr(rax, FB_R14, r14) + mov_mr(rax, FB_R15, r15)
+    let yield_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(y_save) + str_len(y_set_ready) + str_len(y_tail) + str_len(y_branch) + str_len(y_tail_link) + str_len(y_to_join) + str_len(y_first) + str_len(y_join) + str_len(mov_ri64(r8, 0)) + str_len(jmp_r(r8))) + push_r(r8)
+    let yield_seq = y_cur + yield_push + y_save + y_set_ready + y_tail + y_branch + y_tail_link + y_to_join + y_first + y_join + mov_ri64(r8, sched_addr) + jmp_r(r8)
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jg_rel32(str_len(yield_seq)) + yield_seq + timer_path + unit_ret
+    head
+}
+

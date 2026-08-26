@@ -1,0 +1,103 @@
+// mod_testwalk.bur — 测试发现。
+// mod_testwalk.bur — test discovery.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// test_walk 遍历测试目录 / test_walk walks the test directory
+pub fn test_walk(root) {
+    let mut acc = ["."]
+    // walk 递归遍历 / walk recurses
+    fn walk(rel) {
+        let dir = if rel == "" {
+            root
+        } else {
+            root + "/" + rel
+        }
+        match read_dir(dir) {
+            Ok(names) => {
+                for n in sorted_strs(names) {
+                    if !lib::str_has_prefix(n, ".") {
+                        let sub = if rel == "" {
+                            n
+                        } else {
+                            rel + "/" + n
+                        }
+                        match read_dir(root + "/" + sub) {
+                            Ok(_) => {
+                                if !file_exists(root + "/" + sub + "/bur.mod") {
+                                    push(acc, sub)
+                                    walk(sub)
+                                }
+                            },
+                            Err(_) => {},
+                        }
+                    }
+                }
+            },
+            Err(_) => {},
+        }
+    }
+    walk("")
+    acc
+}
+
+// test_discover 发现测试 / test_discover discovers tests
+pub fn test_discover(dir) {
+    let entries = match read_dir(dir) {
+        Ok(es) => es,
+        Err(m) => {
+            return Err("cannot read " + dir + ": " + m)
+            []
+        },
+    }
+    let mut tfiles = []
+    for n in entries {
+        if str_ends_with(n, "_test.bur") {
+            push(tfiles, n)
+        }
+    }
+    let mut names = []
+    for fname in sorted_strs(tfiles) {
+        let disp = dir + "/" + fname
+        let src = match lsp_overlay_read(disp) {
+            Ok(s) => s,
+            Err(m) => {
+                return Err("cannot read " + disp + ": " + m)
+                ""
+            },
+        }
+        match frontend::lex(src) {
+            lib::LexOut::Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    return Err(disp + " has lex errors; run `bur check " + dir + "`")
+                }
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            return Err(disp + " has parse errors; run `bur check " + dir + "`")
+                        }
+                        for s in stmts {
+                            match s {
+                                frontend::Node::FnDecl(n, _, _, flit, _) => {
+                                    if lib::str_has_prefix(n, "test_") {
+                                        match flit {
+                                            frontend::Node::FnLit(ps, _, _, _, _, _, _, _, _) => {
+                                                if len(ps) == 0 {
+                                                    push(names, n)
+                                                }
+                                            },
+                                            _ => {},
+                                        }
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+    Ok(names)
+}

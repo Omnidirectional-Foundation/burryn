@@ -1,0 +1,66 @@
+// cli/fmt.bur — fmt 子命令。
+// cli/fmt.bur — fmt subcommand.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+// fmt_cmd 处理 fmt 子命令：文件/目录/stdin 与 --check
+// fmt_cmd handles the fmt subcommand: file/dir/stdin and --check
+pub fn fmt_cmd(rest) {
+    let mut check_only = false
+    let mut targets = []
+    for a in rest {
+        if a == "--check" {
+            check_only = true
+        } else {
+            push(targets, a)
+        }
+    }
+    if len(targets) == 0 {
+        usage()
+        exit(exit_usage)
+    }
+    let mut state = [0, 0]
+    for t in targets {
+        if t == "-" {
+            fmt_stdin(state)
+        } else if ends_with(t, ".bur") {
+            fmt_one(t, check_only, state)
+        } else {
+            fmt_dir(strip_trailing_slash(t), check_only, state)
+        }
+    }
+    if state[1] > 0 || check_only && state[0] > 0 {
+        exit(exit_static)
+    }
+}
+
+// fmt_source 格式化单个源码 / fmt_source formats one source
+fn fmt_source(path, src, mut state) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
+            if len(ldiags) > 0 {
+                let _ = emit_errors(ldiags, path, false)
+                state[1] = 1
+                return None
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if len(pdiags) > 0 {
+                        let _ = emit_errors(pdiags, path, false)
+                        state[1] = 1
+                        return None
+                    }
+                    match tooling::format_verified(stmts, src, comments) {
+                        Ok(out) => Some(out),
+                        Err(msg) => {
+                            eprintln("internal error: " + msg)
+                            exit(4)
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+

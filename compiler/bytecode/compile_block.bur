@@ -1,0 +1,84 @@
+// compile_block.bur — 块语句代码生成（CompileCtx + cp_stmt 回调）。
+// compile_block.bur — block stmt codegen (CompileCtx + cp_stmt callback).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+fn cp_block_stmts(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, blk, cp_stmt) {
+    begin_scope(ctx, ch)
+    match blk {
+        frontend::Node::Block(ss, bsp) => {
+            for s in ss {
+                match cp_stmt(ch, s) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+            }
+            end_scope(ctx, ch, bsp)
+        },
+        _ => {},
+    }
+    Ok(true)
+}
+
+fn cp_block_expr(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, blk, cp_expr, cp_stmt) {
+    begin_scope(ctx, ch)
+    match blk {
+        frontend::Node::Block(ss, bsp) => {
+            let n = len(ss)
+            let mut produced = false
+            let mut i = 0
+            while i < n {
+                let s = ss[i]
+                let last_expr = if i == n - 1 {
+                    match s {
+                        frontend::Node::ExprStmt(_, _) => true,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+                if last_expr {
+                    match s {
+                        frontend::Node::ExprStmt(e, _) => {
+                            match cp_expr(ch, e) {
+                                Ok(_) => {},
+                                Err(d) => {
+                                    return Err(d)
+                                },
+                            }
+                            produced = true
+                        },
+                        _ => {},
+                    }
+                } else {
+                    match cp_stmt(ch, s) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                }
+                i = i + 1
+            }
+            if !produced {
+                let last_diverges = if n > 0 {
+                    match ss[n - 1] {
+                        frontend::Node::BreakStmt(_, _) => true,
+                        frontend::Node::ReturnStmt(_, _) => true,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+                if !last_diverges {
+                    emit(ctx, ch, lib::op_unit, bsp)
+                }
+            }
+            end_scope_expr(ctx, ch, bsp)
+        },
+        _ => Ok(true),
+    }
+}

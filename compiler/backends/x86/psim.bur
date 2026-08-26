@@ -1,0 +1,1516 @@
+// psim.bur — x86 预扫描 type shadow（psim）；自 x86gen_program_to_buf 提升。
+// psim.bur — x86 type-shadow pre-scan (psim); lifted from x86gen_program_to_buf.
+
+import "burryn.dev/compiler/lib"
+
+    // psim 预扫单函数体模拟：aggregate=true 写入共享类型表（多轮传播），
+    // aggregate=false 纯读（per-signature 返回类型查询）。返回模拟的返回类型。
+    // psim pre-scans one function body: aggregate=true writes the shared type tables
+    // (multi-round propagation); aggregate=false is read-only (per-signature ret lookup).
+// X86Ctx 结构见 x86gen_program_to_buf 构造处 / see the X86Ctx construction in x86gen_program_to_buf
+fn psim(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_depth) {
+        let pcode = ctx.f_code[ptfh]
+        let mut pret_type = ""
+        let mut pshadow_ps = []
+        let mut ptshadow_ps = []
+        let mut ppos_types = []
+        let mut ppos_auth = []
+        let mut p_local_sub = []
+        let mut p_pending_sub = -1
+        let mut pcur_variant = -1
+        let mut pcur_enum_eh = -1
+        let pa_ps = ctx.f_arity[ptfh]
+        let mut pseed = 0
+        while pseed < pa_ps + 1 {
+            push(pshadow_ps, "")
+            push(ptshadow_ps, "")
+            pseed = pseed + 1
+        }
+        let mut pseed2 = 0
+        while pseed2 < pa_ps + 1 {
+            push(ppos_types, "")
+            push(ppos_auth, false)
+            pseed2 = pseed2 + 1
+        }
+        let mut pp = 1
+        while pp < pa_ps + 1 {
+            if pp - 1 < len(param_types) {
+                ppos_types[pp] = param_types[pp - 1]
+            }
+            ppos_auth[pp] = true
+            pp = pp + 1
+        }
+        let mut p_depth_at = map()
+        let mut pit = 0
+        let mut p_dead = false
+        while pit < len(pcode) {
+            if p_dead && pcode[pit] != lib::op_no_match {
+                match get(pt_target_shadow, str(ptfh) + ":" + str(pit)) {
+                    Some(pss) => {
+                        pshadow_ps = cp_ps(pss[0])
+                        ptshadow_ps = cp_ps(pss[1])
+                        p_dead = false
+                    },
+                    None => {},
+                }
+            }
+            let pal = match get(p_depth_at, pit) {
+                Some(pd) => pd,
+                None => 0 - 1,
+            }
+            if pal >= 0 && pcode[pit] != lib::op_no_match {
+                while len(pshadow_ps) > pal {
+                    shadow_pop(pshadow_ps, 1)
+                }
+                while len(ptshadow_ps) > pal {
+                    shadow_pop(ptshadow_ps, 1)
+                }
+            }
+            if p_dead {
+                pit = pit + inst_len(ctx, ptfh, pcode, pit)
+                continue
+            }
+            let pop = pcode[pit]
+            if pop == lib::op_return {
+                if len(ptshadow_ps) > 0 {
+                    pret_type = merge_enum_ann(pret_type, ptshadow_ps[len(ptshadow_ps) - 1])
+                    if aggregate {
+                        ctx.fn_ret_type[ptfh] = merge_enum_ann(ctx.fn_ret_type[ptfh], pret_type)
+                    }
+                }
+                // 直接返回参数：返回类型跟随实参类型（多态函数异构调用修正）
+                // Direct param return: ret type follows the arg type (fixes hetero polymorphic calls)
+                let mut pret_param = 0 - 1
+                if len(pshadow_ps) > 0 {
+                    let pt = pshadow_ps[len(pshadow_ps) - 1]
+                    if str_len(pt) > 5 && substr(pt, 0, 5) == "slot:" {
+                        match parse_int(substr(pt, 5, str_len(pt) - 5)) {
+                            Some(psn) => {
+                                if psn >= 1 && psn <= pa_ps {
+                                    pret_param = psn - 1
+                                }
+                            },
+                            None => {},
+                        }
+                    }
+                }
+                if aggregate {
+                    ctx.fn_ret_param[ptfh] = pret_param
+                }
+            } else if pop == lib::op_const {
+                let pval = ctx.f_consts[ptfh][read_u16(pcode, pit + 1)]
+                match pval {
+                    lib::CVal::CStr(_) => {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "str")
+                    },
+                    lib::CVal::CEnumType(peh) => {
+                        push(pshadow_ps, "enumtype")
+                        push(ptshadow_ps, "enum:e" + str(peh))
+                    },
+                    lib::CVal::CSingleton(peh, pvi) => {
+                        push(pshadow_ps, "ctor:" + str(peh) + ":" + str(pvi))
+                        push(ptshadow_ps, "enum:e" + str(peh) + "#" + str(pvi) + ":")
+                    },
+                    lib::CVal::CCtor(peh, pvi) => {
+                        push(pshadow_ps, "ctor:" + str(peh) + ":" + str(pvi))
+                        push(ptshadow_ps, "enum")
+                    },
+                    lib::CVal::CFloat(_) => {
+                        push(pshadow_ps, "float")
+                        push(ptshadow_ps, "float")
+                    },
+                    _ => {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, "int")
+                    },
+                }
+            } else if pop == lib::op_get_local {
+                let pslot = read_u16(pcode, pit + 1)
+                if pslot == 0 {
+                    push(pshadow_ps, ctx.f_name[ptfh])
+                    push(ptshadow_ps, "")
+                } else {
+                    push(pshadow_ps, "slot:" + str(pslot))
+                    if p_pending_sub >= 0 {
+                        if pslot >= len(p_local_sub) || p_local_sub[pslot] < 0 {
+                            if len(p_local_sub) <= pslot {
+                                while len(p_local_sub) <= pslot {
+                                    push(p_local_sub, -1)
+                                }
+                            }
+                            p_local_sub[pslot] = p_pending_sub
+                        }
+                        p_pending_sub = -1
+                    }
+                    // 未初始化的 local（如 match 的 (match) 临时）采用当前栈顶类型并回写
+                    // an uninitialized local (e.g. a match's (match) temp) takes the current
+                    // stack-top type and writes it back
+                    let mut pstype = ""
+                    if pslot < len(ppos_types) && str_len(ppos_types[pslot]) > 0 {
+                        pstype = ppos_types[pslot]
+                        if len(ptshadow_ps) > 0 {
+                            let ptop = ptshadow_ps[len(ptshadow_ps) - 1]
+                            if pslot == len(ptshadow_ps) - 1 && is_enum_enc(ptop) && ptop != pstype {
+                                pstype = ptop
+                                ppos_types[pslot] = ptop
+                            } else if pslot == len(ptshadow_ps) - 1 && is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
+                                pstype = ptop
+                                ppos_types[pslot] = ptop
+                            }
+                        }
+                    } else if pslot < len(ppos_auth) && ppos_auth[pslot] {
+                        pstype = ""
+                    } else if len(ptshadow_ps) > 0 && pslot == len(ptshadow_ps) - 1 {
+                        pstype = ptshadow_ps[len(ptshadow_ps) - 1]
+                        if pslot >= len(ppos_types) {
+                            while len(ppos_types) <= pslot {
+                                push(ppos_types, "")
+                            }
+                        }
+                        ppos_types[pslot] = pstype
+                    }
+                    push(ptshadow_ps, pstype)
+                }
+            } else if pop == lib::op_set_local {
+                let pslot = read_u16(pcode, pit + 1)
+                if pslot > 0 && len(ptshadow_ps) > 0 {
+                    if len(ppos_types) <= pslot {
+                        while len(ppos_types) <= pslot {
+                            push(ppos_types, "")
+                        }
+                    }
+                    ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
+                    if len(ppos_auth) <= pslot {
+                        while len(ppos_auth) <= pslot {
+                            push(ppos_auth, false)
+                        }
+                    }
+                    ppos_auth[pslot] = true
+                    if p_pending_sub >= 0 {
+                        if len(p_local_sub) <= pslot {
+                            while len(p_local_sub) <= pslot {
+                                push(p_local_sub, -1)
+                            }
+                        }
+                        p_local_sub[pslot] = p_pending_sub
+                        p_pending_sub = -1
+                    }
+                }
+            } else if pop == lib::op_get_global {
+                let pidx = read_u16(pcode, pit + 1)
+                let pname = const_str(ctx, ptfh, pidx)
+                push(pshadow_ps, pname)
+                let pgtype = if find_fn_by_name(ctx.f_name, pname) >= 0 {
+                    ""
+                } else if contains(lib::native_names, pname) {
+                    "native:" + pname
+                } else {
+                    match get(ctx.global_type, pname) {
+                        Some(pt) => pt,
+                        None => "",
+                    }
+                }
+                push(ptshadow_ps, pgtype)
+            } else if pop == lib::op_set_global {
+                // 重绑定全局（如 saved = fn(){...}）必须刷新 global_type，
+                // 否则 closure:N 静态解析钉在旧闭包上
+                // rebinding a global (e.g. saved = fn(){...}) must refresh
+                // global_type, or closure:N static resolution pins the old closure
+                if aggregate && len(ptshadow_ps) > 0 {
+                    let psg_idx = read_u16(pcode, pit + 1)
+                    let psg_name = const_str(ctx, ptfh, psg_idx)
+                    put(ctx.global_type, psg_name, ptshadow_ps[len(ptshadow_ps) - 1])
+                }
+            } else if pop == lib::op_def_global {
+                let pdt = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let pdidx = read_u16(pcode, pit + 1)
+                let pdname = const_str(ctx, ptfh, pdidx)
+                if aggregate {
+                    put(ctx.global_type, pdname, pdt)
+                }
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+            } else if pop == lib::op_pop {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+            } else if pop == lib::op_pop_n {
+                shadow_pop(pshadow_ps, pcode[pit + 1])
+                shadow_pop(ptshadow_ps, pcode[pit + 1])
+            } else if pop == lib::op_end_block {
+                let pn_eb = pcode[pit + 1]
+                let presult = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    "int"
+                }
+                let presname = if len(pshadow_ps) > 0 {
+                    pshadow_ps[len(pshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, pn_eb + 1)
+                shadow_pop(ptshadow_ps, pn_eb + 1)
+                push(pshadow_ps, presname)
+                push(ptshadow_ps, presult)
+                let plive = len(ptshadow_ps)
+                let mut pci = plive
+                while pci < len(ppos_types) {
+                    ppos_types[pci] = ""
+                    if pci < len(ppos_auth) {
+                        ppos_auth[pci] = false
+                    }
+                    pci = pci + 1
+                }
+            } else if pop == lib::op_call {
+                let pn = pcode[pit + 1]
+                let mut pcallee = if len(pshadow_ps) > pn {
+                    pshadow_ps[len(pshadow_ps) - pn - 1]
+                } else {
+                    ""
+                }
+                let mut pcallee_t = if len(ptshadow_ps) > pn {
+                    ptshadow_ps[len(ptshadow_ps) - pn - 1]
+                } else {
+                    ""
+                }
+                if str_len(pcallee_t) > 7 && substr(pcallee_t, 0, 7) == "native:" {
+                    pcallee = substr(pcallee_t, 7, str_len(pcallee_t) - 7)
+                    pcallee_t = ""
+                }
+                let mut p_arg_t = []
+                let mut p_arg_s = []
+                let mut pca = 0
+                while pca < pn {
+                    push(p_arg_t, ptshadow_ps[len(ptshadow_ps) - pn + pca])
+                    push(p_arg_s, pshadow_ps[len(pshadow_ps) - pn + pca])
+                    pca = pca + 1
+                }
+                shadow_pop(pshadow_ps, pn + 1)
+                shadow_pop(ptshadow_ps, pn + 1)
+                if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "ctor:" {
+                    // 预扫 ctor：按 eh:vi 注册字段类型 / pre-scan ctor: register field types by eh:vi
+                    let pctor_rest = substr(pcallee, 5, str_len(pcallee) - 5)
+                    let pctor_eh = match str_index_of(pctor_rest, ":") {
+                        Some(pcei) => match parse_int(substr(pctor_rest, 0, pcei)) {
+                            Some(pcev) => pcev,
+                            None => 0,
+                        },
+                        None => 0,
+                    }
+                    let pctor_vi = match str_index_of(pctor_rest, ":") {
+                        Some(pcei) => match parse_int(substr(pctor_rest, pcei + 1, str_len(pctor_rest) - pcei - 1)) {
+                            Some(pciv) => pciv,
+                            None => 0,
+                        },
+                        None => 0,
+                    }
+                    if aggregate {
+                        put(ctx.enum_variant_types, "v:" + str(pctor_eh) + ":" + str(pctor_vi), p_arg_t)
+                    }
+                    let mut pann = "enum:e" + str(pctor_eh) + "#" + str(pctor_vi) + ":"
+                    let mut paji = 0
+                    while paji < len(p_arg_t) {
+                        if paji > 0 {
+                            pann = pann + ","
+                        }
+                        pann = pann + p_arg_t[paji]
+                        paji = paji + 1
+                    }
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, pann)
+                } else if pcallee == "substr" || pcallee == "chr" || pcallee == "char_at" || pcallee == "byte_chr" || pcallee == "str" || pcallee == "type_of" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "str")
+                } else if pcallee == "range" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "list-int")
+                } else if pcallee == "chan" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "chan")
+                } else if pcallee == "map" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "map")
+                } else if pcallee == "keys" {
+                    let mk = if pn >= 1 {
+                        map_key_type(p_arg_t[0])
+                    } else {
+                        ""
+                    }
+                    push(pshadow_ps, "")
+                    if mk == "str" {
+                        push(ptshadow_ps, "list-str")
+                    } else {
+                        push(ptshadow_ps, "list-int")
+                    }
+                } else if pcallee == "put" || pcallee == "get" || pcallee == "delete" {
+                    let mt = if pn >= 1 {
+                        p_arg_t[0]
+                    } else {
+                        ""
+                    }
+                    let kt = if pn >= 2 {
+                        p_arg_t[1]
+                    } else {
+                        ""
+                    }
+                    let vt = if pcallee == "put" && pn >= 3 {
+                        p_arg_t[2]
+                    } else {
+                        ""
+                    }
+                    let refined = if pcallee == "put" {
+                        refine_map_arg(mt, kt, vt)
+                    } else {
+                        refine_map_arg(mt, kt, "")
+                    }
+                    let mslot = if pn >= 1 {
+                        p_arg_s[0]
+                    } else {
+                        ""
+                    }
+                    if str_len(mslot) > 5 && substr(mslot, 0, 5) == "slot:" {
+                        match parse_int(substr(mslot, 5, str_len(mslot) - 5)) {
+                            Some(sn) => {
+                                if sn > 0 {
+                                    if len(ppos_types) <= sn {
+                                        while len(ppos_types) <= sn {
+                                            push(ppos_types, "")
+                                        }
+                                    }
+                                    ppos_types[sn] = merge_type(ppos_types[sn], refined)
+                                    if sn <= pa_ps {
+                                        if aggregate {
+                                            ctx.fn_param_types[ptfh][sn - 1] = merge_type(ctx.fn_param_types[ptfh][sn - 1], refined)
+                                        }
+                                    }
+                                }
+                            },
+                            None => {},
+                        }
+                    } else if str_len(mslot) > 0 {
+                        let pg_cur = match get(ctx.global_type, mslot) {
+                            Some(pgt) => pgt,
+                            None => "",
+                        }
+                        if aggregate {
+                            put(ctx.global_type, mslot, merge_type(pg_cur, refined))
+                        }
+                    }
+                    push(pshadow_ps, "")
+                    if pcallee == "get" {
+                        let pv_kind = map_val_type(mt)
+                        if pv_kind == "" {
+                            push(ptshadow_ps, "enum")
+                        } else {
+                            push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Option", [[pv_kind]]))
+                        }
+                    } else {
+                        push(ptshadow_ps, "unit")
+                    }
+                } else if pcallee == "push" {
+                    // 预扫 push：按元素类型更新 mut list 的 slot/全局类型，保证函数返回类型正确
+                    // pre-scan push: update the mut-list slot/global type from the element type
+                    let pelem = if pn >= 2 {
+                        p_arg_t[1]
+                    } else {
+                        "int"
+                    }
+                    let pis_known = pelem == "str" || pelem == "int" || pelem == "float" || pelem == "bool" || pelem == "unit" || is_list_type(pelem) || is_map_type(pelem) || is_record_type(pelem) || is_enum_enc(pelem) || str_len(pelem) > 4 && substr(pelem, 0, 4) == "tup:"
+                    if pis_known {
+                        let pltag = "list-" + pelem
+                        let pslot = if pn >= 1 {
+                            p_arg_s[0]
+                        } else {
+                            ""
+                        }
+                        if str_len(pslot) > 5 && substr(pslot, 0, 5) == "slot:" {
+                            match parse_int(substr(pslot, 5, str_len(pslot) - 5)) {
+                                Some(sn) => {
+                                    if sn > 0 {
+                                        if len(ppos_types) <= sn {
+                                            while len(ppos_types) <= sn {
+                                                push(ppos_types, "")
+                                            }
+                                        }
+                                        if len(ppos_auth) <= sn {
+                                            while len(ppos_auth) <= sn {
+                                                push(ppos_auth, false)
+                                            }
+                                        }
+                                        ppos_types[sn] = merge_type(ppos_types[sn], pltag)
+                                        // 标记权威：push 已确定元素类型，栈顶启发式不得覆写
+                                        // mark authoritative: push fixed the element type; the
+                                        // stack-top heuristic must not overwrite it
+                                        ppos_auth[sn] = true
+                                    }
+                                },
+                                None => {},
+                            }
+                        } else if str_len(pslot) > 0 {
+                            let pg_cur = match get(ctx.global_type, pslot) {
+                                Some(pgt) => pgt,
+                                None => "",
+                            }
+                            if aggregate {
+                                put(ctx.global_type, pslot, merge_type(pg_cur, pltag))
+                            }
+                        }
+                    }
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "unit")
+                } else if pcallee == "tcp_listen" || pcallee == "tcp_accept" || pcallee == "tcp_dial" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["int"], ["str"]]))
+                } else if pcallee == "net_read" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["str"], ["str"]]))
+                } else if pcallee == "net_write" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["unit"], ["str"]]))
+                } else if pcallee == "net_close" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "unit")
+                } else if pcallee == "net_nb" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["str"], ["str"]]))
+                } else if pcallee == "read_file" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["str"], ["str"]]))
+                } else if pcallee == "stdin_nb" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["str"], ["str"]]))
+                } else if pcallee == "write_file" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["unit"], ["str"]]))
+                } else if pcallee == "read_dir" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Result", [["list-str"], ["str"]]))
+                } else if pcallee == "exec" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, ctx.res_out_enc)
+                } else if pcallee == "exec_start" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, ctx.res_int_enc)
+                } else if pcallee == "exec_poll" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, ctx.opt_res_enc)
+                } else if pcallee == "str_index_of" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Option", [["int"]]))
+                } else if pcallee == "parse_int" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Option", [["int"]]))
+                } else if pcallee == "split" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "list-str")
+                } else if pcallee == "concat" || pcallee == "slice" {
+                    let clt = if pn >= 1 {
+                        p_arg_t[0]
+                    } else {
+                        "list"
+                    }
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, clt)
+                } else if pcallee == "len" || pcallee == "str_len" || pcallee == "trunc" || pcallee == "float_bits" || pcallee == "ord" || pcallee == "byte_at" {
+                    // 整数返回的原生调用此前落入匿名回退，被标成实参类型（如 list-str），
+                    // 导致后续按错误类型转换/打印
+                    // integer-returning natives previously fell into the anonymous
+                    // fallback and inherited the argument type (e.g. list-str), making
+                    // later conversion/printing dereference raw ints
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pcallee == "to_float" || pcallee == "clock" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "float")
+                } else if pcallee == "parse_float" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc_ctx(ctx, "Option", [["float"]]))
+                } else if pcallee == "contains" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "bool")
+                } else if pcallee == "trim" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "str")
+                } else if pcallee == "args" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "list-str")
+                } else if pcallee == "yield" || pcallee == "sleep" || pcallee == "close" || pcallee == "gc" || pcallee == "assert" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "unit")
+                } else {
+                    let mut phandle = find_fn_by_name(ctx.f_name, pcallee)
+                    if phandle < 0 {
+                        match get(ctx.method_full_map, pcallee) {
+                            Some(mh) => {
+                                phandle = mh
+                            },
+                            None => {},
+                        }
+                    }
+                    if phandle < 0 {
+                        if str_len(pcallee_t) > 8 && substr(pcallee_t, 0, 8) == "closure:" && str_len(pcallee) == 0 {
+                            match parse_int(substr(pcallee_t, 8, str_len(pcallee_t) - 8)) {
+                                Some(cts) => {
+                                    if cts >= 0 && cts < ctx.nfn {
+                                        phandle = cts
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                    }
+                    if phandle >= 0 {
+                        if aggregate {
+                            let mut pff = 0
+                            while pff < pn && pff < len(ctx.fn_param_types[phandle]) {
+                                ctx.fn_param_types[phandle][pff] = merge_type(ctx.fn_param_types[phandle][pff], p_arg_t[pff])
+                                pff = pff + 1
+                            }
+                        }
+                        if pn >= 1 {
+                            let mut psig_known = true
+                            let mut psig_parts = []
+                            let mut psx = 0
+                            let mut psig_any = false
+                            while psx < pn {
+                                if str_len(p_arg_t[psx]) == 0 {
+                                    psig_known = false
+                                } else {
+                                    psig_any = true
+                                }
+                                push(psig_parts, p_arg_t[psx])
+                                psx = psx + 1
+                            }
+                            if psig_known || psig_any {
+                                let pkey = psig_key(phandle, psig_parts)
+                                let pseen = match get(ctx.sig_specs, pkey) {
+                                    Some(_) => true,
+                                    None => false,
+                                }
+                                if !pseen {
+                                    put(ctx.sig_specs, pkey, p_arg_t)
+                                    ctx.p_sig_grew[0] = true
+                                }
+                            }
+                        }
+                        let mut pbb = 0
+                        while pbb < pn && pbb < len(ctx.fn_param_types[phandle]) {
+                            let bslot = p_arg_s[pbb]
+                            let ctype = ctx.fn_param_types[phandle][pbb]
+                            if str_len(bslot) > 5 && substr(bslot, 0, 5) == "slot:" {
+                                match parse_int(substr(bslot, 5, str_len(bslot) - 5)) {
+                                    Some(sn) => {
+                                        if sn > 0 {
+                                            if len(ppos_types) <= sn {
+                                                while len(ppos_types) <= sn {
+                                                    push(ppos_types, "")
+                                                }
+                                            }
+                                            ppos_types[sn] = merge_type(ppos_types[sn], ctype)
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            } else if str_len(bslot) > 0 {
+                                // 全局实参反查：被调参数类型回流升级全局类型
+                                // global arg back-lookup: a callee param type promotes the global type
+                                match get(ctx.global_type, bslot) {
+                                    Some(pgt) => {
+                                        if str_len(pgt) >= 4 && substr(pgt, 0, 4) == "chan" && str_len(ctype) > 5 && substr(ctype, 0, 5) == "chan:" {
+                                            put(ctx.global_type, bslot, ctype)
+                                        } else if str_len(ctype) > 0 {
+                                            let pmerged = merge_type(pgt, ctype)
+                                            if pmerged != pgt {
+                                                put(ctx.global_type, bslot, pmerged)
+                                            }
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            }
+                            pbb = pbb + 1
+                        }
+                        if ctx.fn_ret_type[phandle] != "" {
+                            // param-tied：结果 shadow/type 跟随实参（嵌套透传 provenance）
+                            // param-tied: result shadow/type follows the arg (nested passthrough provenance)
+                            let rp2 = if phandle < len(ctx.fn_ret_param) {
+                                ctx.fn_ret_param[phandle]
+                            } else {
+                                0 - 1
+                            }
+                            if rp2 >= 0 && rp2 < pn {
+                                push(pshadow_ps, p_arg_s[rp2])
+                                push(ptshadow_ps, p_arg_t[rp2])
+                            } else {
+                                // 嵌套多态：signature 模式优先查 sig_ret（嵌套透传 propagation）
+                                // nested polymorphic calls: signature mode consults sig_ret first
+                                let mut pnested_ret = ctx.fn_ret_type[phandle]
+                                let pnval = psig_lookup(ctx, phandle, p_arg_t)
+                                if pnval != "" {
+                                    pnested_ret = pnval
+                                }
+                                push(pshadow_ps, "")
+                                push(ptshadow_ps, pnested_ret)
+                            }
+                        } else {
+                            push(pshadow_ps, "")
+                            push(ptshadow_ps, "int")
+                        }
+                    } else {
+                        let mut anon_sub = -1
+                        if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "slot:" {
+                            match parse_int(substr(pcallee, 5, str_len(pcallee) - 5)) {
+                                Some(psn) => {
+                                    if psn < len(p_local_sub) {
+                                        anon_sub = p_local_sub[psn]
+                                    }
+                                },
+                                None => {},
+                            }
+                        } else if pcallee == "" {
+                            anon_sub = p_pending_sub
+                        }
+                        if anon_sub >= 0 && anon_sub < len(ctx.fn_param_types) {
+                            // 经参数槽的间接调用：聚合轮不要把实参写入具体闭包的
+                            // fn_param_types。否则 apply_twice 等对 int/str 签名合并后，
+                            // 会把 int 打进 shout 之类的闭包机身（s+"!" 变成整数转串）。
+                            // indirect calls via a param slot: aggregate rounds must not write
+                            // arg types into the concrete closure's fn_param_types. Otherwise a
+                            // merged apply_twice(int|str) signature paints int onto shout's
+                            // body (s+"!" becomes int-to-str).
+                            let mut indirect_ho = false
+                            if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "slot:" {
+                                match parse_int(substr(pcallee, 5, str_len(pcallee) - 5)) {
+                                    Some(psn) => {
+                                        if psn >= 1 && psn <= pa_ps {
+                                            indirect_ho = true
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            }
+                            if aggregate && !indirect_ho {
+                                let mut paf = 0
+                                while paf < pn && paf < len(ctx.fn_param_types[anon_sub]) {
+                                    ctx.fn_param_types[anon_sub][paf] = merge_type(ctx.fn_param_types[anon_sub][paf], p_arg_t[paf])
+                                    paf = paf + 1
+                                }
+                            }
+                        }
+                        // 匿名/槽持闭包：优先 sig_ret / fn_ret_type，勿把 closure:N 当返回类型
+                        // anonymous / slot-held closure: prefer sig_ret / fn_ret_type; never
+                        // treat closure:N as the result type
+                        let mut aret_t = ""
+                        let mut aret_h = anon_sub
+                        if aret_h < 0 && str_len(pcallee_t) >= 8 && substr(pcallee_t, 0, 8) == "closure:" {
+                            match parse_int(substr(pcallee_t, 8, str_len(pcallee_t) - 8)) {
+                                Some(cts) => {
+                                    aret_h = cts
+                                },
+                                None => {},
+                            }
+                        }
+                        if aret_h >= 0 {
+                            // 间接 HO：仅在签名求解轮（!aggregate）登记；聚合轮的合并参数
+                            // 会造出 shout@[int] 之类的假签名，污染闭包机身
+                            // indirect HO: register only in the signature-solve round
+                            // (!aggregate); aggregate's merged params invent false specs like
+                            // shout@[int] and poison the closure body
+                            let mut indirect_ho = false
+                            if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "slot:" {
+                                match parse_int(substr(pcallee, 5, str_len(pcallee) - 5)) {
+                                    Some(psn) => {
+                                        if psn >= 1 && psn <= pa_ps {
+                                            indirect_ho = true
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            }
+                            if pn >= 1 && !(aggregate && indirect_ho) {
+                                let mut psig_known = true
+                                let mut psig_parts = []
+                                let mut psx = 0
+                                let mut psig_any = false
+                                while psx < pn {
+                                    if str_len(p_arg_t[psx]) == 0 {
+                                        psig_known = false
+                                    } else {
+                                        psig_any = true
+                                    }
+                                    push(psig_parts, p_arg_t[psx])
+                                    psx = psx + 1
+                                }
+                                if psig_known || psig_any {
+                                    let pkey = psig_key(aret_h, psig_parts)
+                                    let pseen = match get(ctx.sig_specs, pkey) {
+                                        Some(_) => true,
+                                        None => false,
+                                    }
+                                    if !pseen {
+                                        put(ctx.sig_specs, pkey, p_arg_t)
+                                        ctx.p_sig_grew[0] = true
+                                    }
+                                }
+                            }
+                            if !aggregate {
+                                let alr = psig_lookup(ctx, aret_h, p_arg_t)
+                                if alr != "" {
+                                    aret_t = alr
+                                }
+                            }
+                            if aret_t == "" {
+                                let rp = if aret_h < len(ctx.fn_ret_param) {
+                                    ctx.fn_ret_param[aret_h]
+                                } else {
+                                    0 - 1
+                                }
+                                if rp >= 0 && rp < pn {
+                                    aret_t = p_arg_t[rp]
+                                } else if aret_h < len(ctx.fn_ret_type) {
+                                    aret_t = ctx.fn_ret_type[aret_h]
+                                }
+                            }
+                        }
+                        if aret_t != "" && aret_t != "fn" && !(str_len(aret_t) >= 8 && substr(aret_t, 0, 8) == "closure:") {
+                            push(pshadow_ps, "")
+                            push(ptshadow_ps, aret_t)
+                        } else if pn >= 1 && p_arg_t[0] != "" {
+                            push(pshadow_ps, "")
+                            push(ptshadow_ps, p_arg_t[0])
+                        } else {
+                            push(pshadow_ps, "")
+                            push(ptshadow_ps, "int")
+                        }
+                    }
+                }
+            } else if pop == lib::op_closure {
+                let p_sub = fn_const(ctx, ptfh, read_u16(pcode, pit + 1))
+                p_pending_sub = p_sub
+                let mut puip = pit + 3
+                let pui_n = ctx.f_nupvals[p_sub]
+                let mut pui = 0
+                while pui < pui_n {
+                    if puip + 2 >= len(pcode) {
+                        break
+                    }
+                    let puflag = pcode[puip]
+                    let puidx = read_u16(pcode, puip + 1)
+                    let uvt = if puflag % 2 == 1 {
+                        if puidx < len(ppos_types) && str_len(ppos_types[puidx]) > 0 {
+                            ppos_types[puidx]
+                        } else if puidx < len(ptshadow_ps) {
+                            ptshadow_ps[puidx]
+                        } else {
+                            ""
+                        }
+                    } else {
+                        match get(ctx.global_type, "upval:" + str(ptfh) + ":" + str(puidx)) {
+                            Some(pt) => pt,
+                            None => "",
+                        }
+                    }
+                    put(ctx.global_type, "upval:" + str(p_sub) + ":" + str(pui), uvt)
+                    puip = puip + 3
+                    pui = pui + 1
+                }
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "closure:" + str(p_sub))
+            } else if pop == lib::op_get_upval {
+                push(pshadow_ps, "")
+                match get(ctx.global_type, "upval:" + str(ptfh) + ":" + str(read_u16(pcode, pit + 1))) {
+                    Some(pt) => {
+                        push(ptshadow_ps, pt)
+                    },
+                    None => push(ptshadow_ps, ""),
+                }
+            } else if pop == lib::op_jump {
+                let jt = pit + 3 + read_u16(pcode, pit + 1)
+                match get(p_depth_at, jt) {
+                    Some(pd) => {
+                        // 汇聚点取最大栈深：fall-through 路径的栈不被错误裁剪
+                        // take the max depth at a join point so fall-through paths keep their stack
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, jt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, jt, len(pshadow_ps))
+                        put(pt_target_shadow, str(ptfh) + ":" + str(jt), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
+                p_dead = true
+            } else if pop == lib::op_loop {
+                let ljt = pit + 3 - read_u16(pcode, pit + 1)
+                match get(p_depth_at, ljt) {
+                    Some(pd) => {
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, ljt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, ljt, len(pshadow_ps))
+                        put(pt_target_shadow, str(ptfh) + ":" + str(ljt), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
+            } else if pop == lib::op_jump_if_false || pop == lib::op_jump_if_true {
+                let jjt = pit + 3 + read_u16(pcode, pit + 1)
+                match get(p_depth_at, jjt) {
+                    Some(pd) => {
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, jjt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, jjt, len(pshadow_ps))
+                        put(pt_target_shadow, str(ptfh) + ":" + str(jjt), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
+            } else if pop == lib::op_jump_if_false_pop {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                let pjt = pit + 3 + read_u16(pcode, pit + 1)
+                match get(p_depth_at, pjt) {
+                    Some(pd) => {
+                        if len(pshadow_ps) > pd {
+                            put(p_depth_at, pjt, len(pshadow_ps))
+                        }
+                    },
+                    None => {
+                        put(p_depth_at, pjt, len(pshadow_ps))
+                        put(pt_target_shadow, str(ptfh) + ":" + str(pjt), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                    },
+                }
+            } else if pop == lib::op_chan_next {
+                put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
+                // 结果类型 = ch 槽的元素类型（chan:X → X；未知 → 空）
+                // result type = the channel slot's element type (chan:X -> X; unknown -> empty)
+                let mut pcn_elem = ""
+                if len(ptshadow_ps) > 0 {
+                    let pcn_ct = ptshadow_ps[len(ptshadow_ps) - 1]
+                    if str_len(pcn_ct) > 5 && substr(pcn_ct, 0, 5) == "chan:" {
+                        pcn_elem = substr(pcn_ct, 5, str_len(pcn_ct) - 5)
+                    }
+                }
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, pcn_elem)
+            } else if pop == lib::op_neg {
+                let neg_last = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                if neg_last == "float" {
+                    push(ptshadow_ps, "float")
+                } else {
+                    push(ptshadow_ps, "int")
+                }
+            } else if pop == lib::op_not {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib::op_true {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib::op_false {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib::op_unit {
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "unit")
+            } else if pop == lib::op_eq || pop == lib::op_neq || pop == lib::op_gt || pop == lib::op_gt_eq || pop == lib::op_lt || pop == lib::op_lt_eq {
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "bool")
+            } else if pop == lib::op_add {
+                let add_last = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let add_prev = if len(ptshadow_ps) > 1 {
+                    ptshadow_ps[len(ptshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                if add_last == "str" || add_prev == "str" {
+                    push(ptshadow_ps, "str")
+                } else if add_last == "float" || add_prev == "float" {
+                    push(ptshadow_ps, "float")
+                } else {
+                    push(ptshadow_ps, "int")
+                }
+            } else if pop == lib::op_sub || pop == lib::op_mul || pop == lib::op_div || pop == lib::op_mod {
+                let sub_last = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let sub_prev = if len(ptshadow_ps) > 1 {
+                    ptshadow_ps[len(ptshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                if pop != lib::op_mod && (sub_last == "float" || sub_prev == "float") {
+                    push(ptshadow_ps, "float")
+                } else {
+                    push(ptshadow_ps, "int")
+                }
+            } else if pop == lib::op_list {
+                let plen = read_u16(pcode, pit + 1)
+                let pelt = if plen > 0 && len(ptshadow_ps) >= 1 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, plen)
+                shadow_pop(ptshadow_ps, plen)
+                push(pshadow_ps, "")
+                if plen > 0 {
+                    if pelt == "bool" {
+                        push(ptshadow_ps, "list-bool")
+                    } else if pelt == "unit" {
+                        push(ptshadow_ps, "list-unit")
+                    } else {
+                        push(ptshadow_ps, "list-" + pelt)
+                    }
+                } else {
+                    push(ptshadow_ps, "list-int")
+                }
+            } else if pop == lib::op_index_get {
+                let plt = if len(ptshadow_ps) >= 2 {
+                    ptshadow_ps[len(ptshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                if is_list_type(plt) {
+                    let plel = list_elem_type(plt)
+                    if plel == "str" {
+                        push(ptshadow_ps, "str")
+                    } else {
+                        push(ptshadow_ps, plel)
+                    }
+                } else if plt == "str" {
+                    push(ptshadow_ps, "str")
+                } else if str_len(plt) > 4 && substr(plt, 0, 4) == "tup:" {
+                    let mut pel_t = "int"
+                    let ppt = if pit >= 3 {
+                        pcode[pit - 3]
+                    } else {
+                        255
+                    }
+                    if ppt == lib::op_const {
+                        let ppidx = read_u16(pcode, pit - 2)
+                        match ctx.f_consts[ptfh][ppidx] {
+                            lib::CVal::CInt(ppv) => {
+                                let pelems = tup_elems(plt)
+                                if ppv >= 0 && ppv < len(pelems) {
+                                    pel_t = pelems[ppv]
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                    push(ptshadow_ps, pel_t)
+                } else {
+                    push(ptshadow_ps, "int")
+                }
+            } else if pop == lib::op_index_set {
+                shadow_pop(pshadow_ps, 3)
+                shadow_pop(ptshadow_ps, 3)
+            } else if pop == lib::op_len {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "int")
+            } else if pop == lib::op_tuple {
+                let ptup_n = pcode[pit + 1]
+                let mut ptup_ts = []
+                let mut ptup_i = 0
+                while ptup_i < ptup_n {
+                    if len(ptshadow_ps) >= ptup_n - ptup_i {
+                        push(ptup_ts, ptshadow_ps[len(ptshadow_ps) - ptup_n + ptup_i])
+                    } else {
+                        push(ptup_ts, "int")
+                    }
+                    ptup_i = ptup_i + 1
+                }
+                shadow_pop(pshadow_ps, ptup_n)
+                shadow_pop(ptshadow_ps, ptup_n)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, tup_enc(ptup_ts))
+            } else if pop == lib::op_record {
+                let prec_n = pcode[pit + 1]
+                let prec_cidx = read_u16(pcode, pit + 2)
+                let prec_enc = const_str(ctx, ptfh, prec_cidx)
+                let mut prec_ft = []
+                let mut prec_i = 0
+                while prec_i < prec_n {
+                    push(prec_ft, ptshadow_ps[len(ptshadow_ps) - prec_n + prec_i])
+                    prec_i = prec_i + 1
+                }
+                if aggregate {
+                    put(ctx.record_field_types, prec_enc, prec_ft)
+                }
+                shadow_pop(pshadow_ps, prec_n)
+                shadow_pop(ptshadow_ps, prec_n)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "record:" + prec_enc)
+            } else if pop == lib::op_test_variant {
+                pcur_variant = pcode[pit + 1]
+                // 栈顶是描述符，下一格是 scrutinee；有 payload 标注的 scrutinee 优先
+                // TOS is the descriptor, the cell below is the scrutinee; a payload-annotated
+                // scrutinee wins
+                let ptv_desc = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let ptv_val = if len(ptshadow_ps) >= 2 {
+                    ptshadow_ps[len(ptshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                let ptv_e = if is_enum_enc(ptv_val) && str_index_of(ptv_val, "#") != None {
+                    ptv_val
+                } else if is_enum_enc(ptv_val) {
+                    ptv_val
+                } else {
+                    ptv_desc
+                }
+                if str_len(ptv_e) > 6 && substr(ptv_e, 0, 6) == "enum:e" {
+                    let ptv_rest = substr(ptv_e, 6, str_len(ptv_e) - 6)
+                    let mut ptv_n = 0
+                    while ptv_n < str_len(ptv_rest) {
+                        let ch = substr(ptv_rest, ptv_n, 1)
+                        if ch < "0" || ch > "9" {
+                            break
+                        }
+                        ptv_n = ptv_n + 1
+                    }
+                    match parse_int(substr(ptv_rest, 0, ptv_n)) {
+                        Some(peh) => {
+                            pcur_enum_eh = peh
+                        },
+                        None => {},
+                    }
+                }
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, ptv_e)
+            } else if pop == lib::op_no_match {} else if pop == lib::op_try {
+                let pt_t = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let pt_payload = if is_enum_enc(pt_t) {
+                    let pt_var = enum_fields_resolve(ctx, pt_t, 0)
+                    if len(pt_var) > 0 {
+                        pt_var[0]
+                    } else {
+                        "int"
+                    }
+                } else {
+                    "int"
+                }
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, pt_payload)
+            } else if pop == lib::op_get_field_name || pop == lib::op_get_field {
+                let pg_rt = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let mut pg_field_t = "int"
+                let mut pg_from_enc = false
+                if is_record_type(pg_rt) {
+                    let pg_schema = record_schema(pg_rt)
+                    let mut pg_idx = -1
+                    if pop == lib::op_get_field_name {
+                        let pg_cidx = read_u16(pcode, pit + 1)
+                        let pg_name = const_str(ctx, ptfh, pg_cidx)
+                        let mut pg_ei = 0
+                        while pg_ei < len(ctx.record_encs) && pg_idx < 0 {
+                            pg_idx = find_field_in_enc(ctx.record_encs[pg_ei], pg_name)
+                            pg_ei = pg_ei + 1
+                        }
+                    } else {
+                        pg_idx = pcode[pit + 1]
+                    }
+                    match get(ctx.record_field_types, pg_schema) {
+                        Some(pg_ft) => {
+                            if pg_idx >= 0 && pg_idx < len(pg_ft) {
+                                pg_field_t = pg_ft[pg_idx]
+                                pg_from_enc = true
+                            }
+                        },
+                        None => {},
+                    }
+                } else if is_enum_enc(pg_rt) {
+                    let pg_var = enum_fields_resolve(ctx, pg_rt, pcur_variant)
+                    let pg_fidx = pcode[pit + 1]
+                    if pg_fidx < len(pg_var) {
+                        pg_field_t = pg_var[pg_fidx]
+                        pg_from_enc = true
+                    }
+                }
+                if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && pcur_enum_eh >= 0 {
+                    let pg_fb = enum_variant_fields(ctx, pcur_enum_eh, pcur_variant)
+                    let pg_fidx2 = pcode[pit + 1]
+                    if pg_fidx2 < len(pg_fb) && str_len(pg_fb[pg_fidx2]) > 0 {
+                        pg_field_t = pg_fb[pg_fidx2]
+                    }
+                }
+                if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && pcur_enum_eh >= 0 && pcur_enum_eh < len(ctx.en_qual) {
+                    let pg_q = ctx.en_qual[pcur_enum_eh]
+                    let pg_be = if pg_q == "Output" {
+                        ctx.out_enc
+                    } else {
+                        ""
+                    }
+                    if str_len(pg_be) > 0 {
+                        let pg_bv = enum_fields_for_variant(ctx, pg_be, pcur_variant)
+                        let pg_fidx3 = pcode[pit + 1]
+                        if pg_fidx3 < len(pg_bv) && str_len(pg_bv[pg_fidx3]) > 0 {
+                            pg_field_t = pg_bv[pg_fidx3]
+                        }
+                    }
+                }
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, pg_field_t)
+            } else if pop == lib::op_record_update {
+                let pu_cidx = read_u16(pcode, pit + 2)
+                let pu_enc = const_str(ctx, ptfh, pu_cidx)
+                let pu_base = if len(ptshadow_ps) > pcode[pit + 1] {
+                    ptshadow_ps[len(ptshadow_ps) - pcode[pit + 1] - 1]
+                } else {
+                    "record"
+                }
+                shadow_pop(pshadow_ps, pcode[pit + 1] + 1)
+                shadow_pop(ptshadow_ps, pcode[pit + 1] + 1)
+                push(pshadow_ps, "")
+                if is_record_type(pu_base) {
+                    push(ptshadow_ps, pu_base)
+                } else {
+                    push(ptshadow_ps, "record:" + pu_enc)
+                }
+            } else if pop == lib::op_defer {
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+            } else if pop == lib::op_spawn {
+                let psn = pcode[pit + 1]
+                let pspawn_callee = if len(pshadow_ps) > psn {
+                    pshadow_ps[len(pshadow_ps) - psn - 1]
+                } else {
+                    ""
+                }
+                let mut pspawn_handle = find_fn_by_name(ctx.f_name, pspawn_callee)
+                if pspawn_handle < 0 {
+                    match get(ctx.method_full_map, pspawn_callee) {
+                        Some(mh) => {
+                            pspawn_handle = mh
+                        },
+                        None => {},
+                    }
+                }
+                if pspawn_handle >= 0 {
+                    if aggregate {
+                        let mut pfa = 0
+                        while pfa < psn && pfa < len(ctx.fn_param_types[pspawn_handle]) {
+                            ctx.fn_param_types[pspawn_handle][pfa] = merge_type(ctx.fn_param_types[pspawn_handle][pfa], ptshadow_ps[len(ptshadow_ps) - psn + pfa])
+                            pfa = pfa + 1
+                        }
+                        // 全局实参反查：被调参数 chan:X 回流升级全局 chan 类型
+                        // global arg back-lookup: a callee param chan:X promotes the
+                        // global channel type
+                        let mut pfx = 0
+                        while pfx < psn && pfx < len(ctx.fn_param_types[pspawn_handle]) {
+                            let pfslot = pshadow_ps[len(pshadow_ps) - psn + pfx]
+                            let pfct = ctx.fn_param_types[pspawn_handle][pfx]
+                            if str_len(pfslot) > 0 && !(str_len(pfslot) > 5 && substr(pfslot, 0, 5) == "slot:") {
+                                match get(ctx.global_type, pfslot) {
+                                    Some(pfgt) => {
+                                        if str_len(pfgt) >= 4 && substr(pfgt, 0, 4) == "chan" && str_len(pfct) > 5 && substr(pfct, 0, 5) == "chan:" {
+                                            put(ctx.global_type, pfslot, pfct)
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            }
+                            pfx = pfx + 1
+                        }
+                        // 局部实参反查：被调参数 chan:X 回流升级局部槽 chan 类型（跨函数传播）
+                        // local arg back-lookup: a callee param chan:X promotes the local
+                        // slot's channel type (cross-function element propagation)
+                        let mut pfx2 = 0
+                        while pfx2 < psn && pfx2 < len(ctx.fn_param_types[pspawn_handle]) {
+                            let pfslot2 = pshadow_ps[len(pshadow_ps) - psn + pfx2]
+                            let pfct2 = ctx.fn_param_types[pspawn_handle][pfx2]
+                            if str_len(pfslot2) > 5 && substr(pfslot2, 0, 5) == "slot:" && str_len(pfct2) > 5 && substr(pfct2, 0, 5) == "chan:" {
+                                match parse_int(substr(pfslot2, 5, str_len(pfslot2) - 5)) {
+                                    Some(pfn2) => {
+                                        if pfn2 < len(ppos_types) && str_len(ppos_types[pfn2]) >= 4 && substr(ppos_types[pfn2], 0, 4) == "chan" && str_len(ppos_types[pfn2]) <= 5 {
+                                            ppos_types[pfn2] = pfct2
+                                        }
+                                    },
+                                    None => {},
+                                }
+                            }
+                            pfx2 = pfx2 + 1
+                        }
+                    }
+                    let mut pspawn_known = true
+                    let mut pspawn_parts = []
+                    let mut pskx = 0
+                    while pskx < psn {
+                        if str_len(ptshadow_ps[len(ptshadow_ps) - psn + pskx]) == 0 {
+                            pspawn_known = false
+                        }
+                        push(pspawn_parts, ptshadow_ps[len(ptshadow_ps) - psn + pskx])
+                        pskx = pskx + 1
+                    }
+                    if pspawn_known {
+                        let pskey = psig_key(pspawn_handle, pspawn_parts)
+                        let pseen = match get(ctx.sig_specs, pskey) {
+                            Some(_) => true,
+                            None => false,
+                        }
+                        if !pseen {
+                            put(ctx.sig_specs, pskey, pspawn_parts)
+                            ctx.p_sig_grew[0] = true
+                        }
+                    }
+                }
+                shadow_pop(pshadow_ps, psn + 1)
+                shadow_pop(ptshadow_ps, psn + 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, "unit")
+            } else if pop == lib::op_send {
+                // 元素类型传播：v 类型已知 → ch 槽升级（本地/参数槽 → 回流 fn_param_types；
+                // 全局名 → 升级 global_type）
+                // element-type propagation: a known v type promotes the channel slot
+                // (local/param slot -> back into fn_param_types; global name -> global_type)
+                let ps_vt = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let ps_cs = if len(pshadow_ps) > 1 {
+                    pshadow_ps[len(pshadow_ps) - 2]
+                } else {
+                    ""
+                }
+                if str_len(ps_vt) > 0 {
+                    if str_len(ps_cs) > 5 && substr(ps_cs, 0, 5) == "slot:" {
+                        match parse_int(substr(ps_cs, 5, str_len(ps_cs) - 5)) {
+                            Some(psn) => {
+                                if psn > 0 {
+                                    while len(ppos_types) <= psn {
+                                        push(ppos_types, "")
+                                    }
+                                    ppos_types[psn] = "chan:" + ps_vt
+                                    if aggregate && psn <= pa_ps && psn - 1 < len(ctx.fn_param_types[ptfh]) {
+                                        ctx.fn_param_types[ptfh][psn - 1] = "chan:" + ps_vt
+                                    }
+                                }
+                            },
+                            None => {},
+                        }
+                    } else if str_len(ps_cs) > 0 {
+                        match get(ctx.global_type, ps_cs) {
+                            Some(_) => put(ctx.global_type, ps_cs, "chan:" + ps_vt),
+                            None => {},
+                        }
+                    }
+                }
+                shadow_pop(pshadow_ps, 2)
+                shadow_pop(ptshadow_ps, 2)
+            } else if pop == lib::op_recv {
+                // 结果类型 = ch 槽的元素类型（chan:X → X；未知 → 空）
+                // result type = the channel slot's element type (chan:X -> X; unknown -> empty)
+                let pr_ct = if len(ptshadow_ps) > 0 {
+                    ptshadow_ps[len(ptshadow_ps) - 1]
+                } else {
+                    ""
+                }
+                let mut pr_elem = ""
+                if str_len(pr_ct) > 5 && substr(pr_ct, 0, 5) == "chan:" {
+                    pr_elem = substr(pr_ct, 5, str_len(pr_ct) - 5)
+                }
+                shadow_pop(pshadow_ps, 1)
+                shadow_pop(ptshadow_ps, 1)
+                push(pshadow_ps, "")
+                push(ptshadow_ps, pr_elem)
+            } else if pop == lib::op_select {
+                let mut psel_p = pit + 1
+                let psel_n = pcode[psel_p]
+                let psel_has_dflt = pcode[psel_p + 1] != 0
+                psel_p = psel_p + 2
+                let mut psel_total = 0
+                let mut psel_ti = 0
+                while psel_ti < psel_n {
+                    psel_total = psel_total + (if pcode[pit + 3 + 3 * psel_ti] == 1 {
+                        2
+                    } else {
+                        1
+                    })
+                    psel_ti = psel_ti + 1
+                }
+                let mut psel_slots = 0
+                let mut psel_recvs = 0
+                let mut psel_ets = []
+                // psel_cum: 已扫臂中 recv 臂的元素类型（臂体快照增量累积）
+                // psel_cum: element types of recv arms scanned so far (incremental for arm snapshots)
+                let mut psel_cum = []
+                let mut psel_i = 0
+                while psel_i < psel_n {
+                    let psel_kind = pcode[psel_p]
+                    let psel_dist = read_u16(pcode, psel_p + 1)
+                    psel_p = psel_p + 3
+                    // recv 臂：运行时值覆盖 chan 槽（[ch] → [v]），臂体栈多一个值类型
+                    // recv arm: the runtime value overwrites the channel slot
+                    // ([ch] -> [v]); the arm body stack carries one extra value type
+                    put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs + (if psel_kind == 1 {
+                        0
+                    } else {
+                        1
+                    }))
+                    psel_recvs = psel_recvs + (if psel_kind == 1 {
+                        0
+                    } else {
+                        1
+                    })
+                    if psel_kind == 1 {
+                        push(psel_ets, "")
+                    } else {
+                        // recv 臂：ch 槽的元素类型（chan:X → X；未知 → 空）
+                        // recv arm: the channel slot's element type (chan:X -> X; unknown -> empty)
+                        let pact = if len(ptshadow_ps) >= psel_total && psel_slots < len(ptshadow_ps) {
+                            ptshadow_ps[len(ptshadow_ps) - psel_total + psel_slots]
+                        } else {
+                            ""
+                        }
+                        let mut paet = ""
+                        if str_len(pact) > 5 && substr(pact, 0, 5) == "chan:" {
+                            paet = substr(pact, 5, str_len(pact) - 5)
+                        }
+                        push(psel_ets, paet)
+                    }
+                    // 臂体跳入点快照：底部槽 + 已扫 recv 值 + 本臂 recv 值（与深度公式对齐）
+                    // arm-body snapshot: bottom slots + scanned recv values + this arm's recv
+                    // value (aligned with the depth formula)
+                    let mut psel_ss = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_slots)
+                    let mut psel_ts = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_slots)
+                    let mut psel_cj = 0
+                    while psel_cj < len(psel_cum) {
+                        push(psel_ss, "")
+                        push(psel_ts, psel_cum[psel_cj])
+                        psel_cj = psel_cj + 1
+                    }
+                    if psel_kind != 1 {
+                        push(psel_ss, "")
+                        push(psel_ts, psel_ets[psel_i])
+                        push(psel_cum, psel_ets[psel_i])
+                    }
+                    put(pt_target_shadow, str(ptfh) + ":" + str(psel_p + psel_dist), [psel_ss, psel_ts])
+                    psel_slots = psel_slots + (if psel_kind == 1 {
+                        2
+                    } else {
+                        1
+                    })
+                    psel_i = psel_i + 1
+                }
+                if psel_has_dflt {
+                    let psel_dist = read_u16(pcode, psel_p)
+                    psel_p = psel_p + 2
+                    put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs)
+                    // default 跳入点快照：底部槽 + 全部 recv 值（与深度公式对齐）
+                    // default snapshot: bottom slots + all recv values (aligned with the depth formula)
+                    let mut psel_ds = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_slots)
+                    let mut psel_dt = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_slots)
+                    let mut psel_cj = 0
+                    while psel_cj < len(psel_cum) {
+                        push(psel_ds, "")
+                        push(psel_dt, psel_cum[psel_cj])
+                        psel_cj = psel_cj + 1
+                    }
+                    put(pt_target_shadow, str(ptfh) + ":" + str(psel_p + psel_dist), [psel_ds, psel_dt])
+                }
+                shadow_pop(pshadow_ps, psel_slots)
+                shadow_pop(ptshadow_ps, psel_slots)
+                let mut pv = 0
+                while pv < psel_n {
+                    if pcode[pit + 3 + 3 * pv] != 1 {
+                        push(pshadow_ps, "")
+                        push(ptshadow_ps, psel_ets[pv])
+                    }
+                    pv = pv + 1
+                }
+            }
+            if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
+                // 种子含槽 0（链接槽）占位，栈顶槽号 = 模拟栈深 - 1（与 emit 的 vds 对齐）
+                // seed includes a slot-0 (link) placeholder, so the top slot = shadow
+                // depth - 1 (aligned with emit's vds)
+                let pdepth = len(ptshadow_ps) - 1
+                if pdepth < len(ppos_auth) && ppos_auth[pdepth] {
+                    // 已由 set_local 权威设置，跳过栈顶启发式写入
+                    // skip the stack-top heuristic write for slots set authoritatively
+                    // by set_local
+                } else {
+                    while len(ppos_types) <= pdepth {
+                        push(ppos_types, "")
+                    }
+                    let p_replaces_tos = pop == lib::op_call || pop == lib::op_get_field || pop == lib::op_get_field_name || pop == lib::op_tuple || pop == lib::op_list || pop == lib::op_record || pop == lib::op_index_get || pop == lib::op_get_global || pop == lib::op_try
+                    if pop != lib::op_test_variant && (str_len(ppos_types[pdepth]) == 0 || p_replaces_tos || pop == lib::op_const || pop == lib::op_closure) {
+                        let p_old = ppos_types[pdepth]
+                        let p_new = if pop == lib::op_call || pop == lib::op_get_field || pop == lib::op_get_field_name {
+                            ptshadow_ps[len(ptshadow_ps) - 1]
+                        } else {
+                            merge_pos(p_old, ptshadow_ps[len(ptshadow_ps) - 1])
+                        }
+                        ppos_types[pdepth] = p_new
+                    }
+                }
+            }
+            pit = pit + inst_len(ctx, ptfh, pcode, pit)
+        }
+        if aggregate {
+            let pd_keys = keys(p_depth_at)
+            let mut pd_ki = 0
+            while pd_ki < len(pd_keys) {
+                match get(p_depth_at, pd_keys[pd_ki]) {
+                    Some(pd_v) => put(p_depth, pd_keys[pd_ki], pd_v),
+                    None => {},
+                }
+                pd_ki = pd_ki + 1
+            }
+        }
+        pret_type
+    }

@@ -1,0 +1,59 @@
+// natives_trap.bur — chan format / trap。
+// natives_trap.bur — chan format / trap.
+
+
+
+// x86gen_chan_format_at 生成 chan→str 转换：<chan cap=<cap> len=<len>>
+// x86gen_chan_format_at emits chan-to-str: <chan cap=<cap> len=<len>>
+fn x86gen_chan_format_at(off) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let dl_loop = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+    let dl_jne = jne_rel32(0 - (str_len(dl_loop) + 6))
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_jne) + str_len(write2))
+    let int2_at = fn(r, foff) {
+        mov_rm(rax, r, foff) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_jne + write2
+    }
+    let l1 = mov_rm(r9, r15, off) + mov_rr(r10, r9) + mov_ri64(rcx, 16) + mov_rm(rax, r10, CH_CAP) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi) + mov_rm(rax, r10, CH_BUFLEN) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi)
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + gc_rec(r9, mov_rr(rsi, rcx))
+    let lit_head = mov_ri64(rdx, 7017488302826087228) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 8) + mov_ri64(rdx, 15728) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 2)
+    let lit_mid = mov_ri64(rdx, 263845145632) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 5)
+    let l2 = lit_head + int2_at(r10, CH_CAP) + lit_mid + int2_at(r10, CH_BUFLEN) + mb(62) + add_ri32(rdi, 1)
+    l1 + alloc + l2 + mov_mr(r15, off, r9)
+}
+
+// x86gen_trap_exit 发射 trap：文本按 8B 块写入 [rsp-n..] + write(2) + exit 4
+// x86gen_trap_exit emits a trap: the message in 8-byte chunks at [rsp-n..] + write(2) + exit 4
+fn x86gen_trap_exit(msg) {
+    let mlen = str_len(msg)
+    let nchunks = (mlen + 7) / 8
+    let mut code = ""
+    let mut ci = 0
+    while ci < nchunks {
+        let mut ask = 8
+        if mlen - ci * 8 < 8 {
+            ask = mlen - ci * 8
+        }
+        let chunk = substr(msg, ci * 8, ask)
+        let clen = str_len(chunk)
+        let mut v = 0
+        let mut mul = 1
+        let mut bj = 0
+        while bj < clen {
+            v = v + ord(substr(chunk, bj, 1)) * mul
+            if bj + 1 < clen {
+                mul = mul * 256
+            }
+            bj = bj + 1
+        }
+        code = code + mov_ri64(rax, v) + mov_mr(rsp, 0 - 8 * (nchunks - ci), rax)
+        ci = ci + 1
+    }
+    code + mov_ri64(rdi, 2) + lea(rsi, rsp, 0 - 8 * nchunks) + mov_ri64(rdx, mlen) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 4) + mov_ri64(rax, 60) + syscall()
+}

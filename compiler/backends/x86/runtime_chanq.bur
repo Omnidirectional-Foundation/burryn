@@ -1,0 +1,43 @@
+// runtime_chanq.bur — channel 队列。
+// runtime_chanq.bur — channel queue.
+
+
+
+// x86gen_chan_push_queue_block 生成队列 push 子程序（rax=ch, rdi=fiber → 队尾 push，
+// len==cap 时倍增重分配；保留 rax/rdi，毁 rcx/rdx/rsi/r8/r9/r10/r11/r12）
+// x86gen_chan_push_queue_block emits the queue-push subroutine (rax=ch, rdi=fiber -> append
+// to the queue at field offset off, doubling when full; preserves rax/rdi, clobbers
+// rcx/rdx/rsi/r8/r9/r10/r11/r12)
+fn x86gen_chan_push_queue_block(off) {
+    // 布局 head + grow + no_grow + store_n：n==cap 落入 grow（倍增重分配后拷贝旧元素，
+    // 写回新数组指针，落入 no_grow 写 fiber），n<cap 跳 no_grow；store_n 重读 n 自增后 ret。
+    // gc_rec 跨调用只保 rax/r11/r12/rsi/rdi（rdx/rcx/r8/r9/r10 全毁），
+    // 故 grow_copy/no_grow 一律从内存重读 array/n，且 [rax+off] 在拷贝完成前不写回；
+    // grow_copy 把 rdi 覆写为新数组（rep movsb 还会推进），no_grow 在存储前从
+    // rt_cur_fiber 重读 fiber——被 push 的恒是当前 fiber
+    let store_n = mov_rm(r8, rax, off + 8) + add_ri32(r8, 1) + mov_mr(rax, off + 8, r8) + ret()
+    let no_grow = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rdx, rax, off) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(rcx, 0, rdi)
+    // grow_alloc 记录新块但先不写回指针，grow_copy 从 [rax+off] 读旧数组拷贝 n 元素后再写回
+    let grow_alloc = mov_rr(r11, r12) + mov_rr(rsi, r8) + add_rr(r12, rsi) + gc_rec(r11, mov_rr(rsi, rsi)) + mov_rm(rcx, rax, off + 16) + add_rr(rcx, rcx) + add_ri32(rcx, QUEUE_GROW_ADD) + mov_mr(rax, off + 16, rcx)
+    let grow_copy = mov_rm(rsi, rax, off) + mov_rr(rdi, r11) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(rax, off, r11)
+    let grow_size = mov_rr(r8, rcx) + add_rr(r8, r8) + add_ri32(r8, QUEUE_GROW_ADD) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r8)
+    let grow = mov_rm(rdx, rax, off) + mov_rm(rcx, rax, off + 16) + mov_rm(r9, rax, off + 8) + grow_size + grow_alloc + grow_copy
+    let head = mov_rm(rdx, rax, off) + mov_rm(r8, rax, off + 8) + mov_rm(rcx, rax, off + 16) + cmp_rr(r8, rcx) + jne_rel32(str_len(grow))
+    head + grow + no_grow + store_n
+}
+
+// x86gen_chan_remove_waiter_block 生成 waiter 移除子程序（rax=ch, rdi=fiber →
+// 从 waiters 队列删除该 fiber（尾部 memmove），不存在则不动；毁 rcx/rdx/rsi/r8/r9/r10）
+// x86gen_chan_remove_waiter_block emits the waiter-removal subroutine (rax=ch, rdi=fiber ->
+// remove that fiber from the waiters queue (tail memmove); no-op when absent; clobbers
+// rcx/rdx/rsi/r8/r9/r10)
+fn x86gen_chan_remove_waiter_block() {
+    let rm_found_tail = mov_rm(rcx, rax, CH_NWAIT) + sub_ri32(rcx, 1) + mov_mr(rax, CH_NWAIT, rcx) + ret()
+    let rm_found = mov_rr(rsi, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdi, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdi) + add_rr(rdi, r9) + mov_rm(rcx, rax, CH_NWAIT) + sub_rr(rcx, r10) + sub_ri32(rcx, 1) + xor_rr(r8, r8) + add_ri32(r8, 3) + shl_rcl(rcx) + rep_movsb() + rm_found_tail
+    let rm_none = ret()
+    let rm_slot = mov_rr(rsi, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r9) + mov_rm(rcx, rsi, 0)
+    let rm_step = sub_ri32(r10, 1) + rm_slot + cmp_rr(rcx, rdi) + je_rel32(5)
+    let rm_head = mov_rm(r10, rax, CH_NWAIT) + test_rr(r10, r10) + je_rel32(str_len(rm_step) + 5 + str_len(rm_found))
+    let rm_loop = rm_step + jmp_rel32(0 - (str_len(rm_head) + str_len(rm_step) + 5))
+    rm_head + rm_loop + rm_found + rm_none
+}

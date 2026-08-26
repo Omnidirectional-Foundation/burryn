@@ -1,0 +1,64 @@
+// parse_item.bur — pub/import/fn/method 声明。
+// parse_item.bur — pub/import/fn/method decls.
+
+
+// p_pub_decl 解析 pub 声明（导出修饰下推给具体声明）
+// p_pub_decl parses pub declarations (the export flag is pushed down)
+fn p_pub_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    if p_check(toks, pos, t_let) {
+        let s = match p_let_stmt(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match s {
+            LetStmt(name, nsp, is_mut, _, ty, init, sp) => Ok(LetStmt(name, nsp, is_mut, true, ty, init, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_const) {
+        let s = match p_const_stmt(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match s {
+            ConstDecl(name, nsp, _, ty, init, sp) => Ok(ConstDecl(name, nsp, true, ty, init, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
+        let s = match p_fn_decl(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match s {
+            FnDecl(name, nsp, _, lit, sp) => Ok(FnDecl(name, nsp, true, lit, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_enum) {
+        let s = match p_enum_decl(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match s {
+            EnumDecl(name, params, variants, _, sp) => Ok(EnumDecl(name, params, variants, true, sp_union(sp_of_tok(tok), sp))),
+            other => Ok(other),
+        }
+    } else if p_check(toks, pos, t_type) {
+        p_type_alias_decl(toks, pos, true)
+    } else {
+        perr("E1114", "`pub` exports a top-level declaration: `pub fn`, `pub enum`, `pub let`, `pub const`, or `pub type`", "expected `fn`, `enum`, `let`, `const`, or `type` after `pub`, got \"" + tok_lex(p_peek(toks, pos)) + "\"", sp_of_tok(tok))
+    }
+}
+
+

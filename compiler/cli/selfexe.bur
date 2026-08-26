@@ -1,0 +1,70 @@
+// cli/selfexe.bur — self exe / build dir。
+// cli/selfexe.bur — self exe / build dir.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/backends/c"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/bytecode"
+import "burryn.dev/compiler/module"
+
+// self_exe 取自身可执行路径 / self_exe returns the own executable path
+fn self_exe() {
+    match exec("sh", ["-c", "readlink /proc/$PPID/exe"]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    trim(so)
+                } else {
+                    ""
+                }
+            },
+        },
+        Err(_) => "",
+    }
+}
+
+
+// dev_build_dir 处理 dev build-dir / dev_build_dir handles dev build-dir
+// dev_build_dir 处理 dev build-dir / dev_build_dir handles dev build-dir
+fn dev_build_dir(dir) {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(tooling::dump_diag_f(diags[i], dfiles[i]))
+                i = i + 1
+            }
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let mut i = 0
+            while i < len(ldiags) {
+                println(tooling::dump_diag_f(ldiags[i], lfiles[i]))
+                i = i + 1
+            }
+            match fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                Some(checked_stmts) => match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                    lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                        let mut errs = false
+                        i = 0
+                        while i < len(cdiags) {
+                            println(tooling::dump_diag_f(cdiags[i], cfiles[i]))
+                            if diag_is_error(cdiags[i]) {
+                                errs = true
+                            }
+                            i = i + 1
+                        }
+                        if !errs {
+                            let ls_files = concat_lists(pkgs_fpaths)
+                            let ls_tables = concat_lists(pkgs_lstarts)
+                            match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, f) => println(tooling::dump_diag_f(d, f)),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(c::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
+                            }
+                        }
+                    },
+                },
+                None => {},
+            }
+        },
+    }
+}

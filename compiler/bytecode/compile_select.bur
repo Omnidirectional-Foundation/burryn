@@ -1,0 +1,150 @@
+// compile_select.bur — select 代码生成（CompileCtx）。
+// compile_select.bur — select codegen (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+// cp_select select 代码生成 / cp_select codegens select
+fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, arms, has_default, dflt, dsp, sp, cp_expr) {
+    let base_temps = ctx.c_temps[ch]
+    for arm in arms {
+        match arm {
+            frontend::Node::SelectArm(is_send, _, _, cch, val, _, _) => {
+                match cp_expr(ch, cch) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+                if is_send {
+                    match cp_expr(ch, val) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+                }
+            },
+            _ => {},
+        }
+    }
+    ctx.c_temps[ch] = base_temps
+
+    if len(arms) > 255 {
+        return frontend::perr("E2021", "", "too many select arms", sp)
+    }
+    emit(ctx, ch, lib::op_select, sp)
+    emit(ctx, ch, len(arms), sp)
+    emit(ctx, ch, if has_default {
+        1
+    } else {
+        0
+    }, sp)
+    let mut arm_slots = []
+    for arm in arms {
+        match arm {
+            frontend::Node::SelectArm(is_send, _, _, _, _, _, _) => {
+                emit(ctx, ch, if is_send {
+                    1
+                } else {
+                    0
+                }, sp)
+                emit_u16(ctx, ch, 65535, sp)
+                push(arm_slots, code_len(ctx, ch) - 2)
+            },
+            _ => {},
+        }
+    }
+    let mut def_slot = -1
+    if has_default {
+        emit_u16(ctx, ch, 65535, sp)
+        def_slot = code_len(ctx, ch) - 2
+    }
+
+    let mut end_jumps = []
+    let mut i = 0
+    for arm in arms {
+        match arm {
+            frontend::Node::SelectArm(is_send, bind, _, _, _, body, asp) => {
+                match patch_jump(ctx, ch, arm_slots[i]) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                begin_scope(ctx, ch)
+                if is_send {
+                    match cp_expr(ch, body) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    emit(ctx, ch, lib::op_pop, asp)
+                } else if bind != "" && bind != "_" {
+                    match declare_local(ctx, ch, bind, false, asp) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    // recv 值在栈顶（select exec 留槽），拷入臂变量槽，让 x86 后端拿到权威类型
+                    // the recv value sits on the stack top (select exec leaves the slot);
+                    // copy it into the arm-variable slot so the x86 backend records an
+                    // authoritative type instead of guessing from a polluted stack top
+                    emit(ctx, ch, lib::op_set_local, asp)
+                    emit_u16(ctx, ch, ctx.c_l_slot[ch][len(ctx.c_l_slot[ch]) - 1], asp)
+                    match cp_expr(ch, body) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    emit(ctx, ch, lib::op_pop, asp)
+                } else {
+                    emit(ctx, ch, lib::op_pop, asp)
+                    match cp_expr(ch, body) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    emit(ctx, ch, lib::op_pop, asp)
+                }
+                end_scope(ctx, ch, asp)
+                push(end_jumps, emit_jump(ctx, ch, lib::op_jump, asp))
+            },
+            _ => {},
+        }
+        i = i + 1
+    }
+    if has_default {
+        match patch_jump(ctx, ch, def_slot) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        begin_scope(ctx, ch)
+        match cp_expr(ch, dflt) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        emit(ctx, ch, lib::op_pop, dsp)
+        end_scope(ctx, ch, dsp)
+        push(end_jumps, emit_jump(ctx, ch, lib::op_jump, dsp))
+    }
+    for j in end_jumps {
+        match patch_jump(ctx, ch, j) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+    }
+    Ok(true)
+}

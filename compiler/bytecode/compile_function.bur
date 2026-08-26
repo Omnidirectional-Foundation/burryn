@@ -1,0 +1,63 @@
+// compile_function.bur — 函数字面量代码生成（CompileCtx）。
+// compile_function.bur — function-literal codegen (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+fn cp_function(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, cur_file, ch, lit, cp_expr, cp_stmt) {
+    match lit {
+        frontend::Node::FnLit(params, muts, _, _, _, body, name, crefs, lsp) => {
+            let fh = new_func(ctx, name, cur_file, len(params))
+            let sub = new_compiler(ctx, ch, fh)
+            begin_scope(ctx, sub)
+            push_local(ctx, sub, name, ctx.c_scope_depth[sub], 0, false, 0)
+            if len(params) > 255 {
+                return frontend::perr("E2019", "", "too many parameters", lsp)
+            }
+            let mut seen = map()
+            let mut i = 0
+            while i < len(params) {
+                let dup = match get(seen, params[i]) {
+                    Some(_) => true,
+                    None => false,
+                }
+                if dup {
+                    return frontend::perr("E2020", "", "duplicate parameter \"" + params[i] + "\"", lsp)
+                }
+                put(seen, params[i], true)
+                push_local(ctx, sub, params[i], ctx.c_scope_depth[sub], ctx.c_l_slot[sub][n_locals(ctx.c_l_name, sub) - 1] + 1, muts[i], 0)
+                i = i + 1
+            }
+            match cp_block_expr(ctx, sub, body, cp_expr, cp_stmt) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            emit(ctx, sub, lib::op_return, lsp)
+
+            let idx = add_const(ctx, ch, lib::CVal::CFn(fh))
+            emit(ctx, ch, lib::op_closure, lsp)
+            emit_u16(ctx, ch, idx, lsp)
+            let mut u = 0
+            while u < len(ctx.c_u_index[sub]) {
+                let mut flag = 0
+                if ctx.c_u_islocal[sub][u] {
+                    flag = flag + 1
+                }
+                let mut ri = 0
+                while ri < len(crefs) {
+                    if ctx.c_u_name[sub][u] == crefs[ri] {
+                        flag = flag + 2
+                    }
+                    ri = ri + 1
+                }
+                emit(ctx, ch, flag, lsp)
+                emit_u16(ctx, ch, ctx.c_u_index[sub][u], lsp)
+                u = u + 1
+            }
+            Ok(true)
+        },
+        _ => Ok(true),
+    }
+}

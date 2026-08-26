@@ -1,0 +1,152 @@
+// parse_select.bur — select 语句解析。
+// parse_select.bur — select statement parsing.
+
+import "burryn.dev/compiler/lib"
+
+// p_select_stmt 解析 select 语句（通信臂 + 至多一个 default）
+// p_select_stmt parses select (communication arms plus at most one default)
+fn p_select_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after select") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let mut arms = []
+    let mut has_default = false
+    let mut dflt = NoNode
+    let mut dsp = Sp(0, 0)
+    p_skip_semis(toks, pos)
+    while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
+        if p_check(toks, pos, t_ident) && tok_lex(p_peek(toks, pos)) == "default" {
+            let d = p_advance(toks, pos)
+            if has_default {
+                return perr("E1115", "", "`select` may have at most one `default` arm", sp_of_tok(d))
+            }
+            match p_expect(toks, pos, t_arrow, "'=>' after default") {
+                Ok(_) => {},
+                Err(dg) => {
+                    return Err(dg)
+                },
+            }
+            p_skip_semis(toks, pos)
+            has_default = true
+            dsp = sp_of_tok(d)
+            dflt = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(dg) => {
+                    return Err(dg)
+                    NoNode
+                },
+            }
+        } else {
+            let arm = match p_select_arm(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+            push(arms, arm)
+        }
+        if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
+            return perr("E1104", "", "expected ',' or newline between select arms", sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let rb = match p_expect(toks, pos, t_rbrace, "'}' after select arms") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let sp = sp_union(sp_of_tok(tok), sp_of_tok(rb))
+    if len(arms) == 0 && !has_default {
+        return perr("E1116", "", "`select` needs at least one communication arm", sp)
+    }
+    Ok(SelectStmt(arms, has_default, dflt, dsp, sp))
+}
+
+// p_select_arm 解析单个 select 臂（接收绑定/裸接收/发送三种形态）
+// p_select_arm parses one select arm (bind-receive, bare receive, or send)
+fn p_select_arm(toks, mut pos) {
+    let mut is_send = false
+    let mut bind = ""
+    let mut bind_sp = Sp(0, 0)
+    let mut ch = NoNode
+    let mut val = NoNode
+    let mut asp = Sp(0, 0)
+    if p_check(toks, pos, t_larrow) {
+        let start = p_advance(toks, pos)
+        ch = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        asp = sp_of_tok(start)
+    } else {
+        let e = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        asp = span_of(e)
+        if p_match(toks, pos, t_eq) {
+            match e {
+                Ident(n, isp) => {
+                    bind = n
+                    bind_sp = isp
+                },
+                _ => {
+                    return perr("E1117", "", "only a name can bind a received value: `name = <-ch`", span_of(e))
+                },
+            }
+            match p_expect(toks, pos, t_larrow, "'<-' after `=` in a select receive arm") {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            ch = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else if p_match(toks, pos, t_larrow) {
+            is_send = true
+            ch = e
+            val = match p_expression(toks, pos) {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    NoNode
+                },
+            }
+        } else {
+            return perr("E1118", "a select arm is a receive (`v = <-ch`), a send (`ch <- v`), or `default`", "expected `=`, `<-`, or `=>` in this select arm", sp_of_tok(p_peek(toks, pos)))
+        }
+    }
+    match p_expect(toks, pos, t_arrow, "'=>' after a select arm") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    p_skip_semis(toks, pos)
+    let body = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    Ok(SelectArm(is_send, bind, bind_sp, ch, val, body, sp_union(asp, span_of(body))))
+}

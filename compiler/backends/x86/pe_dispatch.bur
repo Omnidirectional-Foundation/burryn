@@ -1,0 +1,61 @@
+// pe_dispatch.bur — PE Win64 syscall 分派桩。
+// pe_dispatch.bur — PE Win64 syscall dispatch stub.
+
+// pe_build_dispatcher 生成 syscall 兼容分派器。
+// pe_build_dispatcher emits the syscall shim dispatcher.
+// 契约对齐 Linux syscall：只破坏 rax/rcx/r11，保全其余寄存器；结果走 rax。
+// Contract mirrors Linux syscall: only rax/rcx/r11 die, everything else
+// survives; result returns in rax.
+// 支持号：1 write→WriteFile、60 exit→ExitProcess、9 mmap→VirtualAlloc、
+// 228 clock_gettime→QPC/QPF 合成 timespec；其余 ud2 立即崩溃暴露缺口。
+// Supported: 1 write→WriteFile, 60 exit→ExitProcess, 9 mmap→VirtualAlloc,
+// 228 clock_gettime→QPC/QPF synthesizing timespec; anything else hits ud2.
+// iat 为六个 IAT 槽的绝对地址：GetStdHandle / WriteFile / ExitProcess /
+// VirtualAlloc / QueryPerformanceCounter / QueryPerformanceFrequency。
+// iat holds six absolute IAT addresses in that order.
+pub fn pe_build_dispatcher(iat) {
+    // 先压 SysV 仍活寄存器，再 16 字节对齐并开出 Win64 影子空间与局部量
+    // Save still-live SysV regs, then 16-byte-align and open Win64 shadow plus locals
+    let head = e1(85) + e1(72) + e1(137) + e1(229) + e1(87) + e1(86) + e1(82) + e1(65) + e1(80) + e1(65) + e1(81) + e1(65) + e1(82) + e1(72) + e1(131) + e1(228) + e1(240) + e1(72) + e1(129) + e1(236) + e1(64) + e1(0) + e1(0) + e1(0)
+
+    // 分派链：cmp rax,imm32 + je rel32，落在 ud2 之后的对应 case
+    // Dispatch: cmp rax,imm32 + je rel32 onto the matching case after ud2
+    let je32 = e1(15) + e1(132)
+    let cmp_write = e1(72) + e1(61) + e4(1) + je32
+    let cmp_exit = e1(72) + e1(61) + e4(60) + je32
+    let cmp_mmap = e1(72) + e1(61) + e4(9) + je32
+    let cmp_clock = e1(72) + e1(61) + e4(228) + je32
+    let default_case = e1(15) + e1(11)
+    let cmp_arm = str_len(cmp_write) + 4
+
+    // 尾声：rsp 回到保存区再弹寄存器；各 case 以 5 字节 jmp rel32 归拢
+    // Epilogue: rsp back to the save area, then pop; cases funnel via 5-byte jmp rel32
+    let epilogue = e1(72) + e1(141) + e1(101) + e1(208) + e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(201) + e1(195)
+
+    // write(fd=rdi, buf=rsi, len=rdx)：句柄 1→STD_OUTPUT 其余→STD_ERROR；
+    // GetStdHandle 的 rcx 与 WriteFile 的四寄存器槽按 Win64 装填；长度先存局部
+    // write: handle 1→STD_OUTPUT else STD_ERROR; Win64 rcx/rdx/r8/r9; length in a local
+    let write_case = e1(73) + e1(199) + e1(195) + e1(245) + e1(255) + e1(255) + e1(255) + e1(72) + e1(131) + e1(255) + e1(1) + e1(116) + e1(7) + e1(73) + e1(199) + e1(195) + e1(244) + e1(255) + e1(255) + e1(255) + e1(72) + e1(137) + e1(84) + e1(36) + e1(56) + e1(76) + e1(137) + e1(217) + e1(76) + e1(186) + e8(iat[0]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(137) + e1(193) + e1(72) + e1(137) + e1(242) + e1(76) + e1(139) + e1(68) + e1(36) + e1(56) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + e1(76) + e1(141) + e1(76) + e1(36) + e1(48) + e1(76) + e1(186) + e8(iat[1]) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + e1(116) + e1(7) + e1(72) + e1(139) + e1(68) + e1(36) + e1(56) + e1(235) + e1(4) + e1(72) + e1(131) + e1(200) + e1(255)
+
+    // exit(code=rdi)：ExitProcess 不返回；int3 兜底
+    // exit(code=rdi): ExitProcess never returns; int3 as a guard
+    let exit_case = e1(72) + e1(137) + e1(249) + e1(76) + e1(186) + e8(iat[2]) + e1(65) + e1(255) + e1(18) + e1(204)
+
+    // mmap(addr=0, len=rsi, prot, flags, ...)：固定 RW 私有页，prot/flags 忽略
+    // mmap(addr=0, len=rsi, prot, flags, ...): fixed RW private pages, prot/flags ignored
+    let mmap_case = e1(69) + e1(49) + e1(201) + e1(65) + e1(185) + e4(4) + e1(69) + e1(49) + e1(192) + e1(65) + e1(184) + e4(12288) + e1(72) + e1(137) + e1(242) + e1(72) + e1(49) + e1(201) + e1(76) + e1(186) + e8(iat[3]) + e1(65) + e1(255) + e1(18)
+
+    // clock_gettime(CLOCK_MONOTONIC, ts=rsi)：QPC/QPF 合成 {sec, nsec}，
+    // 商余拆分乘法避免 int64 溢出（与 C runtime 的 bur_mono_ns 同式）
+    // clock_gettime(CLOCK_MONOTONIC, ts=rsi): QPC/QPF synthesized {sec, nsec}
+    // with quotient/remainder split multiply (same shape as bur_mono_ns)
+    let clock_case = e1(72) + e1(141) + e1(76) + e1(36) + e1(32) + e1(76) + e1(186) + e8(iat[4]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(141) + e1(76) + e1(36) + e1(40) + e1(76) + e1(186) + e8(iat[5]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(139) + e1(68) + e1(36) + e1(32) + e1(72) + e1(49) + e1(210) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(72) + e1(105) + e1(192) + e4(1000000000) + e1(73) + e1(137) + e1(193) + e1(72) + e1(137) + e1(208) + e1(76) + e1(186) + e8(1000000000) + e1(73) + e1(247) + e1(226) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(76) + e1(1) + e1(200) + e1(76) + e1(186) + e8(1000000000) + e1(72) + e1(49) + e1(210) + e1(73) + e1(247) + e1(242) + e1(72) + e1(137) + e1(6) + e1(72) + e1(137) + e1(86) + e1(8)
+
+    let jmp_epi_after_write = e1(233) + e4(str_len(exit_case) + str_len(mmap_case) + 5 + str_len(clock_case))
+    let jmp_epi_after_mmap = e1(233) + e4(str_len(clock_case))
+    let jw = 3 * cmp_arm + str_len(default_case)
+    let jx = 2 * cmp_arm + str_len(default_case) + str_len(write_case) + 5
+    let jm = cmp_arm + str_len(default_case) + str_len(write_case) + 5 + str_len(exit_case)
+    let jc = str_len(default_case) + str_len(write_case) + 5 + str_len(exit_case) + str_len(mmap_case) + 5
+    head + cmp_write + e4s(jw) + cmp_exit + e4s(jx) + cmp_mmap + e4s(jm) + cmp_clock + e4s(jc) + default_case + write_case + jmp_epi_after_write + exit_case + mmap_case + jmp_epi_after_mmap + clock_case + epilogue
+}

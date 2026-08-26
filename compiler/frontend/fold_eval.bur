@@ -1,0 +1,99 @@
+// fold_eval.bur — 常量折叠求值。
+// fold_eval.bur — const-fold evaluation.
+
+
+
+// fc_eval 求值常量表达式：支持字面量、const/变量引用、算术比较、逻辑、字符串拼接
+// fc_eval evaluates constant expressions: literals, const/variable references,
+// arithmetic, comparisons, logic, string concat
+fn fc_eval(e, aliases, penv, qenv, pending, env_names, env_vals, mut adiags) {
+    // 常量表达式求值：字面量直返，标识符查环境/包，运算递归
+    // Constant evaluation: literals return, identifiers consult env/package
+    // tables, operators recurse
+    match e {
+        IntLit(v, _) => FRVal(FVInt(v)),
+        FloatLit(v, _) => FRVal(FVFloat(v)),
+        StrLit(v, _) => FRVal(FVStr(v)),
+        BoolLit(v, _) => FRVal(FVBool(v)),
+        Ident(n, sp) => {
+            // 标识符：局部环境优先，再查包内常量，pending 表示依赖未就绪
+            // Identifiers: local env first, then package consts; pending marks not-yet-ready deps
+            let mut hit = -1
+            let mut i = len(env_names) - 1
+            while i >= 0 {
+                if hit < 0 && env_names[i] == n {
+                    hit = i
+                }
+                i = i - 1
+            }
+            if hit >= 0 {
+                fc_of_val(env_vals[hit], n, sp, adiags)
+            } else {
+                match get(penv, n) {
+                    Some(v) => fc_of_val(v, n, sp, adiags),
+                    None => match get(pending, n) {
+                        Some(p) => if p {
+                            FRBlocked(n)
+                        } else {
+                            fc_not_const(n, sp, adiags)
+                        },
+                        None => fc_not_const(n, sp, adiags),
+                    },
+                }
+            }
+        },
+        VariantAccess(en, vn, sp) => match get(aliases, en) {
+            Some(path) => match get(qenv, path + "." + vn) {
+                Some(v) => fc_of_val(v, en + "." + vn, sp, adiags),
+                None => fc_not_const(en + "." + vn, sp, adiags),
+            },
+            None => fc_shape(sp, adiags),
+        },
+        Unary(op, rhs, sp) => {
+            let r = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            match r {
+                FRVal(v) => fc_un(op, v, sp, adiags),
+                other => other,
+            }
+        },
+        Binary(op, lhs, rhs, sp) => {
+            let lr = fc_eval(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            let rr = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            fc_combine(lr, rr, op, sp, adiags)
+        },
+        // 逻辑运算：短路可用时按类型提前返回
+        // Logical ops: short-circuit when the type allows it
+        Logical(op, lhs, rhs, _) => {
+            let lr = fc_eval(lhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+            match lr {
+                FRVal(lv) => match lv {
+                    FVBool(x) => if op == t_and_and && !x || op == t_or_or && x {
+                        match fc_type(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags) {
+                            FTType(t) => if t == 3 {
+                                FRVal(FVBool(x))
+                            } else {
+                                FRSoft
+                            },
+                            FTBlocked(n) => FRBlocked(n),
+                            FTSoft => FRSoft,
+                            FTErr => FRErr,
+                        }
+                    } else {
+                        let rr = fc_eval(rhs, aliases, penv, qenv, pending, env_names, env_vals, adiags)
+                        match rr {
+                            FRVal(rv) => fc_logical(op, lv, rv),
+                            other => other,
+                        }
+                    },
+                    _ => FRSoft,
+                },
+                FRBlocked(n) => FRBlocked(n),
+                other => other,
+            }
+        },
+        _ => fc_shape(span_of(e), adiags),
+    }
+}
+
+
+

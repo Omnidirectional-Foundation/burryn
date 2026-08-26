@@ -1,0 +1,66 @@
+// compile_stmt_conc.bur — spawn / defer / send（CompileCtx）。
+// compile_stmt_conc.bur — spawn/defer/send (CompileCtx).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+fn cp_spawn_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, call, sp, cp_expr) {
+    match call {
+        frontend::Node::Call(callee, cargs, _) => {
+            match cp_expr(ch, callee) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+            for a in cargs {
+                match cp_expr(ch, a) {
+                    Ok(_) => {},
+                    Err(d) => {
+                        return Err(d)
+                    },
+                }
+                ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+            }
+            ctx.c_temps[ch] = ctx.c_temps[ch] - (len(cargs) + 1)
+            if len(cargs) > 255 {
+                return frontend::perr("E2005", "", "too many arguments", sp)
+            }
+            emit(ctx, ch, lib::op_spawn, sp)
+            emit(ctx, ch, len(cargs), sp)
+            Ok(true)
+        },
+        _ => Ok(true),
+    }
+}
+
+fn cp_defer_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, cur_file, ch, body, crefs, sp, cp_expr, cp_stmt) {
+    match cp_function(ctx, cur_file, ch, frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, body, "<defer>", crefs, sp), cp_expr, cp_stmt) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    emit(ctx, ch, lib::op_defer, sp)
+    Ok(true)
+}
+
+fn cp_send_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cch, val, sp, cp_expr) {
+    match cp_expr(ch, cch) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+    match cp_expr(ch, val) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    ctx.c_temps[ch] = ctx.c_temps[ch] - 1
+    emit(ctx, ch, lib::op_send, sp)
+    Ok(true)
+}

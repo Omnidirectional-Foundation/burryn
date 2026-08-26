@@ -1,0 +1,145 @@
+// parse_decl.bur — let/const/fn/method/import 声明。
+// parse_decl.bur — let/const/fn/method/import declarations.
+
+import "burryn.dev/compiler/lib"
+
+// p_let_stmt 解析 let 语句：类型标注、mut/pub、元组解构
+// p_let_stmt parses let: type annotations, mut/pub, tuple destructuring
+fn p_let_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let is_mut = p_match(toks, pos, t_mut)
+    // 元组解构 let 与普通 let 两条路径
+    // Two paths: tuple-destructuring let and plain let
+    if p_check(toks, pos, t_lparen) {
+        p_advance(toks, pos)
+        let mut names = []
+        let mut nspans = []
+        p_skip_semis(toks, pos)
+        while !p_check(toks, pos, t_rparen) {
+            let nm = match p_expect(toks, pos, t_ident, "name in destructuring let") {
+                Ok(v) => v,
+                Err(d) => {
+                    return Err(d)
+                    lib::Token::Tok(0, "", 0, 0)
+                },
+            }
+            push(names, tok_lex(nm))
+            push(nspans, sp_of_tok(nm))
+            if !p_match(toks, pos, t_comma) {
+                break
+            }
+            p_skip_semis(toks, pos)
+        }
+        let rp = match p_expect(toks, pos, t_rparen, "')' in destructuring let") {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                lib::Token::Tok(0, "", 0, 0)
+            },
+        }
+        match p_expect(toks, pos, t_eq, "'=' in let binding") {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        let init = match p_expression(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+        match p_end_stmt(toks, pos) {
+            Ok(_) => {},
+            Err(d) => {
+                return Err(d)
+            },
+        }
+        return Ok(DestructLet(names, nspans, is_mut, init, sp_union(sp_of_tok(tok), span_of(init))))
+    }
+    let name = match p_expect(toks, pos, t_ident, "variable name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    // 可选类型标注 + = 初始化 + 语句结束
+    // Optional type annotation, = initializer, statement end
+    let ty = if p_match(toks, pos, t_colon) {
+        match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    } else {
+        NoNode
+    }
+    match p_expect(toks, pos, t_eq, "'=' in let binding") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let init = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
+}
+
+// p_const_stmt 解析 const 声明 / p_const_stmt parses a const declaration
+fn p_const_stmt(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let name = match p_expect(toks, pos, t_ident, "constant name") {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            lib::Token::Tok(0, "", 0, 0)
+        },
+    }
+    let ty = if p_match(toks, pos, t_colon) {
+        match p_type_expr(toks, pos) {
+            Ok(v) => v,
+            Err(d) => {
+                return Err(d)
+                NoNode
+            },
+        }
+    } else {
+        NoNode
+    }
+    match p_expect(toks, pos, t_eq, "'=' in const declaration") {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    let init = match p_expression(toks, pos) {
+        Ok(v) => v,
+        Err(d) => {
+            return Err(d)
+            NoNode
+        },
+    }
+    match p_end_stmt(toks, pos) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
+}
+

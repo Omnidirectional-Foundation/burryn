@@ -1,0 +1,70 @@
+// cli/hover.bur — hover / interface parse。
+// cli/hover.bur — hover / interface parse.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/module"
+
+// dev_hover 处理 dev hover / dev_hover handles dev hover
+// dev_hover 处理 dev hover / dev_hover handles dev hover
+fn dev_hover(dir, file, offset_str) {
+    let offset = match parse_int(offset_str) {
+        Some(n) => n,
+        None => {
+            eprintln("error: offset must be an integer")
+            exit(exit_usage)
+        },
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, _pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            frontend::lsp_set_recording(true)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(_, _, _, _, _) => {},
+            }
+            frontend::lsp_set_recording(false)
+            println(frontend::lsp_type_at(file, offset))
+        },
+    }
+}
+
+// dev_interface_parse 处理 dev interface-parse
+// dev_interface_parse handles dev interface-parse
+// dev_interface_parse 处理 dev interface-parse
+// dev_interface_parse handles dev interface-parse
+fn dev_interface_parse(path) {
+    match read_file(path) {
+        Ok(src) => match frontend::lex(src) {
+            lib::LexOut::Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    for d in ldiags {
+                        println(tooling::dump_diag(d))
+                    }
+                } else {
+                    match frontend::parse_interface(toks) {
+                        frontend::ParseOut::Parsed(stmts, pdiags) => {
+                            for s in stmts {
+                                tooling::dump_node(s, "")
+                            }
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        },
+                    }
+                }
+            },
+        },
+        Err(msg) => {
+            println("error:", msg)
+            exit(exit_no_input)
+        },
+    }
+}
