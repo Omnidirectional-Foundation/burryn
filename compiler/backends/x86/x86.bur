@@ -4410,7 +4410,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                 }
                 push(ptshadow_ps, pgtype)
-            } else if pop == lib::op_set_global {} else if pop == lib::op_def_global {
+            } else if pop == lib::op_set_global {
+                // 重绑定全局（如 saved = fn(){...}）必须刷新 global_type，
+                // 否则 closure:N 静态解析钉在旧闭包上
+                // rebinding a global (e.g. saved = fn(){...}) must refresh
+                // global_type, or closure:N static resolution pins the old closure
+                if aggregate && len(ptshadow_ps) > 0 {
+                    let psg_idx = read_u16(pcode, pit + 1)
+                    let psg_name = const_str(ptfh, psg_idx)
+                    put(global_type, psg_name, ptshadow_ps[len(ptshadow_ps) - 1])
+                }
+            } else if pop == lib::op_def_global {
                 let pdt = if len(ptshadow_ps) > 0 {
                     ptshadow_ps[len(ptshadow_ps) - 1]
                 } else {
@@ -4704,6 +4714,32 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                     }
                     push(pshadow_ps, "")
                     push(ptshadow_ps, clt)
+                } else if pcallee == "len" || pcallee == "str_len" || pcallee == "trunc" || pcallee == "float_bits" || pcallee == "ord" || pcallee == "byte_at" {
+                    // 整数返回的原生调用此前落入匿名回退，被标成实参类型（如 list-str），
+                    // 导致后续按错误类型转换/打印
+                    // integer-returning natives previously fell into the anonymous
+                    // fallback and inherited the argument type (e.g. list-str), making
+                    // later conversion/printing dereference raw ints
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "int")
+                } else if pcallee == "to_float" || pcallee == "clock" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "float")
+                } else if pcallee == "parse_float" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, enum_payload_enc("Option", [["float"]]))
+                } else if pcallee == "contains" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "bool")
+                } else if pcallee == "trim" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "str")
+                } else if pcallee == "args" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "list-str")
+                } else if pcallee == "yield" || pcallee == "sleep" || pcallee == "close" || pcallee == "gc" || pcallee == "assert" {
+                    push(pshadow_ps, "")
+                    push(ptshadow_ps, "unit")
                 } else {
                     let mut phandle = find_fn_by_name(pcallee)
                     if phandle < 0 {
@@ -4715,7 +4751,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         }
                     }
                     if phandle < 0 {
-                        if str_len(pcallee_t) > 8 && substr(pcallee_t, 0, 8) == "closure:" {
+                        if str_len(pcallee_t) > 8 && substr(pcallee_t, 0, 8) == "closure:" && str_len(pcallee) == 0 {
                             match parse_int(substr(pcallee_t, 8, str_len(pcallee_t) - 8)) {
                                 Some(cts) => {
                                     if cts >= 0 && cts < nfn {
@@ -6180,6 +6216,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         None => 0,
                     }
                     w(mov_rm(rax, r15, 0 - 8) + mov_mr(rbx, 8 * slot, rax))
+                    put(global_type, name, type_shadow[len(type_shadow) - 1])
                 } else if op == lib::op_eq {
                     let sa_eq = if len(type_shadow) > 1 {
                         type_shadow[len(type_shadow) - 2]
@@ -6688,7 +6725,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
                         let ctv = type_shadow[len(type_shadow) - n - 1]
                         if str_len(ctv) > 7 && substr(ctv, 0, 7) == "native:" {
                             callee = substr(ctv, 7, str_len(ctv) - 7)
-                        } else if str_len(ctv) > 8 && substr(ctv, 0, 8) == "closure:" {
+                        } else if str_len(ctv) > 8 && substr(ctv, 0, 8) == "closure:" && str_len(callee) == 0 {
                             match parse_int(substr(ctv, 8, str_len(ctv) - 8)) {
                                 Some(cts) => {
                                     if cts >= 0 && cts < nfn {
