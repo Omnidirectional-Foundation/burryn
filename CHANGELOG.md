@@ -40,29 +40,48 @@ SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口
   collect-at-exit behavior (stdin inherited, no streaming), TCP loopback as the
   only bidirectional IPC with measured numbers (231 µs in-process, 1350–1550 µs
   cross-process, 65 MiB/s 512KiB round-trip), no built-in message framing.
+- **新增：** SPEC `§6.3` 正式条款 —— `exec_start`/`exec_poll` 的管道与退出时收集行为
+  （stdin 继承，无流式）；TCP loopback 是唯一的双向 IPC，附实测数据（进程内 231 µs，
+  跨进程 1350–1550 µs，512KiB 往返 65 MiB/s）；不内建消息分帧。
 - **Added:** SPEC `§6.1` known limitation — x86 `net_read`/`tcp_accept` are raw
   blocking syscalls that stall every fiber; the supervisor/worker concurrency
   model runs on the VM or the C backend only.
+- **新增：** SPEC `§6.1` 已知局限 —— x86 的 `net_read`/`tcp_accept` 是裸阻塞系统调用，
+  会卡住所有 fiber；supervisor/worker 并发模型只能跑在 VM 或 C 后端上。
 - **Added:** SPEC `§7` four pending owner decisions — Unix domain socket
   primitive, built-in IPC message protocol, first-class process pool, x86
   fiber-aware IO (no conclusion preset).
+- **新增：** SPEC `§7` 四项待定 owner 决策 —— Unix domain socket 原语、内建 IPC 消息协议、
+  一等进程池、x86 fiber 感知 IO（不预设结论）。
 - **Changed:** Version constants extended to 0.6.0 in lockstep with the new
   window (`compiler/main.bur` CLI version, `compiler/lib/defs.bur`
   toolchain_version, `compiler/tooling/lsp.bur` serverInfo); `docs/SPEC.md`
   header advanced to v0.6.
+- **变更：** 版本常量随新窗口同步推到 0.6.0（`compiler/main.bur` 的 CLI 版本、
+  `compiler/lib/defs.bur` 的 toolchain_version、`compiler/tooling/lsp.bur` 的 serverInfo）；
+  `docs/SPEC.md` 头行推进到 v0.6。
 - **Added:** `capture` / `capture(ref …)` clause — default copy-at-capture;
   `ref` shares a heap cell. Grammar keyword list, parser, and SPEC §6.1
   (grammar.md §10 revision after the S8.2 freeze).
+- **新增：** `capture` / `capture(ref …)` 子句 —— 默认捕获时拷贝，`ref` 共享堆单元。
+  涉及 grammar 关键字表、parser 与 SPEC `§6.1`（S8.2 冻结后对 grammar.md `§10` 的修订）。
 - **Added:** S8.4 closed records unify by field name (`record { x, y }` is
   `record { y, x }`); RecordLit/RecordUpdate emit fields in lexicographic order.
+- **新增：** S8.4 封闭 record 按字段名合一（`record { x, y }` 即 `record { y, x }`）；
+  RecordLit/RecordUpdate 按字典序发射字段。
 - **Changed:** SPEC §7 four IPC questions settled by owner — no AF_UNIX
   primitive, no built-in IPC framing, no first-class `std/procpool`, x86
   fiber-aware IO approved (`O_NONBLOCK` + fiber park + `poll(2)`; `net_nb` in
   the same design). The §6.1 "raw blocking net syscall" limitation is superseded
   by that decision.
+- **变更：** SPEC `§7` 四项 IPC 问题由 owner 定案 —— 不做 AF_UNIX 原语、不内建 IPC 分帧、
+  不做一等 `std/procpool`、批准 x86 fiber 感知 IO（`O_NONBLOCK` + fiber park + `poll(2)`；
+  `net_nb` 属同一设计）。`§6.1` 的「裸阻塞 net 系统调用」局限由该定案取代。
 - **Changed:** User-facing closure text in README and tutorial matches SPEC
   (copy-at-capture; `capture(ref)` for shared `mut`). grammar.md records
   shebang, labeled loops in `statement`, and `..` range in the expression EBNF.
+- **变更：** README 与 tutorial 中面向用户的闭包表述与 SPEC 对齐（捕获时拷贝；共享 `mut`
+  用 `capture(ref)`）。grammar.md 在 EBNF 中记入 shebang、`statement` 里的带标签循环与 `..` 区间。
 - **Fixed:** C runtime defines `bur_start_ns` (monotonic origin used by `clock`).
 - **修复：** C runtime 补上 `bur_start_ns` 定义（`clock` 用的单调时钟原点）。
 - **Fixed:** x86 PE shim calls `[dispatcher slot]`, emits one import descriptor per
@@ -70,6 +89,9 @@ SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口
   WriteFile / QPC arguments in the Win64 registers.
 - **修复：** x86 PE shim 经分派器槽间接调用；每个 DLL 一条导入描述符；Win64
   影子空间在保存寄存器之下；GetStdHandle / WriteFile / QPC 按 Win64 填参。
+- **Fixed:** x86 pre-scan registers `net_nb` as `Result<str,str>`; GET_FIELD stamps
+  payload types onto locals; link-slot seeding merges with enum payloads; an
+  `enum_mono` sentinel is added; the `net_nb` would-block notice prints once.
 - **修复：** x86 预扫描把 `net_nb` 记成 `Result<str,str>`；GET_FIELD payload
   类型盖到 local；链接槽种子与枚举 payload 合并；`enum_mono` 哨兵；`net_nb`
   的 would-block 只打一行。
@@ -84,12 +106,18 @@ SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口
 - **Changed:** Split `docs/GOALS.md` (milestones and remaining completion lines)
   from `docs/SPEC.md` (retrospective decisions). Stage state no longer lives in
   SPEC §5; that section points at GOALS.
+- **变更：** 把 `docs/GOALS.md`（里程碑与剩余完成线）从 `docs/SPEC.md`（回顾性定案）中拆出。
+  阶段状态不再留在 SPEC `§5`，该节改为指向 GOALS。
 - **Changed:** User-facing docs match the current toolchain: `bur lsp` in the
   command list; tutorial `net_nb` is `(op, h, data, max)`; CONTRIBUTING uses
   `bur test [dir]`.
+- **变更：** 面向用户的文档与当前工具链对齐：命令表补 `bur lsp`；tutorial 的 `net_nb`
+  改为 `(op, h, data, max)`；CONTRIBUTING 改用 `bur test [dir]`。
 - **Changed:** README follows the CLI skeleton (Prerequisites, Features,
   Examples, Documentation before Honest Limitations) with `$` on command
   examples. Tutorial headings drop emoji.
+- **变更：** README 按 CLI 骨架排列（Prerequisites、Features、Examples、Documentation 在
+  Honest Limitations 之前），命令示例统一加 `$`。tutorial 标题去掉 emoji。
 
 ## v0.5 (2026-08-03 ~ 08-04)
 
