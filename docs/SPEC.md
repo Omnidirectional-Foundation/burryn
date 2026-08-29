@@ -1,8 +1,8 @@
 # SPEC — Burryn 项目规范
 
 > v0.6 · active · 2026-08-22
-> 状态:回顾性权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
-> 相关文档:[`GOALS.md`](GOALS.md) 路线与完成线 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
+> 状态：回顾性权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
+> 相关文档：[`GOALS.md`](GOALS.md) 路线与完成线 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
 > **注意：** 本文档是本项目的最高优先级约束。
 > 所有实现工作以此为准。
@@ -20,19 +20,19 @@
 
 ### 显式优先
 
-语法糖允许存在，但任何语义不得隐藏在语法糖背后——读者看到代码即可推断全部行为，无需查阅"这个上下文里它其实还做了 X"。隐式转换、隐式 coercion、magic method、隐式控制流转移(异常)均在拒绝清单。`?` 是显式早退(看到 `?` 就知道这里可能返回)；`defer` 是显式清理(看到 `defer` 就知道退出时跑)；插值是显式拼接的糖(`{expr}` 内必须是 str，非 str 编译错而非隐式 `str()`)；record 字面量带 `record` 关键字(不与 block 混淆)。类型推导是唯一的"隐式"——但可选签名标注使显式标注随时可用。
+语法糖允许存在，但任何语义不得隐藏在语法糖背后——读者看到代码即可推断全部行为，无需查阅"这个上下文里它其实还做了 X"。隐式转换、隐式 coercion、magic method、隐式控制流转移（异常）均在拒绝清单。`?` 是显式早退（看到 `?` 就知道这里可能返回）；`defer` 是显式清理（看到 `defer` 就知道退出时跑）；插值是显式拼接的糖（`{expr}` 内必须是 str，非 str 编译错而非隐式 `str()`）；record 字面量带 `record` 关键字（不与 block 混淆）。类型推导是唯一的"隐式"——但可选签名标注使显式标注随时可用。
 
 ### 类型系统
 
 - 静态，Hindley-Milner 全程序推导；函数参数/返回值零标注，仅枚举字段声明类型
 - **可选函数签名标注**：「零标注」从「不能标」收窄为「不必标」——不标注的程序语义与推导结果不变；显式标注为 opt-in，用于诊断锚定与包边界 API 冻结，推导须与标注 unify，冲突报错
-- 参数多态函数 + 泛型枚举；运算符用 SML 式受约束类型变量(`num` / `addord`)
+- 参数多态函数 + 泛型枚举；运算符用 SML 式受约束类型变量（`num` / `addord`）
 - **受约束标注类型参数**：小写类型参数可在函数签名标注中写为 `a:addord`；同一签名后续出现的 `a` 复用该变量。允许 `num`、`addord`、`key`、`int`、`float`、`str` 约束；重复标注按既有约束交集规则合并，空交集报静态错。该语法只表达既有 HM 约束，不增加运行时语义。
 - 禁止一切隐式转换
-- **多态运行时表示：统一装箱(uniform boxing)**。
-  不做单态化(monomorphization)，该决策覆盖字节码 VM 与全部原生后端
+- **多态运行时表示：统一装箱（uniform boxing）**。
+  不做单态化（monomorphization），该决策覆盖字节码 VM 与全部原生后端
 - **`--dyn` 逃生门：砍掉**。
-  语言只有一套语义(静态检查)，不维护动态模式
+  语言只有一套语义（静态检查），不维护动态模式
 
 ### 值与内存
 
@@ -42,10 +42,10 @@
 - **整数溢出一律 trap(运行时 panic)**，不区分 debug/release，不静默回绕
 - 内存管理：GC(mark-sweep)。
   明确不做所有权/借用检查
-- **`mut` 为深语义、绑定级纪律**：经由 `let` 绑定名不可修改其值(含容器内容)；push/元素修改要求 `mut`。
+- **`mut` 为深语义、绑定级纪律**：经由 `let` 绑定名不可修改其值（含容器内容）；push/元素修改要求 `mut`。
   不可变性挂在**绑定**上而非值上——无借用检查器与 move 语义，别名可绕过（`let mut b = a` 后改 `b` 可见于 `a`），故**不承诺值级不可变**。
-  **流规则**：`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值(字面量/构造/调用返回值)，违者 error。
-  **只对堆类型(list/map 及含其的类型)生效**：int/float/bool/str/unit 为拷贝语义、无别名危害，豁免；**chan 整体豁免、不论元素类型**(send/recv/close 在现行纪律里本就不要求 mut，chan 别名是 CSP 语义本体)；if/match 作来源时递归看各臂尾表达式，皆新鲜则整体新鲜；来源类型未解时延迟判 error(宁滥勿缺)。
+  **流规则**：`mut` 形参的实参与 `let mut` 的初始化来源须本身可变或为新鲜值（字面量/构造/调用返回值），违者 error。
+  **只对堆类型（list/map 及含其的类型）生效**：int/float/bool/str/unit 为拷贝语义、无别名危害，豁免；**chan 整体豁免、不论元素类型**(send/recv/close 在现行纪律里本就不要求 mut，chan 别名是 CSP 语义本体)；if/match 作来源时递归看各臂尾表达式，皆新鲜则整体新鲜；来源类型未解时延迟判 error(宁滥勿缺)。
 - **参数默认不可变；`fn f(mut xs)` 声明可变参数**——调用点无标记，与「无借用检查器 + GC」的定位一致，属 Go 式取舍。
 
 ### 字符串
@@ -61,8 +61,8 @@
 - **执行模型长期承诺单 OS 线程**(并发 ≠ 并行，Node/Lua 路线)。
   纤程调度 + 时间片抢占，不做真并行——无借用检查器时真并行 + 深 mut 会引入数据竞争，且单线程使 GC 与原生运行时简化一个量级。
   此承诺覆盖全部后端
-- **确定性承诺收窄**：纯计算程序跨后端逐字节确定；含 IO 程序不承诺调度顺序(IO 完成时序来自外部世界，与真 IO 重叠原理上互斥)。
-  提供 opt-in 确定性模式(环境变量 `BUR_DETERMINISTIC=1`，IO 全串行化、timer 唤醒按 deadline + fiber 创建序双键排序)，`bur test` 默认启用
+- **确定性承诺收窄**：纯计算程序跨后端逐字节确定；含 IO 程序不承诺调度顺序（IO 完成时序来自外部世界，与真 IO 重叠原理上互斥）。
+  提供 opt-in 确定性模式（环境变量 `BUR_DETERMINISTIC=1`，IO 全串行化、timer 唤醒按 deadline + fiber 创建序双键排序），`bur test` 默认启用
 
 ### 错误处理
 
@@ -76,10 +76,10 @@
 ### 语法
 
 - 参考系：Rust(`let`/`mut`、`match`、带字段枚举、`?`、表达式导向、遮蔽)+ Go(`spawn`、channel 语法、自动分号插入)
-- **`defer`**(资源清理，脚本场景刚需)：块作用域(表达式导向下比 Go 的函数作用域干净)
+- **`defer`**(资源清理，脚本场景刚需)：块作用域（表达式导向下比 Go 的函数作用域干净）
 - **表层语法见 [`grammar.md`](grammar.md)**(与 `compiler/frontend/` 实现逐条对应)；语法变更走 grammar.md §10 修订流程。
 
-### 明确拒绝清单(护住简洁，不接受重新提案)
+### 明确拒绝清单（护住简洁，不接受重新提案）
 
 - 宏 / 元编程
 - trait / typeclass(S8 以后才可重新讨论)
@@ -96,73 +96,73 @@
 
 | 后端 | 值表示 | GC / CSP | 工具链依赖 | 平台覆盖 | 发布形态 |
 |---|---|---|---|---|---|
-| 字节码栈式 VM | 16B tagged Value(开发/测试基线、自举 oracle) | 已完整(burrt.h:mark-sweep + ucontext) | 自举期 cc(构建 `bur` 本身) | 天然跨平台(POSIX,两处 #ifdef) | 并入核心 `bur` |
-| **C 后端** | 16B tagged Value | 已完整(同 VM,链接 burrt.c) | `cc`/`gcc`/`clang`(任一) | 天然跨平台 | 并入核心 `bur`,`bur build` 运行期探测 cc |
-| **手写 x86-64** | 8B raw int64,无 tag | 独立实现(shadow stack；CSP 不链 burrt.c，见 §6.1) | **无**(硬约束) | Linux ELF（S8.1）；Mach-O / PE 有目标 OS 测试环境再开序列化层 | 并入核心 `bur` |
-| **LLVM 后端** | 复用 C runtime 16B tagged | 链接 burrt.c,免费获得 | `clang`(必须是 clang) | 三平台(随 clang target) | 并入核心 `bur`,运行期探测 clang |
-| **Cranelift 后端** | 复用 C runtime 16B tagged | 链接 burrt.c | 构建期 `cargo`;运行期 `cranelift-driver` + 系统链接器(`cc`/`ld`)落地 `.o` | 三平台(随 driver 编译目标) | codegen 在核心 `bur`;**独立 `cranelift-driver` 二进制** |
-| **WASM 后端** | 16B tagged(仅 GC 子集) | GC 链接 wasm32 版 burrt.c;**CSP 不能链接 ucontext**,须独立状态机或等 WASM Stack Switching 提案 | `clang --target=wasm32` + `wasm-ld` | 平台无关(wasm 本身) | 并入核心 `bur`,运行期探测 clang |
+| 字节码栈式 VM | 16B tagged Value(开发/测试基线、自举 oracle) | 已完整（burrt.h:mark-sweep + ucontext） | 自举期 cc(构建 `bur` 本身) | 天然跨平台（POSIX,两处 #ifdef） | 并入核心 `bur` |
+| **C 后端** | 16B tagged Value | 已完整（同 VM,链接 burrt.c） | `cc`/`gcc`/`clang`(任一) | 天然跨平台 | 并入核心 `bur`,`bur build` 运行期探测 cc |
+| **手写 x86-64** | 8B raw int64,无 tag | 独立实现（shadow stack；CSP 不链 burrt.c，见 §6.1） | **无**(硬约束) | Linux ELF（S8.1）；Mach-O / PE 有目标 OS 测试环境再开序列化层 | 并入核心 `bur` |
+| **LLVM 后端** | 复用 C runtime 16B tagged | 链接 burrt.c,免费获得 | `clang`(必须是 clang) | 三平台（随 clang target） | 并入核心 `bur`，运行期探测 clang |
+| **Cranelift 后端** | 复用 C runtime 16B tagged | 链接 burrt.c | 构建期 `cargo`；运行期 `cranelift-driver` + 系统链接器（`cc`/`ld`）落地 `.o` | 三平台（随 driver 编译目标） | codegen 在核心 `bur`;**独立 `cranelift-driver` 二进制** |
+| **WASM 后端** | 16B tagged(仅 GC 子集) | GC 链接 wasm32 版 burrt.c;**CSP 不能链接 ucontext**,须独立状态机或等 WASM Stack Switching 提案 | `clang --target=wasm32` + `wasm-ld` | 平台无关（wasm 本身） | 并入核心 `bur`，运行期探测 clang |
 
-**单二进制交付(§1)精化**:`bur` 一个二进制打包 VM + C + x86 + WASM(codegen) + LLVM(codegen) 五种后端的 codegen 逻辑。真正"零外部工具链"的只有 x86;C/WASM/LLVM 三个后端在运行期需要机器上有 clang 才能产出可执行文件,Cranelift 还需独立 `cranelift-driver` 二进制 + 系统链接器。简言之:**发行的编译器本身自包含,非所有后端都自包含**。
+**单二进制交付（§1）精化**:`bur` 一个二进制打包 VM + C + x86 + WASM(codegen) + LLVM(codegen) 五种后端的 codegen 逻辑。真正"零外部工具链"的只有 x86;C/WASM/LLVM 三个后端在运行期需要机器上有 clang 才能产出可执行文件，Cranelift 还需独立 `cranelift-driver` 二进制 + 系统链接器。简言之：**发行的编译器本身自包含，非所有后端都自包含**。
 
 后端开工次序见 [`GOALS.md`](GOALS.md) §5。下列条款是次序背后的约束，不是进度。
 
-### 工具链探测:按工具聚类,判定独立
+### 工具链探测：按工具聚类，判定独立
 
-四个非 x86 后端共享底层工具(主要 clang),但**判定逻辑不合并**——机器只装 `gcc` 没装 `clang` 时若合并探测,LLVM/WASM 会被误判可跑,运行时才报错比探测期 skip 更差:
+四个非 x86 后端共享底层工具（主要 clang），但**判定逻辑不合并**——机器只装 `gcc` 没装 `clang` 时若合并探测，LLVM/WASM 会被误判可跑，运行时才报错比探测期 skip 更差：
 
-- 探测原语(`find_binary`、`clang_supports_target` 等)共享实现,放 `shared/toolchain-probe.bur`,避免四份重复样板
-- 每后端在自己模块内声明依赖组合(C 要 `cc/gcc/clang` 任一;LLVM 要 clang;WASM 要 clang + `wasm32` target;Cranelift 要 `cranelift-driver` + `cc`/`ld`),不合并成统一布尔
-- CI 保持每后端独立 job(出现"有 clang 无 wasm32 target"时,LLVM 跑、WASM skip,合并 job 无法表达)。
+- 探测原语（`find_binary`、`clang_supports_target` 等）共享实现，放 `shared/toolchain-probe.bur`，避免四份重复样板
+- 每后端在自己模块内声明依赖组合（C 要 `cc/gcc/clang` 任一；LLVM 要 clang;WASM 要 clang + `wasm32` target;Cranelift 要 `cranelift-driver` + `cc`/`ld`），不合并成统一布尔
+- CI 保持每后端独立 job(出现"有 clang 无 wasm32 target"时，LLVM 跑、WASM skip,合并 job 无法表达)。
 
 ### Runtime 平台抽象
 
-调度器平台差异从 `runtime/burrt.c` 拆出独立模块(`#ifdef` 分支):
+调度器平台差异从 `runtime/burrt.c` 拆出独立模块（`#ifdef` 分支）：
 - POSIX(Linux/macOS)继续走 ucontext
 - Windows 改走 Fibers API(`CreateFiber`/`SwitchToFiber`/`DeleteFiber`)
 - WASM **不复用此层**——CSP 不能链接 ucontext,见下
 
-平台抽象先做,优先于 x86 三平台序列化层。理由:它直接决定 LLVM/Cranelift 后端能不能在 Windows 上跑,而 `pe.bur`(x86 的 Windows 文件格式层)与调度器互不阻塞,可并行推进。
+平台抽象先做，优先于 x86 三平台序列化层。理由：它直接决定 LLVM/Cranelift 后端能不能在 Windows 上跑，而 `pe.bur`(x86 的 Windows 文件格式层)与调度器互不阻塞，可并行推进。
 
 ### WASM CSP 修正
 
-WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burrt.c 的 CSP 调用 `ucontext.h`(POSIX 系统调用级),wasm32 freestanding target 下没有这套东西,编译期直接失败,不是链接期报错。
+WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burrt.c 的 CSP 调用 `ucontext.h`(POSIX 系统调用级),wasm32 freestanding target 下没有这套东西，编译期直接失败，不是链接期报错。
 
-修正:WASM 第一版只能链接 GC 子集(`bur_alloc`/`bur_gc_collect`/`bur_mark_value`/`bur_gc_trace`,这些不碰 ucontext);CSP(spawn/send/recv/select)要么编译期状态机转换重写,要么等 WASM Stack Switching 提案成熟。**不存在"链接现有代码就免费拿到 CSP"这条路**,这点上 WASM 与 x86 的 CSP 处境类似(都要独立造轮子),各后端的 CSP 路径需独立设计。
+修正：WASM 第一版只能链接 GC 子集（`bur_alloc`/`bur_gc_collect`/`bur_mark_value`/`bur_gc_trace`，这些不碰 ucontext）；CSP(spawn/send/recv/select)要么编译期状态机转换重写，要么等 WASM Stack Switching 提案成熟。**不存在"链接现有代码就免费拿到 CSP"这条路**,这点上 WASM 与 x86 的 CSP 处境类似（都要独立造轮子），各后端的 CSP 路径需独立设计。
 
 ### 自举判定与原生运行时
 
-- 自举判定标准:**编译器由本语言写成且能编译自己**;输出 C 再经 gcc/clang 落地,完全算自举
-- 「任何架构都能跑」由 C 后端承担;手写后端只承诺 x86-64,其余架构不做手写
-- 双后端互为测试参照:同一程序在 VM / C 后端 / 手写后端输出必须一致,纳入测试
-- 原生运行时:GC 为 **shadow stack 精确扫描**;单线程承诺使运行时无需线程同步
+- 自举判定标准：**编译器由本语言写成且能编译自己**;输出 C 再经 gcc/clang 落地，完全算自举
+- 「任何架构都能跑」由 C 后端承担；手写后端只承诺 x86-64,其余架构不做手写
+- 双后端互为测试参照：同一程序在 VM / C 后端 / 手写后端输出必须一致，纳入测试
+- 原生运行时：GC 为 **shadow stack 精确扫描**;单线程承诺使运行时无需线程同步
 
 ### Release 产物
 
-**命名**:`burryn-<version>-<os>-<arch>.<ext>` 综合包;`burryn-<backend>-<version>-<os>-<arch>.<ext>` 单后端产物。
+**命名**:`burryn-<version>-<os>-<arch>.<ext>` 综合包；`burryn-<backend>-<version>-<os>-<arch>.<ext>` 单后端产物。
 - 架构命名统一 `amd64`/`arm64`(对齐 GHA runner、Docker tag),不用 Rust 的 `x86_64`/`aarch64`
-- 归档格式按平台走:Windows `.zip`、Linux/macOS `.tar.gz`
-- 版本号进文件名(脱离 release 页上下文仍可辨识)
-- `cranelift-driver` 随 Cranelift 后端产物打包,不独立发
+- 归档格式按平台走：Windows `.zip`、Linux/macOS `.tar.gz`
+- 版本号进文件名（脱离 release 页上下文仍可辨识）
+- `cranelift-driver` 随 Cranelift 后端产物打包，不独立发
 
-**预编译矩阵(6 cell + 1 跨系统 wasm)**:
+**预编译矩阵（6 cell + 1 跨系统 wasm）**:
 
 | 系统 \ 架构 | amd64 | arm64 |
 |---|---|---|
-| Linux | 5 后端(x86/C/LLVM/Cranelift/WASM) | 4 后端(无 x86 自写) |
-| macOS | 5 后端 | 4 后端(无 x86 自写) |
-| Windows | 5 后端 | 4 后端(无 x86 自写,Windows arm64 条件成熟再上) |
-| WASM | 跨系统共享,独立 zip | — |
+| Linux | 5 后端（x86/C/LLVM/Cranelift/WASM） | 4 后端（无 x86 自写） |
+| macOS | 5 后端 | 4 后端（无 x86 自写） |
+| Windows | 5 后端 | 4 后端（无 x86 自写，Windows arm64 条件成熟再上） |
+| WASM | 跨系统共享，独立 zip | — |
 
-→ **7 个综合包** + 各后端单产物(22 个,扣除不可能的 cell)。
+→ **7 个综合包** + 各后端单产物（22 个，扣除不可能的 cell）。
 
-**Release 页组织**:正文手写 Markdown 表,行 = 后端(含 Full Bundle 一行),列 = 6 平台架构,每格直链具体 asset。原生 Assets 面板留作自动化抓取入口 + `SHA256SUMS.txt` 落脚点。
+**Release 页组织**:正文手写 Markdown 表，行 = 后端（含 Full Bundle 一行），列 = 6 平台架构，每格直链具体 asset。原生 Assets 面板留作自动化抓取入口 + `SHA256SUMS.txt` 落脚点。
 
-**`SHA256SUMS.txt`**:每次发布生成,汇总所有产物哈希,脚本化校验单一入口。
+**`SHA256SUMS.txt`**:每次发布生成，汇总所有产物哈希，脚本化校验单一入口。
 
-**冷门架构与移动平台**:riscv64/ppc64le/i386/armv7 等 32 位架构、iOS/Android 等移动平台**不进预编译矩阵**——32 位/冷门架构走 `docs/build-exotic.md` 自行产出,移动平台走 `docs/mobile-future.md`(未规划)。
+**冷门架构与移动平台**:riscv64/ppc64le/i386/armv7 等 32 位架构、iOS/Android 等移动平台**不进预编译矩阵**——32 位/冷门架构走 `docs/build-exotic.md` 自行产出，移动平台走 `docs/mobile-future.md`(未规划)。
 
-## 4. 工具链设计(单一二进制，cargo 式一体化)
+## 4. 工具链设计（单一二进制，cargo 式一体化）
 
 **内核学 go，工程功能与 UX 学 cargo：**
 
@@ -176,7 +176,7 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 
 - workspace
 - profile:仅 `debug` / `release` 两档，不开放自定义
-- feature flags:**只允许布尔、纯加法(additive)** feature；禁止互斥 feature、禁止 feature 改变 API 签名；不做 optional dependency 绑 feature。
+- feature flags:**只允许布尔、纯加法（additive）** feature；禁止互斥 feature、禁止 feature 改变 API 签名；不做 optional dependency 绑 feature。
   解析两阶段：先 MVS 定版本，再取全图 feature 并集
 - 顶级 UX:一个命令、好报错、内建 `test` / `fmt` / `build`
 - `fmt` 唯一官方格式，零配置
@@ -189,28 +189,28 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 ## 6. 工程规范
 
 - Conventional Commits 1.0.0:`<type>(<scope>): <description>`，subject ≤72 字符，祈使句，无句号无 emoji
-- 分支：`main` 受保护仅 PR 合入(merge commit，不 squash)；开发期集成分支 `dev/<topic>`
-- 测试：自举 parity + 示例 golden test 覆盖全链路；自举判定为一等验收(`bur build burc` 逐字节重建自身)；重构类改动必须先有测试安全网再动手
-- 诊断质量是卖点本体：错误信息按 rustc 标准要求自己(精确 span、指出修法)
+- 分支：`main` 受保护仅 PR 合入（merge commit，不 squash）；开发期集成分支 `dev/<topic>`
+- 测试：自举 parity + 示例 golden test 覆盖全链路；自举判定为一等验收（`bur build burc` 逐字节重建自身）；重构类改动必须先有测试安全网再动手
+- 诊断质量是卖点本体：错误信息按 rustc 标准要求自己（精确 span、指出修法）
 
 ## 6.1 S8 后端与类型系统扩展
 
 **类型系统扩展决策**(S8 工程评估):
 
-- **纳入**:row polymorphism(S8.3,首位) → 封闭 record(S8.4)。复用现有 var/generalize 加「行 var」,扁平 if-链撑得住;是结构化接口的公共地基,唯一值得投入的重型项
+- **纳入**:row polymorphism(S8.3,首位) → 封闭 record(S8.4)。复用现有 var/generalize 加「行 var」，扁平 if-链撑得住；是结构化接口的公共地基，唯一值得投入的重型项
 - **S8.3 实现定案**:行变量复用类型变量句柄（`tn="row"` 标记），开放 record 编码为 `@rec|field|?rowvar`——`?` 前缀 = 行变量槽，置于字段名列表末尾，对应句柄置于 `ta` 末尾。`ty_unify` record 开放分支：开放侧已知字段按名与另一侧配对（须为子集），行变量绑定另一侧剩余字段的（开放/封闭）record；行变量独立出现时绑定整个 record 或另一行变量。generalize/occurs/adjust 经 `ta` 递归自动覆盖行变量。标注解析经 `collect_annotation_vars` 预建行变量句柄
 - **S8.4 实现定案**:封闭 record 是结构类型。合一按字段名配对（与开放分支同一套），字段书写顺序不进入类型身份——`record { x: int, y: int }` 与 `record { y: int, x: int }` 是同一类型。封闭额外要求字段集合相等（无剩余、无缺失）；开放侧仍按 S8.3。完成条件（类型与运行时缺一不可）：`take_xy(record { y: 2, x: 1 })` 在标注 `record { x: int, y: int }` 下通过类型检查且三后端求值均为 `3`；`record { x: 1, y: 2 } == record { y: 2, x: 1 }` 三后端均为 true。相等与字段偏移按名，不按插入顺序下标
 - **S8.1 完成线（定案）**:Linux ELF 单文件程序后端（`bur build --backend x86 <file.bur>`）。完成条件 = fiber 感知 IO + `net_nb` 落地 + multi-backend 已知缺陷清零或显式登记为语言级限制。**不含**模块包、**不含**用 x86 编 compiler（x86 自举）、**不含** Mach-O/PE。自举判定维持 §3：编译器由本语言写成且能编译自己；输出 C 再经 cc 落地，完全算自举。模块包与 x86 自举若将来做，必须拆成两项（用户包 ≠ 编 compiler），另开编号，不得并入 S8.1
 - **Mach-O**:从 S8.1 拆出。不接在 Linux ELF 收尾之后排期。与 S8.5 PE 同级：有可验收的目标 OS 环境再开（Mach-O 前置 = macOS 测试环境）
-- **排除**:Effects——与现有 CSP(fiber/channel/select)竞争控制流转移,CSP 已覆盖 IO/并发大半实用场景,边际价值与代价不成比例
-- **排除**:Refinement Types——无 constraint solver 地基,须从零造子系统;与轻标注工程气质冲突(Rust 未上)
-- **排除**:GADTs——动 HM 最微妙处,通用工程价值最低
+- **排除**:Effects——与现有 CSP(fiber/channel/select)竞争控制流转移，CSP 已覆盖 IO/并发大半实用场景，边际价值与代价不成比例
+- **排除**:Refinement Types——无 constraint solver 地基，须从零造子系统；与轻标注工程气质冲突（Rust 未上）
+- **排除**:GADTs——动 HM 最微妙处，通用工程价值最低
 - **排除**:Linear(全局)——永不
-- **backlog**:局部 Affine(资源)——file/socket/channel 的 use-after-close 检查,流敏感 lint 级,不碰 GC,能把 close-of-closed-channel 运行时 trap 提前为编译期错
+- **backlog**:局部 Affine(资源)——file/socket/channel 的 use-after-close 检查，流敏感 lint 级，不碰 GC,能把 close-of-closed-channel 运行时 trap 提前为编译期错
 
 ### x86-64 后端架构（S8.1）
 
-实现：`compiler/backends/x86/x86.bur` + ELF64 发射 `compiler/backends/x86/elf.bur`。无 cc 依赖,手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义(cgen 的根栈纪律照搬到手写代码生成)。
+实现：`compiler/backends/x86/x86.bur` + ELF64 发射 `compiler/backends/x86/elf.bur`。无 cc 依赖，手写 ELF。调用约定 = System V AMD64 ABI;GC 根扫描沿用 C 后端 shadow stack 精确扫描语义（cgen 的根栈纪律照搬到手写代码生成）。
 
 #### 寄存器约定
 
@@ -227,7 +227,7 @@ WASM 后端"链接 wasm32 版 burrt.c 获得 CSP"在架构上不成立——burr
 
 #### 值表示
 
-Raw int64，8 字节/槽，**无 tag**。字符串是指针 → `[8B len][content bytes]`（data section 或堆）。**float 装箱(boxed)**：值栈/字段/列表元素/闭包 upval 里存 8B **指针** → 指向堆上 `[8B bits]` 盒（IEEE-754 double 位模式）；算术/比较/取负走 SSE（`addsd`/`subsd`/`mulsd`/`divsd`/`cmpsd`），`to_float`/`trunc`/`float_bits`/`parse_float` 在盒与 int/str 间转换。
+Raw int64，8 字节/槽，**无 tag**。字符串是指针 → `[8B len][content bytes]`（data section 或堆）。**float 装箱（boxed）**：值栈/字段/列表元素/闭包 upval 里存 8B **指针** → 指向堆上 `[8B bits]` 盒（IEEE-754 double 位模式）；算术/比较/取负走 SSE（`addsd`/`subsd`/`mulsd`/`divsd`/`cmpsd`），`to_float`/`trunc`/`float_bits`/`parse_float` 在盒与 int/str 间转换。
 
 #### 内存布局
 
@@ -278,7 +278,7 @@ ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
 
 **Tuple**（堆）：`[8B n][8B elem0]...[8B elemN-1]`（8+8n 字节），构造时从值栈 rep movsb 复制元素。
 
-**Record**（堆）：`[8B n_fields][8B cidx][8B field0]...[8B fieldN-1]`,与 op_record 配套字段名编码查表。
+**Record**（堆）：`[8B n_fields][8B cidx][8B field0]...[8B fieldN-1]`，与 op_record 配套字段名编码查表。
 
 **不加 type tag 的理由**：类型检查器保证 op_test_variant 和 op_get_field 只收到 enum instance。运行时类型区分只在 op_call（closure vs constructor）需要，sentinel 处理。
 
@@ -374,20 +374,20 @@ x86 后端无 libc、无 ucontext——fiber 调度、park/wake、上下文切�
 - per-fiber defer 栈（数组存 closure 指针）+ 帧进入记 watermark（照 C runtime `bur_run_defers` 的 dbase 语义）
 - op_defer 压入；函数 epilogue 前按 watermark LIFO 执行，返回值先 peek 保留在栈上再执行 defer（防 defer 内分配回收）
 
-## 6.2 LSP 与编辑器生态(工程视角，对应 S9)
+## 6.2 LSP 与编辑器生态（工程视角，对应 S9）
 
-**架构定案**：LSP 服务器用 Burryn 写(延续自举原则)，作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0(LSP 3.17 规范)。所有语言智能在服务器端；编辑器插件是**薄客户端**——只转发 LSP 消息 + 渲染 UI，不含语言逻辑。新增编辑器支持 = 实现 LSP client 协议，零服务器改动。
+**架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0(LSP 3.17 规范)。所有语言智能在服务器端；编辑器插件是**薄客户端**——只转发 LSP 消息 + 渲染 UI，不含语言逻辑。新增编辑器支持 = 实现 LSP client 协议，零服务器改动。
 
 **传输层**：Content-Length 帧分割 + JSON-RPC 消息解析/路由；消息体 JSON 序列化/反序列化走 `std/json`。
 
-**文档同步**：Full sync 模式(didOpen/didChange/didClose 全量内容)，服务器维护内存文档表，checker 读内存覆盖磁盘。增量 sync(delta)为后续优化，v1 不做。
+**文档同步**：Full sync 模式（didOpen/didChange/didClose 全量内容），服务器维护内存文档表，checker 读内存覆盖磁盘。增量 sync(delta)为后续优化，v1 不做。
 
-**诊断推送**：didOpen 与 didChange(防抖)后重跑 check 管线(lex → parse → check)，DiagT/DiagX 转 LSP Diagnostic 推送。check 管线须支持从内存源码运行(LSP 核心工程改造点)。
+**诊断推送**：didOpen 与 didChange(防抖)后重跑 check 管线（lex → parse → check），DiagT/DiagX 转 LSP Diagnostic 推送。check 管线须支持从内存源码运行（LSP 核心工程改造点）。
 
-**语言特性(S9.2)**：
-- hover：显示推导类型/签名(复用 checker 推导结果)
-- go-to-definition：从名字使用处跳到绑定处(需 AST span → 定义 span 映射，跨文件走 module loader)
-- completion：作用域感知名字补全(局部变量、函数名、包成员 `pkg::`)
+**语言特性（S9.2）**：
+- hover：显示推导类型/签名（复用 checker 推导结果）
+- go-to-definition：从名字使用处跳到绑定处（需 AST span → 定义 span 映射，跨文件走 module loader）
+- completion：作用域感知名字补全（局部变量、函数名、包成员 `pkg::`）
 - formatting：调 `bur fmt -`(stdin→stdout)
 - signature-help：函数调用时显示参数信息
 

@@ -1,8 +1,8 @@
 # GOALS — Burryn 路线与里程碑
 
 > v0.6 · active · 2026-08-22
-> 状态:前瞻规划 · 编号 `S<n>[.<m>]`
-> 相关文档:[`SPEC.md`](SPEC.md) 已定设计 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
+> 状态：前瞻规划 · 编号 `S<n>[.<m>]`
+> 相关文档：[`SPEC.md`](SPEC.md) 已定设计 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
 > **注意：** 本文档管阶段、完成线、未开工项。语言/ABI/拒绝清单在 [`SPEC.md`](SPEC.md)；冲突以 SPEC 为准。
 > 新的设计决策先问 owner，写入 SPEC，不堆在本文件当「已定」。

@@ -40,7 +40,7 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
   使用祈使句；结尾不加句号，不用 emoji。
 - Scope examples: `lexer`, `parser`, `checker`, `cgen`, `vm`, `docs`.
 
-Example / 示例:
+Example / 示例：
 
 ```markdown
 feat(lexer): collect comments as out-of-band trivia

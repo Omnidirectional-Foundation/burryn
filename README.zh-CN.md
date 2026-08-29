@@ -211,6 +211,7 @@ $ ./bur-base build compiler -o bur
 | [`docs/SPEC.md`](docs/SPEC.md) | 设计权威 —— 语言定案与拒绝清单 |
 | [`docs/GOALS.md`](docs/GOALS.md) | 路线 —— 分阶段里程碑（S1–S10）与剩余完成线 |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | 贡献者 —— 旧 `v`/`L` 标签到新 `S` 编号的历史对照 |
+| [`examples/README.md`](examples/README.md) | 可运行示例索引，附阅读顺序 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献者 —— 分支策略、提交规范与自举定点要求 |
 | [`SECURITY.md`](SECURITY.md) | 私下报告安全漏洞 |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | 社区行为准则 |
@@ -232,4 +233,4 @@ $ ./bur-base build compiler -o bur
 作者不对因使用本软件而产生的任何损害承担责任。
 完整条款（包括免责声明与责任限制）见 [LICENSE](LICENSE) 文件。
 
-任何使用本软件的商业实体，须自行负责遵守适用的法律法规，包括但不限于欧盟《网络弹性法案》(CRA) 及任何其他区域性要求。
+任何使用本软件的商业实体，须自行负责遵守适用的法律法规，包括但不限于欧盟《网络弹性法案》（CRA） 及任何其他区域性要求。

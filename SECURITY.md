@@ -71,4 +71,4 @@ This software is provided "as is", without warranty of any kind.
 Any commercial entity using this software is solely responsible for its own compliance with applicable laws and regulations, including the EU Cyber Resilience Act (CRA).
 
 本软件按"原样"提供，不附带任何形式的担保。
-任何使用本软件的商业实体，须自行负责遵守适用的法律法规，包括欧盟《网络弹性法案》(CRA)。
+任何使用本软件的商业实体，须自行负责遵守适用的法律法规，包括欧盟《网络弹性法案》（CRA）。

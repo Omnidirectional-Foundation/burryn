@@ -211,6 +211,7 @@ Policy and private reporting: [`SECURITY.md`](SECURITY.md).
 | [`docs/SPEC.md`](docs/SPEC.md) | design authority — language decisions and the rejection list |
 | [`docs/GOALS.md`](docs/GOALS.md) | roadmap — staged milestones (S1–S10) and remaining completion lines |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
+| [`examples/README.md`](examples/README.md) | index of the runnable examples, with a reading order |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
 | [`SECURITY.md`](SECURITY.md) | reporting vulnerabilities privately |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | community conduct standards |
