@@ -9,7 +9,7 @@ until the next tag. Latest first.
 版本号跟 `v0.N.0` tag 走，不走全局两日窗口。
 条目标题上的日期是该版本的跨度：从开窗到下一枚 tag 之前。最新在前。
 
-## v0.6 (2026-08-13 ~ 08-26)
+## v0.6 (2026-08-13 ~ 08-29)
 
 **Recorded IPC clauses, then settled them; landed capture and name-based records;
 stopped restating live status across docs** — SPEC keeps decisions, GOALS keeps
@@ -20,6 +20,22 @@ roadmap.
 SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口，README/tutorial
 跟可观察语义，CLAUDE.md 管闸门而不是第二份路线图。
 
+- **Fixed:** The from-scratch bootstrap in both READMEs builds `bur-base` inside
+  the archived Go host worktree, matching `ci.yml`; the obsolete `seed-base-1`
+  bridge step is gone.
+- **修复：** 两份 README 的从零自举改为在归档 Go 宿主 worktree 内构建 `bur-base`，
+  与 `ci.yml` 一致；废弃的 `seed-base-1` 过桥步骤已移除。
+- **Changed:** Release tags are `v0.N.0`; the `seed-base-N` anchors are retired and
+  the CHANGELOG version note follows the new scheme.
+- **变更：** 发布 tag 改用 `v0.N.0`，`seed-base-N` 基准 tag 退役，CHANGELOG 的版本号
+  说明同步改写。
+- **Changed:** Chinese prose in SPEC, GOALS, NUMBERING, README.zh-CN, CONTRIBUTING
+  and SECURITY uses full-width punctuation.
+- **变更：** SPEC、GOALS、NUMBERING、README.zh-CN、CONTRIBUTING 与 SECURITY 的中文
+  正文改用全角标点。
+- **Added:** `examples/README.md` is listed in the Documentation table of both
+  READMEs.
+- **新增：** 两份 README 的文档表补入 `examples/README.md`。
 - **Changed:** Compiler sources split by concern under `frontend/`, `bytecode/`,
   `backends/{c,x86}/`, `module/`, `tooling/`, and `lib/`; CLI helpers move to
   `compiler/cli/` with a thin `main.bur` entry.

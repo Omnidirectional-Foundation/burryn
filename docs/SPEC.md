@@ -1,6 +1,6 @@
 # SPEC — Burryn 项目规范
 
-> v0.6 · active · 2026-08-22
+> v0.6 · active · 2026-08-29
 > 状态：回顾性权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
 > 相关文档：[`GOALS.md`](GOALS.md) 路线与完成线 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
