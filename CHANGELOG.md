@@ -3,11 +3,11 @@
 All notable changes to this project are documented here.
 本文件记录项目的所有重要变更。
 
-Version numbers follow seed-base tags (`v0.(N+1)` after `seed-base-N`), not the
-global two-day window. The date range on each heading spans that version: from
-the day the window opened until the next seed-base tag. Latest first.
-版本号跟 `seed-base-N` tag（打 tag 后下一号为 `v0.(N+1)`），不走全局两日窗口。
-条目标题上的日期是该版本的跨度：从开窗到下一枚 seed-base 之前。最新在前。
+Version numbers follow the `v0.N.0` tags, not the global two-day window. The
+date range on each heading spans that version: from the day the window opened
+until the next tag. Latest first.
+版本号跟 `v0.N.0` tag 走，不走全局两日窗口。
+条目标题上的日期是该版本的跨度：从开窗到下一枚 tag 之前。最新在前。
 
 ## v0.6 (2026-08-13 ~ 08-26)
 

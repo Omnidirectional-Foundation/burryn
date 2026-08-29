@@ -188,13 +188,12 @@ $ bur version           打印版本号
 $ bur build compiler -o bur
 ```
 
-从零自举（归档 Go 宿主 + 冻结的 `seed-base-1` 过桥）：
+从零自举（归档 Go 宿主）：
 
 ```sh
 $ git worktree add ../go-host archive/go-host
 $ (cd ../go-host && go build -o ../bur-seed .)
-$ git worktree add ../seed-base seed-base-1
-$ (cd ../seed-base && ../bur-seed build burc -o ../bur-base)
+$ (cd ../go-host && ../bur-seed build burc -o ../bur-base)
 $ ./bur-base build compiler -o bur
 ```
 

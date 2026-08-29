@@ -188,13 +188,12 @@ A native `bur` rebuilds itself with:
 $ bur build compiler -o bur
 ```
 
-Bootstrap from scratch (archived Go host + frozen `seed-base-1` bridge):
+Bootstrap from scratch (archived Go host):
 
 ```sh
 $ git worktree add ../go-host archive/go-host
 $ (cd ../go-host && go build -o ../bur-seed .)
-$ git worktree add ../seed-base seed-base-1
-$ (cd ../seed-base && ../bur-seed build burc -o ../bur-base)
+$ (cd ../go-host && ../bur-seed build burc -o ../bur-base)
 $ ./bur-base build compiler -o bur
 ```
 
