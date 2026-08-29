@@ -12,14 +12,50 @@ until the next tag. Latest first.
 ## v0.6 (2026-08-13 ~ 08-29)
 
 **Recorded IPC clauses, then settled them; landed capture and name-based records;
-stopped restating live status across docs** — SPEC keeps decisions, GOALS keeps
-milestones, grammar keeps surface syntax, CHANGELOG keeps the version window,
+retired `SPEC.md` and stopped restating live status across docs** —
+architecture.md keeps decisions and the backend ABI, GOALS keeps milestones and
+the rejection list, grammar keeps surface syntax, CHANGELOG keeps the version window,
 README/tutorial follow observable semantics, CLAUDE.md keeps gates not a second
 roadmap.
-**先落地 IPC 条款再定案；补上 capture 与封闭 record 按名合一；文档不再互相复述「现在怎样」** —
-SPEC 管定案，GOALS 管阶段，grammar 管表层，CHANGELOG 管版本窗口，README/tutorial
-跟可观察语义，CLAUDE.md 管闸门而不是第二份路线图。
+**先落地 IPC 条款再定案；补上 capture 与封闭 record 按名合一；废弃 `SPEC.md`，文档不再互相
+复述「现在怎样」** —— architecture.md 管定案与后端 ABI，GOALS 管阶段与拒绝清单，grammar
+管表层，CHANGELOG 管版本窗口，README/tutorial 跟可观察语义，CLAUDE.md 管闸门而不是第二
+份路线图。
 
+- **Removed:** `docs/SPEC.md`. Its content splits by job: language decisions,
+  the backend matrix, the x86-64 ABI, LSP architecture and runtime IO go to
+  `docs/architecture.md`; completion lines and the rejection list go to
+  `docs/GOALS.md`. Pointers in both READMEs, both tutorials, `grammar.md`,
+  `NUMBERING.md`, `CONTRIBUTING.md` and the feature-request template follow.
+- **移除：** `docs/SPEC.md`。内容按职责拆分：语言定案、后端矩阵、x86-64 ABI、LSP
+  架构与 runtime IO 迁入 `docs/architecture.md`；完成线与拒绝清单迁入
+  `docs/GOALS.md`。两份 README、两份 tutorial、`grammar.md`、`NUMBERING.md`、
+  `CONTRIBUTING.md` 与功能请求模板的指针同步更新。
+- **Changed:** Both READMEs, both tutorials and `CLAUDE.md` describe the x86-64
+  backend as emitting ELF, PE and Mach-O, matching the `--os linux|windows|darwin`
+  the CLI already accepts; the tutorials list `--backend`, `--os`, `bur mod`,
+  `bur get` and `bur lsp`.
+- **变更：** 两份 README、两份 tutorial 与 `CLAUDE.md` 按 CLI 已接受的
+  `--os linux|windows|darwin` 描述 x86-64 后端可发 ELF / PE / Mach-O；两份 tutorial
+  补上 `--backend`、`--os`、`bur mod`、`bur get` 与 `bur lsp`。
+- **Changed:** `GOALS.md` states S8.5 as PE together with Mach-O (no separate
+  number), pins the completion gate for S8.1 and S8.5 to a continuously green
+  `ci.yml`, and labels stages 已实现 / 部分实现 / 未实现 instead of phase words
+  that go stale.
+- **变更：** `GOALS.md` 把 S8.5 写为 PE 与 Mach-O 同项（不另开编号），把 S8.1 与
+  S8.5 的验收闸钉在 `ci.yml` 持续全绿，阶段状态改用 已实现 / 部分实现 / 未实现。
+- **Changed:** `CONTRIBUTING.md` records the long-lived `dev` branch instead of
+  claiming `main` only.
+- **变更：** `CONTRIBUTING.md` 改为记录常驻 `dev` 分支，不再声称只用 `main`。
+- **Changed:** `CLAUDE.md` points at the README for the CLI table and keeps only
+  this repository's verification entry points.
+- **变更：** `CLAUDE.md` 的命令节指向 README，只保留本仓的验证入口。
+- **Added:** `examples/README.md` indexes the eight runnable examples it omitted
+  (`fileio`, `float_arith`, `readir`, `syscall`, `records`, `enum_mono`,
+  `poly_hetero`, `select_recv`).
+- **新增：** `examples/README.md` 补入此前漏列的八个可运行样例（`fileio`、
+  `float_arith`、`readir`、`syscall`、`records`、`enum_mono`、`poly_hetero`、
+  `select_recv`）。
 - **Fixed:** The from-scratch bootstrap in both READMEs builds `bur-base` inside
   the archived Go host worktree, matching `ci.yml`; the obsolete `seed-base-1`
   bridge step is gone.

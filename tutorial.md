@@ -2,7 +2,7 @@ English | [中文](tutorial.zh-CN.md)
 
 # The Burryn Tutorial
 
-> See also: [`README.md`](README.md) project overview · [`docs/SPEC.md`](docs/SPEC.md) design decisions · [`docs/GOALS.md`](docs/GOALS.md) milestones
+> See also: [`README.md`](README.md) project overview · [`docs/architecture.md`](docs/architecture.md) implementation authority · [`docs/GOALS.md`](docs/GOALS.md) milestones
 
 Burryn is a small, statically-inferred, zero-annotation language with CSP
 concurrency: Rust-style types and `match`, Go-style concurrency and
@@ -245,7 +245,7 @@ fn classify(n) {
 
 **Closures**: an anonymous function `fn() { ... }` captures by **value**
 (copy-at-capture). To share a `mut` local, write `capture(ref n)` — see
-`docs/SPEC.md` §6.1 and `docs/grammar.md`.
+`docs/architecture.md` §5.9 and `docs/grammar.md`.
 
 ```rust
 fn make_counter() {
@@ -668,7 +668,7 @@ returns the full string; `write_line(h, s)` writes a line (appends `\n`).
 
 **Known limitations**: DNS resolution blocks the scheduler synchronously.
 UDP and TLS are not in the language. Unix domain sockets are rejected
-(`docs/SPEC.md` §7).
+(`docs/GOALS.md` §7.3).
 
 ---
 
@@ -810,12 +810,17 @@ $ bur build <file|dir>     compile to a native binary via C
 $ bur fmt <file|dir|->     format source (--check reports without writing)
 $ bur test [dir]           run tests (--run <substr> filter, -v verbose)
 $ bur dis <file|dir>       disassemble the bytecode
+$ bur mod <subcommand>     module management (init, tidy, download, verify)
+$ bur get <path>@<ver>     add or upgrade a dependency
+$ bur lsp                  language server (stdin/stdout JSON-RPC)
 $ bur version
 ```
 
 `bur build` flags: `-o <path>` output path; `--emit c` emits C instead of a
-binary. Compiler search: `$CC` -> `cc` -> `gcc` -> `clang`; if none, it errors
-and suggests `bur run`.
+binary; `--backend <name>` picks the code backend (`c` by default, `x86` for the
+hand-written one); `--os <linux|windows|darwin>` picks the x86 target format.
+Compiler search: `$CC` -> `cc` -> `gcc` -> `clang`; if none, it errors and
+suggests `bur run`.
 
 `bur fmt` formats the full AST and reinserts comments; `--check` reports whether
 formatting is needed without writing, suitable for CI. `bur fmt -` reads stdin
@@ -824,10 +829,13 @@ and writes stdout.
 Exit codes: `0` success, `1` static error, `2` usage error, `3` input unreadable,
 `4` runtime trap.
 
-**Two backends**: the VM (`bur run`, dependency-free) and the C backend
-(`bur build`, native binary via the system cc). The contract is **byte-identical
-stdout + matching exit code**; the whole language, concurrency included, matches
-on both paths, enforced by tests.
+**Backends**: the VM (`bur run`, dependency-free), the C backend (`bur build`,
+native binary via the system cc), and the hand-written x86-64 backend
+(`bur build --backend x86`, single files, no toolchain at all). The contract
+between VM and C is **byte-identical stdout + matching exit code**; the whole
+language, concurrency included, matches on both paths, enforced by tests. The
+x86 backend is held to that same contract as its completion line — see
+`docs/GOALS.md` §3.
 
 ---
 

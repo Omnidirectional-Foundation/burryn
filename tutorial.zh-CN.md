@@ -2,7 +2,7 @@
 
 # Burryn 教程
 
-> 相关文档：[`README.zh-CN.md`](README.zh-CN.md) 项目概览 · [`docs/SPEC.md`](docs/SPEC.md) 设计定案 · [`docs/GOALS.md`](docs/GOALS.md) 里程碑
+> 相关文档：[`README.zh-CN.md`](README.zh-CN.md) 项目概览 · [`docs/architecture.md`](docs/architecture.md) 设计定案 · [`docs/GOALS.md`](docs/GOALS.md) 里程碑
 
 Burryn 是一门静态推导、零标注、CSP 并发的实用工具语言：Rust 式的类型与
 `match`，Go 式的并发与简洁，一个二进制交付。本教程只用**当前能跑**的特性，
@@ -231,7 +231,7 @@ fn classify(n) {
 ```
 
 **闭包**：匿名函数 `fn() { ... }` **按值**捕获（copy-at-capture）。要与外层
-`mut` 局部共享，写 `capture(ref n)` —— 见 `docs/SPEC.md` §6.1 与 `docs/grammar.md`。
+`mut` 局部共享，写 `capture(ref n)` —— 见 `docs/architecture.md` §5.9 与 `docs/grammar.md`。
 
 ```rust
 fn make_counter() {
@@ -631,7 +631,7 @@ match client() {
 `std/net` 提供两个便利函数：`read_all(h)` 读到 EOF 并返回完整字符串，
 `write_line(h, s)` 写一行（自动追加 `\n`）。
 
-**已知限制**：DNS 解析同步阻塞调度器。语言里没有 UDP、TLS。Unix domain socket 已否决（`docs/SPEC.md` §7）。
+**已知限制**：DNS 解析同步阻塞调度器。语言里没有 UDP、TLS。Unix domain socket 已否决（`docs/GOALS.md` §7.3）。
 
 ---
 
@@ -770,20 +770,26 @@ $ bur build <file|dir>     经由 C 编译成原生二进制
 $ bur fmt <file|dir|->     格式化源码（--check 只检查不写回）
 $ bur test [dir]           运行测试（--run <substr> 过滤，-v 详细）
 $ bur dis <file|dir>       反汇编字节码
+$ bur mod <subcommand>     模块管理（init、tidy、download、verify）
+$ bur get <path>@<ver>     添加或升级依赖
+$ bur lsp                  language server（stdin/stdout JSON-RPC）
 $ bur version
 ```
 
-`bur build` 选项：`-o <path>` 输出路径；`--emit c` 吐出 C 而非二进制。找
-编译器顺序：`$CC` -> `cc` -> `gcc` -> `clang`；都没有则报错并提示改用 `bur run`。
+`bur build` 选项：`-o <path>` 输出路径；`--emit c` 吐出 C 而非二进制；
+`--backend <name>` 选代码后端（默认 `c`，手写后端为 `x86`）；`--os <linux|windows|darwin>`
+选 x86 的目标格式。找编译器顺序：`$CC` -> `cc` -> `gcc` -> `clang`；都没有则报错并
+提示改用 `bur run`。
 
 `bur fmt` 格式化整棵 AST 并重新插入注释；`--check` 模式只报告是否需要格式化而不
 写回文件，适合 CI。`bur fmt -` 从 stdin 读、写到 stdout。
 
 退出码：`0` 成功、`1` 静态错误、`2` 用法错误、`3` 读不到输入、`4` 运行时 trap。
 
-**两套后端**：VM（`bur run`，零依赖）与 C 后端（`bur build`，经系统 cc 出原生
-二进制）。判定标准是 **stdout 逐字节 + 退出码一致**，整门语言（含并发）两条路径
-已一致，由测试持续保证。
+**三套后端**：VM（`bur run`，零依赖）、C 后端（`bur build`，经系统 cc 出原生
+二进制），以及手写 x86-64 后端（`bur build --backend x86`，只吃单文件，完全不依赖
+工具链）。VM 与 C 的判定标准是 **stdout 逐字节 + 退出码一致**，整门语言（含并发）
+两条路径已一致，由测试持续保证；x86 后端以同一标准作为完成线，见 `docs/GOALS.md` §3。
 
 ---
 

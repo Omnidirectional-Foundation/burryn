@@ -1,7 +1,7 @@
 [English](README.md) | 中文
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
-[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
+[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/architecture.md)
 
 # Burryn
 
@@ -10,7 +10,7 @@
 ## 简介
 
 Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
-它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断（需要时可选签名标注）、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机、可移植的 C 后端，以及手写 x86-64 Linux ELF 后端（单文件程序；剩余工作见 `docs/GOALS.md`）。
+它拥有手写词法分析器、递归下降解析器、零标注的 Hindley-Milner 类型推断（需要时可选签名标注）、单遍字节码编译器、自带 mark-sweep 垃圾回收器与绿色线程调度器的栈式虚拟机、可移植的 C 后端，以及完全不依赖工具链、可直接发射 ELF / PE / Mach-O 的手写 x86-64 后端（单文件程序；剩余工作见 `docs/GOALS.md`）。
 
 **编译器是自举的。**
 `compiler/` 用 Burryn 自身重实现了整条编译管线——词法、语法、类型检查、字节码编译、C 代码生成、虚拟机、模块加载、工具链与 `bur` CLI。
@@ -28,7 +28,7 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 
 - 一份原生 `bur` 二进制，或用 **Go 1.26+** 从 `archive/go-host` 自举
 - C99 编译器（`gcc` 或 `clang`），用于 `bur build` 以及重建 `bur`
-- Linux，用于 x86-64 ELF 后端（`bur build --backend x86`）
+- 一台 x86-64 主机运行原生后端的产物：Linux（ELF）、Windows（PE）或 macOS（Mach-O）
 
 ## 特性
 
@@ -152,7 +152,7 @@ source --lexer--> tokens --parser--> AST --checker--> typed --compiler--> byteco
                                          v                   v
                                    BurrynVM               原生后端
                                    (vm.bur)               - C backend (backends/c/cgen.bur)
-                                   fibers + GC            - x86-64 ELF (backends/x86/)
+                                   fibers + GC            - x86-64 ELF/PE/Mach-O (backends/x86/)
 
 Burryn 已完成自举：整条管线位于 `compiler/` 下（`frontend/`、`bytecode/`、
 `backends/`、`module/`、`tooling/`），`bur` CLI 位于 `compiler/main.bur`。
@@ -160,7 +160,7 @@ Burryn 已完成自举：整条管线位于 `compiler/` 下（`frontend/`、`byt
 ```
 
 - **编译器：** 单遍编译，clox 风格的局部变量/upvalue，配合临时值追踪，使 `match`/块表达式（会声明局部变量）可出现在任意表达式深度。
-- **闭包：** 捕获语义见 `docs/SPEC.md` §6.1。
+- **闭包：** 捕获语义见 `docs/architecture.md` §5.9。
 - **Match：** 编译为变体测试（基于枚举标识与 tag 的 `TEST_VARIANT`）和字段提取，无需哈希，无需反射。
 - **GC：** 每个语言对象都在一个侵入式列表中；根包括全局变量、每个 fiber 的栈/帧/闭包 cell/待发送的 channel 值。
 - **调度器：** FIFO 就绪队列；fiber 在 channel 等待队列上 park；接收方/发送方直接交接值。
@@ -172,7 +172,8 @@ $ bur run <file|dir>    类型检查并在 VM 上运行
 $ bur <file|dir>        同上
 $ bur check <file|dir>  仅类型检查（rustc 风格诊断）
 $ bur build <file|dir>  经 C 编译为原生二进制（需要 cc/gcc/clang）
-$ bur build --backend x86 <file.bur> -o <out>  编译为 x86-64 ELF 原生二进制
+$ bur build --backend x86 <file.bur> -o <out>  直接编译为 x86-64 原生二进制
+$ bur build --backend x86 --os <linux|windows|darwin> <file.bur>  选择 ELF、PE 或 Mach-O
 $ bur fmt <file|dir|->  按官方格式重写源码
 $ bur dis <file|dir>    反编译字节码
 $ bur test [dir]        运行 *_test.bur 中的 test_* 函数
@@ -208,8 +209,8 @@ $ ./bur-base build compiler -o bur
 | ----------------- | ---------------- |
 | [`tutorial.zh-CN.md`](tutorial.zh-CN.md) | 用户 —— 语言实践导览（[English](tutorial.md)） |
 | [`docs/grammar.md`](docs/grammar.md) | 已冻结的表层 grammar |
-| [`docs/SPEC.md`](docs/SPEC.md) | 设计权威 —— 语言定案与拒绝清单 |
-| [`docs/GOALS.md`](docs/GOALS.md) | 路线 —— 分阶段里程碑（S1–S10）与剩余完成线 |
+| [`docs/architecture.md`](docs/architecture.md) | 实现权威 —— 语言定案、后端 ABI、runtime IO |
+| [`docs/GOALS.md`](docs/GOALS.md) | 路线 —— 分阶段里程碑（S1–S10）、完成线与拒绝清单 |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | 贡献者 —— 旧 `v`/`L` 标签到新 `S` 编号的历史对照 |
 | [`examples/README.md`](examples/README.md) | 可运行示例索引，附阅读顺序 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献者 —— 分支策略、提交规范与自举定点要求 |
@@ -221,7 +222,7 @@ $ ./bur-base build compiler -o bur
 
 ## 诚实局限
 
-缺口见 [`docs/GOALS.md`](docs/GOALS.md)。当前可观察：x86-64 ELF 仅 Linux、仅单文件；std 没有 `sort`、`getenv`、regex。
+缺口见 [`docs/GOALS.md`](docs/GOALS.md)。当前可观察：x86-64 后端只吃单文件、不吃模块包；Linux ELF 是主目标，PE 与 Mach-O 的产物由 CI 上 hello 级冒烟覆盖；std 没有 `sort`、`getenv`、regex。
 
 ## 许可与免责
 

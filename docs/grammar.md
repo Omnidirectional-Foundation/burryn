@@ -269,5 +269,5 @@ pub_interface_fn ::= 'pub' 'fn' ident '(' { ident ':' type_expr } ',' ')' '->' t
 ## 10. 变更流程
 
 1. 语法变更 = 改本文件 + parser/lexer + 全仓 `bur fmt` + 自举 fixpoint + parity 全绿
-2. 语义变更（不改表层语法）不触碰本文件，但须更新 [`SPEC.md`](SPEC.md)；阶段/完成线更新 [`GOALS.md`](GOALS.md)
+2. 语义变更（不改表层语法）不触碰本文件，但须更新 [`architecture.md`](architecture.md)；阶段/完成线更新 [`GOALS.md`](GOALS.md)
 3. LSP 以本文件为语法契约，语法变更须同步 TextMate grammar 与 LSP 词法

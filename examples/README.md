@@ -30,6 +30,10 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 | `textproc.bur` | string and list natives: split, trim, join, slice, concat |
 | `interpolation.bur` | string interpolation with `{expr}` and `{{` escape |
 | `cleanup.bur` | defer: LIFO cleanup, closure capture, `?` early exit |
+| `fileio.bur` | write_file/read_file round-trip and the missing-path error |
+| `float_arith.bur` | float arithmetic and comparison over the SSE paths |
+| `readir.bur` | read_dir: list a directory and scan its entries |
+| `syscall.bur` | file_exists probes and sleep |
 
 ## types/ — 类型系统、match、枚举
 
@@ -42,6 +46,8 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 | `constants.bur` | compile-time const folding |
 | `match_guard.bur` | match arms with `if` guards |
 | `pipeline_op.bur` | the `\|>` pipe operator |
+| `records.bur` | record literals, field access, functional update |
+| `enum_mono.bur` | one generic Result used at several instantiations |
 
 ## concurrency/ — CSP、channel、select
 
@@ -83,3 +89,5 @@ byte-identical stdout. Files without one (`*_trap.bur`) are expected to abort
 | `wordcount.bur` | word frequency counter with maps |
 | `gc_stress.bur` | heap churn to exercise the mark-sweep collector |
 | `geometry/` | multi-package module: bur.mod, import, pub |
+| `poly_hetero.bur` | heterogeneous polymorphic calls, per-signature emission |
+| `select_recv.bur` | single-arm recv `select`: arm-variable typing and delivery |

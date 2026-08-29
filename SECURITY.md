@@ -39,9 +39,9 @@ Security-sensitive areas include, but are not limited to:
 Burryn 是一门自举编译器与虚拟机。
 安全敏感面包括但不限于：
 
-- **x86-64 ELF backend** — hand-written native codegen and scheduler (`compiler/backends/x86/`).
+- **x86-64 backend** — hand-written native codegen, scheduler and the ELF/PE/Mach-O writers (`compiler/backends/x86/`).
 
-  x86-64 ELF 后端 — 手写原生代码生成与调度器。
+  x86-64 后端 — 手写原生代码生成、调度器与 ELF/PE/Mach-O 写出层。
 - **C backend** — code generation and the emitted `program.c` compiled by `cc`.
 
   C 后端 — 代码生成与交给 `cc` 编译的 `program.c`。

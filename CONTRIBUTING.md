@@ -19,9 +19,10 @@ issue、PR 和评论都可以使用**英文或中文**，任选其一。
 
 ## Branching / 分支策略
 
-- This project uses **`main` only**. There are no long-lived feature branches.
+- Day-to-day work lands on the long-lived **`dev`** branch; `main` is protected
+  and takes merge commits from PRs only.
 
-  本项目**只用 `main` 分支**，没有长期存在的功能分支。
+  日常开发在长期分支 **`dev`** 上进行；`main` 受保护，只接受来自 PR 的 merge commit。
 - Open PRs against `main`. / 请以 `main` 为目标发起 PR。
 
 ## Commits / 提交规范
@@ -45,7 +46,7 @@ Example / 示例：
 ```markdown
 feat(lexer): collect comments as out-of-band trivia
 fix(cgen): access enum fields by integer index
-docs(SPEC): record a capture-semantics decision
+docs(architecture): record a capture-semantics decision
 ```
 
 ## Bootstrap fixpoint / 自举定点
@@ -71,8 +72,13 @@ bur test -v                 # verbose: print each test name
 Each `test_*` function with zero parameters in a `*_test.bur` file is a test.
 Tests run in separate subprocesses; traps and deadlocks count as failures.
 
+Refactoring changes need a test safety net in place **before** the refactor
+starts, not after.
+
 每个 `*_test.bur` 文件中零参数的 `test_*` 函数即为一个测试。
 测试在独立子进程中运行；trap 和死锁视为失败。
+
+重构类改动必须**先**有测试安全网再动手，不能改完再补。
 
 ### Golden examples / Golden 样例
 

@@ -1,7 +1,7 @@
 English | [中文](README.zh-CN.md)
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square)](LICENSE)
-[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/SPEC.md)
+[![Bootstrapping](https://img.shields.io/badge/Bootstrapping--4a4a4a?style=flat-square)](docs/architecture.md)
 
 # Burryn
 
@@ -10,7 +10,7 @@ English | [中文](README.zh-CN.md)
 ## Introduction
 
 Burryn is a small programming language forged from Go and Rust — a practical tool language for ops scripts, CSP-style concurrent pipelines, and small tools with static guarantees.
-It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference (zero annotations by default, optional signature annotations), a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and a hand-written x86-64 Linux ELF backend (single-file programs; remaining work in `docs/GOALS.md`).
+It has a hand-written lexer, recursive-descent parser, Hindley-Milner type inference (zero annotations by default, optional signature annotations), a single-pass bytecode compiler, a stack-based VM with its own mark-sweep garbage collector and green-thread scheduler, a portable C backend that turns programs into standalone native binaries, and a hand-written x86-64 backend that emits ELF, PE and Mach-O with no toolchain at all (single-file programs; remaining work in `docs/GOALS.md`).
 
 **The compiler is self-hosted.**
 `compiler/` reimplements the whole pipeline — lexer, parser, type checker, bytecode compiler, C code generator, VM, module loader, tooling, and the `bur` CLI — in Burryn itself.
@@ -28,7 +28,7 @@ A **burr** is what forging leaves on metal.
 
 - A native `bur` binary, or **Go 1.26+** to bootstrap from `archive/go-host`
 - A C99 compiler (`gcc` or `clang`) for `bur build` and for rebuilding `bur`
-- Linux, for the x86-64 ELF backend (`bur build --backend x86`)
+- An x86-64 host to run what the native backend emits: Linux (ELF), Windows (PE) or macOS (Mach-O)
 
 ## Features
 
@@ -151,7 +151,7 @@ source --lexer--> tokens --parser--> AST --checker--> typed --compiler--> byteco
                                          v                   v
                                    BurrynVM            Native backends
                                    (vm.bur)            - C backend (backends/c/cgen.bur)
-                                   fibers + GC         - x86-64 ELF (backends/x86/)
+                                   fibers + GC         - x86-64 ELF/PE/Mach-O (backends/x86/)
 
 Burryn is self-hosted: the whole pipeline lives under `compiler/`
 (`frontend/`, `bytecode/`, `backends/`, `module/`, `tooling/`), and the `bur`
@@ -160,7 +160,7 @@ native binary, and the result rebuilds itself byte for byte.
 ```
 
 - **Compiler**: single pass, clox-style locals/upvalues, with a temp-tracking scheme that lets `match`/block expressions (which declare locals) appear at any expression depth.
-- **Closures**: capture semantics in `docs/SPEC.md` §6.1.
+- **Closures**: capture semantics in `docs/architecture.md` §5.9.
 - **Match**: compiles to variant tests (`TEST_VARIANT` on enum identity + tag) and field extraction, no hashing, no reflection.
 - **GC**: every language object lives in an intrusive list; roots are globals, every fiber's stack/frames/closure cells/pending channel sends.
 - **Scheduler**: FIFO ready queue; fibers park on channel wait queues; the receiver/sender hands values across directly.
@@ -172,7 +172,8 @@ $ bur run <file|dir>    typecheck and run on the VM
 $ bur <file|dir>        same
 $ bur check <file|dir>  typecheck only (rustc-style diagnostics)
 $ bur build <file|dir>  compile to a native binary via C (needs cc/gcc/clang)
-$ bur build --backend x86 <file.bur> -o <out>  compile to a native x86-64 ELF binary
+$ bur build --backend x86 <file.bur> -o <out>  compile straight to an x86-64 binary
+$ bur build --backend x86 --os <linux|windows|darwin> <file.bur>  pick ELF, PE or Mach-O
 $ bur fmt <file|dir|->  rewrite source in the official format
 $ bur dis <file|dir>    disassemble the compiled bytecode
 $ bur test [dir]        run test_* functions from *_test.bur files
@@ -208,8 +209,8 @@ Policy and private reporting: [`SECURITY.md`](SECURITY.md).
 | ----------------- | ---------------- |
 | [`tutorial.md`](tutorial.md) | users — a hands-on tour of the language ([中文](tutorial.zh-CN.md)) |
 | [`docs/grammar.md`](docs/grammar.md) | frozen surface grammar |
-| [`docs/SPEC.md`](docs/SPEC.md) | design authority — language decisions and the rejection list |
-| [`docs/GOALS.md`](docs/GOALS.md) | roadmap — staged milestones (S1–S10) and remaining completion lines |
+| [`docs/architecture.md`](docs/architecture.md) | implementation authority — language decisions, backend ABI, runtime IO |
+| [`docs/GOALS.md`](docs/GOALS.md) | roadmap — staged milestones (S1–S10), completion lines, and the rejection list |
 | [`docs/NUMBERING.md`](docs/NUMBERING.md) | contributors — historical map from old `v`/`L` labels to the unified `S` scheme |
 | [`examples/README.md`](examples/README.md) | index of the runnable examples, with a reading order |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributors — branching, commit rules, and the bootstrap-fixpoint requirement |
@@ -221,7 +222,7 @@ Policy and private reporting: [`SECURITY.md`](SECURITY.md).
 
 ## Honest Limitations
 
-Known gaps: [`docs/GOALS.md`](docs/GOALS.md). Observable today: x86-64 ELF is Linux-only and single-file; std has no `sort`, `getenv`, or regex.
+Known gaps: [`docs/GOALS.md`](docs/GOALS.md). Observable today: the x86-64 backend takes single files only, never module packages; Linux ELF is its primary target, while the PE and Mach-O outputs are covered by a hello-level smoke run in CI; std has no `sort`, `getenv`, or regex.
 
 ## License & Disclaimer
 
