@@ -494,6 +494,20 @@ func (g *cgen) emitInst(id int, code []byte, ip int) int {
 		n := int(code[ip+1])
 		w("bur_tuple_make(%d);", n)
 		return ip + 2
+	case OpRecord:
+		n := int(code[ip+1])
+		cidx := u16(1)
+		w("bur_record_make(%d, %s);", n, cStr(g.constStr(id, cidx)))
+		return ip + 4
+	case OpGetFieldName:
+		cidx := u16(0)
+		w("bur_record_get(%s);", cStr(g.constStr(id, cidx)))
+		return ip + 3
+	case OpRecordUpdate:
+		n := int(code[ip+1])
+		cidx := u16(1)
+		w("bur_record_update(%d, %s);", n, cStr(g.constStr(id, cidx)))
+		return ip + 4
 	case OpList:
 		n := u16(0)
 		w("{ OList *l = bur_new_list(&bur_cur->stack[bur_cur->top - %d], %d); bur_cur->top -= %d; bur_push(bur_obj((Obj *)l)); }", n, n, n)

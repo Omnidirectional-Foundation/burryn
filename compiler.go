@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 type EnumInfo struct {
 	Name       string // qualified name: <pkg>.<Name>, or Name outside packages
@@ -1000,6 +1003,60 @@ func (c *Compiler) expr(e Expr) {
 	case *RecvExpr:
 		c.expr(ex.Chan)
 		c.emit(OpRecv, ex.Span)
+	case *FieldAccess:
+		c.expr(ex.Base)
+		idx := c.chunk().addConst(ObjV(c.shared.gc.newString(ex.Field)))
+		c.emit(OpGetFieldName, ex.Span)
+		c.emitU16(idx, ex.Span)
+	case *Pipe:
+		// desugar lhs |> target(args) => target(lhs, args...)
+		c.expr(ex.Target)
+		c.temps++
+		c.expr(ex.Lhs)
+		c.temps++
+		for _, a := range ex.Args {
+			c.expr(a)
+			c.temps++
+		}
+		nargs := 1 + len(ex.Args)
+		c.temps -= nargs + 1
+		if nargs > 255 {
+			c.fail(ex.Span, "E2005", "", "too many arguments")
+		}
+		c.emit(OpCall, ex.Span)
+		c.emit(byte(nargs), ex.Span)
+	case *RecordLit:
+		ord := fieldSortOrder(ex.Names)
+		for _, k := range ord {
+			c.expr(ex.Vals[k])
+			c.temps++
+		}
+		c.temps -= len(ord)
+		enc := ""
+		for _, k := range ord {
+			enc += ex.Names[k] + "\n"
+		}
+		cidx := c.chunk().addConst(ObjV(c.shared.gc.newString(enc)))
+		c.emit(OpRecord, ex.Span)
+		c.emit(byte(len(ex.Names)), ex.Span)
+		c.emitU16(cidx, ex.Span)
+	case *RecordUpdate:
+		c.expr(ex.Base)
+		c.temps++
+		ord := fieldSortOrder(ex.Names)
+		for _, k := range ord {
+			c.expr(ex.Vals[k])
+			c.temps++
+		}
+		c.temps -= len(ord) + 1
+		enc := ""
+		for _, k := range ord {
+			enc += ex.Names[k] + "\n"
+		}
+		cidx := c.chunk().addConst(ObjV(c.shared.gc.newString(enc)))
+		c.emit(OpRecordUpdate, ex.Span)
+		c.emit(byte(len(ex.Names)), ex.Span)
+		c.emitU16(cidx, ex.Span)
 	default:
 		panic(fmt.Sprintf("unhandled expr %T", e))
 	}
@@ -1151,22 +1208,86 @@ func (c *Compiler) blockAsStmts(b *Block) {
 }
 
 func (c *Compiler) ifExpr(ex *IfExpr) {
-	c.expr(ex.Cond)
-	elseJ := c.emitJump(OpJumpIfFalsePop, ex.Span)
-	c.blockExpr(ex.Then)
-	endJ := c.emitJump(OpJump, ex.Span)
-	c.patchJump(elseJ)
-	switch els := ex.Else.(type) {
-	case nil:
-		c.emit(OpUnit, ex.Span)
-	case *Block:
-		c.blockExpr(els)
-	case *IfExpr:
-		c.ifExpr(els)
-	default:
-		c.fail(ex.Span, "E2018", "", "invalid else branch")
+	// iterative to avoid Go stack overflow on long else-if chains
+	cur := ex
+	for {
+		c.expr(cur.Cond)
+		elseJ := c.emitJump(OpJumpIfFalsePop, cur.Span)
+		c.blockExpr(cur.Then)
+		if cur.Else == nil {
+			endJ := c.emitJump(OpJump, cur.Span)
+			c.patchJump(elseJ)
+			c.emit(OpUnit, cur.Span)
+			c.patchJump(endJ)
+			break
+		}
+		if blk, ok := cur.Else.(*Block); ok {
+			endJ := c.emitJump(OpJump, cur.Span)
+			c.patchJump(elseJ)
+			c.blockExpr(blk)
+			c.patchJump(endJ)
+			break
+		}
+		if nxt, ok := cur.Else.(*IfExpr); ok {
+			endJ := c.emitJump(OpJump, cur.Span)
+			c.patchJump(elseJ)
+			// patch the previous else's end after the whole chain; collect via stack
+			// instead recurse, loop to nxt and stitch jumps iteratively:
+			// we need to keep the endJ to patch after the final else,
+			// so we push it and continue.
+			// For simplicity, emit jump and patch later via a stack.
+			// Use a manual stack for pending end jumps.
+			var pending []int
+			pending = append(pending, endJ)
+			cur = nxt
+			for {
+				c.expr(cur.Cond)
+				ej := c.emitJump(OpJumpIfFalsePop, cur.Span)
+				c.blockExpr(cur.Then)
+				if cur.Else == nil {
+					ej2 := c.emitJump(OpJump, cur.Span)
+					c.patchJump(ej)
+					c.emit(OpUnit, cur.Span)
+					c.patchJump(ej2)
+					for _, pj := range pending {
+						c.patchJump(pj)
+					}
+					break
+				}
+				if blk2, ok := cur.Else.(*Block); ok {
+					ej2 := c.emitJump(OpJump, cur.Span)
+					c.patchJump(ej)
+					c.blockExpr(blk2)
+					c.patchJump(ej2)
+					for _, pj := range pending {
+						c.patchJump(pj)
+					}
+					break
+				}
+				if nxt2, ok := cur.Else.(*IfExpr); ok {
+					ej2 := c.emitJump(OpJump, cur.Span)
+					c.patchJump(ej)
+					pending = append(pending, ej2)
+					cur = nxt2
+					continue
+				}
+				c.fail(cur.Span, "E2018", "", "invalid else branch")
+				break
+			}
+			break
+		}
+		c.fail(cur.Span, "E2018", "", "invalid else branch")
+		break
 	}
-	c.patchJump(endJ)
+}
+
+func fieldSortOrder(names []string) []int {
+	ord := make([]int, len(names))
+	for i := range ord {
+		ord[i] = i
+	}
+	sort.Slice(ord, func(a, b int) bool { return names[ord[a]] < names[ord[b]] })
+	return ord
 }
 
 func (c *Compiler) matchExpr(m *MatchExpr) {
