@@ -772,51 +772,70 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
         }
     }
 
-    // cp_if if 代码生成 / cp_if codegens if
+    // cp_if if 代码生成 / cp_if codegens if — iterative for deep else-if chains
     fn cp_if(ch, cond, then, els, sp) capture(ref cp_expr_ref) {
-        match cp_expr_ref(ch, cond) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
+        let mut cur_cond = cond
+        let mut cur_then = then
+        let mut cur_els = els
+        let mut cur_sp = sp
+        let mut pending_ends = []
+        while true {
+            match cp_expr_ref(ch, cur_cond) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            let else_j = emit_jump(ch, lib::op_jump_if_false_pop, cur_sp)
+            match cp_block_expr(ch, cur_then) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            let end_j = emit_jump(ch, lib::op_jump, cur_sp)
+            match patch_jump(ch, else_j) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
+            push(pending_ends, end_j)
+            match cur_els {
+                frontend::Node::NoNode => {
+                    emit(ch, lib::op_unit, cur_sp)
+                    break
+                },
+                frontend::Node::Block(_, _) => {
+                    match cp_block_expr(ch, cur_els) {
+                        Ok(_) => {},
+                        Err(d) => {
+                            return Err(d)
+                        },
+                    }
+                    break
+                },
+                frontend::Node::IfExpr(c2, t2, e2, sp2) => {
+                    cur_cond = c2
+                    cur_then = t2
+                    cur_els = e2
+                    cur_sp = sp2
+                    continue
+                },
+                _ => {
+                    return frontend::perr("E2018", "", "invalid else branch", cur_sp)
+                },
+            }
         }
-        let else_j = emit_jump(ch, lib::op_jump_if_false_pop, sp)
-        match cp_block_expr(ch, then) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
+        for ej in pending_ends {
+            match patch_jump(ch, ej) {
+                Ok(_) => {},
+                Err(d) => {
+                    return Err(d)
+                },
+            }
         }
-        let end_j = emit_jump(ch, lib::op_jump, sp)
-        match patch_jump(ch, else_j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        match els {
-            frontend::Node::NoNode => emit(ch, lib::op_unit, sp),
-            frontend::Node::Block(_, _) => {
-                match cp_block_expr(ch, els) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-            },
-            frontend::Node::IfExpr(c2, t2, e2, sp2) => {
-                match cp_if(ch, c2, t2, e2, sp2) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-            },
-            _ => {
-                return frontend::perr("E2018", "", "invalid else branch", sp)
-            },
-        }
-        patch_jump(ch, end_j)
+        Ok(true)
     }
 
     // cp_while while 代码生成 / cp_while codegens while
