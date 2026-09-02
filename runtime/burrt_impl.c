@@ -172,19 +172,25 @@ Value bur_pop(void);
 void bur_trap(const char *fmt, ...);
 
 void bur_record_make(int n, const char *names_enc) {
-    OString **names = (OString **)malloc(sizeof(OString *) * (size_t)n);
-    Value *fields = (Value *)malloc(sizeof(Value) * (size_t)n);
+    int base = bur_cur->top - n;
     const char *p = names_enc;
     for (int i = 0; i < n; i++) {
         const char *end = strchr(p, '\n');
         int64_t len = end ? (int64_t)(end - p) : (int64_t)strlen(p);
-        names[i] = bur_new_string_n(p, len);
-        fields[i] = bur_cur->stack[bur_cur->top - n + i];
+        OString *s = bur_new_string_n(p, len);
+        bur_push(bur_obj((Obj *)s));
         p = end ? end + 1 : p + len;
     }
-    bur_cur->top -= n;
+    OString **names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    Value *fields = (Value *)malloc(sizeof(Value) * (size_t)n);
+    for (int i = 0; i < n; i++) {
+        names[i] = (OString *)bur_cur->stack[base + n + i].u.o;
+        fields[i] = bur_cur->stack[base + i];
+    }
+    bur_cur->top = base;
     ORecord *r = bur_new_record(names, fields, n);
-    free(names); free(fields);
+    free(names);
+    free(fields);
     bur_push(bur_obj((Obj *)r));
 }
 
@@ -213,22 +219,30 @@ void bur_record_get(const char *fname) {
 }
 
 void bur_record_update(int n, const char *names_enc) {
+    int top0 = bur_cur->top;
     Value *new_vals = (Value *)malloc(sizeof(Value) * (size_t)n);
-    for (int i = 0; i < n; i++)
-        new_vals[i] = bur_cur->stack[bur_cur->top - n + i];
+    for (int i = 0; i < n; i++) new_vals[i] = bur_cur->stack[top0 - n + i];
     bur_cur->top -= n;
     Value base_v = bur_pop();
     if (base_v.t != VOBJ || base_v.u.o->type != OBJ_RECORD)
         bur_trap("record update needs a record");
-    ORecord *base = (ORecord *)base_v.u.o;
-    OString **upd_names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    bur_push(base_v);
+    for (int i = 0; i < n; i++) bur_push(new_vals[i]);
     const char *p = names_enc;
     for (int i = 0; i < n; i++) {
         const char *end = strchr(p, '\n');
         int64_t len = end ? (int64_t)(end - p) : (int64_t)strlen(p);
-        upd_names[i] = bur_new_string_n(p, len);
+        OString *s = bur_new_string_n(p, len);
+        bur_push(bur_obj((Obj *)s));
         p = end ? end + 1 : p + len;
     }
+    int upd_base = bur_cur->top - n;
+    int vals_base = upd_base - n;
+    int base_idx = vals_base - 1;
+    ORecord *base = (ORecord *)bur_cur->stack[base_idx].u.o;
+    OString **upd_names = (OString **)malloc(sizeof(OString *) * (size_t)n);
+    for (int i = 0; i < n; i++) upd_names[i] = (OString *)bur_cur->stack[upd_base + i].u.o;
+    for (int i = 0; i < n; i++) new_vals[i] = bur_cur->stack[vals_base + i];
     OString **rnames = (OString **)malloc(sizeof(OString *) * (size_t)base->nfields);
     Value *rvals = (Value *)malloc(sizeof(Value) * (size_t)base->nfields);
     for (int i = 0; i < base->nfields; i++) {
@@ -242,8 +256,12 @@ void bur_record_update(int n, const char *names_enc) {
             }
         }
     }
+    bur_cur->top = base_idx;
     ORecord *r = bur_new_record(rnames, rvals, base->nfields);
-    free(new_vals); free(upd_names); free(rnames); free(rvals);
+    free(new_vals);
+    free(upd_names);
+    free(rnames);
+    free(rvals);
     bur_push(bur_obj((Obj *)r));
 }
 
