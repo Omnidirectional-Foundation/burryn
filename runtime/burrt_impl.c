@@ -94,7 +94,7 @@ void buf_free(Buf *b) { free(b->data); b->data = NULL; b->len = b->cap = 0; }
 Obj *bur_alloc(size_t size, ObjType type) {
     if (bur_gc_ready && bur_gc_count + 1 > bur_gc_threshold) {
         bur_gc_collect();
-        bur_gc_threshold = bur_gc_count + 64;
+        bur_gc_threshold = bur_gc_count + 128;
     }
     Obj *o = (Obj *)calloc(1, size);
     o->type = type;
