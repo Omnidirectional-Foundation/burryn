@@ -88,6 +88,8 @@ extern void bur_stdin_nonblock(void) ;
 extern Value nat_read_stdin(Value *args, int argc) ;
 extern Value nat_stdin_nb(Value *args, int argc) ;
 extern Value nat_gc(Value *args, int argc) ;
+extern Value nat_gc_disable(Value *args, int argc) ;
+extern Value nat_gc_enable(Value *args, int argc) ;
 extern Value nat_heap_objects(Value *args, int argc) ;
 extern Value nat_gc_cycles(Value *args, int argc) ;
 extern void bur_register_native(const char *name, int arity, NativeFn fn) ;
