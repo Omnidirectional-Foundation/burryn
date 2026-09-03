@@ -187,10 +187,10 @@ void bur_record_make(int n, const char *names_enc) {
         names[i] = (OString *)bur_cur->stack[base + n + i].u.o;
         fields[i] = bur_cur->stack[base + i];
     }
-    bur_cur->top = base;
     ORecord *r = bur_new_record(names, fields, n);
     free(names);
     free(fields);
+    bur_cur->top = base;
     bur_push(bur_obj((Obj *)r));
 }
 
@@ -256,12 +256,12 @@ void bur_record_update(int n, const char *names_enc) {
             }
         }
     }
-    bur_cur->top = base_idx;
     ORecord *r = bur_new_record(rnames, rvals, base->nfields);
     free(new_vals);
     free(upd_names);
     free(rnames);
     free(rvals);
+    bur_cur->top = base_idx;
     bur_push(bur_obj((Obj *)r));
 }
 
