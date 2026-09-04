@@ -1,19 +1,22 @@
 // elf_sys.bur — syscall / 参数寄存器。
 // elf_sys.bur — syscall / arg regs.
 
-// syscall 发射 syscall 指令；Windows 无稳定裸 syscall，改为经 runtime 区尾的
-// 分派器槽间接调用（movabs rcx,<slot>; call [rcx]）。槽里是分派器绝对地址，
-// 不是可执行桩。rcx/r11 本就是 Linux syscall 契约的牺牲寄存器，调用点语义不变。
-// syscall emits the syscall instruction; Windows has no stable raw syscalls,
-// so it calls through the dispatcher slot appended after the runtime area
-// (movabs rcx,<slot>; call [rcx]). The slot holds the dispatcher's absolute
-// address, not executable stub bytes. rcx/r11 die under the Linux contract
-// anyway, keeping every call site's semantics unchanged.
+// syscall 只在 linux 发裸 syscall 指令；其余目标没有稳定的裸 syscall 契约
+// （Windows 无裸接口，darwin 的号与 ABI 都不同），一律经 runtime 区尾的分派器
+// 槽间接调用（movabs rcx,<slot>; call [rcx]）。槽里是分派器绝对地址，不是可
+// 执行桩。rcx/r11 本就是 Linux syscall 契约的牺牲寄存器，调用点语义不变。
+// syscall emits the raw syscall instruction on linux only; other targets lack a
+// stable raw-syscall contract (Windows has no raw surface, darwin differs in
+// numbers and ABI), so they uniformly call through the dispatcher pointer slot
+// appended after the runtime area (movabs rcx,<slot>; call [rcx]). The slot
+// holds the dispatcher's absolute address, not executable stub bytes. rcx/r11
+// die under the Linux contract anyway, keeping every call site's semantics
+// unchanged.
 pub fn syscall() {
-    if target_os == "windows" {
-        byte_chr(72) + byte_chr(185) + e8(thunk_slot_abs()) + byte_chr(255) + byte_chr(17)
-    } else {
+    if target_os == "linux" {
         byte_chr(15) + byte_chr(5)
+    } else {
+        byte_chr(72) + byte_chr(185) + e8(thunk_slot_abs()) + byte_chr(255) + byte_chr(17)
     }
 }
 
