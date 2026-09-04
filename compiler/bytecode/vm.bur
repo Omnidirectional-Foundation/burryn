@@ -2751,6 +2751,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 o_vals[h] = vals
                 fpush(f, VObj(h))
             } else if op == lib::op_record {
+                gc_disable()
                 let n = code[start_ip + 1]
                 let cidx = rd_u16(code, start_ip + 2)
                 fb_fr_ip[f][fi] = start_ip + 4
@@ -2765,12 +2766,9 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     push(vals, fpeek(f, n - 1 - i))
                     i = i + 1
                 }
-                fpush(f, vals)
-                fpush(f, fnames)
+                fsettop(f, ftop(f) - n)
                 let h = alloc_obj(ot_record)
-                fpush(f, VObj(h))
                 let mut keys = []
-                fpush(f, keys)
                 let mut j = 0
                 while j < len(fnames) {
                     if fnames[j] != "" {
@@ -2778,14 +2776,10 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                     j = j + 1
                 }
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
-                fsettop(f, ftop(f) - n)
                 o_vals[h] = vals
                 o_keys[h] = keys
                 fpush(f, VObj(h))
+                gc_enable()
             } else if op == lib::op_get_field_name {
                 let cidx = rd_u16(code, start_ip + 1)
                 fb_fr_ip[f][fi] = start_ip + 3
@@ -2812,6 +2806,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     trap("record has no field \"" + fname + "\"")
                 }
             } else if op == lib::op_record_update {
+                gc_disable()
                 let n = code[start_ip + 1]
                 let cidx = rd_u16(code, start_ip + 2)
                 fb_fr_ip[f][fi] = start_ip + 4
@@ -2820,16 +2815,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     _ => "",
                 }
                 let fnames = split(names_str, "\n")
-                let mut new_vals = []
-                let mut i = 0
-                while i < n {
-                    push(new_vals, fpeek(f, n - 1 - i))
-                    i = i + 1
-                }
-                fpush(f, new_vals)
-                fpush(f, fnames)
                 let mut update_names = []
-                fpush(f, update_names)
                 let mut j = 0
                 while j < len(fnames) {
                     if fnames[j] != "" {
@@ -2837,15 +2823,21 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                     j = j + 1
                 }
+                let mut new_vals = []
+                let mut i = 0
+                while i < n {
+                    push(new_vals, fpeek(f, n - 1 - i))
+                    i = i + 1
+                }
                 fsettop(f, ftop(f) - n)
                 let base_v = fpop(f)
-                fpush(f, base_v)
+                let bh = tagged_h(base_v, ot_record)
+                if bh < 0 {
+                    trap("record update needs a record, got " + type_name(base_v))
+                }
                 let h = alloc_obj(ot_record)
-                fpush(f, VObj(h))
                 let mut rkeys = []
-                fpush(f, rkeys)
                 let mut rvals = []
-                fpush(f, rvals)
                 let mut k = 0
                 while k < len(o_keys[bh]) {
                     push(rkeys, o_keys[bh][k])
@@ -2864,16 +2856,10 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                     }
                     k = k + 1
                 }
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
-                let _ = fpop(f)
                 o_vals[h] = rvals
                 o_keys[h] = rkeys
                 fpush(f, VObj(h))
+                gc_enable()
             } else {
                 trap("bad opcode " + str(op) + " (VM bug)")
             }
