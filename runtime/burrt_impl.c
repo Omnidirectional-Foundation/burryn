@@ -197,9 +197,9 @@ void bur_record_make(int n, const char *names_enc) {
 void bur_tuple_make(int n) {
     Value *elems = (Value *)malloc(sizeof(Value) * (size_t)n);
     for (int i = 0; i < n; i++) elems[i] = bur_cur->stack[bur_cur->top - n + i];
-    bur_cur->top -= n;
     OTuple *t = bur_new_tuple(elems, n);
     free(elems);
+    bur_cur->top -= n;
     bur_push(bur_obj((Obj *)t));
 }
 
