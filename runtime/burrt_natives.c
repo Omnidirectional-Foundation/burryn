@@ -1238,8 +1238,6 @@ Value nat_stdin_nb(Value *args, int argc) {
 }
 
 Value nat_gc(Value *args, int argc) { (void)args; (void)argc; bur_gc_collect(); return bur_int(bur_gc_last_freed); }
-Value nat_gc_disable(Value *args, int argc) { (void)args; (void)argc; bur_gc_ready = false; return bur_unit(); }
-Value nat_gc_enable(Value *args, int argc) { (void)args; (void)argc; bur_gc_ready = true; return bur_unit(); }
 Value nat_heap_objects(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_count); }
 Value nat_gc_cycles(Value *args, int argc) { (void)args; (void)argc; return bur_int(bur_gc_cycles); }
 
@@ -1310,8 +1308,6 @@ void bur_register_natives(void) {
     bur_register_native("type_of", 1, nat_type_of);
     bur_register_native("assert", 2, nat_assert);
     bur_register_native("gc", 0, nat_gc);
-    bur_register_native("gc_disable", 0, nat_gc_disable);
-    bur_register_native("gc_enable", 0, nat_gc_enable);
     bur_register_native("heap_objects", 0, nat_heap_objects);
     bur_register_native("gc_cycles", 0, nat_gc_cycles);
     bur_register_native("chan", -1, nat_chan);
