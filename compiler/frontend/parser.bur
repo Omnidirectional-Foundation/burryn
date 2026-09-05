@@ -53,22 +53,10 @@ fn p_advance(toks, mut pos) {
 
 // p_term 解析加法项（Pratt 层级：+ -）/ p_term parses additive terms (Pratt level: + -)
 fn p_term(toks, mut pos) {
-    let mut e = match p_factor(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_factor(toks, pos)?
     while p_check(toks, pos, t_plus) || p_check(toks, pos, t_minus) {
         let op = p_advance(toks, pos)
-        let rhs = match p_factor(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_factor(toks, pos)?
         e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
     Ok(e)
@@ -76,22 +64,10 @@ fn p_term(toks, mut pos) {
 
 // p_factor 解析乘法项（Pratt 层级：* / %）/ p_factor parses multiplicative terms (Pratt level: * / %)
 fn p_factor(toks, mut pos) {
-    let mut e = match p_unary(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_unary(toks, pos)?
     while p_check(toks, pos, t_star) || p_check(toks, pos, t_slash) || p_check(toks, pos, t_percent) {
         let op = p_advance(toks, pos)
-        let rhs = match p_unary(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_unary(toks, pos)?
         e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
     Ok(e)
@@ -100,32 +76,14 @@ fn p_factor(toks, mut pos) {
 // p_or_expr 解析逻辑或（Pratt 层级：||），兼收 `..` range 字面量
 // p_or_expr parses logical or (Pratt level: ||) and the `..` range literal
 fn p_or_expr(toks, mut pos) {
-    let mut e = match p_and_expr(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_and_expr(toks, pos)?
     while p_check(toks, pos, t_or_or) {
         p_advance(toks, pos)
-        let rhs = match p_and_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_and_expr(toks, pos)?
         e = Logical(t_or_or, e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
     if p_match(toks, pos, t_dot_dot) {
-        let rhs = match p_and_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_and_expr(toks, pos)?
         e = Call(Ident("range", span_of(e)), [e, rhs], sp_union(span_of(e), span_of(rhs)))
     }
     Ok(e)
@@ -133,22 +91,10 @@ fn p_or_expr(toks, mut pos) {
 
 // p_and_expr 解析逻辑与（Pratt 层级：&&）/ p_and_expr parses logical and (Pratt level: &&)
 fn p_and_expr(toks, mut pos) {
-    let mut e = match p_equality(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_equality(toks, pos)?
     while p_check(toks, pos, t_and_and) {
         p_advance(toks, pos)
-        let rhs = match p_equality(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_equality(toks, pos)?
         e = Logical(t_and_and, e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
     Ok(e)
@@ -160,12 +106,7 @@ fn p_break_stmt(toks, mut pos) {
     if p_check(toks, pos, t_ident) {
         lb = tok_lex(p_advance(toks, pos))
     }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_end_stmt(toks, pos)?
     Ok(BreakStmt(lb, sp_of_tok(tok)))
 }
 
@@ -173,12 +114,7 @@ fn p_break_stmt(toks, mut pos) {
 // p_capture_list parses a capture clause list: returns ref-captured names
 // (value-captured items are default and not recorded)
 fn p_capture_list(toks, mut pos) {
-    match p_expect(toks, pos, t_lparen, "'(' after capture") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lparen, "'(' after capture")?
     let mut crefs = []
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rparen) {
@@ -186,13 +122,7 @@ fn p_capture_list(toks, mut pos) {
         if is_ref {
             let _ = p_advance(toks, pos)
         }
-        let ptok = match p_expect(toks, pos, t_ident, "captured name") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let ptok = p_expect(toks, pos, t_ident, "captured name")?
         if is_ref {
             push(crefs, tok_lex(ptok))
         }
@@ -201,33 +131,16 @@ fn p_capture_list(toks, mut pos) {
         }
         p_skip_semis(toks, pos)
     }
-    match p_expect(toks, pos, t_rparen, "')' after capture list") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_rparen, "')' after capture list")?
     Ok(crefs)
 }
 
 // p_equality 解析相等比较（Pratt 层级：== !=）/ p_equality parses equality (Pratt level: == !=)
 fn p_equality(toks, mut pos) {
-    let mut e = match p_comparison(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_comparison(toks, pos)?
     while p_check(toks, pos, t_eq_eq) || p_check(toks, pos, t_bang_eq) {
         let op = p_advance(toks, pos)
-        let rhs = match p_comparison(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_comparison(toks, pos)?
         e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
     Ok(e)
@@ -235,22 +148,10 @@ fn p_equality(toks, mut pos) {
 
 // p_comparison 解析比较（Pratt 层级：< <= > >=）/ p_comparison parses comparison (Pratt level: < <= > >=)
 fn p_comparison(toks, mut pos) {
-    let mut e = match p_term(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_term(toks, pos)?
     while p_check(toks, pos, t_lt) || p_check(toks, pos, t_lt_eq) || p_check(toks, pos, t_gt) || p_check(toks, pos, t_gt_eq) {
         let op = p_advance(toks, pos)
-        let rhs = match p_term(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_term(toks, pos)?
         e = Binary(tok_type(op), e, rhs, sp_union(span_of(e), span_of(rhs)))
     }
     Ok(e)
@@ -262,32 +163,15 @@ fn p_continue_stmt(toks, mut pos) {
     if p_check(toks, pos, t_ident) {
         lb = tok_lex(p_advance(toks, pos))
     }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_end_stmt(toks, pos)?
     Ok(ContinueStmt(lb, sp_of_tok(tok)))
 }
 
 // p_while_stmt 解析 while 语句 / p_while_stmt parses a while statement
 fn p_while_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    let cond = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    let body = match p_block(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let cond = p_expression(toks, pos)?
+    let body = p_block(toks, pos)?
     Ok(WhileStmt(cond, body, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
@@ -295,13 +179,7 @@ fn p_while_stmt(toks, mut pos) {
 // p_for_stmt parses for: value iteration, optional index form (channels reject the index form)
 fn p_for_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    let first = match p_expect(toks, pos, t_ident, "loop variable") {
-        Ok(x) => x,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let first = p_expect(toks, pos, t_ident, "loop variable")?
     let mut v = tok_lex(first)
     let mut vsp = sp_of_tok(first)
     let mut idx = ""
@@ -309,36 +187,13 @@ fn p_for_stmt(toks, mut pos) {
     if p_match(toks, pos, t_comma) {
         idx = v
         isp = vsp
-        let e = match p_expect(toks, pos, t_ident, "element variable after ','") {
-            Ok(x) => x,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let e = p_expect(toks, pos, t_ident, "element variable after ','")?
         v = tok_lex(e)
         vsp = sp_of_tok(e)
     }
-    match p_expect(toks, pos, t_in, "'in' in for loop") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let iter = match p_expression(toks, pos) {
-        Ok(x) => x,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    let body = match p_block(toks, pos) {
-        Ok(x) => x,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    p_expect(toks, pos, t_in, "'in' in for loop")?
+    let iter = p_expression(toks, pos)?
+    let body = p_block(toks, pos)?
     Ok(ForStmt(v, vsp, idx, isp, iter, false, body, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
@@ -355,13 +210,7 @@ fn p_let_stmt(toks, mut pos) {
         let mut nspans = []
         p_skip_semis(toks, pos)
         while !p_check(toks, pos, t_rparen) {
-            let nm = match p_expect(toks, pos, t_ident, "name in destructuring let") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let nm = p_expect(toks, pos, t_ident, "name in destructuring let")?
             push(names, tok_lex(nm))
             push(nspans, sp_of_tok(nm))
             if !p_match(toks, pos, t_comma) {
@@ -369,116 +218,38 @@ fn p_let_stmt(toks, mut pos) {
             }
             p_skip_semis(toks, pos)
         }
-        let _ = match p_expect(toks, pos, t_rparen, "')' in destructuring let") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
-        match p_expect(toks, pos, t_eq, "'=' in let binding") {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let init = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
-        match p_end_stmt(toks, pos) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = p_expect(toks, pos, t_rparen, "')' in destructuring let")?
+        p_expect(toks, pos, t_eq, "'=' in let binding")?
+        let init = p_expression(toks, pos)?
+        p_end_stmt(toks, pos)?
         return Ok(DestructLet(names, nspans, is_mut, init, sp_union(sp_of_tok(tok), span_of(init))))
     }
-    let name = match p_expect(toks, pos, t_ident, "variable name") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let name = p_expect(toks, pos, t_ident, "variable name")?
     // 可选类型标注 + = 初始化 + 语句结束
     // Optional type annotation, = initializer, statement end
     let ty = if p_match(toks, pos, t_colon) {
-        match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        p_type_expr(toks, pos)?
     } else {
         NoNode
     }
-    match p_expect(toks, pos, t_eq, "'=' in let binding") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let init = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_eq, "'=' in let binding")?
+    let init = p_expression(toks, pos)?
+    p_end_stmt(toks, pos)?
     Ok(LetStmt(tok_lex(name), sp_of_tok(name), is_mut, false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
 // p_const_stmt 解析 const 声明 / p_const_stmt parses a const declaration
 fn p_const_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    let name = match p_expect(toks, pos, t_ident, "constant name") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let name = p_expect(toks, pos, t_ident, "constant name")?
     let ty = if p_match(toks, pos, t_colon) {
-        match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        p_type_expr(toks, pos)?
     } else {
         NoNode
     }
-    match p_expect(toks, pos, t_eq, "'=' in const declaration") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let init = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_eq, "'=' in const declaration")?
+    let init = p_expression(toks, pos)?
+    p_end_stmt(toks, pos)?
     Ok(ConstDecl(tok_lex(name), sp_of_tok(name), false, ty, init, sp_union(sp_of_tok(tok), span_of(init))))
 }
 
@@ -498,64 +269,30 @@ fn p_enum_decl(toks, mut pos) {
     let mut params = []
     if p_match(toks, pos, t_lparen) {
         while !p_check(toks, pos, t_rparen) {
-            let ptok = match p_expect(toks, pos, t_ident, "type parameter") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let ptok = p_expect(toks, pos, t_ident, "type parameter")?
             push(params, tok_lex(ptok))
             if !p_match(toks, pos, t_comma) {
                 break
             }
         }
-        match p_expect(toks, pos, t_rparen, "')' after type parameters") {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = p_expect(toks, pos, t_rparen, "')' after type parameters")?
     }
-    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after enum name") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after enum name")?
     let mut variants = []
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rbrace) {
-        let vname = match p_expect(toks, pos, t_ident, "variant name") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let vname = p_expect(toks, pos, t_ident, "variant name")?
         let mut vtypes = []
         let mut vsp = sp_of_tok(vname)
         if p_match(toks, pos, t_lparen) {
             while !p_check(toks, pos, t_rparen) {
-                let vt = match p_type_expr(toks, pos) {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        NoNode
-                    },
-                }
+                let vt = p_type_expr(toks, pos)?
                 push(vtypes, vt)
                 if !p_match(toks, pos, t_comma) {
                     break
                 }
             }
-            let vrp = match p_expect(toks, pos, t_rparen, "')' after variant field types") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let vrp = p_expect(toks, pos, t_rparen, "')' after variant field types")?
             vsp = sp_union(vsp, sp_of_tok(vrp))
         }
         push(variants, EnumVariantDecl(tok_lex(vname), len(vtypes), vtypes, vsp))
@@ -564,45 +301,17 @@ fn p_enum_decl(toks, mut pos) {
         }
         p_skip_semis(toks, pos)
     }
-    let rb = match p_expect(toks, pos, t_rbrace, "'}' after enum variants") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbrace, "'}' after enum variants")?
     Ok(EnumDecl(tok_lex(name), params, variants, false, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
 // p_type_alias_decl 解析类型别名声明 / p_type_alias_decl parses a type alias declaration
 fn p_type_alias_decl(toks, mut pos, is_pub) {
     let tok = p_advance(toks, pos)
-    let name = match p_expect(toks, pos, t_ident, "type alias name") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
-    match p_expect(toks, pos, t_eq, "'=' after type alias name") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let te = match p_type_expr(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    let name = p_expect(toks, pos, t_ident, "type alias name")?
+    p_expect(toks, pos, t_eq, "'=' after type alias name")?
+    let te = p_type_expr(toks, pos)?
+    p_end_stmt(toks, pos)?
     Ok(TypeAliasDecl(tok_lex(name), te, is_pub, sp_union(sp_of_tok(tok), span_of(te))))
 }
 
@@ -622,21 +331,9 @@ fn p_expression(toks, mut pos) {
 }
 
 fn p_expr_or_assign_stmt(toks, mut pos) {
-    let e = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let e = p_expression(toks, pos)?
     if p_match(toks, pos, t_eq) {
-        let val = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let val = p_expression(toks, pos)?
         let ok_target = match e {
             Ident(_, _) => true,
             Index(_, _, _) => true,
@@ -645,12 +342,7 @@ fn p_expr_or_assign_stmt(toks, mut pos) {
         if !ok_target {
             return perr("E1103", "only a variable or an index expression can be assigned to", "invalid assignment target", span_of(e))
         }
-        match p_end_stmt(toks, pos) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        p_end_stmt(toks, pos)?
         Ok(AssignStmt(e, val, sp_union(span_of(e), span_of(val))))
     } else if p_check(toks, pos, t_plus_eq) || p_check(toks, pos, t_minus_eq) || p_check(toks, pos, t_star_eq) || p_check(toks, pos, t_slash_eq) || p_check(toks, pos, t_percent_eq) {
         let op = p_advance(toks, pos)
@@ -666,13 +358,7 @@ fn p_expr_or_assign_stmt(toks, mut pos) {
         } else {
             t_percent
         }
-        let val = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let val = p_expression(toks, pos)?
         let ok_target = match e {
             Ident(_, _) => true,
             Index(_, _, _) => true,
@@ -681,35 +367,14 @@ fn p_expr_or_assign_stmt(toks, mut pos) {
         if !ok_target {
             return perr("E1103", "only a variable or an index expression can be assigned to", "invalid assignment target", span_of(e))
         }
-        match p_end_stmt(toks, pos) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        p_end_stmt(toks, pos)?
         Ok(AssignStmt(e, Binary(binop, e, val, sp_union(span_of(e), span_of(val))), sp_union(span_of(e), span_of(val))))
     } else if p_match(toks, pos, t_larrow) {
-        let val = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
-        match p_end_stmt(toks, pos) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let val = p_expression(toks, pos)?
+        p_end_stmt(toks, pos)?
         Ok(SendStmt(e, val, sp_union(span_of(e), span_of(val))))
     } else {
-        match p_end_stmt(toks, pos) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        p_end_stmt(toks, pos)?
         Ok(ExprStmt(e, span_of(e)))
     }
 }
@@ -717,20 +382,8 @@ fn p_expr_or_assign_stmt(toks, mut pos) {
 // p_fn_decl 解析函数声明 / p_fn_decl parses a function declaration
 fn p_fn_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    let name = match p_expect(toks, pos, t_ident, "function name") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
-    let lit = match p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(tok), false) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let name = p_expect(toks, pos, t_ident, "function name")?
+    let lit = p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(tok), false)?
     Ok(FnDecl(tok_lex(name), sp_of_tok(name), false, lit, span_of(lit)))
 }
 
@@ -740,51 +393,13 @@ fn p_method_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     // receiver 方法：recv: Type 并入参数表首位
     // Receiver methods: recv: Type joins the parameter list first
-    match p_expect(toks, pos, t_lparen, "'(' after fn in method") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let recv = match p_expect(toks, pos, t_ident, "receiver name") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
-    match p_expect(toks, pos, t_colon, "':' after receiver name") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let rty = match p_type_expr(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    match p_expect(toks, pos, t_rparen, "')' after receiver") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let name = match p_expect(toks, pos, t_ident, "method name") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
-    match p_expect(toks, pos, t_lparen, "'(' after method name") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lparen, "'(' after fn in method")?
+    let recv = p_expect(toks, pos, t_ident, "receiver name")?
+    p_expect(toks, pos, t_colon, "':' after receiver name")?
+    let rty = p_type_expr(toks, pos)?
+    p_expect(toks, pos, t_rparen, "')' after receiver")?
+    let name = p_expect(toks, pos, t_ident, "method name")?
+    p_expect(toks, pos, t_lparen, "'(' after method name")?
     let mut params = [tok_lex(recv)]
     let mut muts = [false]
     let mut pspans = [sp_of_tok(recv)]
@@ -792,24 +407,12 @@ fn p_method_decl(toks, mut pos) {
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rparen) {
         let is_mut = p_match(toks, pos, t_mut)
-        let ptok = match p_expect(toks, pos, t_ident, "parameter name") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let ptok = p_expect(toks, pos, t_ident, "parameter name")?
         push(params, tok_lex(ptok))
         push(muts, is_mut)
         push(pspans, sp_of_tok(ptok))
         let pty = if p_match(toks, pos, t_colon) {
-            match p_type_expr(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            p_type_expr(toks, pos)?
         } else {
             NoNode
         }
@@ -820,31 +423,13 @@ fn p_method_decl(toks, mut pos) {
         p_skip_semis(toks, pos)
     }
     p_skip_semis(toks, pos)
-    let _ = match p_expect(toks, pos, t_rparen, "')' after parameters") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let _ = p_expect(toks, pos, t_rparen, "')' after parameters")?
     let ret_ty = if p_match(toks, pos, t_thin_arrow) {
-        match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        p_type_expr(toks, pos)?
     } else {
         NoNode
     }
-    let body = match p_block(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let body = p_block(toks, pos)?
     let lit = FnLit(params, muts, pspans, param_tys, ret_ty, body, tok_lex(name), [], sp_union(sp_of_tok(tok), span_of(body)))
     Ok(MethodDecl(rty_name(rty), tok_lex(name), sp_of_tok(name), lit, span_of(lit)))
 }
@@ -856,13 +441,7 @@ fn p_interpolated(toks, mut pos) {
     let mut out = StrLit(tok_lex(start), sp_of_tok(start))
     let mut done = false
     while !done {
-        let inner = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let inner = p_expression(toks, pos)?
         out = Binary(t_plus, out, inner, sp_union(span_of(out), span_of(inner)))
         p_skip_semis(toks, pos)
         let next = p_peek(toks, pos)
@@ -883,39 +462,15 @@ fn p_interpolated(toks, mut pos) {
 // p_if_expr parses if: condition with then/else blocks (else required when used as a value)
 fn p_if_expr(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    let cond = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    let then = match p_block(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let cond = p_expression(toks, pos)?
+    let then = p_block(toks, pos)?
     let mut sp = sp_union(sp_of_tok(tok), span_of(then))
     let mut els = NoNode
     if p_match(toks, pos, t_else) {
         els = if p_check(toks, pos, t_if) {
-            match p_if_expr(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            p_if_expr(toks, pos)?
         } else {
-            match p_block(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            p_block(toks, pos)?
         }
         sp = sp_union(sp, span_of(els))
     }
@@ -933,58 +488,18 @@ fn p_interface_statement(toks, mut pos) {
         let pub_tok = p_advance(toks, pos)
         if p_check(toks, pos, t_fn) {
             let fn_tok = p_advance(toks, pos)
-            let name = match p_expect(toks, pos, t_ident, "function name") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
-            let lit = match p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(fn_tok), true) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let name = p_expect(toks, pos, t_ident, "function name")?
+            let lit = p_fn_rest(toks, pos, tok_lex(name), sp_of_tok(fn_tok), true)?
             Ok(FnDecl(tok_lex(name), sp_of_tok(name), true, lit, sp_union(sp_of_tok(pub_tok), span_of(lit))))
         } else if p_check(toks, pos, t_let) {
             let let_tok = p_advance(toks, pos)
-            let name = match p_expect(toks, pos, t_ident, "variable name") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
-            match p_expect(toks, pos, t_colon, "':' before the exported value type") {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-            let te = match p_type_expr(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
-            match p_end_stmt(toks, pos) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
+            let name = p_expect(toks, pos, t_ident, "variable name")?
+            p_expect(toks, pos, t_colon, "':' before the exported value type")?
+            let te = p_type_expr(toks, pos)?
+            p_end_stmt(toks, pos)?
             Ok(LetStmt(tok_lex(name), sp_of_tok(name), false, true, NoNode, te, sp_union(sp_of_tok(pub_tok), sp_union(sp_of_tok(let_tok), span_of(te)))))
         } else if p_check(toks, pos, t_enum) {
-            let decl = match p_enum_decl(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let decl = p_enum_decl(toks, pos)?
             match decl {
                 EnumDecl(name, params, variants, _, sp) => Ok(EnumDecl(name, params, variants, true, sp_union(sp_of_tok(pub_tok), sp))),
                 other => Ok(other),
@@ -999,33 +514,15 @@ fn p_interface_statement(toks, mut pos) {
 
 // p_block 解析块 / p_block parses a block
 fn p_block(toks, mut pos) {
-    let lb = match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "'") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let lb = p_expect(toks, pos, t_lbrace, "'" + chr(123) + "'")?
     let mut stmts = []
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
-        let s = match p_statement(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let s = p_statement(toks, pos)?
         push(stmts, s)
         p_skip_semis(toks, pos)
     }
-    let rb = match p_expect(toks, pos, t_rbrace, "'}'") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbrace, "'}'")?
     Ok(Block(stmts, sp_union(sp_of_tok(lb), sp_of_tok(rb))))
 }
 
@@ -1040,19 +537,8 @@ fn p_import_decl(toks, mut pos) {
         alias = tok_lex(a)
         asp = sp_of_tok(a)
     }
-    let path_tok = match p_expect(toks, pos, t_string, "an import path string") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    let path_tok = p_expect(toks, pos, t_string, "an import path string")?
+    p_end_stmt(toks, pos)?
     Ok(ImportDecl(alias, asp, tok_lex(path_tok), sp_of_tok(path_tok), sp_union(sp_of_tok(tok), sp_of_tok(path_tok))))
 }
 
@@ -1061,49 +547,25 @@ fn p_import_decl(toks, mut pos) {
 fn p_pub_decl(toks, mut pos) {
     let tok = p_advance(toks, pos)
     if p_check(toks, pos, t_let) {
-        let s = match p_let_stmt(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let s = p_let_stmt(toks, pos)?
         match s {
             LetStmt(name, nsp, is_mut, _, ty, init, sp) => Ok(LetStmt(name, nsp, is_mut, true, ty, init, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
     } else if p_check(toks, pos, t_const) {
-        let s = match p_const_stmt(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let s = p_const_stmt(toks, pos)?
         match s {
             ConstDecl(name, nsp, _, ty, init, sp) => Ok(ConstDecl(name, nsp, true, ty, init, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
-        let s = match p_fn_decl(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let s = p_fn_decl(toks, pos)?
         match s {
             FnDecl(name, nsp, _, lit, sp) => Ok(FnDecl(name, nsp, true, lit, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
         }
     } else if p_check(toks, pos, t_enum) {
-        let s = match p_enum_decl(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let s = p_enum_decl(toks, pos)?
         match s {
             EnumDecl(name, params, variants, _, sp) => Ok(EnumDecl(name, params, variants, true, sp_union(sp_of_tok(tok), sp))),
             other => Ok(other),
@@ -1118,13 +580,7 @@ fn p_pub_decl(toks, mut pos) {
 fn p_label_stmt(toks, mut pos) {
     let ltok = p_advance(toks, pos)
     let _ = p_advance(toks, pos)
-    let inner = match p_statement(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let inner = p_statement(toks, pos)?
     Ok(LabelStmt(tok_lex(ltok), inner, sp_union(sp_of_tok(ltok), span_of(inner))))
 }
 
@@ -1199,49 +655,20 @@ fn p_match_expr(toks, mut pos) {
     let tok = p_advance(toks, pos)
     // match：scrutinee 后解析模式臂（or-pattern 展开 + 可选 guard）
     // Match: scrutinee, then pattern arms (or-patterns expand, optional guards)
-    let scrut = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after match scrutinee") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    let scrut = p_expression(toks, pos)?
+    p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after match scrutinee")?
     let mut arms = []
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
-        let pat = match p_pattern(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let pat = p_pattern(toks, pos)?
         let mut pats = [pat]
         while p_match(toks, pos, t_bar) {
-            let p2 = match p_pattern(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let p2 = p_pattern(toks, pos)?
             push(pats, p2)
         }
         let has_guard = p_match(toks, pos, t_if)
         let guard = if has_guard {
-            match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            p_expression(toks, pos)?
         } else {
             NoNode
         }
@@ -1256,13 +683,7 @@ fn p_match_expr(toks, mut pos) {
             },
         }
         p_skip_semis(toks, pos)
-        let body = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let body = p_expression(toks, pos)?
         for p in pats {
             push(arms, MatchArm(p, guard, body, sp_union(span_of(p), span_of(body))))
         }
@@ -1271,13 +692,7 @@ fn p_match_expr(toks, mut pos) {
         }
         p_skip_semis(toks, pos)
     }
-    let rb = match p_expect(toks, pos, t_rbrace, "'}' after match arms") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbrace, "'}' after match arms")?
     let sp = sp_union(sp_of_tok(tok), sp_of_tok(rb))
     if len(arms) == 0 {
         return perr("E1110", "", "match must have at least one arm", sp)
@@ -1305,54 +720,25 @@ fn p_pattern(toks, mut pos) {
     let t = tok_type(tok)
     if t == t_record {
         let rk = p_advance(toks, pos)
-        match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after record pattern") {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after record pattern")?
         let mut names = []
         p_skip_semis(toks, pos)
         while !p_check(toks, pos, t_rbrace) {
-            let fname = match p_expect(toks, pos, t_ident, "field name in record pattern") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let fname = p_expect(toks, pos, t_ident, "field name in record pattern")?
             push(names, tok_lex(fname))
             if !p_match(toks, pos, t_comma) {
                 break
             }
             p_skip_semis(toks, pos)
         }
-        let rb = match p_expect(toks, pos, t_rbrace, "'}' after record pattern fields") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let rb = p_expect(toks, pos, t_rbrace, "'}' after record pattern fields")?
         Ok(PatRecord(names, sp_union(sp_of_tok(rk), sp_of_tok(rb))))
     } else if t == t_int || t == t_float || t == t_string || t == t_true || t == t_false {
-        let lit = match p_primary(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let lit = p_primary(toks, pos)?
         Ok(PatLiteral(lit, span_of(lit)))
     } else if t == t_minus {
         p_advance(toks, pos)
-        let lit = match p_primary(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let lit = p_primary(toks, pos)?
         match lit {
             IntLit(n, lsp) => Ok(PatLiteral(IntLit(-n, lsp), sp_union(sp_of_tok(tok), lsp))),
             FloatLit(f, lsp) => Ok(PatLiteral(FloatLit(-f, lsp), sp_union(sp_of_tok(tok), lsp))),
@@ -1371,25 +757,13 @@ fn p_pattern(toks, mut pos) {
             let mut sp = sp_of_tok(tok)
             if p_match(toks, pos, t_colon_colon) {
                 enum_name = tok_lex(tok)
-                let vtok = match p_expect(toks, pos, t_ident, "variant name after '::'") {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        lib::Token::Tok(0, "", 0, 0)
-                    },
-                }
+                let vtok = p_expect(toks, pos, t_ident, "variant name after '::'")?
                 variant = tok_lex(vtok)
                 sp = sp_union(sp, sp_of_tok(vtok))
                 if p_match(toks, pos, t_colon_colon) {
                     pkg = enum_name
                     enum_name = variant
-                    let vtok2 = match p_expect(toks, pos, t_ident, "variant name after '::'") {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            lib::Token::Tok(0, "", 0, 0)
-                        },
-                    }
+                    let vtok2 = p_expect(toks, pos, t_ident, "variant name after '::'")?
                     variant = tok_lex(vtok2)
                     sp = sp_union(sp, sp_of_tok(vtok2))
                 }
@@ -1397,13 +771,7 @@ fn p_pattern(toks, mut pos) {
             if p_match(toks, pos, t_lparen) {
                 let mut binds = []
                 while !p_check(toks, pos, t_rparen) {
-                    let sub = match p_pattern(toks, pos) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            NoNode
-                        },
-                    }
+                    let sub = p_pattern(toks, pos)?
                     let ok_sub = match sub {
                         PatBinding(_, _) => true,
                         PatWildcard(_) => true,
@@ -1417,13 +785,7 @@ fn p_pattern(toks, mut pos) {
                         break
                     }
                 }
-                let rp = match p_expect(toks, pos, t_rparen, "')' after variant pattern") {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        lib::Token::Tok(0, "", 0, 0)
-                    },
-                }
+                let rp = p_expect(toks, pos, t_rparen, "')' after variant pattern")?
                 Ok(PatVariant(pkg, enum_name, variant, binds, sp_union(sp, sp_of_tok(rp))))
             } else if enum_name != "" {
                 Ok(PatVariant(pkg, enum_name, variant, [], sp))
@@ -1440,22 +802,10 @@ fn p_pattern(toks, mut pos) {
 // p_pipe_expr is the entry: the lowest-precedence operator is the pipe
 // (left-assoc; the target must be a function or package name, optionally with arguments)
 fn p_pipe_expr(toks, mut pos) {
-    let mut e = match p_or_expr(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_or_expr(toks, pos)?
     while p_check(toks, pos, t_pipe) {
         p_advance(toks, pos)
-        e = match p_pipe_target(toks, pos, e) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        e = p_pipe_target(toks, pos, e)?
     }
     Ok(e)
 }
@@ -1463,22 +813,10 @@ fn p_pipe_expr(toks, mut pos) {
 // p_pipe_target 解析管道目标：名字路径（可 :: 限定）+ 可选实参列表
 // p_pipe_target parses the pipe target: a name path (::-qualified) plus optional arguments
 fn p_pipe_target(toks, mut pos, lhs) {
-    let first = match p_expect(toks, pos, t_ident, "a pipe target") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let first = p_expect(toks, pos, t_ident, "a pipe target")?
     let mut path = Ident(tok_lex(first), sp_of_tok(first))
     while p_match(toks, pos, t_colon_colon) {
-        let part = match p_expect(toks, pos, t_ident, "a name after '::' in pipe target") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let part = p_expect(toks, pos, t_ident, "a name after '::' in pipe target")?
         path = match path {
             Ident(name, sp) => VariantAccess(name, tok_lex(part), sp_union(sp, sp_of_tok(part))),
             VariantAccess(pkg, name, sp) => QualVariantAccess(pkg, name, tok_lex(part), sp_union(sp, sp_of_tok(part))),
@@ -1493,13 +831,7 @@ fn p_pipe_target(toks, mut pos, lhs) {
     if p_match(toks, pos, t_lparen) {
         p_skip_semis(toks, pos)
         while !p_check(toks, pos, t_rparen) {
-            let arg = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let arg = p_expression(toks, pos)?
             push(args, arg)
             if !p_match(toks, pos, t_comma) {
                 break
@@ -1507,13 +839,7 @@ fn p_pipe_target(toks, mut pos, lhs) {
             p_skip_semis(toks, pos)
         }
         p_skip_semis(toks, pos)
-        let rp = match p_expect(toks, pos, t_rparen, "')' after pipe target arguments") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let rp = p_expect(toks, pos, t_rparen, "')' after pipe target arguments")?
         end_sp = sp_union(end_sp, sp_of_tok(rp))
     }
     Ok(Pipe(lhs, path, args, sp_union(span_of(lhs), end_sp)))
@@ -1523,13 +849,7 @@ fn p_pipe_target(toks, mut pos, lhs) {
 // p_postfix parses postfix: calls, indexing, field and member access,
 // record updates, tuple destructuring
 fn p_postfix(toks, mut pos) {
-    let mut e = match p_primary(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let mut e = p_primary(toks, pos)?
     // 后缀链：调用/索引/try/:: 限定/字段访问
     // Postfix chain: calls, indexing, try, :: qualification, field access
     let mut going = true
@@ -1539,13 +859,7 @@ fn p_postfix(toks, mut pos) {
             let mut cargs = []
             p_skip_semis(toks, pos)
             while !p_check(toks, pos, t_rparen) {
-                let a = match p_expression(toks, pos) {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        NoNode
-                    },
-                }
+                let a = p_expression(toks, pos)?
                 push(cargs, a)
                 if !p_match(toks, pos, t_comma) {
                     break
@@ -1553,30 +867,12 @@ fn p_postfix(toks, mut pos) {
                 p_skip_semis(toks, pos)
             }
             p_skip_semis(toks, pos)
-            let rp = match p_expect(toks, pos, t_rparen, "')' after arguments") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let rp = p_expect(toks, pos, t_rparen, "')' after arguments")?
             e = Call(e, cargs, sp_union(span_of(e), sp_of_tok(rp)))
         } else if p_check(toks, pos, t_lbracket) {
             p_advance(toks, pos)
-            let idx = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
-            let rb = match p_expect(toks, pos, t_rbracket, "']' after index") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let idx = p_expression(toks, pos)?
+            let rb = p_expect(toks, pos, t_rbracket, "']' after index")?
             e = Index(e, idx, sp_union(span_of(e), sp_of_tok(rb)))
         } else if p_check(toks, pos, t_question) {
             let q = p_advance(toks, pos)
@@ -1585,23 +881,11 @@ fn p_postfix(toks, mut pos) {
             let _ = p_advance(toks, pos)
             e = match e {
                 Ident(name, hsp) => {
-                    let v = match p_expect(toks, pos, t_ident, "a name after '::'") {
-                        Ok(x) => x,
-                        Err(dg) => {
-                            return Err(dg)
-                            lib::Token::Tok(0, "", 0, 0)
-                        },
-                    }
+                    let v = p_expect(toks, pos, t_ident, "a name after '::'")?
                     VariantAccess(name, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
                 },
                 VariantAccess(en, vr, hsp) => {
-                    let v = match p_expect(toks, pos, t_ident, "a name after '::'") {
-                        Ok(x) => x,
-                        Err(dg) => {
-                            return Err(dg)
-                            lib::Token::Tok(0, "", 0, 0)
-                        },
-                    }
+                    let v = p_expect(toks, pos, t_ident, "a name after '::'")?
                     QualVariantAccess(en, vr, tok_lex(v), sp_union(hsp, sp_of_tok(v)))
                 },
                 _ => {
@@ -1611,13 +895,7 @@ fn p_postfix(toks, mut pos) {
             }
         } else if p_check(toks, pos, t_dot) {
             let _ = p_advance(toks, pos)
-            let v = match p_expect(toks, pos, t_ident, "a field name after '.'") {
-                Ok(x) => x,
-                Err(dg) => {
-                    return Err(dg)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let v = p_expect(toks, pos, t_ident, "a field name after '.'")?
             e = FieldAccess(e, tok_lex(v), sp_union(span_of(e), sp_of_tok(v)))
         } else {
             going = false
@@ -1689,13 +967,7 @@ fn p_primary_list(toks, mut pos, tok) {
     let mut elems = []
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rbracket) {
-        let el = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let el = p_expression(toks, pos)?
         push(elems, el)
         if !p_match(toks, pos, t_comma) {
             break
@@ -1703,107 +975,50 @@ fn p_primary_list(toks, mut pos, tok) {
         p_skip_semis(toks, pos)
     }
     p_skip_semis(toks, pos)
-    let rb = match p_expect(toks, pos, t_rbracket, "']' after list elements") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbracket, "']' after list elements")?
     Ok(ListLit(elems, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
 fn p_primary_paren(toks, mut pos, _tok) {
     let lp = p_advance(toks, pos)
-    let e = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let e = p_expression(toks, pos)?
     if p_match(toks, pos, t_comma) {
         let mut elems = [e]
         p_skip_semis(toks, pos)
         while !p_check(toks, pos, t_rparen) {
-            let el = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let el = p_expression(toks, pos)?
             push(elems, el)
             if !p_match(toks, pos, t_comma) {
                 break
             }
             p_skip_semis(toks, pos)
         }
-        let rp = match p_expect(toks, pos, t_rparen, "')' after tuple") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let rp = p_expect(toks, pos, t_rparen, "')' after tuple")?
         Ok(TupleLit(elems, sp_union(sp_of_tok(lp), sp_of_tok(rp))))
     } else {
-        match p_expect(toks, pos, t_rparen, "')'") {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        p_expect(toks, pos, t_rparen, "')'")?
         Ok(e)
     }
 }
 
 fn p_primary_record(toks, mut pos, tok) {
     p_advance(toks, pos)
-    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record`") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record`")?
     p_skip_semis(toks, pos)
     if p_check(toks, pos, t_rbrace) {
         let rb = p_advance(toks, pos)
         return Ok(RecordLit([], [], sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     }
-    let first_name = match p_expect(toks, pos, t_ident, "field name in record literal") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let first_name = p_expect(toks, pos, t_ident, "field name in record literal")?
     if p_match(toks, pos, t_bar) {
         let base = Ident(tok_lex(first_name), sp_of_tok(first_name))
         let mut names = []
         let mut vals = []
         p_skip_semis(toks, pos)
         while !p_check(toks, pos, t_rbrace) {
-            let fname = match p_expect(toks, pos, t_ident, "field name in record update") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
-            match p_expect(toks, pos, t_colon, "':' after field name") {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-            let fv = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let fname = p_expect(toks, pos, t_ident, "field name in record update")?
+            p_expect(toks, pos, t_colon, "':' after field name")?
+            let fv = p_expression(toks, pos)?
             push(names, tok_lex(fname))
             push(vals, fv)
             if !p_match(toks, pos, t_comma) {
@@ -1811,53 +1026,19 @@ fn p_primary_record(toks, mut pos, tok) {
             }
             p_skip_semis(toks, pos)
         }
-        let rb = match p_expect(toks, pos, t_rbrace, "'}' after record update fields") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let rb = p_expect(toks, pos, t_rbrace, "'}' after record update fields")?
         return Ok(RecordUpdate(base, names, vals, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
     }
-    match p_expect(toks, pos, t_colon, "':' after field name") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let first_val = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    p_expect(toks, pos, t_colon, "':' after field name")?
+    let first_val = p_expression(toks, pos)?
     let mut names = [tok_lex(first_name)]
     let mut vals = [first_val]
     if p_match(toks, pos, t_comma) {
         p_skip_semis(toks, pos)
         while !p_check(toks, pos, t_rbrace) {
-            let fname = match p_expect(toks, pos, t_ident, "field name in record literal") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
-            match p_expect(toks, pos, t_colon, "':' after field name") {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-            let fv = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let fname = p_expect(toks, pos, t_ident, "field name in record literal")?
+            p_expect(toks, pos, t_colon, "':' after field name")?
+            let fv = p_expression(toks, pos)?
             push(names, tok_lex(fname))
             push(vals, fv)
             if !p_match(toks, pos, t_comma) {
@@ -1866,13 +1047,7 @@ fn p_primary_record(toks, mut pos, tok) {
             p_skip_semis(toks, pos)
         }
     }
-    let rb = match p_expect(toks, pos, t_rbrace, "'}' after record fields") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbrace, "'}' after record fields")?
     Ok(RecordLit(names, vals, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
@@ -1881,21 +1056,10 @@ fn p_return_stmt(toks, mut pos) {
     let mut sp = sp_of_tok(tok)
     let mut val = NoNode
     if !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) && !p_check(toks, pos, t_eof) {
-        val = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        val = p_expression(toks, pos)?
         sp = sp_union(sp, span_of(val))
     }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_end_stmt(toks, pos)?
     Ok(ReturnStmt(val, sp))
 }
 
@@ -1903,12 +1067,7 @@ fn p_return_stmt(toks, mut pos) {
 // p_select_stmt parses select (communication arms plus at most one default)
 fn p_select_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after select") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after select")?
     let mut arms = []
     let mut has_default = false
     let mut dflt = NoNode
@@ -1920,30 +1079,13 @@ fn p_select_stmt(toks, mut pos) {
             if has_default {
                 return perr("E1115", "", "`select` may have at most one `default` arm", sp_of_tok(d))
             }
-            match p_expect(toks, pos, t_arrow, "'=>' after default") {
-                Ok(_) => {},
-                Err(dg) => {
-                    return Err(dg)
-                },
-            }
+            p_expect(toks, pos, t_arrow, "'=>' after default")?
             p_skip_semis(toks, pos)
             has_default = true
             dsp = sp_of_tok(d)
-            dflt = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(dg) => {
-                    return Err(dg)
-                    NoNode
-                },
-            }
+            dflt = p_expression(toks, pos)?
         } else {
-            let arm = match p_select_arm(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let arm = p_select_arm(toks, pos)?
             push(arms, arm)
         }
         if !p_match(toks, pos, t_comma) && !p_check(toks, pos, t_semi) && !p_check(toks, pos, t_rbrace) {
@@ -1951,13 +1093,7 @@ fn p_select_stmt(toks, mut pos) {
         }
         p_skip_semis(toks, pos)
     }
-    let rb = match p_expect(toks, pos, t_rbrace, "'}' after select arms") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbrace, "'}' after select arms")?
     let sp = sp_union(sp_of_tok(tok), sp_of_tok(rb))
     if len(arms) == 0 && !has_default {
         return perr("E1116", "", "`select` needs at least one communication arm", sp)
@@ -1976,22 +1112,10 @@ fn p_select_arm(toks, mut pos) {
     let mut asp = Sp(0, 0)
     if p_check(toks, pos, t_larrow) {
         let start = p_advance(toks, pos)
-        ch = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        ch = p_expression(toks, pos)?
         asp = sp_of_tok(start)
     } else {
-        let e = match p_expression(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let e = p_expression(toks, pos)?
         asp = span_of(e)
         if p_match(toks, pos, t_eq) {
             match e {
@@ -2003,47 +1127,19 @@ fn p_select_arm(toks, mut pos) {
                     return perr("E1117", "", "only a name can bind a received value: `name = <-ch`", span_of(e))
                 },
             }
-            match p_expect(toks, pos, t_larrow, "'<-' after `=` in a select receive arm") {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
-            ch = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            p_expect(toks, pos, t_larrow, "'<-' after `=` in a select receive arm")?
+            ch = p_expression(toks, pos)?
         } else if p_match(toks, pos, t_larrow) {
             is_send = true
             ch = e
-            val = match p_expression(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            val = p_expression(toks, pos)?
         } else {
             return perr("E1118", "a select arm is a receive (`v = <-ch`), a send (`ch <- v`), or `default`", "expected `=`, `<-`, or `=>` in this select arm", sp_of_tok(p_peek(toks, pos)))
         }
     }
-    match p_expect(toks, pos, t_arrow, "'=>' after a select arm") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_arrow, "'=>' after a select arm")?
     p_skip_semis(toks, pos)
-    let body = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let body = p_expression(toks, pos)?
     Ok(SelectArm(is_send, bind, bind_sp, ch, val, body, sp_union(asp, span_of(body))))
 }
 
@@ -2072,13 +1168,7 @@ fn p_end_stmt(toks, mut pos) {
 // p_spawn_stmt 解析 spawn 语句（必须跟函数调用）/ p_spawn_stmt parses spawn (a function call is required)
 fn p_spawn_stmt(toks, mut pos) {
     let tok = p_advance(toks, pos)
-    let e = match p_expression(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let e = p_expression(toks, pos)?
     let is_call = match e {
         Call(_, _, _) => true,
         _ => false,
@@ -2086,12 +1176,7 @@ fn p_spawn_stmt(toks, mut pos) {
     if !is_call {
         return perr("E1106", "", "spawn expects a function call, e.g. `spawn worker(ch)`", sp_of_tok(tok))
     }
-    match p_end_stmt(toks, pos) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_end_stmt(toks, pos)?
     Ok(SpawnStmt(e, sp_union(sp_of_tok(tok), span_of(e))))
 }
 
@@ -2102,23 +1187,11 @@ fn p_defer_stmt(toks, mut pos) {
         return perr("E1119", "defer takes a block, e.g. `defer " + chr(123) + " close(ch) }`", "expected '" + chr(123) + "' after defer", sp_of_tok(p_peek(toks, pos)))
     }
     let crefs = if p_match(toks, pos, t_capture) {
-        match p_capture_list(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                []
-            },
-        }
+        p_capture_list(toks, pos)?
     } else {
         []
     }
-    let body = match p_block(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    let body = p_block(toks, pos)?
     Ok(DeferStmt(body, crefs, sp_union(sp_of_tok(tok), span_of(body))))
 }
 
@@ -2214,64 +1287,25 @@ fn p_type_expr(toks, mut pos) {
 
 fn p_type_fn(toks, mut pos, tok) {
     p_advance(toks, pos)
-    match p_expect(toks, pos, t_lparen, "'(' in fn type") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lparen, "'(' in fn type")?
     let mut ps = []
     while !p_check(toks, pos, t_rparen) {
-        let pt = match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let pt = p_type_expr(toks, pos)?
         push(ps, pt)
         if !p_match(toks, pos, t_comma) {
             break
         }
     }
-    match p_expect(toks, pos, t_rparen, "')' in fn type") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    match p_expect(toks, pos, t_thin_arrow, "'->' in fn type") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    let ret = match p_type_expr(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
+    p_expect(toks, pos, t_rparen, "')' in fn type")?
+    p_expect(toks, pos, t_thin_arrow, "'->' in fn type")?
+    let ret = p_type_expr(toks, pos)?
     Ok(TEFn(ps, ret, sp_union(sp_of_tok(tok), span_of(ret))))
 }
 
 fn p_type_list(toks, mut pos, tok) {
     p_advance(toks, pos)
-    let el = match p_type_expr(toks, pos) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            NoNode
-        },
-    }
-    let rb = match p_expect(toks, pos, t_rbracket, "']' in list type") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let el = p_type_expr(toks, pos)?
+    let rb = p_expect(toks, pos, t_rbracket, "']' in list type")?
     Ok(TEList(el, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
@@ -2281,51 +1315,27 @@ fn p_type_name(toks, mut pos, tok) {
     let mut name = tok_lex(tok)
     let mut sp = sp_of_tok(tok)
     if p_match(toks, pos, t_colon_colon) {
-        let n = match p_expect(toks, pos, t_ident, "a type name after '::'") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let n = p_expect(toks, pos, t_ident, "a type name after '::'")?
         pkg = tok_lex(tok)
         name = tok_lex(n)
         sp = sp_union(sp, sp_of_tok(n))
     }
     let mut constraint = ""
     if p_match(toks, pos, t_colon) {
-        let ctok = match p_expect(toks, pos, t_ident, "a type constraint after ':'") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let ctok = p_expect(toks, pos, t_ident, "a type constraint after ':'")?
         constraint = tok_lex(ctok)
         sp = sp_union(sp, sp_of_tok(ctok))
     }
     let mut targs = []
     if p_match(toks, pos, t_lparen) {
         while !p_check(toks, pos, t_rparen) {
-            let ta = match p_type_expr(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            let ta = p_type_expr(toks, pos)?
             push(targs, ta)
             if !p_match(toks, pos, t_comma) {
                 break
             }
         }
-        let rp = match p_expect(toks, pos, t_rparen, "')' in type arguments") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let rp = p_expect(toks, pos, t_rparen, "')' in type arguments")?
         sp = sp_union(sp, sp_of_tok(rp))
     }
     Ok(TEName(pkg, name, constraint, targs, sp))
@@ -2335,72 +1345,32 @@ fn p_type_record(toks, mut pos, tok) {
     // record 类型：字段名: 类型列表 + 可选行变量（| r）
     // Record types: field-name: type pairs plus an optional row variable (| r)
     p_advance(toks, pos)
-    match p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record` in type") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after `record` in type")?
     let mut names = []
     let mut types = []
     let mut row_var = NoNode
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rbrace) {
         if p_match(toks, pos, t_bar) {
-            let rv = match p_expect(toks, pos, t_ident, "row variable after '|'") {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    lib::Token::Tok(0, "", 0, 0)
-                },
-            }
+            let rv = p_expect(toks, pos, t_ident, "row variable after '|'")?
             row_var = TEName("", tok_lex(rv), "", [], sp_of_tok(rv))
             break
         }
-        let fname = match p_expect(toks, pos, t_ident, "field name in record type") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
-        match p_expect(toks, pos, t_colon, "':' after field name") {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
-        let ft = match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let fname = p_expect(toks, pos, t_ident, "field name in record type")?
+        p_expect(toks, pos, t_colon, "':' after field name")?
+        let ft = p_type_expr(toks, pos)?
         push(names, tok_lex(fname))
         push(types, ft)
         if !p_match(toks, pos, t_comma) {
             if p_match(toks, pos, t_bar) {
-                let rv = match p_expect(toks, pos, t_ident, "row variable after '|'") {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        lib::Token::Tok(0, "", 0, 0)
-                    },
-                }
+                let rv = p_expect(toks, pos, t_ident, "row variable after '|'")?
                 row_var = TEName("", tok_lex(rv), "", [], sp_of_tok(rv))
             }
             break
         }
         p_skip_semis(toks, pos)
     }
-    let rb = match p_expect(toks, pos, t_rbrace, "'}' after record type fields") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rb = p_expect(toks, pos, t_rbrace, "'}' after record type fields")?
     Ok(TERecord(names, types, row_var, sp_union(sp_of_tok(tok), sp_of_tok(rb))))
 }
 
@@ -2408,25 +1378,13 @@ fn p_type_tuple(toks, mut pos, _tok) {
     let lp = p_advance(toks, pos)
     let mut ets = []
     while !p_check(toks, pos, t_rparen) {
-        let et = match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let et = p_type_expr(toks, pos)?
         push(ets, et)
         if !p_match(toks, pos, t_comma) {
             break
         }
     }
-    let rp = match p_expect(toks, pos, t_rparen, "')' in tuple type") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rp = p_expect(toks, pos, t_rparen, "')' in tuple type")?
     Ok(TETuple(ets, sp_union(sp_of_tok(lp), sp_of_tok(rp))))
 }
 
@@ -2435,12 +1393,7 @@ fn p_type_tuple(toks, mut pos, _tok) {
 fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     // 参数列表：可选 mut 与类型标注；interface 模式强制标注
     // Parameters: optional mut and annotations; interface mode requires annotations
-    match p_expect(toks, pos, t_lparen, "'(' after fn") {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    p_expect(toks, pos, t_lparen, "'(' after fn")?
     let mut params = []
     let mut muts = []
     let mut pspans = []
@@ -2448,24 +1401,12 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
     p_skip_semis(toks, pos)
     while !p_check(toks, pos, t_rparen) {
         let is_mut = p_match(toks, pos, t_mut)
-        let ptok = match p_expect(toks, pos, t_ident, "parameter name") {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                lib::Token::Tok(0, "", 0, 0)
-            },
-        }
+        let ptok = p_expect(toks, pos, t_ident, "parameter name")?
         push(params, tok_lex(ptok))
         push(muts, is_mut)
         push(pspans, sp_of_tok(ptok))
         let pty = if p_match(toks, pos, t_colon) {
-            match p_type_expr(toks, pos) {
-                Ok(v) => v,
-                Err(d) => {
-                    return Err(d)
-                    NoNode
-                },
-            }
+            p_type_expr(toks, pos)?
         } else if interface_only {
             return perr("E1101", "interface parameters require explicit types", "expected ':' after interface parameter `" + tok_lex(ptok) + "`", sp_of_tok(ptok))
             NoNode
@@ -2479,21 +1420,9 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
         p_skip_semis(toks, pos)
     }
     p_skip_semis(toks, pos)
-    let rp = match p_expect(toks, pos, t_rparen, "')' after parameters") {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            lib::Token::Tok(0, "", 0, 0)
-        },
-    }
+    let rp = p_expect(toks, pos, t_rparen, "')' after parameters")?
     let ret_ty = if p_match(toks, pos, t_thin_arrow) {
-        match p_type_expr(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        p_type_expr(toks, pos)?
     } else if interface_only {
         return perr("E1101", "interface functions require an explicit return type", "expected '->' after interface parameters", sp_of_tok(rp))
         NoNode
@@ -2501,32 +1430,15 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
         NoNode
     }
     let crefs = if !interface_only && p_match(toks, pos, t_capture) {
-        match p_capture_list(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                []
-            },
-        }
+        p_capture_list(toks, pos)?
     } else {
         []
     }
     if interface_only {
-        match p_end_stmt(toks, pos) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        p_end_stmt(toks, pos)?
         Ok(FnLit(params, muts, pspans, param_tys, ret_ty, NoNode, name, [], sp_union(fn_sp, span_of(ret_ty))))
     } else {
-        let body = match p_block(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let body = p_block(toks, pos)?
         Ok(FnLit(params, muts, pspans, param_tys, ret_ty, body, name, crefs, sp_union(fn_sp, span_of(body))))
     }
 }
@@ -2535,23 +1447,11 @@ fn p_fn_rest(toks, mut pos, name, fn_sp, interface_only) {
 fn p_unary(toks, mut pos) {
     if p_check(toks, pos, t_bang) || p_check(toks, pos, t_minus) {
         let op = p_advance(toks, pos)
-        let rhs = match p_unary(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_unary(toks, pos)?
         Ok(Unary(tok_type(op), rhs, sp_union(sp_of_tok(op), span_of(rhs))))
     } else if p_check(toks, pos, t_larrow) {
         let op = p_advance(toks, pos)
-        let rhs = match p_unary(toks, pos) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                NoNode
-            },
-        }
+        let rhs = p_unary(toks, pos)?
         Ok(RecvExpr(rhs, sp_union(sp_of_tok(op), span_of(rhs))))
     } else {
         p_postfix(toks, pos)

@@ -120,18 +120,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     fn cp_stmt(ch, s) capture(ref cur_pkg, ref cur_file, ref cp_expr_ref, ref cp_stmt_ref, ref pkg_decls) {
         match s {
             frontend::Node::DestructLet(names, _nspans, is_mut, init, sp) => {
-                match cp_expr(ch, init) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
-                match declare_local(emit_ctx, ch, "(dtmp)", false, sp) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
+                cp_expr(ch, init)?
+                declare_local(emit_ctx, ch, "(dtmp)", false, sp)?
                 let tslot = c_l_slot[ch][n_locals(c_l_name, ch) - 1]
                 let mut i = 0
                 while i < len(names) {
@@ -140,19 +130,9 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                     emit_const(emit_ctx, ch, lib::CVal::CInt(i), sp)
                     emit(emit_ctx, ch, lib::op_index_get, sp)
                     if c_scope_depth[ch] == 0 {
-                        match define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, names[i], is_mut, sp) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
+                        let _ = define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, names[i], is_mut, sp)?
                     } else {
-                        match declare_local(emit_ctx, ch, names[i], is_mut, sp) {
-                            Ok(_) => {},
-                            Err(d) => {
-                                return Err(d)
-                            },
-                        }
+                        let _ = declare_local(emit_ctx, ch, names[i], is_mut, sp)?
                     }
                     i = i + 1
                 }
@@ -163,12 +143,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 Ok(true)
             },
             frontend::Node::LetStmt(name, _, is_mut, _, _, init, sp) => {
-                match cp_expr(ch, init) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
+                cp_expr(ch, init)?
                 if c_scope_depth[ch] == 0 {
                     define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, name, is_mut, sp)
                 } else {
@@ -177,12 +152,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             },
             frontend::Node::MethodDecl(rt, name, _, lit, sp) => {
                 if c_scope_depth[ch] == 0 {
-                    match cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
+                    cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref)?
                     define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, rt + "." + name, false, sp)
                 } else {
                     return frontend::perr("E2019", "", "methods must be declared at the top level", sp)
@@ -191,27 +161,12 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             },
             frontend::Node::FnDecl(name, _, _, lit, sp) => {
                 if c_scope_depth[ch] == 0 {
-                    match cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
+                    cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref)?
                     define_global(emit_ctx, global_mut, c_fn, enum_by, cur_pkg, ch, name, false, sp)
                 } else {
                     emit(emit_ctx, ch, lib::op_unit, sp)
-                    match declare_local(emit_ctx, ch, name, true, sp) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
-                    match cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
+                    declare_local(emit_ctx, ch, name, true, sp)?
+                    cp_function(emit_ctx, cur_file, ch, lit, cp_expr_ref, cp_stmt_ref)?
                     let slot = c_l_slot[ch][resolve_local(c_l_name, c_l_slot, ch, name)]
                     emit(emit_ctx, ch, lib::op_set_local, sp)
                     emit_u16(emit_ctx, ch, slot, sp)
@@ -232,13 +187,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 let eh = if pre >= 0 && cur_pkg != "" {
                     pre
                 } else {
-                    match register_enum_decl(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, cur_pkg, ch, name, variants, sp) {
-                        Ok(v) => v,
-                        Err(d) => {
-                            return Err(d)
-                            0
-                        },
-                    }
+                    register_enum_decl(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, cur_pkg, ch, name, variants, sp)?
                 }
                 emit_const(emit_ctx, ch, lib::CVal::CEnumType(eh), sp)
                 let idx = add_const(emit_ctx, ch, lib::CVal::CStr(qual))
@@ -396,13 +345,7 @@ fn cp_assign(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
                 emit(ctx, ch, lib::op_set_local, sp)
                 emit_u16(ctx, ch, ctx.c_l_slot[ch][li], sp)
             } else {
-                let ui = match resolve_upvalue(ctx, ch, name, sp) {
-                    Ok(v) => v,
-                    Err(d) => {
-                        return Err(d)
-                        0
-                    },
-                }
+                let ui = resolve_upvalue(ctx, ch, name, sp)?
                 if ui >= 0 {
                     if !ctx.c_u_mut[ch][ui] {
                         return frontend::perr("E2010", "declare it with `let mut`", "cannot assign to immutable variable \"" + name + "\"", sp)
@@ -734,13 +677,7 @@ fn cp_ident(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
         emit_u16(ctx, ch, ctx.c_l_slot[ch][li], sp)
         return Ok(true)
     }
-    let ui = match resolve_upvalue(ctx, ch, name, sp) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            0
-        },
-    }
+    let ui = resolve_upvalue(ctx, ch, name, sp)?
     if ui >= 0 {
         emit(ctx, ch, lib::op_get_upval, sp)
         emit_u16(ctx, ch, ui, sp)
@@ -1132,20 +1069,10 @@ fn cp_for(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
             return Err(d)
         },
     }
-    match declare_local(ctx, ch, "(iter)", false, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    declare_local(ctx, ch, "(iter)", false, sp)?
     let iter_slot = ctx.c_l_slot[ch][n_locals(ctx.c_l_name, ch) - 1]
     emit_const(ctx, ch, lib::CVal::CInt(0), sp)
-    match declare_local(ctx, ch, "(idx)", false, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    declare_local(ctx, ch, "(idx)", false, sp)?
     let idx_slot = ctx.c_l_slot[ch][n_locals(ctx.c_l_name, ch) - 1]
 
     push_loop(ctx, ch, next_slot(ctx, ch), -1)
@@ -1163,24 +1090,14 @@ fn cp_for(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
     if idx != "" {
         emit(ctx, ch, lib::op_get_local, sp)
         emit_u16(ctx, ch, idx_slot, sp)
-        match declare_local(ctx, ch, idx, false, sp) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = declare_local(ctx, ch, idx, false, sp)?
     }
     emit(ctx, ch, lib::op_get_local, sp)
     emit_u16(ctx, ch, iter_slot, sp)
     emit(ctx, ch, lib::op_get_local, sp)
     emit_u16(ctx, ch, idx_slot, sp)
     emit(ctx, ch, lib::op_index_get, sp)
-    match declare_local(ctx, ch, v, false, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    declare_local(ctx, ch, v, false, sp)?
     match body {
         frontend::Node::Block(ss, _) => {
             for s in ss {
@@ -1198,12 +1115,7 @@ fn cp_for(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
 
     let li = len(ctx.c_lp_conts[ch]) - 1
     for j in ctx.c_lp_conts[ch][li] {
-        match patch_jump(ctx, ch, j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, j)?
     }
     emit(ctx, ch, lib::op_get_local, sp)
     emit_u16(ctx, ch, idx_slot, sp)
@@ -1212,26 +1124,11 @@ fn cp_for(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
     emit(ctx, ch, lib::op_set_local, sp)
     emit_u16(ctx, ch, idx_slot, sp)
     emit(ctx, ch, lib::op_pop, sp)
-    match emit_loop(ctx, ch, cond_start, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    emit_loop(ctx, ch, cond_start, sp)?
 
-    match patch_jump(ctx, ch, exit_j) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    patch_jump(ctx, ch, exit_j)?
     for j in ctx.c_lp_breaks[ch][li] {
-        match patch_jump(ctx, ch, j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, j)?
     }
     pop_loop(ctx, ch)
     end_scope(ctx, ch, sp)
@@ -1246,12 +1143,7 @@ fn cp_for_chan(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
             return Err(d)
         },
     }
-    match declare_local(ctx, ch, "(chan)", false, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    declare_local(ctx, ch, "(chan)", false, sp)?
     let chan_slot = ctx.c_l_slot[ch][n_locals(ctx.c_l_name, ch) - 1]
 
     let cond_start = code_len(ctx, ch)
@@ -1262,12 +1154,7 @@ fn cp_for_chan(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     let exit_j = emit_jump(ctx, ch, lib::op_chan_next, sp)
 
     begin_scope(ctx, ch)
-    match declare_local(ctx, ch, v, false, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    declare_local(ctx, ch, v, false, sp)?
     match body {
         frontend::Node::Block(ss, _) => {
             for s in ss {
@@ -1283,27 +1170,12 @@ fn cp_for_chan(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     }
     end_scope(ctx, ch, sp)
 
-    match emit_loop(ctx, ch, cond_start, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    emit_loop(ctx, ch, cond_start, sp)?
 
-    match patch_jump(ctx, ch, exit_j) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    patch_jump(ctx, ch, exit_j)?
     let li = len(ctx.c_lp_breaks[ch]) - 1
     for j in ctx.c_lp_breaks[ch][li] {
-        match patch_jump(ctx, ch, j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, j)?
     }
     pop_loop(ctx, ch)
     end_scope(ctx, ch, sp)
@@ -1369,12 +1241,7 @@ fn cp_function(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
                 push_local(ctx, sub, params[i], ctx.c_scope_depth[sub], ctx.c_l_slot[sub][n_locals(ctx.c_l_name, sub) - 1] + 1, muts[i], 0)
                 i = i + 1
             }
-            match cp_block_expr(ctx, sub, body, cp_expr, cp_stmt) {
-                Ok(_) => {},
-                Err(d) => {
-                    return Err(d)
-                },
-            }
+            cp_block_expr(ctx, sub, body, cp_expr, cp_stmt)?
             emit(ctx, sub, lib::op_return, lsp)
 
             let idx = add_const(ctx, ch, lib::CVal::CFn(fh))
@@ -1473,19 +1340,9 @@ fn cp_if(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: 
             },
         }
         let else_j = emit_jump(ctx, ch, lib::op_jump_if_false_pop, cur_sp)
-        match cp_block_expr(ctx, ch, cur_then, cp_expr, cp_stmt) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        cp_block_expr(ctx, ch, cur_then, cp_expr, cp_stmt)?
         let end_j = emit_jump(ctx, ch, lib::op_jump, cur_sp)
-        match patch_jump(ctx, ch, else_j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        patch_jump(ctx, ch, else_j)?
         push(pending_ends, end_j)
         match cur_els {
             frontend::Node::NoNode => {
@@ -1493,12 +1350,7 @@ fn cp_if(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: 
                 break
             },
             frontend::Node::Block(_, _) => {
-                match cp_block_expr(ctx, ch, cur_els, cp_expr, cp_stmt) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
+                cp_block_expr(ctx, ch, cur_els, cp_expr, cp_stmt)?
                 break
             },
             frontend::Node::IfExpr(c2, t2, e2, sp2) => {
@@ -1514,12 +1366,7 @@ fn cp_if(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: 
         }
     }
     for ej in pending_ends {
-        match patch_jump(ctx, ch, ej) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, ej)?
     }
     Ok(true)
 }
@@ -1626,12 +1473,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
             return Err(d)
         },
     }
-    match declare_local(ctx, ch, "(match)", false, msp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    declare_local(ctx, ch, "(match)", false, msp)?
     let scrut_slot = ctx.c_l_slot[ch][n_locals(ctx.c_l_name, ch) - 1]
 
     let mut end_jumps = []
@@ -1664,24 +1506,13 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
                         if fv[0] == -2 {
                             return frontend::perr("E2014", "qualify it as Enum." + name, "variant \"" + name + "\" exists in several enums", asp)
                         } else if fv[1] >= 0 && en_varities[fv[0]][fv[1]] == 0 {
-                            fail_j = match emit_variant_test(ctx, ch, fv[0], fv[1], scrut_slot, asp) {
-                                Ok(v) => v,
-                                Err(d) => {
-                                    return Err(d)
-                                    0
-                                },
-                            }
+                            fail_j = emit_variant_test(ctx, ch, fv[0], fv[1], scrut_slot, asp)?
                         } else if fv[1] >= 0 {
                             return frontend::perr("E2017", "bind them: " + name + "(...)", "variant \"" + name + "\" has " + str(en_varities[fv[0]][fv[1]]) + " field(s)", asp)
                         } else {
                             emit(ctx, ch, lib::op_get_local, asp)
                             emit_u16(ctx, ch, scrut_slot, asp)
-                            match declare_local(ctx, ch, name, false, asp) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
+                            declare_local(ctx, ch, name, false, asp)?
                             arm_locals = arm_locals + 1
                         }
                     },
@@ -1742,13 +1573,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
                         if len(binds) != arity {
                             return frontend::perr("E2017", "", "variant " + pvar + " has " + str(arity) + " field(s), pattern binds " + str(len(binds)), asp)
                         }
-                        fail_j = match emit_variant_test(ctx, ch, eh, idx, scrut_slot, asp) {
-                            Ok(v) => v,
-                            Err(d) => {
-                                return Err(d)
-                                0
-                            },
-                        }
+                        fail_j = emit_variant_test(ctx, ch, eh, idx, scrut_slot, asp)?
                         let mut i = 0
                         while i < len(binds) {
                             let bname = match binds[i] {
@@ -1760,12 +1585,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
                                 emit_u16(ctx, ch, scrut_slot, asp)
                                 emit(ctx, ch, lib::op_get_field, asp)
                                 emit(ctx, ch, i, asp)
-                                match declare_local(ctx, ch, bname, false, asp) {
-                                    Ok(_) => {},
-                                    Err(d) => {
-                                        return Err(d)
-                                    },
-                                }
+                                declare_local(ctx, ch, bname, false, asp)?
                                 arm_locals = arm_locals + 1
                             }
                             i = i + 1
@@ -1778,12 +1598,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
                             let cidx = add_const(ctx, ch, lib::CVal::CStr(fname))
                             emit(ctx, ch, lib::op_get_field_name, asp)
                             emit_u16(ctx, ch, cidx, asp)
-                            match declare_local(ctx, ch, fname, false, asp) {
-                                Ok(_) => {},
-                                Err(d) => {
-                                    return Err(d)
-                                },
-                            }
+                            declare_local(ctx, ch, fname, false, asp)?
                             arm_locals = arm_locals + 1
                         }
                     },
@@ -1818,12 +1633,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
                 }
                 push(end_jumps, emit_jump(ctx, ch, lib::op_jump, asp))
                 if guard_fail_j >= 0 {
-                    match patch_jump(ctx, ch, guard_fail_j) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
+                    patch_jump(ctx, ch, guard_fail_j)?
                     if arm_locals > 0 {
                         emit(ctx, ch, lib::op_unit, asp)
                         emit(ctx, ch, lib::op_end_block, asp)
@@ -1832,12 +1642,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
                     }
                 }
                 if fail_j >= 0 {
-                    match patch_jump(ctx, ch, fail_j) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
+                    let _ = patch_jump(ctx, ch, fail_j)?
                 }
             },
             _ => {},
@@ -1845,12 +1650,7 @@ fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
     }
     emit(ctx, ch, lib::op_no_match, msp)
     for j in end_jumps {
-        match patch_jump(ctx, ch, j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, j)?
     }
     ctx.c_scope_depth[ch] = ctx.c_scope_depth[ch] - 1
     pop_local(ctx, ch)
@@ -1982,12 +1782,7 @@ fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     for arm in arms {
         match arm {
             frontend::Node::SelectArm(is_send, bind, _, _, _, body, asp) => {
-                match patch_jump(ctx, ch, arm_slots[i]) {
-                    Ok(_) => {},
-                    Err(d) => {
-                        return Err(d)
-                    },
-                }
+                patch_jump(ctx, ch, arm_slots[i])?
                 begin_scope(ctx, ch)
                 if is_send {
                     match cp_expr(ch, body) {
@@ -1998,12 +1793,7 @@ fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
                     }
                     emit(ctx, ch, lib::op_pop, asp)
                 } else if bind != "" && bind != "_" {
-                    match declare_local(ctx, ch, bind, false, asp) {
-                        Ok(_) => {},
-                        Err(d) => {
-                            return Err(d)
-                        },
-                    }
+                    declare_local(ctx, ch, bind, false, asp)?
                     // recv 值在栈顶（select exec 留槽），拷入臂变量槽，让 x86 后端拿到权威类型
                     // the recv value sits on the stack top (select exec leaves the slot);
                     // copy it into the arm-variable slot so the x86 backend records an
@@ -2035,12 +1825,7 @@ fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
         i = i + 1
     }
     if has_default {
-        match patch_jump(ctx, ch, def_slot) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        patch_jump(ctx, ch, def_slot)?
         begin_scope(ctx, ch)
         match cp_expr(ch, dflt) {
             Ok(_) => {},
@@ -2053,12 +1838,7 @@ fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
         push(end_jumps, emit_jump(ctx, ch, lib::op_jump, dsp))
     }
     for j in end_jumps {
-        match patch_jump(ctx, ch, j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, j)?
     }
     Ok(true)
 }
@@ -2095,12 +1875,7 @@ fn cp_spawn_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
 }
 
 fn cp_defer_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, cur_file, ch, body, crefs, sp, cp_expr, cp_stmt) {
-    match cp_function(ctx, cur_file, ch, frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, body, "<defer>", crefs, sp), cp_expr, cp_stmt) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    cp_function(ctx, cur_file, ch, frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, body, "<defer>", crefs, sp), cp_expr, cp_stmt)?
     emit(ctx, ch, lib::op_defer, sp)
     Ok(true)
 }
@@ -2137,21 +1912,9 @@ fn cp_for_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
 
 fn cp_break_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
     let li = if lb == "" {
-        match unwind_to_loop(ctx, ch, sp) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                0
-            },
-        }
+        unwind_to_loop(ctx, ch, sp)?
     } else {
-        match labeled_loop(ctx, ch, lb, sp) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                0
-            },
-        }
+        labeled_loop(ctx, ch, lb, sp)?
     }
     push(ctx.c_lp_breaks[ch][li], emit_jump(ctx, ch, lib::op_jump, sp))
     Ok(true)
@@ -2159,21 +1922,9 @@ fn cp_break_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
 
 fn cp_continue_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
     let li = if lb == "" {
-        match unwind_to_loop(ctx, ch, sp) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                0
-            },
-        }
+        unwind_to_loop(ctx, ch, sp)?
     } else {
-        match labeled_loop(ctx, ch, lb, sp) {
-            Ok(v) => v,
-            Err(d) => {
-                return Err(d)
-                0
-            },
-        }
+        labeled_loop(ctx, ch, lb, sp)?
     }
     if ctx.c_lp_contto[ch][li] >= 0 {
         emit_loop(ctx, ch, ctx.c_lp_contto[ch][li], sp)
@@ -2252,13 +2003,7 @@ fn resolve_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], 
         ctx.c_l_captured[enc][li] = true
         return add_upvalue(ctx, ch, ctx.c_l_slot[enc][li], true, ctx.c_l_mut[enc][li], name, sp)
     }
-    let ui = match resolve_upvalue(ctx, enc, name, sp) {
-        Ok(v) => v,
-        Err(d) => {
-            return Err(d)
-            0
-        },
-    }
+    let ui = resolve_upvalue(ctx, enc, name, sp)?
     if ui >= 0 {
         return add_upvalue(ctx, ch, ui, false, ctx.c_u_mut[enc][ui], name, sp)
     }
@@ -2275,32 +2020,12 @@ fn cp_while(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
         },
     }
     let exit_j = emit_jump(ctx, ch, lib::op_jump_if_false_pop, sp)
-    match cp_block_stmts(ctx, ch, body, cp_stmt) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    match emit_loop(ctx, ch, start, sp) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    match patch_jump(ctx, ch, exit_j) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
+    cp_block_stmts(ctx, ch, body, cp_stmt)?
+    emit_loop(ctx, ch, start, sp)?
+    patch_jump(ctx, ch, exit_j)?
     let li = len(ctx.c_lp_breaks[ch]) - 1
     for j in ctx.c_lp_breaks[ch][li] {
-        match patch_jump(ctx, ch, j) {
-            Ok(_) => {},
-            Err(d) => {
-                return Err(d)
-            },
-        }
+        let _ = patch_jump(ctx, ch, j)?
     }
     pop_loop(ctx, ch)
     Ok(true)
