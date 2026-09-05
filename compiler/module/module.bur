@@ -1247,6 +1247,13 @@ fn resolve_te(te, aliases, mod_path, disp, mut diags, mut dfiles) {
             }
             frontend::Node::TEFn(rps, resolve_te(ret, aliases, mod_path, disp, diags, dfiles), sp)
         },
+        frontend::Node::TERecord(fnames, ftypes, row, rsp) => {
+            let mut rfts = []
+            for ft in ftypes {
+                push(rfts, resolve_te(ft, aliases, mod_path, disp, diags, dfiles))
+            }
+            frontend::Node::TERecord(fnames, rfts, resolve_te(row, aliases, mod_path, disp, diags, dfiles), rsp)
+        },
         _ => te,
     }
 }
@@ -1296,6 +1303,9 @@ fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
                     _ => push(out, s),
                 }
             },
+            frontend::Node::TypeAliasDecl(name, te, is_pub, sp) => {
+                push(out, frontend::Node::TypeAliasDecl(name, resolve_te(te, aliases, mod_path, disp, diags, dfiles), is_pub, sp))
+            },
             _ => push(out, s),
         }
     }
@@ -1330,6 +1340,19 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
                 frontend::Node::ConstDecl(n, nsp, _, _, _, _) => {
                     name = n
                     name_sp = nsp
+                },
+                frontend::Node::TypeAliasDecl(n, _, is_pub, tasp) => {
+                    if is_pub {
+                        match tasp {
+                            frontend::SpanT::Sp(ps0, pe0) => {
+                                push(diags, lib::DiagT::Diag(true, "E0801", "`pub` on `type` aliases is not supported in package files", "drop `pub`: package-level `type` aliases are visible to the whole package", ps0, pe0))
+                                push(dfiles, disp)
+                            },
+                        }
+                    } else {
+                        name = n
+                        name_sp = tasp
+                    }
                 },
                 frontend::Node::LetStmt(n, nsp, _, _, _, init, _) => {
                     name = n
