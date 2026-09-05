@@ -42,19 +42,24 @@ pub fn emit_macho(text_content, entry_in_text, data_content) {
 // result returns in rax.
 // 直译表：1 write→BSD write(0x2000004)、60 exit→0x2000001、9 mmap→0x20000C5
 // （内核从 r10 取第 4 参——libc 桩为躲过 syscall 对 rcx 的破坏而走 r10——
-// 只需把 flags 值换成 0x1002）、228 clock_gettime→0x2000074（clk_id 6）；
-// 错误返回正 errno 且 CF=1，转回 Linux 式负值；其余 ud2 立即崩溃暴露缺口。
+// 只需把 flags 值换成 0x1002）；错误返回正 errno 且 CF=1，转回 Linux 式负值。
 // Translation table: 1 write→BSD write(0x2000004), 60 exit→0x2000001,
 // 9 mmap→0x20000C5 (the kernel reads the 4th arg from r10 — libc stubs route
 // rcx through r10 to survive syscall clobbering rcx — so only the flags value
-// changes to 0x1002), 228 clock_gettime→0x2000074 (clk_id 6); errors return
-// positive errno with CF set, converted back to Linux-style negatives;
-// anything else hits ud2.
-// 无导入无 API 调用，故帧只需保存六个输入寄存器（mmap 改写 r10、clock 改写 rdi，
-// 尾声弹回），无需影子空间与栈定位。
+// changes to 0x1002); errors return positive errno with CF set, converted back
+// to Linux-style negatives.
+// 228 clock_gettime 在 BSD 表里没有对应号，改走 gettimeofday(0x2000074) 的第三参
+// uint64_t *mach_absolute_time：x86_64 上该时基即纳秒，除 1e9 拆成 timespec。
+// 228 clock_gettime has no number in the BSD table, so it routes through
+// gettimeofday's (0x2000074) third argument uint64_t *mach_absolute_time: that
+// timebase is nanoseconds on x86_64, divided by 1e9 into a timespec.
+// 其余号落 ud2 立即崩溃暴露缺口。
+// Every other number hits ud2.
+// 无导入无 API 调用，故帧只需保存六个输入寄存器（mmap 改写 r10、clock 改写
+// rdi/rsi/rdx/r10，尾声弹回），无需影子空间与栈定位。
 // No imports and no API calls, so the frame only saves the six input registers
-// (mmap rewrites r10, clock rewrites rdi, both restored by the epilogue); no
-// shadow space or frame pointer needed.
+// (mmap rewrites r10, clock rewrites rdi/rsi/rdx/r10, all restored by the
+// epilogue); no shadow space or frame pointer needed.
 pub fn macho_build_dispatcher() {
     let head = e1(87) + e1(86) + e1(82) + e1(65) + e1(80) + e1(65) + e1(81) + e1(65) + e1(82)
     let epilogue = e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(195)
@@ -75,9 +80,20 @@ pub fn macho_build_dispatcher() {
     // epilogue restores the original r10); errors convert negative
     let mmap_case = mov_ri64(rax, 33554629) + mov_ri64(r10, 4098) + e1(15) + e1(5) + errno_tail
 
-    // clock_gettime(clk_id=rdi, tp=rsi)：CLOCK_MONOTONIC 1→6；timespec 内存布局同形
-    // clock_gettime(clk_id=rdi, tp=rsi): CLOCK_MONOTONIC 1→6; the timespec memory layout matches
-    let clock_case = mov_ri64(rdi, 6) + mov_ri64(rax, 33554548) + e1(15) + e1(5) + errno_tail
+    // clock_gettime(clk_id=rdi, tp=rsi)：开 32 字节暂存并把 tp 存 [rsp+16]；
+    // timeval 落 [rsp] 弃用，mach 纳秒落 [rsp+24]，除 1e9 得 {sec, nsec} 写回 tp
+    // clock_gettime(clk_id=rdi, tp=rsi): 32 scratch bytes with tp saved at
+    // [rsp+16]; the timeval at [rsp] is discarded, the mach nanoseconds land at
+    // [rsp+24] and divide by 1e9 into the {sec, nsec} written back through tp
+    let clock_case = e1(72) + e1(131) + e1(236) + e1(32) + e1(72) + e1(137) + e1(116) + e1(36) + e1(16) + e1(72) + e1(137) + e1(231) + e1(72) + e1(49) + e1(246) + e1(72) + e1(141) + e1(84) + e1(36) + e1(24) + mov_ri64(rax, 33554548) + e1(15) + e1(5) + e1(72) + e1(139) + e1(68) + e1(36) + e1(24) + e1(72) + e1(49) + e1(210) + mov_ri64(r10, 1000000000) + e1(73) + e1(247) + e1(242) + e1(72) + e1(139) + e1(116) + e1(36) + e1(16) + e1(72) + e1(137) + e1(6) + e1(72) + e1(137) + e1(86) + e1(8) + e1(72) + e1(131) + e1(196) + e1(32) + e1(72) + e1(49) + e1(192)
 
-    sys_dispatch_chain(head, [1, 60, 9, 228], [write_case, exit_case, mmap_case, clock_case], epilogue)
+    // poll(fds=rdi, nfds=rsi, timeout=rdx)：struct pollfd 布局与 POLLIN/POLLOUT 值两边相同，直通
+    // poll(fds=rdi, nfds=rsi, timeout=rdx): struct pollfd layout and the POLLIN/POLLOUT values match; passes through
+    let poll_case = mov_ri64(rax, 33554662) + e1(15) + e1(5) + errno_tail
+
+    // mprotect(addr=rdi, len=rsi, prot=rdx)：PROT_READ/WRITE/EXEC 两边同值，直通
+    // mprotect(addr=rdi, len=rsi, prot=rdx): PROT_READ/WRITE/EXEC share values; passes through
+    let mprotect_case = mov_ri64(rax, 33554506) + e1(15) + e1(5) + errno_tail
+
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case], epilogue)
 }
