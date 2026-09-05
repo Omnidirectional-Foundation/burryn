@@ -382,6 +382,14 @@ func (m *Module) checkPackageDecls(pkg *Package) {
 						"package-level `let` allows literals, arithmetic on literals, list literals, and `fn` literals; compute anything else inside a function",
 						"package-level `let` must be initialized with a constant expression")
 				}
+			case *TypeAliasDecl:
+				if st.Pub {
+					m.errorf(f.Path, st.Span, "E0801",
+						"drop `pub`: package-level `type` aliases are visible to the whole package",
+						"`pub` on `type` aliases is not supported in package files")
+					continue
+				}
+				name, nameSpan = st.Name, st.Span
 			default:
 				m.errorf(f.Path, s.span(), "E0801",
 					"executable code lives inside functions; the program starts at `fn main`",
