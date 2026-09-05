@@ -6,11 +6,12 @@
 # cache 是捷径，身份是 go-host SHA + sha256。
 # gen1 is born every push from current compiler/. Verify jobs download gen1.
 # gen1 每个 push 从当前 compiler/ 接生。验证 job 下载 gen1。
-# C three-gen fixpoint is not on push. Linux x86 ELF parity is not on push;
-# run scripts/multi-backend-verify.sh at three-way join.
-# C 三代定点不进 push。Linux x86 ELF 对照不进 push；三方汇合时再跑
-# scripts/multi-backend-verify.sh。
-
+# The C three-gen fixpoint runs on push: it is the only check that catches
+# nondeterminism and runtime-state defects the behaviour suites cannot see.
+# C 三代定点进每次 push：行为套件看不见的不确定性与运行时状态缺陷，只有它能抓。
+# Linux x86 ELF parity is not on push; run scripts/multi-backend-verify.sh
+# at the three-way join.
+# Linux x86 ELF 对照不进 push；三方汇合时再跑 scripts/multi-backend-verify.sh。
 name: CI
 
 on:
@@ -165,7 +166,7 @@ jobs:
     needs: bur-base
     if: always() && needs['bur-base'].result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 45
     env:
       CC: clang
       CC_OPT: -O1
@@ -213,11 +214,54 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Verify gen1
+
+  check:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: fmt and typecheck
         run: |
           set -euo pipefail
+          chmod +x gen1
           ./gen1 fmt --check compiler
           ./gen1 check compiler
+
+  fixpoint:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CC: clang
+      CC_OPT: -O1
+      MALLOC_ARENA_MAX: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: Three-generation fixpoint
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build compiler -o g1c
+          ./g1c build compiler -o g2c
+          sha256sum g1c g2c
+          cmp g1c g2c
 
   testdata:
     needs: gen1
