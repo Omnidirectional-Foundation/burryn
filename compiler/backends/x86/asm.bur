@@ -35,7 +35,6 @@ pub fn pop_r(reg) {
 }
 
 // call_rel32 发射相对调用 / call_rel32 emits a relative call
-// Relative call
 pub fn call_rel32(off) {
     e1(232) + e4s(off)
 }
@@ -117,36 +116,38 @@ pub fn imul_rr(dst, src) {
     rex(1, dst, 0, src) + e1(15) + e1(175) + modrm_reg(dst, src)
 }
 
-// add_ri32 发射 add 立即数（小值用短编码） / add_ri32 emits add immediate (short encoding for small values)
-// add immediate (short form for small values)
-pub fn add_ri32(dst, imm) {
+// alu_ri32 发射 81 /digit 组的 ALU 立即数指令，imm8 放得下就用 83 短编码
+// alu_ri32 emits an ALU immediate from the 81 /digit group, taking the short
+// 83 encoding whenever the immediate fits in an imm8
+fn alu_ri32(digit, dst, imm) {
     if imm >= -128 && imm <= 127 {
-        rex(1, 0, 0, dst) + e1(131) + modrm_reg(0, dst) + sb(imm)
+        rex(1, 0, 0, dst) + e1(131) + modrm_reg(digit, dst) + sb(imm)
     } else {
-        rex(1, 0, 0, dst) + e1(129) + modrm_reg(0, dst) + e4s(imm)
+        rex(1, 0, 0, dst) + e1(129) + modrm_reg(digit, dst) + e4s(imm)
     }
 }
 
+// add_ri32 发射 add 立即数（小值用短编码） / add_ri32 emits add immediate (short encoding for small values)
+pub fn add_ri32(dst, imm) {
+    alu_ri32(0, dst, imm)
+}
+
 // jb_rel32 发射 jb rel32（无符号小于） / jb_rel32 emits jb rel32 (unsigned less-than)
-// jb rel32 (unsigned below)
 pub fn jb_rel32(off) {
     e1(15) + e1(130) + e4s(off)
 }
 
 // jae_rel32 发射 jae rel32（无符号大于等于） / jae_rel32 emits jae rel32 (unsigned greater-or-equal)
-// jae rel32 (unsigned above-or-equal)
 pub fn jae_rel32(off) {
     e1(15) + e1(131) + e4s(off)
 }
 
 // jbe_rel32 发射 jbe rel32（无符号小于等于） / jbe_rel32 emits jbe rel32 (unsigned less-or-equal)
-// jbe rel32 (unsigned below-or-equal)
 pub fn jbe_rel32(off) {
     e1(15) + e1(134) + e4s(off)
 }
 
 // jmp_rel32 发射相对跳转 / jmp_rel32 emits a relative jump
-// Relative jump
 pub fn jmp_rel32(off) {
     e1(233) + e4s(off)
 }
@@ -157,19 +158,16 @@ pub fn je_rel32(off) {
 }
 
 // jl_rel32 发射 jl rel32（有符号小于） / jl_rel32 emits jl rel32 (signed less-than)
-// jl rel32 (signed less)
 pub fn jl_rel32(off) {
     e1(15) + e1(140) + e4s(off)
 }
 
 // jg_rel32 发射 jg rel32（有符号大于） / jg_rel32 emits jg rel32 (signed greater-than)
-// jg rel32 (signed greater)
 pub fn jg_rel32(off) {
     e1(15) + e1(143) + e4s(off)
 }
 
 // ja_rel32 发射 ja rel32（无符号大于） / ja_rel32 emits ja rel32 (unsigned greater-than)
-// ja rel32 (unsigned above)
 pub fn ja_rel32(off) {
     e1(15) + e1(135) + e4s(off)
 }
@@ -180,7 +178,6 @@ pub fn jle_rel32(off) {
 }
 
 // jge_rel32 发射 jge rel32（有符号大于等于） / jge_rel32 emits jge rel32 (signed greater-or-equal)
-// jge rel32 (signed greater-or-equal)
 pub fn jge_rel32(off) {
     e1(15) + e1(141) + e4s(off)
 }
@@ -195,26 +192,27 @@ pub fn jne_rel32(off) {
     e1(15) + e1(133) + e4s(off)
 }
 
+// mem_operand 生成 [base+disp] 的 ModRM+SIB+位移，按 disp 宽度选最短的 mod 编码
+// mem_operand builds the ModRM+SIB+displacement of [base+disp], picking the
+// shortest mod encoding the displacement fits in
+fn mem_operand(reg, base, disp) {
+    if disp == 0 && base % 8 != 5 {
+        modrm(0, reg, base) + sib_for(base)
+    } else if disp >= -128 && disp <= 127 {
+        modrm(1, reg, base) + sib_for(base) + sb(disp)
+    } else {
+        modrm(2, reg, base) + sib_for(base) + e4s(disp)
+    }
+}
+
 // mov_rm 发射内存到寄存器 / mov_rm emits memory-to-register
 pub fn mov_rm(dst, base, disp) {
-    if disp == 0 && base % 8 != 5 {
-        rex(1, dst, 0, base) + e1(139) + modrm(0, dst, base) + sib_for(base)
-    } else if disp >= -128 && disp <= 127 {
-        rex(1, dst, 0, base) + e1(139) + modrm(1, dst, base) + sib_for(base) + sb(disp)
-    } else {
-        rex(1, dst, 0, base) + e1(139) + modrm(2, dst, base) + sib_for(base) + e4s(disp)
-    }
+    rex(1, dst, 0, base) + e1(139) + mem_operand(dst, base, disp)
 }
 
 // mov_rm32 发射 32 位内存到寄存器（零扩展） / mov_rm32 emits a 32-bit memory-to-register load (zero-extends)
 pub fn mov_rm32(dst, base, disp) {
-    if disp == 0 && base % 8 != 5 {
-        rex(0, dst, 0, base) + e1(139) + modrm(0, dst, base) + sib_for(base)
-    } else if disp >= -128 && disp <= 127 {
-        rex(0, dst, 0, base) + e1(139) + modrm(1, dst, base) + sib_for(base) + sb(disp)
-    } else {
-        rex(0, dst, 0, base) + e1(139) + modrm(2, dst, base) + sib_for(base) + e4s(disp)
-    }
+    rex(0, dst, 0, base) + e1(139) + mem_operand(dst, base, disp)
 }
 
 // and_rr 发射 and 指令 / and_rr emits an and instruction
@@ -229,7 +227,6 @@ pub fn nop() {
 
 // int3 发射 int3：未实现 native 的 trap（parity 按 SIGTRAP skip）
 // int3 emits int3: the unimplemented-native trap (parity treats it as a SIGTRAP skip)
-// int3: trap for unimplemented natives (parity skips on SIGTRAP)
 pub fn int3() {
     e1(204)
 }
@@ -250,13 +247,11 @@ pub fn mov_rr(dst, src) {
 }
 
 // mov_ri64 发射 movabs（64 位立即数） / mov_ri64 emits movabs (64-bit immediate)
-// movabs 64-bit immediate
 pub fn mov_ri64(dst, imm) {
     rex(1, 0, 0, dst) + e1(184 + dst % 8) + e8s(imm)
 }
 
 // mov_ri32 发射 mov（32 位立即数，高位清零） / mov_ri32 emits mov (32-bit immediate, upper bits cleared)
-// mov 32-bit immediate (zero-extends)
 pub fn mov_ri32(dst, imm) {
     if dst >= 8 {
         rex(0, 0, 0, dst) + e1(184 + dst % 8) + e4(imm)
@@ -267,14 +262,7 @@ pub fn mov_ri32(dst, imm) {
 
 // mov_mr16 发射 16 位寄存器到内存 / mov_mr16 emits a 16-bit register-to-memory store
 pub fn mov_mr16(base, disp, src) {
-    let op = if disp == 0 && base % 8 != 5 {
-        modrm(0, src, base) + sib_for(base)
-    } else if disp >= -128 && disp <= 127 {
-        modrm(1, src, base) + sib_for(base) + sb(disp)
-    } else {
-        modrm(2, src, base) + sib_for(base) + e4s(disp)
-    }
-    e1(102) + rex(0, src, 0, base) + e1(137) + op
+    e1(102) + rex(0, src, 0, base) + e1(137) + mem_operand(src, base, disp)
 }
 
 // mulsd xmm<xdst>, xmm<xsrc>：double 乘 / mulsd: double multiply
@@ -351,13 +339,7 @@ pub fn sar_rcl(dst) {
 
 // lea 发射 lea 地址计算 / lea emits lea (address computation)
 pub fn lea(dst, base, disp) {
-    if disp == 0 && base % 8 != 5 {
-        rex(1, dst, 0, base) + e1(141) + modrm(0, dst, base) + sib_for(base)
-    } else if disp >= -128 && disp <= 127 {
-        rex(1, dst, 0, base) + e1(141) + modrm(1, dst, base) + sib_for(base) + sb(disp)
-    } else {
-        rex(1, dst, 0, base) + e1(141) + modrm(2, dst, base) + sib_for(base) + e4s(disp)
-    }
+    rex(1, dst, 0, base) + e1(141) + mem_operand(dst, base, disp)
 }
 
 // sete 发射 sete（按 ZF 置 0/1）/ sete emits sete (set 0/1 from flags)
@@ -455,24 +437,12 @@ pub fn e8s(v) {
 
 // mov_mr 发射寄存器到内存 / mov_mr emits register-to-memory
 pub fn mov_mr(base, disp, src) {
-    if disp == 0 && base % 8 != 5 {
-        rex(1, src, 0, base) + e1(137) + modrm(0, src, base) + sib_for(base)
-    } else if disp >= -128 && disp <= 127 {
-        rex(1, src, 0, base) + e1(137) + modrm(1, src, base) + sib_for(base) + sb(disp)
-    } else {
-        rex(1, src, 0, base) + e1(137) + modrm(2, src, base) + sib_for(base) + e4s(disp)
-    }
+    rex(1, src, 0, base) + e1(137) + mem_operand(src, base, disp)
 }
 
 // mov_mr32 发射 32 位寄存器到内存 / mov_mr32 emits a 32-bit register-to-memory store
 pub fn mov_mr32(base, disp, src) {
-    if disp == 0 && base % 8 != 5 {
-        rex(0, src, 0, base) + e1(137) + modrm(0, src, base) + sib_for(base)
-    } else if disp >= -128 && disp <= 127 {
-        rex(0, src, 0, base) + e1(137) + modrm(1, src, base) + sib_for(base) + sb(disp)
-    } else {
-        rex(0, src, 0, base) + e1(137) + modrm(2, src, base) + sib_for(base) + e4s(disp)
-    }
+    rex(0, src, 0, base) + e1(137) + mem_operand(src, base, disp)
 }
 
 // rep_movsb 发射 rep movsb（批量拷贝）/ rep_movsb emits rep movsb: bulk copy
@@ -491,17 +461,11 @@ pub fn sub_rr(dst, src) {
 }
 
 // sub_ri32 发射 sub 立即数 / sub_ri32 emits sub immediate
-// sub immediate
 pub fn sub_ri32(dst, imm) {
-    if imm >= -128 && imm <= 127 {
-        rex(1, 0, 0, dst) + e1(131) + modrm_reg(5, dst) + sb(imm)
-    } else {
-        rex(1, 0, 0, dst) + e1(129) + modrm_reg(5, dst) + e4s(imm)
-    }
+    alu_ri32(5, dst, imm)
 }
 
 // lea_rip_rel32 发射 lea rip 相对寻址 / lea_rip_rel32 emits lea rip-relative addressing
-// lea rip-relative addressing
 pub fn lea_rip_rel32(dst, rel32) {
     rex(1, dst, 0, 0) + e1(141) + modrm(0, dst, 5) + e4s(rel32)
 }

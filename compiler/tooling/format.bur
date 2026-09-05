@@ -157,8 +157,8 @@ fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
         frontend::Node::RecordUpdate(base, names, vals, _) => fmt_record_update(base, names, vals, src, comments, cc, indent, buf),
         frontend::Node::FieldAccess(base, field, _) => fmt_field(base, field, src, comments, cc, indent, buf),
         frontend::Node::Index(target, idx, _) => fmt_index_expr(target, idx, src, comments, cc, indent, buf),
-        frontend::Node::ListLit(elems, _) => fmt_list_lit(elems, src, comments, cc, indent, buf),
-        frontend::Node::TupleLit(elems, _) => fmt_tuple_lit(elems, src, comments, cc, indent, buf),
+        frontend::Node::ListLit(elems, _) => fmt_seq_lit("[", "]", elems, src, comments, cc, indent, buf),
+        frontend::Node::TupleLit(elems, _) => fmt_seq_lit("(", ")", elems, src, comments, cc, indent, buf),
         frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => fmt_fn_lit("", n, src, comments, cc, indent, buf),
         frontend::Node::Block(stmts, sp) => fmt_block_expr(stmts, sp, src, comments, cc, indent, buf),
         frontend::Node::IfExpr(cond, then, els, _) => fmt_if_expr(cond, then, els, src, comments, cc, indent, buf),
@@ -233,8 +233,11 @@ fn fmt_record_update(base, names, vals, src, comments, mut cc, indent, mut buf) 
     push(buf, chr(125))
 }
 
-fn fmt_list_lit(elems, src, comments, mut cc, indent, mut buf) {
-    push(buf, "[")
+// fmt_seq_lit 排版逗号分隔的括号序列（list 与 tuple 字面量共用）
+// fmt_seq_lit renders a comma-separated bracketed sequence, shared by list and
+// tuple literals
+fn fmt_seq_lit(open, close, elems, src, comments, mut cc, indent, mut buf) {
+    push(buf, open)
     let mut i = 0
     while i < len(elems) {
         if i > 0 {
@@ -243,20 +246,7 @@ fn fmt_list_lit(elems, src, comments, mut cc, indent, mut buf) {
         fmt_expr(elems[i], src, comments, cc, indent, buf)
         i = i + 1
     }
-    push(buf, "]")
-}
-
-fn fmt_tuple_lit(elems, src, comments, mut cc, indent, mut buf) {
-    push(buf, "(")
-    let mut i = 0
-    while i < len(elems) {
-        if i > 0 {
-            push(buf, ", ")
-        }
-        fmt_expr(elems[i], src, comments, cc, indent, buf)
-        i = i + 1
-    }
-    push(buf, ")")
+    push(buf, close)
 }
 
 fn fmt_call_expr(callee, cargs, src, comments, mut cc, indent, mut buf) {
@@ -835,8 +825,8 @@ fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
         frontend::Node::DeferStmt(body, crefs, _) => fmt_defer_stmt(body, crefs, src, comments, cc, indent, buf),
         frontend::Node::TypeAliasDecl(name, te, is_pub, _) => fmt_type_alias_fmt(name, te, is_pub, src, comments, cc, indent, buf),
         frontend::Node::SendStmt(ch, val, _) => fmt_send_stmt_fmt(ch, val, src, comments, cc, indent, buf),
-        frontend::Node::BreakStmt(lb, _) => fmt_break_stmt_fmt(lb, buf),
-        frontend::Node::ContinueStmt(lb, _) => fmt_continue_stmt_fmt(lb, buf),
+        frontend::Node::BreakStmt(lb, _) => fmt_jump_stmt("break", lb, buf),
+        frontend::Node::ContinueStmt(lb, _) => fmt_jump_stmt("continue", lb, buf),
         frontend::Node::ImportDecl(alias, _, _, psp, _) => fmt_import_decl_fmt(alias, psp, src, buf),
         frontend::Node::EnumDecl(name, tparams, variants, is_pub, sp) => fmt_enum_decl(name, tparams, variants, is_pub, sp, src, comments, cc, indent, buf),
         frontend::Node::SelectStmt(arms, has_default, dflt, dsp, sp) => fmt_select_stmt(arms, has_default, dflt, dsp, sp, src, comments, cc, indent, buf),
@@ -1099,16 +1089,10 @@ fn fmt_send_stmt_fmt(ch, val, src, comments, mut cc, indent, mut buf) {
     fmt_expr(val, src, comments, cc, indent, buf)
 }
 
-fn fmt_break_stmt_fmt(lb, mut buf) {
-    push(buf, "break")
-    if lb != "" {
-        push(buf, " ")
-        push(buf, lb)
-    }
-}
-
-fn fmt_continue_stmt_fmt(lb, mut buf) {
-    push(buf, "continue")
+// fmt_jump_stmt 排版 break / continue 及其可选标签
+// fmt_jump_stmt renders break / continue and its optional label
+fn fmt_jump_stmt(kw, lb, mut buf) {
+    push(buf, kw)
     if lb != "" {
         push(buf, " ")
         push(buf, lb)
