@@ -164,6 +164,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut dm_msg = []
     let mut dm_file = []
     let mut chan_fors = []
+    let mut by_name_refs = []
+    let mut pending_ub = []
+    let mut pending_uname = []
     let mut method_tbl = map()
     let mut cur_file = ""
     let mut diag_files = []
@@ -1606,7 +1609,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     // infer_call infers a call (args, generalization, pending diagnostics)
     // infer_call 解析被调者（名字/包成员/方法），参数逐一推断后合一
     // infer_call resolves the callee (name/package member/method), infers args, then unifies
-    fn infer_call(callee, cargs, csp) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref c, ref chan_fors, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
+    fn infer_call(callee, cargs, csp) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref by_name_refs, ref c, ref chan_fors, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
         // 先探方法调用（receiver.mname），再按名字/包成员解析被调者
         // Method calls (receiver.mname) first, then resolve by name or package member
         match callee {
@@ -1686,6 +1689,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 }
             },
             _ => -1,
+        }
+        // find_fn_by_name 的字面量参数是对该名字的引用（x86 后端按名取注入函数的句柄，契约见 float_rt.bur 头注释）
+        // A literal passed to find_fn_by_name counts as a use of that name (the x86 backend resolves injected functions by name; contract in float_rt.bur's header)
+        if callee_name == "find_fn_by_name" && len(cargs) >= 2 {
+            match cargs[1] {
+                StrLit(s, _) => push(by_name_refs, s),
+                _ => {},
+            }
         }
         // 可变容器操作：第一实参需可 mut 别名
         // Mutable container ops: the first argument must alias mutably
@@ -3247,14 +3258,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             match get(top, name) {
                 Some(b) => {
                     if b_kind[b] == "global" {
-                        if (!is_pkg || !b_pub[b]) && !b_used[b] && !starts_underscore(name) {
-                            let what = if b_isfn[b] {
-                                "function"
-                            } else {
-                                "variable"
-                            }
-                            cur_file = b_file[b]
-                            cwarn_fix(b_span[b], "unused_variable", "unused " + what + ": `" + name + "`", "if this is intentional, prefix it with an underscore", "_" + name)
+                        // 未用检查延到所有包推断完后（见 pi 循环后的 pending_unused 排出）
+                        // The unused check is deferred until every package is inferred (see the pending_unused drain after the pi loop)
+                        if (!is_pkg || !b_pub[b]) && !starts_underscore(name) {
+                            push(pending_ub, b)
+                            push(pending_uname, name)
                         }
                         put(pkg_vals, cur_pkg + "." + name, b)
                         if is_entry {
@@ -3274,6 +3282,24 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         let _ = pop(scopes)
         cur_aliases = map()
         pi = pi + 1
+    }
+
+    // 未用全局检查：find_fn_by_name 的字面量（by_name_refs）在所有包推断完后才收齐，故延到此处；诊断仍按文件排序，不变序
+    // Unused-global check: find_fn_by_name literals (by_name_refs) are complete only after every package is inferred, so drain here; diagnostics stay file-sorted
+    let mut ui = 0
+    while ui < len(pending_ub) {
+        let ub = pending_ub[ui]
+        let uname = pending_uname[ui]
+        if !b_used[ub] && !contains(by_name_refs, uname) {
+            let uwhat = if b_isfn[ub] {
+                "function"
+            } else {
+                "variable"
+            }
+            cur_file = b_file[ub]
+            cwarn_fix(b_span[ub], "unused_variable", "unused " + uwhat + ": `" + uname + "`", "if this is intentional, prefix it with an underscore", "_" + uname)
+        }
+        ui = ui + 1
     }
 
     let mut has_err = false
