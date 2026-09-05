@@ -22,18 +22,8 @@ pub fn pe_build_dispatcher(iat) {
     // Save still-live SysV regs, then 16-byte-align and open Win64 shadow plus locals
     let head = e1(85) + e1(72) + e1(137) + e1(229) + e1(87) + e1(86) + e1(82) + e1(65) + e1(80) + e1(65) + e1(81) + e1(65) + e1(82) + e1(72) + e1(131) + e1(228) + e1(240) + e1(72) + e1(129) + e1(236) + e1(64) + e1(0) + e1(0) + e1(0)
 
-    // 分派链：cmp rax,imm32 + je rel32，落在 ud2 之后的对应 case
-    // Dispatch: cmp rax,imm32 + je rel32 onto the matching case after ud2
-    let je32 = e1(15) + e1(132)
-    let cmp_write = e1(72) + e1(61) + e4(1) + je32
-    let cmp_exit = e1(72) + e1(61) + e4(60) + je32
-    let cmp_mmap = e1(72) + e1(61) + e4(9) + je32
-    let cmp_clock = e1(72) + e1(61) + e4(228) + je32
-    let default_case = e1(15) + e1(11)
-    let cmp_arm = str_len(cmp_write) + 4
-
-    // 尾声：rsp 回到保存区再弹寄存器；各 case 以 5 字节 jmp rel32 归拢
-    // Epilogue: rsp back to the save area, then pop; cases funnel via 5-byte jmp rel32
+    // 尾声：rsp 回到保存区再弹寄存器
+    // Epilogue: rsp back to the save area, then pop
     let epilogue = e1(72) + e1(141) + e1(101) + e1(208) + e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(201) + e1(195)
 
     // write(fd=rdi, buf=rsi, len=rdx)：句柄 1→STD_OUTPUT 其余→STD_ERROR；
@@ -55,11 +45,5 @@ pub fn pe_build_dispatcher(iat) {
     // with quotient/remainder split multiply (same shape as bur_mono_ns)
     let clock_case = e1(72) + e1(141) + e1(76) + e1(36) + e1(32) + mov_ri64(r10, iat[4]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(141) + e1(76) + e1(36) + e1(40) + mov_ri64(r10, iat[5]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(139) + e1(68) + e1(36) + e1(32) + e1(72) + e1(49) + e1(210) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(72) + e1(105) + e1(192) + e4(1000000000) + e1(73) + e1(137) + e1(193) + e1(72) + e1(137) + e1(208) + mov_ri64(r10, 1000000000) + e1(73) + e1(247) + e1(226) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(76) + e1(1) + e1(200) + mov_ri64(r10, 1000000000) + e1(72) + e1(49) + e1(210) + e1(73) + e1(247) + e1(242) + e1(72) + e1(137) + e1(6) + e1(72) + e1(137) + e1(86) + e1(8)
 
-    let jmp_epi_after_write = e1(233) + e4(str_len(exit_case) + str_len(mmap_case) + 5 + str_len(clock_case))
-    let jmp_epi_after_mmap = e1(233) + e4(str_len(clock_case))
-    let jw = 3 * cmp_arm + str_len(default_case)
-    let jx = 2 * cmp_arm + str_len(default_case) + str_len(write_case) + 5
-    let jm = cmp_arm + str_len(default_case) + str_len(write_case) + 5 + str_len(exit_case)
-    let jc = str_len(default_case) + str_len(write_case) + 5 + str_len(exit_case) + str_len(mmap_case) + 5
-    head + cmp_write + e4s(jw) + cmp_exit + e4s(jx) + cmp_mmap + e4s(jm) + cmp_clock + e4s(jc) + default_case + write_case + jmp_epi_after_write + exit_case + mmap_case + jmp_epi_after_mmap + clock_case + epilogue
+    sys_dispatch_chain(head, [1, 60, 9, 228], [write_case, exit_case, mmap_case, clock_case], epilogue)
 }
