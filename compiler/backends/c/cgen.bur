@@ -453,8 +453,27 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         bi = bi + 1
     }
 
+    let init_objs_chunk = 256
+    let mut init_n = 0
+    let mut init_parts = 0
+    // w_init 发射一条对象初始化语句，每满 init_objs_chunk 条另起一个 bur_init_objs_N；
+    // 整程序的初始化语句挤进单个 C 函数时，cc1 的用时随函数体超线性增长
+    // w_init emits one object-initializer statement, opening a fresh bur_init_objs_N
+    // every init_objs_chunk statements; cc1 time grows superlinearly in the size of a
+    // single function body, and a whole program's initializers are one such body
+    fn w_init(s) capture(ref init_n, ref init_parts) {
+        if init_n % init_objs_chunk == 0 {
+            if init_n > 0 {
+                w("}\n\n")
+            }
+            w("static void bur_init_objs_" + str(init_parts) + "(void) " + chr(123) + "\n")
+            init_parts = init_parts + 1
+        }
+        w(s)
+        init_n = init_n + 1
+    }
+
     let glob_start = len(out)
-    w("static void bur_init_objs(void) " + chr(123) + "\n")
     oi = 0
     while oi < len(o_kind) {
         let names = if o_kind[oi] == 0 {
@@ -468,12 +487,12 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         } else {
             ["OBJ_ENUMINST", "OEnumInst"]
         }
-        w("\tbur_K[" + str(oi) + "] = bur_alloc(sizeof(" + names[1] + "), " + names[0] + ");\n")
+        w_init("\tbur_K[" + str(oi) + "] = bur_alloc(sizeof(" + names[1] + "), " + names[0] + ");\n")
         oi = oi + 1
     }
     oi = 0
     while oi < len(o_kind) {
-        w("\tbur_add_root(bur_K[" + str(oi) + "]);\n")
+        w_init("\tbur_add_root(bur_K[" + str(oi) + "]);\n")
         oi = oi + 1
     }
     oi = 0
@@ -481,7 +500,7 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
         if o_kind[oi] == 0 {
             let s = o_str[oi]
             let n = str(str_len(s))
-            w("\t" + chr(123) + " OString *s = (OString *)bur_K[" + str(oi) + "]; s->len = " + n + "; s->data = (char *)malloc(" + str(str_len(s) + 1) + "); memcpy(s->data, " + c_str(s) + ", " + n + "); s->data[" + n + "] = 0; }\n")
+            w_init("\t" + chr(123) + " OString *s = (OString *)bur_K[" + str(oi) + "]; s->len = " + n + "; s->data = (char *)malloc(" + str(str_len(s) + 1) + "); memcpy(s->data, " + c_str(s) + ", " + n + "); s->data[" + n + "] = 0; }\n")
         } else if o_kind[oi] == 2 {
             let eh = o_a[oi]
             let mut vs = []
@@ -490,21 +509,21 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
                 push(vs, "" + chr(123) + "" + c_str(en_vnames[eh][i]) + ", " + str(en_varities[eh][i]) + "}")
                 i = i + 1
             }
-            w("\t" + chr(123) + " static VariantInfo vs[" + str(len(en_vnames[eh])) + "] = " + chr(123) + "" + join(vs, ", ") + "}; OEnumType *e = (OEnumType *)bur_K[" + str(oi) + "]; e->name = " + c_str(en_qual[eh]) + "; e->variants = vs; e->nvariants = " + str(len(en_vnames[eh])) + "; }\n")
+            w_init("\t" + chr(123) + " static VariantInfo vs[" + str(len(en_vnames[eh])) + "] = " + chr(123) + "" + join(vs, ", ") + "}; OEnumType *e = (OEnumType *)bur_K[" + str(oi) + "]; e->name = " + c_str(en_qual[eh]) + "; e->variants = vs; e->nvariants = " + str(len(en_vnames[eh])) + "; }\n")
         } else if o_kind[oi] == 3 {
             let ekey = "e:" + str(o_a[oi])
             let eid = match get(ids, ekey) {
                 Some(x) => x,
                 None => 0,
             }
-            w("\t" + chr(123) + " OVariantCtor *c = (OVariantCtor *)bur_K[" + str(oi) + "]; c->enm = (OEnumType *)bur_K[" + str(eid) + "]; c->idx = " + str(o_b[oi]) + "; }\n")
+            w_init("\t" + chr(123) + " OVariantCtor *c = (OVariantCtor *)bur_K[" + str(oi) + "]; c->enm = (OEnumType *)bur_K[" + str(eid) + "]; c->idx = " + str(o_b[oi]) + "; }\n")
         } else if o_kind[oi] == 4 {
             let ekey = "e:" + str(o_a[oi])
             let eid = match get(ids, ekey) {
                 Some(x) => x,
                 None => 0,
             }
-            w("\t" + chr(123) + " OEnumInst *in = (OEnumInst *)bur_K[" + str(oi) + "]; in->enm = (OEnumType *)bur_K[" + str(eid) + "]; in->variant = " + str(o_b[oi]) + "; in->nfields = 0; }\n")
+            w_init("\t" + chr(123) + " OEnumInst *in = (OEnumInst *)bur_K[" + str(oi) + "]; in->enm = (OEnumType *)bur_K[" + str(eid) + "]; in->variant = " + str(o_b[oi]) + "; in->nfields = 0; }\n")
         } else {
             let fh = o_a[oi]
             let nconsts = len(f_consts[fh])
@@ -527,13 +546,20 @@ pub fn cgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, 
                 line = line + " bur_consts_" + str(oi) + "[" + str(i) + "] = " + c_value(f_consts[fh][i], fconst_ids[fh][i]) + ";"
                 i = i + 1
             }
-            w(line + " }\n")
+            w_init(line + " }\n")
         }
         oi = oi + 1
     }
-    w("\tbur_opt_enum = (OEnumType *)bur_K[" + str(opt_id) + "];\n")
-    w("\tbur_res_enum = (OEnumType *)bur_K[" + str(res_id) + "];\n")
-    w("\tbur_out_enum = (OEnumType *)bur_K[" + str(out_id) + "];\n")
+    w_init("\tbur_opt_enum = (OEnumType *)bur_K[" + str(opt_id) + "];\n")
+    w_init("\tbur_res_enum = (OEnumType *)bur_K[" + str(res_id) + "];\n")
+    w_init("\tbur_out_enum = (OEnumType *)bur_K[" + str(out_id) + "];\n")
+    w("}\n\n")
+    w("static void bur_init_objs(void) " + chr(123) + "\n")
+    let mut ipart = 0
+    while ipart < init_parts {
+        w("\tbur_init_objs_" + str(ipart) + "();\n")
+        ipart = ipart + 1
+    }
     w("}\n\n")
 
     w("int main(int argc, char **argv) " + chr(123) + "\n")
