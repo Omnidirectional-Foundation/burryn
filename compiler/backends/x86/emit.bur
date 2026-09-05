@@ -1,5 +1,8 @@
-// emit.bur — x86 发射侧 helper（const/inst/enum/format 等）；自 x86gen_program_to_buf 提升。
-// emit.bur — x86 emit-side helpers (const/inst/enum/format); lifted from x86gen_program_to_buf.
+// emit.bur — x86 后端发射器：字节码逐条翻译为机器码，
+// 附常量池、局部槽位、枚举与 record 类型解析、值格式化。
+// The x86 backend emitter: translates bytecode opcode by opcode into machine code,
+// with the constant pool, local slots, enum and record type resolution,
+// and value formatting.
 
 import "burryn.dev/compiler/lib"
 
@@ -2510,4 +2513,1235 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         pi = pi + 1
     }
     fbytes
+}
+
+fn merge_enum_ann(a, b) {
+    if a == "" {
+        b
+    } else if b == "" || a == b {
+        a
+    } else if str_len(a) > 6 && substr(a, 0, 6) == "enum:e" && str_len(b) > 6 && substr(b, 0, 6) == "enum:e" {
+        let mut an = 0
+        while 6 + an < str_len(a) {
+            let ch = substr(a, 6 + an, 1)
+            if ch < "0" || ch > "9" {
+                break
+            }
+            an = an + 1
+        }
+        let mut bn = 0
+        while 6 + bn < str_len(b) {
+            let ch = substr(b, 6 + bn, 1)
+            if ch < "0" || ch > "9" {
+                break
+            }
+            bn = bn + 1
+        }
+        let eh_as = substr(a, 6, an)
+        let eh_bs = substr(b, 6, bn)
+        if eh_as != eh_bs {
+            b
+        } else {
+            let mut vis = []
+            let mut fts = []
+            let mut src_i = 0
+            while src_i < 2 {
+                let src = if src_i == 0 {
+                    a
+                } else {
+                    b
+                }
+                let prefix_n = if src_i == 0 {
+                    6 + an
+                } else {
+                    6 + bn
+                }
+                let tail = substr(src, prefix_n, str_len(src) - prefix_n)
+                let mut start = 0
+                let mut i = 0
+                while i <= str_len(tail) {
+                    if i == str_len(tail) || substr(tail, i, 1) == ";" {
+                        let chunk = substr(tail, start, i - start)
+                        if str_len(chunk) > 1 && substr(chunk, 0, 1) == "#" {
+                            match str_index_of(chunk, ":") {
+                                Some(col) => {
+                                    match parse_int(substr(chunk, 1, col - 1)) {
+                                        Some(vi) => {
+                                            let ft = substr(chunk, col + 1, str_len(chunk) - col - 1)
+                                            let mut found = 0 - 1
+                                            let mut k = 0
+                                            while k < len(vis) {
+                                                if vis[k] == vi {
+                                                    found = k
+                                                }
+                                                k = k + 1
+                                            }
+                                            if found >= 0 {
+                                                fts[found] = ft
+                                            } else {
+                                                push(vis, vi)
+                                                push(fts, ft)
+                                            }
+                                        },
+                                        None => {},
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                        start = i + 1
+                    }
+                    i = i + 1
+                }
+                src_i = src_i + 1
+            }
+            let mut out = "enum:e" + eh_as
+            let mut first = true
+            let mut vi = 0
+            while vi < 32 {
+                let mut k = 0
+                while k < len(vis) {
+                    if vis[k] == vi {
+                        if first {
+                            first = false
+                        } else {
+                            out = out + ";"
+                        }
+                        out = out + "#" + str(vi) + ":" + fts[k]
+                    }
+                    k = k + 1
+                }
+                vi = vi + 1
+            }
+            out
+        }
+    } else {
+        b
+    }
+}
+
+// const_str 生成字符串常量字节 / const_str builds string constant bytes
+fn const_str(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, fh, idx) -> str {
+    match ctx.f_consts[fh][idx] {
+        lib::CVal::CStr(s) => s,
+        _ => "",
+    }
+}
+
+// fn_const 生成函数常量字节 / fn_const builds function constant bytes
+fn fn_const(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, fh, idx) {
+    match ctx.f_consts[fh][idx] {
+        lib::CVal::CFn(sub) => sub,
+        _ => 0,
+    }
+}
+
+// inst_len 取指令长度 / inst_len returns the instruction length
+fn inst_len(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, fh, code, ip) {
+    let op = code[ip]
+    if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
+        3
+    } else if op == lib::op_pop_n || op == lib::op_call || op == lib::op_spawn || op == lib::op_end_block || op == lib::op_test_variant || op == lib::op_get_field || op == lib::op_tuple {
+        2
+    } else if op == lib::op_record || op == lib::op_record_update {
+        4
+    } else if op == lib::op_closure {
+        3 + ctx.f_nupvals[fn_const(ctx, fh, read_u16(code, ip + 1))] * 3
+    } else if op == lib::op_select {
+        let n_arms = code[ip + 1]
+        let has_default = code[ip + 2] != 0
+        3 + n_arms * 3 + (if has_default {
+            2
+        } else {
+            0
+        })
+    } else {
+        1
+    }
+}
+
+// cp_ps_n 复制列表前 n 项（n 超界则复制全部）/ cp_ps_n copies the first n
+// entries of a list (all entries if n exceeds the length)
+fn cp_ps_n(lst, n) {
+    let mut r = []
+    let mut i = 0
+    while i < n && i < len(lst) {
+        push(r, lst[i])
+        i = i + 1
+    }
+    r
+}
+
+// enc_names 取编码字段名 / enc_names lists the encoded field names
+fn enc_names(enc) {
+    let mut names = []
+    let mut pos = 0
+    while pos < str_len(enc) {
+        let rest = substr(enc, pos, str_len(enc) - pos)
+        match str_index_of(rest, "\n") {
+            None => {
+                if str_len(rest) > 0 {
+                    push(names, rest)
+                }
+                pos = str_len(enc)
+            },
+            Some(nl) => {
+                if nl > 0 {
+                    push(names, substr(enc, pos, nl))
+                }
+                pos = pos + nl + 1
+            },
+        }
+    }
+    names
+}
+
+// enum_const_key 生成枚举常量键 / enum_const_key keys an enum constant
+fn enum_const_key(cv) {
+    match cv {
+        lib::CVal::CEnumType(eh) => "e:" + str(eh),
+        lib::CVal::CSingleton(eh, vi) => "s:" + str(eh) + ":" + str(vi),
+        lib::CVal::CCtor(eh, vi) => "c:" + str(eh) + ":" + str(vi),
+        _ => "",
+    }
+}
+
+// enum_const_bytes 生成枚举常量字节 / enum_const_bytes builds enum constant bytes
+fn enum_const_bytes(cv) {
+    match cv {
+        lib::CVal::CEnumType(eh) => e8(eh),
+        lib::CVal::CSingleton(eh, vi) => e8(eh) + e8(vi),
+        lib::CVal::CCtor(eh, vi) => e8s(0 - 1) + e8(eh) + e8(vi),
+        _ => "",
+    }
+}
+
+// reg_enum_type 注册枚举实例类型 / reg_enum_type registers an enum instance type
+// qual = 枚举限定名, vts = 各 variant 字段类型列表; 返回编码字符串
+fn reg_enum_type(mut enum_field_types, qual, vts) {
+    let key = enum_field_key(qual, vts)
+    put(enum_field_types, key, vts)
+    key
+}
+
+// x86gen_enum_cmp_fields 比较两个枚举实例（r9/r10 = 实例基址，r11 = 累加器）
+// x86gen_enum_cmp_fields compares two enum instances (r9/r10 = instance bases, r11 =
+// accumulator)
+fn x86gen_enum_cmp_fields(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, enc) {
+    let mut seq = mov_rm(rax, r9, 0) + mov_rm(rcx, r10, 0) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+    seq = seq + mov_rm(rax, r9, 8) + mov_rm(rcx, r10, 8) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+    let feh = enum_qual_to_eh(ctx, enum_qual(enc))
+    let mut nv = 0
+    if feh >= 0 && feh < len(ctx.en_vnames) {
+        nv = len(ctx.en_vnames[feh])
+    }
+    let mut blocks = []
+    while len(blocks) < nv {
+        let fts = enum_fields_resolve(ctx, enc, len(blocks))
+        let mut blk = ""
+        let mut fi = 0
+        while fi < len(fts) {
+            if fts[fi] == "str" {
+                let sbody = lea(rsi, rsi, 8) + lea(rdi, rdi, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(rax)
+                blk = blk + mov_rm(rsi, r9, 16 + 8 * fi) + mov_rm(rdi, r10, 16 + 8 * fi) + mov_rm(rdx, rsi, 0) + mov_rm(r8, rdi, 0) + xor_rr(rax, rax) + cmp_rr(rdx, r8) + jne_rel32(str_len(sbody)) + sbody + and_rr(r11, rax)
+            } else if is_enum_enc(fts[fi]) {
+                blk = blk + push_r(r9) + push_r(r10) + mov_rm(r9, r9, 16 + 8 * fi) + mov_rm(r10, r10, 16 + 8 * fi) + x86gen_enum_cmp_fields(ctx, fts[fi]) + pop_r(r10) + pop_r(r9)
+            } else {
+                blk = blk + mov_rm(rax, r9, 16 + 8 * fi) + mov_rm(rcx, r10, 16 + 8 * fi) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+            }
+            fi = fi + 1
+        }
+        // 变体不匹配（r11 已清零）时跳过字段比较，避免读另一实例的无字段垃圾
+        // when the variants differ (r11 already cleared), skip the field compares to avoid
+        // reading the other instance's absent fields
+        blk = test_rr(r11, r11) + je_rel32(str_len(blk)) + blk
+        push(blocks, blk)
+    }
+    let mut chain = ""
+    let mut bi = 0
+    while bi < len(blocks) {
+        let mut btail = 0
+        let mut bj = bi + 1
+        while bj < len(blocks) {
+            btail = btail + 10 + 3 + 6 + str_len(blocks[bj]) + 5
+            bj = bj + 1
+        }
+        chain = chain + mov_ri64(rdx, bi) + cmp_rr(rax, rdx) + jne_rel32(str_len(blocks[bi]) + 5) + blocks[bi] + jmp_rel32(btail)
+        bi = bi + 1
+    }
+    seq + chain
+}
+
+// x86gen_enum_eq_at 生成枚举相等（操作数 [r15-16]/[r15-8]，结果回写 [r15-16] 并弹 1）
+// x86gen_enum_eq_at emits enum equality (operands at [r15-16]/[r15-8], result at [r15-16],
+// pops 1)
+fn x86gen_enum_eq_at(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, enc) {
+    let mut body = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_ri64(r11, 1)
+    body = body + x86gen_enum_cmp_fields(ctx, enc) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+    body
+}
+
+// enum_qual_to_eh 从 qualifier 名查枚举 handle
+// enum_qual_to_eh looks up an enum handle by qualifier
+fn enum_qual_to_eh(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, qual) {
+    let mut qei = 0
+    while qei < len(ctx.en_qual) {
+        if ctx.en_qual[qei] == qual {
+            return qei
+        }
+        qei = qei + 1
+    }
+    0 - 1
+}
+
+// enum_eq_enc 解析枚举操作数的有效编码（enum:e<eh> 经注册表反查）
+// enum_eq_enc resolves an enum operand's effective encoding
+// ("enum:e<eh>" looks up the registry)
+fn enum_eq_enc(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, t) {
+    if str_len(t) > 6 && substr(t, 0, 6) == "enum:e" {
+        let eh_v = match parse_int(match str_index_of(substr(t, 6, str_len(t) - 6), "#") {
+            Some(_qh) => substr(t, 6, _qh),
+            None => substr(t, 6, str_len(t) - 6),
+        }) {
+            Some(ehv) => ehv,
+            None => 0 - 1,
+        }
+        let qual_v = if eh_v >= 0 && eh_v < len(ctx.en_qual) {
+            ctx.en_qual[eh_v]
+        } else {
+            ""
+        }
+        let mut found = ""
+        let klist = keys(ctx.enum_field_types)
+        let mut ki = 0
+        while ki < len(klist) {
+            if enum_qual(klist[ki]) == qual_v {
+                found = klist[ki]
+            }
+            ki = ki + 1
+        }
+        found
+    } else if is_enum_enc(t) {
+        t
+    } else {
+        ""
+    }
+}
+
+// x86gen_enum_format_at 生成枚举格式化：variant 名 + 字段（str 加引号）
+// x86gen_enum_format_at emits enum formatting: variant name plus fields (str quoted)
+fn x86gen_enum_format_at(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, off, eh, vts) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    // pass 1: 按运行时 variant 索引计算长度（每个 variant 独立块 + 分发链）
+    // pass 1: compute the length for the runtime variant index
+    // (per-variant blocks plus a dispatch chain)
+    let mut lblocks = []
+    let mut vi1 = 0
+    while vi1 < len(vts) {
+        let vname = enum_variant_name(ctx, eh, vi1)
+        let fts = vts[vi1]
+        let mut lb = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+        if len(fts) == 0 {
+            lb = lb + mov_ri64(rcx, str_len(vname))
+        } else {
+            lb = lb + mov_ri64(rcx, 2 + str_len(vname))
+        }
+        let mut fi1 = 0
+        while fi1 < len(fts) {
+            if fi1 > 0 {
+                lb = lb + add_ri32(rcx, 2)
+            }
+            if fts[fi1] == "str" {
+                lb = lb + mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+            } else if fts[fi1] == "float" {
+                // float 字段长度 = 调用注入的 format_float(bits) 所得 str 的长度；保存 r10/r11/rcx 现场
+                // float field length comes from the injected format_float(bits) result;
+                // preserve r10/r11/rcx
+                lb = lb + push_r(r10) + push_r(r11) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r10) + add_rr(rcx, rsi)
+            } else {
+                let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+                let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+                lb = lb + mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+            }
+            lb = lb + add_ri32(r10, 8)
+            fi1 = fi1 + 1
+        }
+        push(lblocks, lb)
+        vi1 = vi1 + 1
+    }
+    // 长度分发链：每块 = [jne skip][lb][jmp end]；alloc 跟在最后块后
+    // length dispatch: each block = [jne skip][lb][jmp end]; alloc follows the last block
+    let mut lchain = ""
+    let mut li = 0
+    while li < len(lblocks) {
+        let mut ltail = 0
+        let mut lj = li + 1
+        while lj < len(lblocks) {
+            ltail = ltail + 10 + 3 + 6 + str_len(lblocks[lj]) + 5
+            lj = lj + 1
+        }
+        lchain = lchain + mov_ri64(rdx, li) + cmp_rr(r11, rdx) + jne_rel32(str_len(lblocks[li]) + 5) + lblocks[li] + jmp_rel32(ltail)
+        li = li + 1
+    }
+    // 分配缓冲
+    // allocate the buffer
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9)
+    // pass 2: 按运行时 variant 索引写对应文本
+    // pass 2: write the text for the runtime variant index
+    let mut wblocks = []
+    let mut vi2 = 0
+    while vi2 < len(vts) {
+        let vname = enum_variant_name(ctx, eh, vi2)
+        let fts = vts[vi2]
+        let mut wb = ""
+        let mut nb2 = 0
+        while nb2 < str_len(vname) {
+            wb = wb + mb(byte_at(vname, nb2)) + add_ri32(rdi, 1)
+            nb2 = nb2 + 1
+        }
+        wb = wb + mb(40) + add_ri32(rdi, 1)
+        let mut fi2 = 0
+        while fi2 < len(fts) {
+            if fi2 > 0 {
+                wb = wb + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+            }
+            if fts[fi2] == "str" {
+                wb = wb + mov_rm(rax, r10, 0) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+            } else if fts[fi2] == "float" {
+                // float 字段：调用 format_float(bits) 得 str，拷入输出缓冲；保存 r10/r11/rdi 现场
+                // float field: call format_float(bits), copy the str into the output buffer;
+                // preserve r10/r11/rdi
+                wb = wb + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + rep_movsb()
+            } else {
+                wb = wb + mov_rm(rdx, r10, 0) + int_write
+            }
+            wb = wb + add_ri32(r10, 8)
+            fi2 = fi2 + 1
+        }
+        wb = wb + mb(41) + add_ri32(rdi, 1)
+        if len(fts) == 0 {
+            wb = wb + sub_ri32(rdi, 2)
+        }
+        push(wblocks, wb)
+        vi2 = vi2 + 1
+    }
+    // 拼接：variant 索引分发（[jne skip][block][jmp end][skip:] 链）
+    // dispatch on the variant index ([jne skip][block][jmp end][skip:] chain)
+    let load_v = mov_rm(rax, r15, off) + mov_rm(r11, rax, 8)
+    let mut wchain = ""
+    let mut wi = 0
+    while wi < len(wblocks) {
+        // 计算本块之后所有后续块的完整长度（每个后续块 = mov(10) + cmp(3) + jne(6) + block + jmp(5)）
+        // tail length after this block: each later block contributes mov(10) + cmp(3) + jne(6)
+        // + block + jmp(5)
+        let mut wtail = 0
+        let mut wj = wi + 1
+        while wj < len(wblocks) {
+            wtail = wtail + 10 + 3 + 6 + str_len(wblocks[wj]) + 5
+            wj = wj + 1
+        }
+        wchain = wchain + mov_ri64(rdx, wi) + cmp_rr(r11, rdx) + jne_rel32(str_len(wblocks[wi]) + 5) + wblocks[wi] + jmp_rel32(wtail)
+        wi = wi + 1
+    }
+    let p2h = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+    let p2t = pop_r(r9) + mov_mr(r15, off, r9)
+    load_v + lchain + alloc + p2h + wchain + p2t
+}
+
+// enum_variant_fields 取用户枚举某 variant 字段类型 / enum_variant_fields fetches a user enum variant's
+// field types
+fn enum_variant_fields(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, eh, vidx) {
+    match get(ctx.enum_variant_types, "v:" + str(eh) + ":" + str(vidx)) {
+        Some(vf) => vf,
+        None => [],
+    }
+}
+
+// enum_field_key 生成枚举字段类型表 key / enum_field_key builds an enum field-type table key
+fn enum_field_key(qual, vts) {
+    let mut key = "enum:" + qual
+    let mut vi = 0
+    while vi < len(vts) {
+        key = key + "|"
+        let fts = vts[vi]
+        let mut fi = 0
+        while fi < len(fts) {
+            if fi > 0 {
+                key = key + ","
+            }
+            key = key + fts[fi]
+            fi = fi + 1
+        }
+        vi = vi + 1
+    }
+    key
+}
+
+// enum_variant_name 取用户枚举 variant 名 / enum_variant_name fetches a user enum variant name
+fn enum_variant_name(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, eh, vidx) {
+    if eh >= 0 && eh < len(ctx.en_vnames) && vidx >= 0 && vidx < len(ctx.en_vnames[eh]) {
+        ctx.en_vnames[eh][vidx]
+    } else {
+        "?" + str(vidx)
+    }
+}
+
+// is_enum_enc 判断是否为枚举编码 / is_enum_enc tells whether t is an enum encoding
+fn is_enum_enc(t) {
+    str_len(t) >= 5 && substr(t, 0, 5) == "enum:"
+}
+
+// enum_qual 取枚举编码名 / enum_qual extracts the qualifier of an enum encoding
+fn enum_qual(t) {
+    let bar = match str_index_of(t, "|") {
+        Some(b) => b,
+        None => str_len(t),
+    }
+    if bar > 5 {
+        substr(t, 5, bar - 5)
+    } else {
+        ""
+    }
+}
+
+// enum_fields_for_variant 取某 variant 的字段类型 / enum_fields_for_variant fetches a variant's field
+// types
+fn enum_fields_for_variant(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, enc, vidx) {
+    match get(ctx.enum_field_types, enc) {
+        Some(vts) => {
+            if vidx >= 0 && vidx < len(vts) {
+                vts[vidx]
+            } else {
+                []
+            }
+        },
+        None => [],
+    }
+}
+
+// enum_fields_resolve 从枚举编码解析 variant 字段类型（先全表后用户 variant 表）
+// enum_fields_resolve resolves a variant's field types (full table first, then the user
+// variant table)
+fn enum_fields_resolve(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, enc, vidx) {
+    if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
+        match str_index_of(enc, "#") {
+            Some(hash) => {
+                let rest = substr(enc, hash, str_len(enc) - hash)
+                let mut start = 0
+                let mut i = 0
+                while i <= str_len(rest) {
+                    if i == str_len(rest) || substr(rest, i, 1) == ";" {
+                        let chunk = substr(rest, start, i - start)
+                        if str_len(chunk) > 1 && substr(chunk, 0, 1) == "#" {
+                            match str_index_of(chunk, ":") {
+                                Some(col) => {
+                                    match parse_int(substr(chunk, 1, col - 1)) {
+                                        Some(avi) => {
+                                            if avi == vidx {
+                                                let ts = substr(chunk, col + 1, str_len(chunk) - col - 1)
+                                                let mut fields = []
+                                                if str_len(ts) > 0 {
+                                                    let mut st = 0
+                                                    let mut j = 0
+                                                    while j <= str_len(ts) {
+                                                        if j == str_len(ts) || substr(ts, j, 1) == "," {
+                                                            push(fields, substr(ts, st, j - st))
+                                                            st = j + 1
+                                                        }
+                                                        j = j + 1
+                                                    }
+                                                }
+                                                return fields
+                                            }
+                                        },
+                                        None => {},
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                        start = i + 1
+                    }
+                    i = i + 1
+                }
+            },
+            None => {},
+        }
+    }
+    let full = enum_fields_for_variant(ctx, enc, vidx)
+    if len(full) > 0 {
+        full
+    } else if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
+        let eh_body = substr(enc, 6, str_len(enc) - 6)
+        let mut eh_n = 0
+        while eh_n < str_len(eh_body) {
+            let ch = substr(eh_body, eh_n, 1)
+            if ch < "0" || ch > "9" {
+                break
+            }
+            eh_n = eh_n + 1
+        }
+        let eh_s = if eh_n > 0 {
+            substr(eh_body, 0, eh_n)
+        } else {
+            eh_body
+        }
+        match parse_int(eh_s) {
+            Some(eh_v) => enum_variant_fields(ctx, eh_v, vidx),
+            None => [],
+        }
+    } else {
+        []
+    }
+}
+
+// find_field_in_enc 在编码中查找字段 / find_field_in_enc finds a field in an encoding
+fn find_field_in_enc(enc, fname) {
+    let mut i = 0
+    let mut pos = 0
+    while pos < str_len(enc) {
+        let rest = substr(enc, pos, str_len(enc) - pos)
+        match str_index_of(rest, "\n") {
+            None => {
+                if rest == fname {
+                    return i
+                }
+                pos = str_len(enc)
+            },
+            Some(nl) => {
+                let field = substr(enc, pos, nl)
+                if field == fname {
+                    return i
+                }
+                pos = pos + nl + 1
+            },
+        }
+        i = i + 1
+    }
+    0 - 1
+}
+
+// x86gen_float_to_str_at 生成 float→str 转换（调用注入的 format_float），作用于 [r15+off] 的 float 盒
+// x86gen_float_to_str_at emits float-to-str by calling the injected format_float
+// (operates on the box at [r15+off])
+// 调用约定：压 fn_ref+bits 两槽后 call，返回后 r15 少 8、返回值在原 fn_ref 槽（新 [r15-8]）；写回 [r15+off] 并恢复 r15
+// call convention: push fn_ref+bits, call; r15 drops by 8 and the result sits at the former
+// fn_ref slot (new [r15-8]);
+// write it back to [r15+off] and restore r15
+fn x86gen_float_to_str_at(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, off) {
+    let ff_h = find_fn_by_name(ctx.f_name, "frt_format_float")
+    let f2s_call = mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax)
+    let f2s_fin = mov_rm(rax, r15, 0 - 8) + mov_mr(r15, off - 8, rax) + sub_ri32(r15, 8)
+    f2s_call + f2s_fin
+}
+
+// enum_format_for_enc 为任意枚举编码生成格式化 / enum_format_for_enc emits formatting for any enum encoding
+fn enum_format_for_enc(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, off, enc) {
+    let feh = if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
+        match parse_int(if str_len(enc) > 6 {
+            let _eb = substr(enc, 6, str_len(enc) - 6)
+            match str_index_of(_eb, "#") {
+                Some(_h) => substr(_eb, 0, _h),
+                None => _eb,
+            }
+        } else {
+            ""
+        }) {
+            Some(fehv) => fehv,
+            None => 0,
+        }
+    } else {
+        enum_qual_to_eh(ctx, enum_qual(enc))
+    }
+    let mut fvts = []
+    let mut fvi = 0
+    let mut fmax = 0
+    if feh >= 0 && feh < len(ctx.en_vnames) {
+        fmax = len(ctx.en_vnames[feh])
+    }
+    while fvi < fmax {
+        push(fvts, enum_fields_resolve(ctx, enc, fvi))
+        fvi = fvi + 1
+    }
+    x86gen_enum_format_at(ctx, off, feh, fvts)
+}
+
+// list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）
+// list_elem_format_code emits the element formatter code for a list element type
+// ("" for str/int/float, which use inline handlers)
+fn list_elem_format_code_core(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, et, ff_h) {
+    if et == "str" || et == "int" || et == "float" {
+        ""
+    } else if et == "bool" {
+        x86gen_bool_convert_at(0 - 8)
+    } else if et == "unit" {
+        x86gen_unit_convert_at(0 - 8)
+    } else if is_list_type(et) {
+        let iet = list_elem_type(et)
+        x86gen_list_format_at(0 - 8, iet, list_elem_format_code_core(ctx, iet, ff_h), ff_h)
+    } else if is_map_type(et) {
+        x86gen_map_format_at(0 - 8, map_key_type(et) == "str", map_val_type(et) == "str", map_val_type(et) == "float", ff_h)
+    } else if is_record_type(et) {
+        let ets = record_schema(et)
+        if str_len(ets) > 0 {
+            match get(ctx.record_field_types, ets) {
+                Some(etf) => {
+                    if len(etf) > 0 {
+                        x86gen_record_format_at(0 - 8, enc_names(ets), etf, ff_h)
+                    } else {
+                        ""
+                    }
+                },
+                None => "",
+            }
+        } else {
+            ""
+        }
+    } else if is_enum_enc(et) {
+        enum_format_for_enc(ctx, 0 - 8, et)
+    } else {
+        ""
+    }
+}
+
+// list_elem_format_code 为 list 元素类型生成 formatter 代码（str/int/float 返回 ""，走内联处理器）
+// list_elem_format_code emits the element formatter code for a list element type
+// ("" for str/int/float, which use inline handlers)
+fn list_elem_format_code(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, et, ff_h) {
+    if et == "str" || et == "int" || et == "float" {
+        ""
+    } else if et == "bool" {
+        x86gen_bool_convert_at(0 - 8)
+    } else if et == "unit" {
+        x86gen_unit_convert_at(0 - 8)
+    } else if is_list_type(et) {
+        let iet = list_elem_type(et)
+        x86gen_list_format_at(0 - 8, iet, list_elem_format_code(ctx, iet, ff_h), ff_h)
+    } else if is_map_type(et) {
+        x86gen_map_format_at(0 - 8, map_key_type(et) == "str", map_val_type(et) == "str", map_val_type(et) == "float", ff_h)
+    } else if is_record_type(et) {
+        let ets = record_schema(et)
+        if str_len(ets) > 0 {
+            match get(ctx.record_field_types, ets) {
+                Some(etf) => {
+                    if len(etf) > 0 {
+                        x86gen_record_format_at(0 - 8, enc_names(ets), etf, ff_h)
+                    } else {
+                        ""
+                    }
+                },
+                None => "",
+            }
+        } else {
+            ""
+        }
+    } else if is_enum_enc(et) {
+        enum_format_for_enc(ctx, 0 - 8, et)
+    } else if str_len(et) > 4 && substr(et, 0, 4) == "tup:" {
+        x86gen_tuple_format_at(ctx, 0 - 8, tup_elems(et), ff_h)
+    } else {
+        ""
+    }
+}
+
+// is_list_type 判断是否为 list 类型 / is_list_type tells whether t is a list type
+fn is_list_type(t) {
+    str_len(t) > 5 && substr(t, 0, 5) == "list-"
+}
+
+// list_elem_type 取 list 元素类型（非 list 类型返回 ""）
+// list_elem_type extracts the list element type (returns "" for non-list types)
+fn list_elem_type(t) {
+    if is_list_type(t) {
+        substr(t, 5, str_len(t) - 5)
+    } else {
+        ""
+    }
+}
+
+// count_locals 统计局部变量数 / count_locals counts locals
+fn count_locals(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, fh) {
+    let code = ctx.f_code[fh]
+    let mut max_slot = ctx.f_arity[fh]
+    let mut ip = 0
+    while ip < len(code) {
+        let op = code[ip]
+        if op == lib::op_get_local || op == lib::op_set_local {
+            let slot = read_u16(code, ip + 1)
+            if slot > max_slot {
+                max_slot = slot
+            }
+        }
+        ip = ip + inst_len(ctx, fh, code, ip)
+    }
+    max_slot + 1
+}
+
+// find_fn_by_name 按名字查找函数 / find_fn_by_name finds a function by name
+fn find_fn_by_name(f_name, name) {
+    let mut i = 0
+    if name == "" {
+        return 0 - 1
+    }
+    while i < len(f_name) {
+        if f_name[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    0 - 1
+}
+
+// map_key_type 取 map 键类型 / map_key_type extracts the map key type
+fn map_key_type(t) {
+    if t == "map-str" || t == "map-str-int" || t == "map-str-str" || t == "map-str-float" {
+        "str"
+    } else if t == "map-int" || t == "map-int-str" || t == "map-int-int" || t == "map-int-float" {
+        "int"
+    } else {
+        ""
+    }
+}
+
+// map_val_type 取 map 值类型 / map_val_type extracts the map value type
+fn map_val_type(t) {
+    if t == "map-str-int" || t == "map-int-int" {
+        "int"
+    } else if t == "map-str-str" || t == "map-int-str" {
+        "str"
+    } else if t == "map-str-float" || t == "map-int-float" {
+        "float"
+    } else {
+        ""
+    }
+}
+
+// refine_map_type 细化 map 类型 / refine_map_type refines a map type
+fn refine_map_type(k, v) {
+    if k == "" {
+        "map"
+    } else if v == "" {
+        "map-" + k
+    } else {
+        "map-" + k + "-" + v
+    }
+}
+
+// refine_map_arg 细化 map 实参 / refine_map_arg refines a map argument
+fn refine_map_arg(arg_t, k, v) {
+    if arg_t == "" || is_map_type(arg_t) {
+        let cur_k = map_key_type(arg_t)
+        let cur_v = map_val_type(arg_t)
+        let new_k = if k != "" {
+            k
+        } else {
+            cur_k
+        }
+        let new_v = if v != "" {
+            v
+        } else {
+            cur_v
+        }
+        refine_map_type(new_k, new_v)
+    } else {
+        arg_t
+    }
+}
+
+// is_map_type 判断是否为 map 类型 / is_map_type tells whether t is a map type
+fn is_map_type(t) {
+    str_len(t) >= 3 && substr(t, 0, 3) == "map"
+}
+
+// merge_type 合并类型跟踪 / merge_type merges type tracking
+fn merge_type(cur, new) {
+    if cur == "" {
+        new
+    } else if new == "" {
+        cur
+    } else if is_map_type(cur) || is_map_type(new) {
+        refine_map_arg(cur, map_key_type(new), map_val_type(new))
+    } else if str_len(cur) >= 5 && substr(cur, 0, 5) == "enum:" && str_len(new) >= 5 && substr(new, 0, 5) == "enum:" {
+        let cur_rich = match str_index_of(cur, "|") {
+            Some(_) => true,
+            None => match str_index_of(cur, "#") {
+                Some(_) => true,
+                None => false,
+            },
+        }
+        let new_rich = match str_index_of(new, "|") {
+            Some(_) => true,
+            None => match str_index_of(new, "#") {
+                Some(_) => true,
+                None => false,
+            },
+        }
+        if cur_rich && !new_rich {
+            cur
+        } else {
+            new
+        }
+    } else if str_len(cur) >= 4 && substr(cur, 0, 4) == "chan" || str_len(new) >= 4 && substr(new, 0, 4) == "chan" {
+        // chan 元素合并：有元素者优先，裸 chan 不覆盖已有元素类型
+        // chan element merge: the side with an element wins; a bare chan does not
+        // overwrite a known element type
+        let cur_has = str_len(cur) > 5 && substr(cur, 0, 5) == "chan:"
+        let new_has = str_len(new) > 5 && substr(new, 0, 5) == "chan:"
+        if new_has {
+            new
+        } else if cur_has {
+            cur
+        } else {
+            new
+        }
+    } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && str_len(new) >= 5 && substr(new, 0, 5) == "enum:" {
+        cur
+    } else if (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && str_len(cur) >= 5 && substr(cur, 0, 5) == "enum:" {
+        new
+    } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && cur != new {
+        cur
+    } else {
+        new
+    }
+}
+
+fn merge_pos(pcur, pnew) {
+    if pcur == "" || pnew == pcur {
+        pnew
+    } else if is_map_type(pcur) && is_map_type(pnew) {
+        refine_map_arg(pcur, map_key_type(pnew), map_val_type(pnew))
+    } else if pnew == "" {
+        pcur
+    } else {
+        merge_enum_ann(pcur, pnew)
+    }
+}
+
+// enum_payload_enc 生成内置枚举 payload 编码 / enum_payload_enc builds a builtin enum payload encoding
+fn enum_payload_enc(mut enum_field_types, qual, payloads) {
+    reg_enum_type(enum_field_types, qual, payloads)
+}
+
+// enum_payload_enc_ctx：经 ctx 字段注册（put 作用于堆上的 map，不需把字段当 mut 参数传出）
+// enum_payload_enc_ctx registers via the ctx field (put mutates the heap map; no mut field arg)
+fn enum_payload_enc_ctx(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, qual, payloads) {
+    let key = enum_field_key(qual, payloads)
+    put(ctx.enum_field_types, key, payloads)
+    key
+}
+
+// cp_ps 复制 shadow 列表（E0597：mutable 绑定只能接 fresh 堆源，快照须隔离）
+// cp_ps copies a shadow list (E0597: mutable bindings take only fresh heap sources;
+// snapshots must stay isolated from the working shadow)
+fn cp_ps(lst) {
+    let mut r = []
+    let mut i = 0
+    while i < len(lst) {
+        push(r, lst[i])
+        i = i + 1
+    }
+    r
+}
+
+// psig_key 长度前缀签名 key（任何类型编码无歧义）/ psig_key length-prefixed signature key
+fn psig_key(h, ats) {
+    let mut k = str(h) + "@"
+    let mut ki = 0
+    while ki < len(ats) {
+        let t = ats[ki]
+        k = k + str(str_len(t)) + ":" + t
+        ki = ki + 1
+    }
+    k
+}
+
+// psig_lookup 查 per-signature 返回类型（未命中返回 ""）
+// psig_lookup looks up a per-signature return type ("" if absent)
+fn psig_lookup(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, h, ats) {
+    match get(ctx.sig_ret, psig_key(h, ats)) {
+        Some(v) => v,
+        None => "",
+    }
+}
+
+// add_record_enc 注册 record 编码 / add_record_enc registers a record encoding
+fn add_record_enc(mut record_encs, mut record_offs, enc, mut const_data) {
+    let mut i = 0
+    while i < len(record_encs) {
+        if record_encs[i] == enc {
+            return const_data
+        }
+        i = i + 1
+    }
+    push(record_encs, enc)
+    push(record_offs, str_len(const_data))
+    const_data = const_data + enc
+    while str_len(const_data) % 8 != 0 {
+        const_data = const_data + byte_chr(0)
+    }
+    const_data
+}
+
+// is_record_type 判断是否为 record 类型 / is_record_type tells whether t is a record type
+fn is_record_type(t) {
+    t == "record" || str_len(t) >= 7 && substr(t, 0, 7) == "record:"
+}
+
+// record_schema 取 record 字段 schema / record_schema fetches a record's field schema
+fn record_schema(t) {
+    if str_len(t) >= 7 && substr(t, 0, 7) == "record:" {
+        substr(t, 7, str_len(t) - 7)
+    } else {
+        ""
+    }
+}
+
+// read_u16 读 u16 操作数 / read_u16 reads a u16 operand
+// Read a u16 operand
+fn read_u16(code, at) {
+    code[at] * 256 + code[at + 1]
+}
+
+// shadow_pop 弹出影子栈 n 项 / shadow_pop pops n entries from the shadow stack
+fn shadow_pop(mut lst, n) {
+    let mut k = 0
+    while k < n && len(lst) > 0 {
+        pop(lst)
+        k = k + 1
+    }
+}
+
+// const_slot_key 生成常量槽键 / const_slot_key keys a constant slot
+fn const_slot_key(f, i) {
+    f * 100000 + i
+}
+
+// tup_enc 长度前缀编码 tuple 元素类型；嵌套类型内嵌的分隔符不会引起歧义
+// tup_enc length-prefixes tuple element types; separators nested inside element types never
+// clash
+fn tup_enc(ets) {
+    let mut s = "tup:"
+    let mut ti = 0
+    while ti < len(ets) {
+        s = s + str(str_len(ets[ti])) + ":" + ets[ti]
+        ti = ti + 1
+    }
+    s
+}
+
+// tup_elems 解析长度前缀编码 / tup_elems parses the length-prefixed encoding
+fn tup_elems(t) {
+    let mut out = []
+    let body = substr(t, 4, str_len(t) - 4)
+    let mut pos = 0
+    while pos < str_len(body) {
+        let rest = substr(body, pos, str_len(body) - pos)
+        match str_index_of(rest, ":") {
+            None => {
+                pos = str_len(body)
+            },
+            Some(colon) => {
+                let nv = match parse_int(substr(rest, 0, colon)) {
+                    Some(v) => v,
+                    None => -1,
+                }
+                let start = pos + colon + 1
+                if nv >= 0 && start + nv <= str_len(body) {
+                    push(out, substr(body, start, nv))
+                    pos = start + nv
+                } else {
+                    pos = str_len(body)
+                }
+            },
+        }
+    }
+    out
+}
+
+// x86gen_tuple_format_at 生成 tuple 格式化：(e0, e1, ...)，元素按静态类型展开，容器元素递归格式化
+// x86gen_tuple_format_at emits tuple formatting: (e0, e1, ...), elements expanded from static
+// types, containers nested
+fn x86gen_tuple_format_at(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, off, types, ff_h) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    // 容器元素：先把元素指针拷入值栈临时槽，再以 off=0-8 调内层 formatter，结果 str box 留在临时槽
+    // container elements: copy the element pointer into a value-stack temp slot,
+    // call the inner formatter
+    // at off=0-8, the resulting str box stays in the slot for length or byte copy
+    let mut inner_codes = []
+    let mut ik = 0
+    while ik < len(types) {
+        let it = types[ik]
+        let mut icode = ""
+        if it == "bool" {
+            icode = x86gen_bool_convert_at(0 - 8)
+        } else if it == "unit" {
+            icode = x86gen_unit_convert_at(0 - 8)
+        } else if is_list_type(it) {
+            let iet = list_elem_type(it)
+            let ilec = if str_len(iet) > 4 && substr(iet, 0, 4) == "tup:" {
+                x86gen_tuple_format_at(ctx, 0 - 8, tup_elems(iet), ff_h)
+            } else {
+                list_elem_format_code_core(ctx, iet, ff_h)
+            }
+            icode = x86gen_list_format_at(0 - 8, iet, ilec, ff_h)
+        } else if is_map_type(it) {
+            icode = x86gen_map_format_at(0 - 8, map_key_type(it) == "str", map_val_type(it) == "str", map_val_type(it) == "float", ff_h)
+        } else if is_record_type(it) {
+            let irs = record_schema(it)
+            if str_len(irs) > 0 {
+                match get(ctx.record_field_types, irs) {
+                    Some(irf) => {
+                        if len(irf) > 0 {
+                            icode = x86gen_record_format_at(0 - 8, enc_names(irs), irf, ff_h)
+                        }
+                    },
+                    None => {},
+                }
+            }
+        } else if is_enum_enc(it) {
+            icode = enum_format_for_enc(ctx, 0 - 8, it)
+        } else if str_len(it) > 4 && substr(it, 0, 4) == "tup:" {
+            icode = x86gen_tuple_format_at(ctx, 0 - 8, tup_elems(it), ff_h)
+        }
+        push(inner_codes, icode)
+        ik = ik + 1
+    }
+    // pass 1: 累计总长度到 rcx（容器元素经临时槽调内层 formatter 后取 box 长度）
+    // pass 1: accumulate the total length in rcx (container elements call the inner formatter,
+    // then read the box length)
+    let mut l1 = mov_rm(r9, r15, off) + mov_rr(r10, r9) + mov_ri64(rcx, 2)
+    let mut i = 0
+    while i < len(types) {
+        if i > 0 {
+            l1 = l1 + add_ri32(rcx, 2)
+        }
+        let t = types[i]
+        if t == "str" {
+            l1 = l1 + mov_rm(rax, r10, 8 + 8 * i) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+        } else if t == "float" {
+            l1 = l1 + push_r(r10) + push_r(rcx) + mov_rm(rax, r10, 8 + 8 * i) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r10) + add_rr(rcx, rsi)
+        } else if str_len(inner_codes[i]) > 0 {
+            l1 = l1 + push_r(rcx) + push_r(r10) + mov_rm(rax, r10, 8 + 8 * i) + vs_push(rax) + inner_codes[i] + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(r10) + pop_r(rcx) + add_rr(rcx, rsi)
+        } else {
+            let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+            let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+            l1 = l1 + mov_rm(rax, r10, 8 + 8 * i) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+        }
+        i = i + 1
+    }
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + mb(40) + add_ri32(rdi, 1)
+    // pass 2: 写入输出串（容器元素经临时槽重新格式化，再 rep_movsb 拷入 rdi）
+    // pass 2: write the output string (container elements reformat on the temp slot, then
+    // rep_movsb into rdi)
+    let mut l2 = ""
+    let mut j = 0
+    while j < len(types) {
+        if j > 0 {
+            l2 = l2 + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+        }
+        let t2 = types[j]
+        if t2 == "str" {
+            l2 = l2 + mov_rm(rax, r10, 8 + 8 * j) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+        } else if t2 == "float" {
+            l2 = l2 + push_r(r9) + push_r(r10) + push_r(rdi) + mov_rm(rax, r10, 8 + 8 * j) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r10) + pop_r(r9) + rep_movsb()
+        } else if str_len(inner_codes[j]) > 0 {
+            l2 = l2 + push_r(r9) + push_r(rdi) + push_r(r10) + mov_rm(rax, r10, 8 + 8 * j) + vs_push(rax) + inner_codes[j] + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(r10) + pop_r(rdi) + pop_r(r9) + rep_movsb()
+        } else {
+            let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+            let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+            let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+            let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+            let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+            l2 = l2 + mov_rm(rax, r10, 8 + 8 * j) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+        }
+        j = j + 1
+    }
+    l2 = l2 + mb(41) + add_ri32(rdi, 1)
+    l1 + alloc + l2 + mov_mr(r15, off, r9)
+}
+
+fn const_addr(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, f, i) {
+    match get(ctx.const_slot_map, const_slot_key(f, i)) {
+        Some(off) => code_origin() + off,
+        None => 0,
+    }
+}
+
+// upval_is_ref 沿透传链判定 upvalue 槽是否为 cell（ref 捕获或透传自 ref）
+// upval_is_ref decides whether an upvalue slot is a cell (ref capture, or
+// inherited from a ref), following the inheritance chain statically
+fn upval_is_ref(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, fh, ui) {
+    match get(ctx.created_by, fh) {
+        Some(cb) => {
+            let cfh = cb[0]
+            let cip = cb[1]
+            let flag = ctx.f_code[cfh][cip + 3 + 3 * ui]
+            if flag % 2 == 1 {
+                flag >= 2
+            } else if flag >= 2 {
+                upval_is_ref(ctx, fn_const(ctx, cfh, read_u16(ctx.f_code[cfh], cip + 1)), read_u16(ctx.f_code[cfh], cip + 4 + 3 * ui))
+            } else {
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+// variant_index: 实参类型在 fn_variants 中的下标（未命中 0 = 默认变体）
+// variant_index: index of arg types in fn_variants (0 = default variant if absent)
+fn variant_index(ctx: record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: [[int]], f_consts: [[lib::CVal]], en_qual: [str], en_vnames: [[str]], nfn: int, f2s_h: int, const_slot_map: map(int, int), record_encs: [str], record_offs: [int], record_field_types: map(str, [str]), enum_field_types: map(str, [[str]]), enum_variant_types: map(str, [str]), out_enc: str, res_out_enc: str, res_int_enc: str, opt_res_enc: str, global_type: map(str, str), sig_specs: map(str, [str]), sig_ret: map(str, str), p_sig_grew: [bool], method_full_map: map(str, int), created_by: map(int, [int]), fn_ret_type: [str], fn_ret_param: [int], fn_param_types: [[str]], fn_variants: [[[str]]] }, h, ats) {
+    if h >= 0 && h < len(ctx.fn_variants) {
+        let fv_vs = ctx.fn_variants[h]
+        let fv_vk = psig_key(h, ats)
+        let mut fv_vi = 0
+        while fv_vi < len(fv_vs) {
+            if psig_key(h, fv_vs[fv_vi]) == fv_vk {
+                return fv_vi
+            }
+            fv_vi = fv_vi + 1
+        }
+        let mut fv_best = 0 - 1
+        let mut fv_best_n = 0 - 1
+        fv_vi = 0
+        while fv_vi < len(fv_vs) {
+            let fv_spec = fv_vs[fv_vi]
+            if len(fv_spec) == len(ats) {
+                let mut fv_ok = true
+                let mut fv_eq = 0
+                let mut fv_k = 0
+                while fv_k < len(ats) {
+                    let a = ats[fv_k]
+                    let s = fv_spec[fv_k]
+                    if str_len(s) > 0 && str_len(a) > 0 && s != a {
+                        fv_ok = false
+                    } else if str_len(s) > 0 && s == a {
+                        fv_eq = fv_eq + 1
+                    }
+                    fv_k = fv_k + 1
+                }
+                if fv_ok && fv_eq > fv_best_n {
+                    fv_best_n = fv_eq
+                    fv_best = fv_vi
+                }
+            }
+            fv_vi = fv_vi + 1
+        }
+        if fv_best >= 0 {
+            return fv_best
+        }
+    }
+    0
 }

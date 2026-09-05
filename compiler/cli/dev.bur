@@ -1,7 +1,11 @@
-// cli/dev.bur — dev/mod/test 子命令。
-// cli/dev.bur — dev/mod/test subcommands.
+// dev.bur — dev 子命令：管线各级转储（lex/parse/check/fold/fmt）、hover 与 interface。
+// The dev subcommand: per-stage pipeline dumps (lex/parse/check/fold/fmt),
+// hover and interface.
 
 import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/module"
 
 // dev_cmd 隐藏 dev 子命令分派 / dev_cmd dispatches hidden dev subcommands
 // dev_cmd 隐藏调试子命令：分段转储与内部入口
@@ -91,5 +95,232 @@ pub fn dev_cmd(rest) {
     } else {
         println("unknown dev command:", sub)
         exit(exit_usage)
+    }
+}
+
+// dev_check 处理 dev check / dev_check handles dev check
+fn dev_check(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, binds, _, _) => {
+                                        for line in binds {
+                                            println(line)
+                                        }
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                        }
+                                    },
+                                },
+                                None => {},
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// dev_fmt 处理 dev fmt / dev_fmt handles dev fmt
+fn dev_fmt(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match tooling::format_verified(stmts, src, comments) {
+                                Ok(out) => print(out),
+                                Err(msg) => {
+                                    eprintln("internal error: " + msg)
+                                    exit(4)
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// dev_lex 处理 dev lex / dev_lex handles dev lex
+fn dev_lex(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, diags, _) => {
+            for t in toks {
+                println(tooling::dump_token(t))
+            }
+            for d in diags {
+                println(tooling::dump_diag(d))
+            }
+        },
+    }
+}
+
+// dev_parse 处理 dev parse / dev_parse handles dev parse
+fn dev_parse(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        for s in stmts {
+                            tooling::dump_node(s, "")
+                        }
+                        for d in pdiags {
+                            println(tooling::dump_diag(d))
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// fold_script_for_dev dev 子命令的脚本折叠 / fold_script_for_dev folds a script for dev subcommands
+fn fold_script_for_dev(stmts) {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
+            for d in diags {
+                println(tooling::dump_diag(d))
+            }
+            if len(diags) > 0 {
+                None
+            } else {
+                Some(out)
+            }
+        },
+        _ => None,
+    }
+}
+
+// fold_packages_for_dev dev 子命令的包折叠
+// fold_packages_for_dev folds packages for dev subcommands
+fn fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        frontend::FoldOut::FoldedPkgs(out, diags, files) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(tooling::dump_diag_f(diags[i], files[i]))
+                i = i + 1
+            }
+            if len(diags) > 0 {
+                None
+            } else {
+                Some(out)
+            }
+        },
+        _ => None,
+    }
+}
+
+// dev_hover 处理 dev hover / dev_hover handles dev hover
+fn dev_hover(dir, file, offset_str) {
+    let offset = match parse_int(offset_str) {
+        Some(n) => n,
+        None => {
+            eprintln("error: offset must be an integer")
+            exit(exit_usage)
+        },
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, _pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            frontend::lsp_set_recording(true)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(_, _, _, _, _) => {},
+            }
+            frontend::lsp_set_recording(false)
+            println(frontend::lsp_type_at(file, offset))
+        },
+    }
+}
+
+// dev_interface_parse 处理 dev interface-parse
+// dev_interface_parse handles dev interface-parse
+fn dev_interface_parse(path) {
+    match read_file(path) {
+        Ok(src) => match frontend::lex(src) {
+            lib::LexOut::Lexed(toks, ldiags, _) => {
+                if len(ldiags) > 0 {
+                    for d in ldiags {
+                        println(tooling::dump_diag(d))
+                    }
+                } else {
+                    match frontend::parse_interface(toks) {
+                        frontend::ParseOut::Parsed(stmts, pdiags) => {
+                            for s in stmts {
+                                tooling::dump_node(s, "")
+                            }
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        },
+                    }
+                }
+            },
+        },
+        Err(msg) => {
+            println("error:", msg)
+            exit(exit_no_input)
+        },
+    }
+}
+
+// dev_interface 处理 dev interface / dev_interface handles dev interface
+fn dev_interface(dir) {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let _ = emit_errors_f(diags, dfiles, false)
+        },
+        module::ModOut::ModLoaded(_, _, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, _, _) => {
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match frontend::typecheck_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports) {
+                lib::CheckOut::Checked(diags, dfiles, _, _, interfaces) => {
+                    if !emit_errors_f(diags, dfiles, true) {
+                        let mut i = 0
+                        while i < len(interfaces) {
+                            println("// package " + pkg_paths[i])
+                            print(interfaces[i])
+                            i = i + 1
+                        }
+                    }
+                },
+            }
+        },
     }
 }

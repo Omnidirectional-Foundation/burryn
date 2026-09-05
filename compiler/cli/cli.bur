@@ -1,0 +1,162 @@
+// cli.bur — CLI 共享件：用法、退出码、诊断打印与路径小工具。
+// Shared CLI plumbing: usage, exit codes, diagnostic printing and path helpers.
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+
+// usage 打印用法 / usage prints usage
+pub fn usage() {
+    let version = lib::toolchain_version
+    println("Burryn " + version + " — a small language forged from Go and Rust")
+    println("")
+    println("usage:")
+    println("  bur run <file.bur>     typecheck and run a script")
+    println("  bur run <dir>          run a module package (needs bur.mod, fn main)")
+    println("  bur <file.bur|dir>     same as run")
+    println("  bur check <file|dir>   typecheck only (rustc-style diagnostics)")
+    println("  bur build <file|dir>   compile to a native binary via C")
+    println("  bur fmt <file|dir|->   rewrite source in the official format")
+    println("  bur dis <file|dir>     disassemble compiled bytecode")
+    println("  bur mod init <path>    write a fresh bur.mod")
+    println("  bur mod tidy [dir]     recompute MVS offline and rewrite bur.sum")
+    println("  bur mod download [dir] fetch the require closure into the cache")
+    println("  bur mod verify [dir]   check cached trees against bur.sum")
+    println("  bur get <path>@<ver>   add or upgrade a require, then download")
+    println("  bur test [dir]         run the test_* fns of *_test.bur files")
+    println("  bur lsp                language server (stdin/stdout JSON-RPC)")
+    println("  bur version")
+    println("")
+    println("bur build flags:")
+    println("  -o <path>              output path (binary, or C file with --emit c)")
+    println("  --emit c               emit generated C instead of a binary")
+    println("  --backend <name>       code backend: c (default), x86, llvm, cranelift, wasm")
+    println("  --os <name>            x86 target os: linux (default), windows, darwin")
+    println("")
+    println("bur fmt flags:")
+    println("  --check                list files that would change; exit 1 if any")
+    println("  -                      read stdin, write the result to stdout")
+    println("")
+    println("bur test flags:")
+    println("  --run <substr>         only run tests whose name contains substr")
+    println("  -v                     print each passing test's output too")
+}
+
+// 退出码镜像 Go host：静态错/用法错/读文件失败/运行时 trap 各占一档
+// Exit codes mirror the Go host: static errors, CLI misuse, unreadable input,
+// and runtime traps each get a distinct status
+pub let exit_static = 1
+pub let exit_usage = 2
+pub let exit_no_input = 3
+pub let _exit_runtime = 4
+
+// run_file/run_module 共享的管线模式 / Pipeline modes shared by run_file/run_module
+pub let mode_run = 0
+pub let mode_check = 1
+pub let mode_dis = 2
+
+// emit_errors 输出诊断并返回是否失败 / emit_errors prints diagnostics and returns the failure flag
+fn emit_errors(diags, path, errors_only) {
+    let mut errs = false
+    for d in diags {
+        let is_err = diag_is_error(d)
+        if is_err {
+            errs = true
+        }
+        if is_err || !errors_only {
+            eprintln(tooling::render_diag(d, path))
+        }
+    }
+    errs
+}
+
+// emit_errors_f 按文件输出诊断 / emit_errors_f prints diagnostics per file
+fn emit_errors_f(diags, files, errors_only) {
+    let mut errs = false
+    let mut i = 0
+    while i < len(diags) {
+        let is_err = diag_is_error(diags[i])
+        if is_err {
+            errs = true
+        }
+        if is_err || !errors_only {
+            eprintln(tooling::render_diag(diags[i], files[i]))
+        }
+        i = i + 1
+    }
+    errs
+}
+
+// fold_script_or_exit 折叠脚本（失败即退出）/ fold_script_or_exit folds a script or exits on failure
+fn fold_script_or_exit(stmts, path) {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
+            if emit_errors(diags, path, false) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+// fold_packages_or_exit 折叠包（失败即退出） / fold_packages_or_exit folds packages or exits on failure
+fn fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+    match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+        frontend::FoldOut::FoldedPkgs(out, diags, files) => {
+            if emit_errors_f(diags, files, false) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+// is_dir 判断路径是否为目录 / is_dir tells whether the path is a directory
+fn is_dir(path) {
+    file_exists(strip_trailing_slash(path) + "/bur.mod")
+}
+
+// strip_trailing_slash 去尾部斜杠 / strip_trailing_slash removes a trailing slash
+fn strip_trailing_slash(p) {
+    if ends_with(p, "/") {
+        substr(p, 0, str_len(p) - 1)
+    } else {
+        p
+    }
+}
+
+// ends_with 后缀判断 / ends_with checks a suffix
+fn ends_with(s, suffix) {
+    let n = str_len(s)
+    let m = str_len(suffix)
+    n >= m && substr(s, n - m, m) == suffix
+}
+
+// diag_is_error 判断诊断是否为错误（非警告）
+// diag_is_error tells whether the diagnostic is an error (not a warning)
+fn diag_is_error(d) {
+    match d {
+        lib::DiagT::Diag(ie, _, _, _, _, _) => ie,
+        lib::DiagT::DiagX(ie, _, _, _, _, _, _, _) => ie,
+    }
+}
+
+// concat_lists 拼接列表 / concat_lists concatenates lists
+fn concat_lists(xss) {
+    let mut acc = []
+    for xs in xss {
+        for x in xs {
+            push(acc, x)
+        }
+    }
+    acc
+}
+
+// starts_with 前缀判断 / starts_with checks a prefix
+fn starts_with(s, prefix) {
+    let n = str_len(s)
+    let m = str_len(prefix)
+    n >= m && substr(s, 0, m) == prefix
+}

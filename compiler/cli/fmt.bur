@@ -1,9 +1,10 @@
-// cli/fmt.bur — fmt 子命令。
-// cli/fmt.bur — fmt subcommand.
+// fmt.bur — fmt 子命令：文件、目录与 stdin 三条路径。
+// The fmt subcommand over files, directories and stdin.
 
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/tooling"
 import "burryn.dev/compiler/frontend"
+
 // fmt_cmd 处理 fmt 子命令：文件/目录/stdin 与 --check
 // fmt_cmd handles the fmt subcommand: file/dir/stdin and --check
 pub fn fmt_cmd(rest) {
@@ -61,5 +62,75 @@ fn fmt_source(path, src, mut state) {
                 },
             }
         },
+    }
+}
+
+// fmt_dir 格式化目录 / fmt_dir formats a directory
+fn fmt_dir(dir, check_only, mut state) {
+    match read_dir(dir) {
+        Ok(names) => {
+            for n in names {
+                if !starts_with(n, ".") {
+                    let p = dir + "/" + n
+                    if ends_with(n, ".bur") {
+                        fmt_one(p, check_only, state)
+                    } else {
+                        match read_dir(p) {
+                            Ok(_) => fmt_dir(p, check_only, state),
+                            Err(_) => {},
+                        }
+                    }
+                }
+            }
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+}
+
+// fmt_one 格式化单个文件 / fmt_one formats one file
+fn fmt_one(path, check_only, mut state) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match fmt_source(path, src, state) {
+        Some(out) => {
+            if out != src {
+                if check_only {
+                    println(path)
+                    state[0] = 1
+                } else {
+                    match write_file(path, out) {
+                        Ok(_) => {},
+                        Err(msg) => {
+                            eprintln("error: " + msg)
+                            exit(exit_no_input)
+                        },
+                    }
+                }
+            }
+        },
+        None => {},
+    }
+}
+
+// fmt_stdin 格式化 stdin / fmt_stdin formats stdin
+fn fmt_stdin(mut state) {
+    let src = match read_file("/dev/stdin") {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match fmt_source("<stdin>", src, state) {
+        Some(out) => print(out),
+        None => {},
     }
 }

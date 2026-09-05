@@ -1,5 +1,10 @@
-// ty_core.bur — 类型层核心：构造、resolve、occurs、unify、泛化与实例化。
-// ty_core.bur — type-layer core: constructors, resolve, occurs, unify, generalize, instantiate.
+// ty_core.bur — 类型层核心：构造、resolve、occurs、unify、泛化与实例化，
+// 附 record 字段表、SCC 分组、约束合并与漂亮打印。
+// The type layer: construction, resolve, occurs, unify, generalization and
+// instantiation, plus record field tables, SCC grouping, constraint joins and
+// pretty printing.
+
+import "burryn.dev/compiler/lib"
 
 // ty_new_con 构造命名类型（list/map/Option 等构造器）
 // ty_new_con builds a fresh named type (list/map/Option constructors)
@@ -31,4 +36,702 @@ fn ty_new_var(mut tk, mut tn, mut ta, mut tr, mut tl, level, con) {
     push(tr, -1)
     push(tl, level)
     len(tk) - 1
+}
+
+// con_set 输出约束集合文本 / con_set renders a constraint set as text
+fn con_set(con) {
+    match con {
+        "num" => ["int", "float"],
+        "addord" => ["int", "float", "str"],
+        "key" => ["int", "str"],
+        "int" => ["int"],
+        "float" => ["float"],
+        "str" => ["str"],
+        _ => [],
+    }
+}
+
+// con_allows 判断约束是否允许该名字 / con_allows tells whether the constraint allows the name
+fn con_allows(con, name) {
+    if con == "" {
+        true
+    } else {
+        contains(con_set(con), name)
+    }
+}
+
+// con_join 拼接约束文本 / con_join joins constraint text
+fn con_join(con, sep) {
+    join(con_set(con), sep)
+}
+
+// con_merge 合并约束（名字交集）/ con_merge merges constraints (name intersection)
+fn con_merge(a, b) {
+    if a == "" {
+        b
+    } else if b == "" || a == b {
+        a
+    } else {
+        let mut inter = []
+        for x in con_set(a) {
+            if contains(con_set(b), x) {
+                push(inter, x)
+            }
+        }
+        if len(inter) == 0 {
+            "!"
+        } else {
+            let mut best = "!"
+            for name in ["num", "addord", "key", "int", "float", "str"] {
+                let set = con_set(name)
+                if len(set) == len(inter) {
+                    let mut same = true
+                    for x in inter {
+                        if !contains(set, x) {
+                            same = false
+                        }
+                    }
+                    if same && best == "!" {
+                        best = name
+                    }
+                }
+            }
+            best
+        }
+    }
+}
+
+// diag_start 取诊断的起点偏移 / diag_start returns a diagnostic's start offset
+fn diag_start(d) {
+    match d {
+        lib::DiagT::Diag(_, _, _, _, s, _) => s,
+        lib::DiagT::DiagX(_, _, _, _, s, _, _, _) => s,
+    }
+}
+
+// fresh_name_copy 复制名字（fresh 语义） / fresh_name_copy copies a name (fresh semantics)
+fn fresh_name_copy(src) {
+    let mut out = map()
+    for name in keys(src) {
+        put(out, name, true)
+    }
+    out
+}
+
+// fresh_pattern_names 收集模式中的 fresh 名字 / fresh_pattern_names collects fresh names from a pattern
+fn fresh_pattern_names(p, mut names) {
+    match p {
+        PatBinding(name, _) => put(names, name, true),
+        PatVariant(_, _, _, binds, _) => {
+            for bind in binds {
+                fresh_pattern_names(bind, names)
+            }
+        },
+        _ => {},
+    }
+}
+
+// is_fresh_source 判断表达式是否为 fresh 来源 / is_fresh_source tells whether an expression is a fresh source
+fn is_fresh_source(e, lookup, b_mut, b_kind, fresh_names) {
+    match e {
+        IntLit(_, _) => true,
+        FloatLit(_, _) => true,
+        StrLit(_, _) => true,
+        BoolLit(_, _) => true,
+        ListLit(_, _) => true,
+        FnLit(_, _, _, _, _, _, _, _, _) => true,
+        VariantAccess(_, _, _) => true,
+        QualVariantAccess(_, _, _, _) => true,
+        Call(_, _, _) => true,
+        Ident(name, _) => {
+            match get(fresh_names, name) {
+                Some(_) => true,
+                None => {
+                    let b = lookup(name)
+                    b >= 0 && b_mut[b]
+                },
+            }
+        },
+        IfExpr(_, then_b, else_b, _) => is_fresh_source(then_b, lookup, b_mut, b_kind, fresh_names) && is_fresh_source(else_b, lookup, b_mut, b_kind, fresh_names),
+        MatchExpr(_, arms, _) => {
+            let mut all_fresh = true
+            for arm in arms {
+                match arm {
+                    MatchArm(pat, _, body, _) => {
+                        let mut arm_names = fresh_name_copy(fresh_names)
+                        fresh_pattern_names(pat, arm_names)
+                        if !is_fresh_source(body, lookup, b_mut, b_kind, arm_names) {
+                            all_fresh = false
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            all_fresh
+        },
+        Block(stmts, _) => {
+            if len(stmts) == 0 {
+                false
+            } else {
+                match stmts[len(stmts) - 1] {
+                    ExprStmt(inner, _) => is_fresh_source(inner, lookup, b_mut, b_kind, fresh_names),
+                    ReturnStmt(_, _) => true,
+                    _ => false,
+                }
+            }
+        },
+        _ => false,
+    }
+}
+
+// dm_heap_walk 深 mut 堆遍历 / dm_heap_walk walks the heap for deep-mut tracking
+fn dm_heap_walk(tk, tn, ta, tr, h) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] != 0 {
+        return false
+    }
+    if tn[x] == "list" || tn[x] == "map" {
+        return true
+    }
+    if tn[x] == "chan" {
+        return false
+    }
+    let mut found = false
+    for a in ta[x] {
+        if dm_heap_walk(tk, tn, ta, tr, a) {
+            found = true
+        }
+    }
+    found
+}
+
+// sp_start 取区间起点偏移 / sp_start returns a span's start offset
+fn sp_start(sp) {
+    match sp {
+        Sp(s, _) => s,
+    }
+}
+
+// ty_occurs 做 occurs 检查：变量是否出现在类型内（阻止递归类型）
+// ty_occurs runs the occurs check: is the variable inside the type? (blocks recursive types)
+fn ty_occurs(tk, ta, tr, v, h) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        x == v
+    } else if tk[x] == 0 {
+        let mut found = false
+        for a in ta[x] {
+            if ty_occurs(tk, ta, tr, v, a) {
+                found = true
+            }
+        }
+        found
+    } else {
+        let mut found = false
+        for p in ta[x] {
+            if ty_occurs(tk, ta, tr, v, p) {
+                found = true
+            }
+        }
+        found || ty_occurs(tk, ta, tr, v, tr[x])
+    }
+}
+
+// ty_pretty 美化输出类型 / ty_pretty pretty-prints a type
+fn ty_pretty(tk, tn, ta, tr, h, mut names, mut cnt) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        let n = match get(names, x) {
+            Some(nm) => nm,
+            None => {
+                let nm = "'" + chr(97 + cnt[0] % 26)
+                put(names, x, nm)
+                cnt[0] = cnt[0] + 1
+                nm
+            },
+        }
+        if tn[x] != "" {
+            n + ":" + tn[x]
+        } else {
+            n
+        }
+    } else if tk[x] == 0 {
+        if tn[x] == "list" {
+            "[" + ty_pretty(tk, tn, ta, tr, ta[x][0], names, cnt) + "]"
+        } else if tn[x] == "chan" {
+            "chan(" + ty_pretty(tk, tn, ta, tr, ta[x][0], names, cnt) + ")"
+        } else if str_len(tn[x]) > 4 && substr(tn[x], 0, 4) == "@rec" {
+            let fnames = rec_parse_names(tn[x])
+            let mut fields = []
+            let mut row_name = ""
+            let mut i = 0
+            while i < len(fnames) {
+                if str_len(fnames[i]) > 0 && substr(fnames[i], 0, 1) == "?" {
+                    row_name = substr(fnames[i], 1, str_len(fnames[i]) - 1)
+                } else {
+                    push(fields, fnames[i] + ": " + ty_pretty(tk, tn, ta, tr, ta[x][i], names, cnt))
+                }
+                i = i + 1
+            }
+            let body = if row_name != "" {
+                join(fields, ", ") + " | " + row_name
+            } else {
+                join(fields, ", ")
+            }
+            "record " + chr(123) + " " + body + " " + chr(125)
+        } else if tn[x] == "@tup" {
+            let mut parts = []
+            for a in ta[x] {
+                push(parts, ty_pretty(tk, tn, ta, tr, a, names, cnt))
+            }
+            "(" + join(parts, ", ") + ")"
+        } else if len(ta[x]) == 0 {
+            tn[x]
+        } else {
+            let mut parts = []
+            for a in ta[x] {
+                push(parts, ty_pretty(tk, tn, ta, tr, a, names, cnt))
+            }
+            tn[x] + "(" + join(parts, ", ") + ")"
+        }
+    } else {
+        let mut parts = []
+        for p in ta[x] {
+            push(parts, ty_pretty(tk, tn, ta, tr, p, names, cnt))
+        }
+        "fn(" + join(parts, ", ") + ") -> " + ty_pretty(tk, tn, ta, tr, tr[x], names, cnt)
+    }
+}
+
+// ty_pretty1 美化单个类型 / ty_pretty1 pretty-prints one type
+// Pretty-print one type
+fn ty_pretty1(tk, tn, ta, tr, h) {
+    let mut names = map()
+    let mut cnt = [0]
+    ty_pretty(tk, tn, ta, tr, h, names, cnt)
+}
+
+// rec_type_name 取 record 类型名字 / rec_type_name extracts the record type name
+fn rec_type_name(names) {
+    let mut s = "@rec"
+    for n in names {
+        s = s + "|" + n
+    }
+    s
+}
+
+// rec_parse_names 解析 record 字段名列表 / rec_parse_names parses record field names
+fn rec_parse_names(tname) {
+    let mut out = []
+    let mut i = 5
+    let mut cur = ""
+    while i < str_len(tname) {
+        let c = substr(tname, i, 1)
+        if c == "|" {
+            push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        push(out, cur)
+    }
+    out
+}
+
+// scc_groups 计算依赖顺序的 SCC 分组 / scc_groups computes SCC groups (dependency order)
+fn scc_groups(adj) {
+    let n = len(adj)
+    let mut sidx = []
+    let mut slow = []
+    let mut onstk = []
+    let mut i = 0
+    while i < n {
+        push(sidx, -1)
+        push(slow, 0)
+        push(onstk, false)
+        i = i + 1
+    }
+    let mut stk = []
+    let mut counter = 0
+    let mut comps = []
+    // connect 是 Tarjan 的 SCC 连接步骤 / connect is the Tarjan SCC connection step
+    fn connect(v) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref c, ref chan_fors, ref counter, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
+        sidx[v] = counter
+        slow[v] = counter
+        counter = counter + 1
+        push(stk, v)
+        onstk[v] = true
+        for w in adj[v] {
+            if sidx[w] < 0 {
+                connect(w)
+                if slow[w] < slow[v] {
+                    slow[v] = slow[w]
+                }
+            } else if onstk[w] {
+                if sidx[w] < slow[v] {
+                    slow[v] = sidx[w]
+                }
+            }
+        }
+        if slow[v] == sidx[v] {
+            let mut comp = []
+            let mut more = true
+            while more {
+                let w = pop(stk)
+                onstk[w] = false
+                push(comp, w)
+                if w == v {
+                    more = false
+                }
+            }
+            push(comps, comp)
+        }
+    }
+    i = 0
+    while i < n {
+        if sidx[i] < 0 {
+            connect(i)
+        }
+        i = i + 1
+    }
+    comps
+}
+
+// ty_generalize_walk 泛化：低于阈值级别的自由变量变为多态
+// ty_generalize_walk generalizes: free variables below the level threshold become polymorphic
+fn ty_generalize_walk(tk, tn, ta, tr, tl, h, level, mut vars, mut seen) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        let dup = match get(seen, x) {
+            Some(_) => true,
+            None => false,
+        }
+        if tl[x] > level && !dup {
+            put(seen, x, true)
+            push(vars, x)
+        }
+    } else if tk[x] == 0 {
+        for a in ta[x] {
+            ty_generalize_walk(tk, tn, ta, tr, tl, a, level, vars, seen)
+        }
+    } else {
+        for p in ta[x] {
+            ty_generalize_walk(tk, tn, ta, tr, tl, p, level, vars, seen)
+        }
+        ty_generalize_walk(tk, tn, ta, tr, tl, tr[x], level, vars, seen)
+    }
+}
+
+// ty_instantiate_cp 实例化：复制多态 scheme，替换约束变量
+// ty_instantiate_cp instantiates: copies a polymorphic scheme, substituting constraint variables
+fn ty_instantiate_cp(mut tk, mut tn, mut ta, mut tr, mut tl, h, subst) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        match get(subst, x) {
+            Some(n) => n,
+            None => x,
+        }
+    } else if tk[x] == 0 {
+        let mut cargs = []
+        for a in ta[x] {
+            push(cargs, ty_instantiate_cp(tk, tn, ta, tr, tl, a, subst))
+        }
+        ty_new_con(tk, tn, ta, tr, tl, tn[x], cargs)
+    } else {
+        let mut ps = []
+        for p in ta[x] {
+            push(ps, ty_instantiate_cp(tk, tn, ta, tr, tl, p, subst))
+        }
+        let ret = ty_instantiate_cp(tk, tn, ta, tr, tl, tr[x], subst)
+        ty_new_fn(tk, tn, ta, tr, tl, ps, ret)
+    }
+}
+
+// sort_order2 按双键排序 / sort_order2 sorts by two keys
+fn sort_order2(ranks, starts) {
+    let n = len(ranks)
+    let mut taken = []
+    for _r in ranks {
+        push(taken, false)
+    }
+    let mut out = []
+    let mut c = 0
+    while c < n {
+        let mut best = -1
+        let mut i = 0
+        while i < n {
+            if !taken[i] {
+                if best < 0 {
+                    best = i
+                } else if ranks[i] < ranks[best] || ranks[i] == ranks[best] && starts[i] < starts[best] {
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        taken[best] = true
+        push(out, best)
+        c = c + 1
+    }
+    out
+}
+
+// sort_strs 对字符串排序 / sort_strs sorts strings
+fn sort_strs(xs) {
+    let n = len(xs)
+    let mut taken = []
+    for _x in xs {
+        push(taken, false)
+    }
+    let mut out = []
+    let mut c = 0
+    while c < n {
+        let mut best = -1
+        let mut i = 0
+        while i < n {
+            if !taken[i] {
+                if best < 0 {
+                    best = i
+                } else if xs[i] < xs[best] {
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        taken[best] = true
+        push(out, xs[best])
+        c = c + 1
+    }
+    out
+}
+
+// ty_unify 合并两个类型句柄，不匹配报 E0308；行变量与 record 逐字段配对
+// ty_unify merges two type handles, E0308 on mismatch; row vars and records pair field by field
+// ty_unify 先解引用两侧，再按类型形态分派合并
+// ty_unify resolves both sides, then merges by type kind
+fn ty_unify(mut tk, mut tn, mut ta, mut tr, mut tl, ah, bh) {
+    // 先解析指针链（可能 a == b，同句柄直接成功） / Resolve pointer chains first (a == b short-circuits)
+    let a = ty_resolve(tk, tr, ah)
+    let b = ty_resolve(tk, tr, bh)
+    if a == b {
+        return ""
+    }
+    // 行变量侧：开放 record 尾巴绑定剩余字段的 record（或另一行变量）
+    // Row variable side: an open-record tail binds to the leftover record (or another row var)
+    if tk[a] == 2 && tn[a] == "row" {
+        if tk[b] == 0 && str_len(tn[b]) > 4 && substr(tn[b], 0, 4) == "@rec" {
+            tr[a] = b
+            return ""
+        }
+        if tk[b] == 2 && tn[b] == "row" {
+            tr[a] = b
+            return ""
+        }
+        return "expected a record, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
+    }
+    if tk[b] == 2 && tn[b] == "row" {
+        return ty_unify(tk, tn, ta, tr, tl, b, a)
+    }
+    // 变量侧合一：occurs 检查 + 约束允许性 + 直接绑定
+    // Variable side: occurs check, constraint allowance, direct binding
+    if tk[a] == 2 {
+        if ty_occurs(tk, ta, tr, a, b) {
+            return "recursive type detected"
+        }
+        if tk[b] == 0 && len(ta[b]) == 0 {
+            if !con_allows(tn[a], tn[b]) {
+                return "`" + tn[b] + "` is not valid here: this operator needs " + con_join(tn[a], " or ")
+            }
+        }
+        if tk[b] == 0 && len(ta[b]) > 0 && tn[a] != "" {
+            return "`" + ty_pretty1(tk, tn, ta, tr, b) + "` is not valid here: this operator needs " + con_join(tn[a], " or ")
+        }
+        if tk[b] == 1 && tn[a] != "" {
+            return "a function is not valid here: this operator needs " + con_join(tn[a], " or ")
+        }
+        if tk[b] == 2 {
+            let merged = con_merge(tn[a], tn[b])
+            if merged == "!" {
+                return "no type satisfies both " + con_join(tn[a], "|") + " and " + con_join(tn[b], "|")
+            }
+            tn[b] = merged
+        }
+        ty_adjust_level(tk, tn, ta, tr, tl, b, tl[a])
+        tr[a] = b
+        return ""
+    }
+    if tk[b] == 2 {
+        return ty_unify(tk, tn, ta, tr, tl, b, a)
+    }
+    if tk[a] == 0 && tk[b] == 0 {
+        if str_len(tn[a]) > 4 && substr(tn[a], 0, 4) == "@rec" && str_len(tn[b]) > 4 && substr(tn[b], 0, 4) == "@rec" {
+            let fa = rec_parse_names(tn[a])
+            let fb = rec_parse_names(tn[b])
+            let a_open = len(fa) > 0 && substr(fa[len(fa) - 1], 0, 1) == "?"
+            let b_open = len(fb) > 0 && substr(fb[len(fb) - 1], 0, 1) == "?"
+            if a_open || b_open {
+                if !a_open && b_open {
+                    return ty_unify(tk, tn, ta, tr, tl, bh, ah)
+                }
+                // 已知字段按名配对（开放侧字段须是另一侧子集）
+                // Pair known fields by name (the open side's fields must be a subset)
+                let mut i = 0
+                while i < len(fa) {
+                    if str_len(fa[i]) > 0 && substr(fa[i], 0, 1) != "?" {
+                        let f = fa[i]
+                        let mut j = 0
+                        let mut found = -1
+                        while j < len(fb) {
+                            if str_len(fb[j]) > 0 && substr(fb[j], 0, 1) != "?" && fb[j] == f {
+                                found = j
+                            }
+                            j = j + 1
+                        }
+                        if found < 0 {
+                            return "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, bh) + "`"
+                        }
+                        let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][found])
+                        if e != "" {
+                            return e
+                        }
+                    }
+                    i = i + 1
+                }
+                // 开放侧行变量绑定另一侧的剩余字段 / The open side's row var binds the other side's leftover fields
+                let ra = ta[a][len(fa) - 1]
+                let mut rest_names = []
+                let mut rest_types = []
+                let mut j = 0
+                while j < len(fb) {
+                    if str_len(fb[j]) > 0 && substr(fb[j], 0, 1) != "?" {
+                        let mut in_a = false
+                        let mut k = 0
+                        while k < len(fa) {
+                            if str_len(fa[k]) > 0 && substr(fa[k], 0, 1) != "?" && fa[k] == fb[j] {
+                                in_a = true
+                            }
+                            k = k + 1
+                        }
+                        if !in_a {
+                            push(rest_names, fb[j])
+                            push(rest_types, ta[b][j])
+                        }
+                    }
+                    j = j + 1
+                }
+                if b_open {
+                    let rb = ta[b][len(fb) - 1]
+                    let brow = substr(fb[len(fb) - 1], 1, str_len(fb[len(fb) - 1]) - 1)
+                    if len(rest_names) == 0 {
+                        tr[ra] = rb
+                    } else {
+                        let mut onames = []
+                        for rn in rest_names {
+                            push(onames, rn)
+                        }
+                        push(onames, "?" + brow)
+                        let mut orts = []
+                        for rt in rest_types {
+                            push(orts, rt)
+                        }
+                        push(orts, rb)
+                        tr[ra] = ty_new_con(tk, tn, ta, tr, tl, rec_type_name(onames), orts)
+                    }
+                } else if len(rest_names) == 0 {
+                    tr[ra] = ty_new_con(tk, tn, ta, tr, tl, "@rec", [])
+                } else {
+                    tr[ra] = ty_new_con(tk, tn, ta, tr, tl, rec_type_name(rest_names), rest_types)
+                }
+                return ""
+            }
+        }
+        // 封闭 record 按名合一：字段顺序不进入类型身份，字段集合须相等
+        // Closed records unify by name; field order is not type identity, field sets must match
+        if str_len(tn[a]) > 4 && substr(tn[a], 0, 4) == "@rec" && str_len(tn[b]) > 4 && substr(tn[b], 0, 4) == "@rec" {
+            let ca = rec_parse_names(tn[a])
+            let cb = rec_parse_names(tn[b])
+            if len(ca) != len(cb) {
+                return "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, bh) + "`"
+            }
+            let mut i = 0
+            while i < len(ca) {
+                let f = ca[i]
+                let mut j = 0
+                let mut found = -1
+                while j < len(cb) {
+                    if cb[j] == f {
+                        found = j
+                    }
+                    j = j + 1
+                }
+                if found < 0 {
+                    return "expected `" + ty_pretty1(tk, tn, ta, tr, ah) + "`, found `" + ty_pretty1(tk, tn, ta, tr, bh) + "`"
+                }
+                let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][found])
+                if e != "" {
+                    return e
+                }
+                i = i + 1
+            }
+            return ""
+        }
+        if tn[a] != tn[b] || len(ta[a]) != len(ta[b]) {
+            return "expected `" + ty_pretty1(tk, tn, ta, tr, a) + "`, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
+        }
+        let mut i = 0
+        while i < len(ta[a]) {
+            let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][i])
+            if e != "" {
+                return e
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    if tk[a] == 1 && tk[b] == 1 {
+        if len(ta[a]) != len(ta[b]) {
+            return "expected a function with " + str(len(ta[a])) + " parameter(s), found one with " + str(len(ta[b]))
+        }
+        let mut i = 0
+        while i < len(ta[a]) {
+            let e = ty_unify(tk, tn, ta, tr, tl, ta[a][i], ta[b][i])
+            if e != "" {
+                return e
+            }
+            i = i + 1
+        }
+        return ty_unify(tk, tn, ta, tr, tl, tr[a], tr[b])
+    }
+    "expected `" + ty_pretty1(tk, tn, ta, tr, a) + "`, found `" + ty_pretty1(tk, tn, ta, tr, b) + "`"
+}
+
+// ty_resolve 沿指针链解析变量（可能 a == b 同句柄）/ ty_resolve resolves a variable along its pointer chain
+fn ty_resolve(tk, tr, h) {
+    let mut cur = h
+    while tk[cur] == 2 && tr[cur] != -1 {
+        cur = tr[cur]
+    }
+    cur
+}
+
+// ty_adjust_level 调整变量的泛化级别 / ty_adjust_level adjusts a variable's generalization level
+fn ty_adjust_level(tk, tn, ta, tr, mut tl, h, level) {
+    let x = ty_resolve(tk, tr, h)
+    if tk[x] == 2 {
+        if tl[x] > level {
+            tl[x] = level
+        }
+    } else if tk[x] == 0 {
+        for a in ta[x] {
+            ty_adjust_level(tk, tn, ta, tr, tl, a, level)
+        }
+    } else {
+        for p in ta[x] {
+            ty_adjust_level(tk, tn, ta, tr, tl, p, level)
+        }
+        ty_adjust_level(tk, tn, ta, tr, tl, tr[x], level)
+    }
 }

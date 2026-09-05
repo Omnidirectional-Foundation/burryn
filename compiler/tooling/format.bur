@@ -1,5 +1,6 @@
-// format.bur — 官方格式化器：AST 重排 + 注释重插 + 验证（bur fmt）。
-// The official formatter: AST reflow, comment reinsertion, verification (bur fmt).
+// format.bur — 官方格式化器：把 AST 与 trivia 重新排版为规范源码。
+// The official formatter: re-renders the AST plus trivia as canonical source.
+
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
@@ -84,4 +85,1203 @@ pub fn format_file(stmts, src, comments) {
         let _ = flush_comments(comments, cc, str_len(src) + 1, src, 0, 0, out)
     }
     join(out, "")
+}
+
+// bin_prec 二元操作符优先级 / bin_prec returns binary operator precedence
+fn bin_prec(op) {
+    if op == frontend::t_eq_eq || op == frontend::t_bang_eq {
+        4
+    } else if op == frontend::t_lt || op == frontend::t_lt_eq || op == frontend::t_gt || op == frontend::t_gt_eq {
+        5
+    } else if op == frontend::t_plus || op == frontend::t_minus {
+        6
+    } else if op == frontend::t_star || op == frontend::t_slash || op == frontend::t_percent {
+        7
+    } else {
+        fmt_internal("unknown binary operator token")
+        0
+    }
+}
+
+// comment_inside 节点内是否有注释 / comment_inside tells whether a comment lies inside the node
+fn comment_inside(comments, cc, limit) {
+    cc[0] < len(comments) && tok_start(comments[cc[0]]) < limit
+}
+
+// src_blank_between 判断两处之间是否全空白 / src_blank_between tells whether the source is blank between
+fn src_blank_between(src, a, b) {
+    let mut i = a
+    let mut nl = 0
+    while i < b {
+        if byte_at(src, i) == 10 {
+            nl = nl + 1
+        }
+        i = i + 1
+    }
+    nl >= 2
+}
+
+// src_has_newline 判断两处之间是否有换行 / src_has_newline tells whether a newline lies between
+fn src_has_newline(src, a, b) {
+    let mut i = a
+    while i < b {
+        if byte_at(src, i) == 10 {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// fmt_expr 表达式格式化（按 Pratt 优先级断行） / fmt_expr formats an expression (line breaks by Pratt precedence)
+fn fmt_expr(n, src, comments, mut cc, indent, mut buf) {
+    // 表达式格式化：按 Pratt 优先级断行与加括号
+    // Expression formatting: line breaks and parens follow Pratt precedence
+    match n {
+        frontend::Node::IntLit(_, sp) => push(buf, span_text(src, sp)),
+        frontend::Node::FloatLit(_, sp) => push(buf, span_text(src, sp)),
+        frontend::Node::StrLit(_, sp) => push(buf, span_text(src, sp)),
+        frontend::Node::BoolLit(v, _) => push(buf, if v {
+            "true"
+        } else {
+            "false"
+        }),
+        frontend::Node::Ident(_, sp) => push(buf, span_text(src, sp)),
+        frontend::Node::Binary(op, lhs, rhs, sp) => fmt_binary(op, lhs, rhs, sp, n, src, comments, cc, indent, buf),
+        frontend::Node::Logical(op, lhs, rhs, _) => fmt_logical(op, lhs, rhs, src, comments, cc, indent, buf),
+        frontend::Node::Pipe(lhs, target, args, sp) => fmt_pipe(lhs, target, args, sp, src, comments, cc, indent, buf),
+        frontend::Node::Unary(op, rhs, _) => fmt_unary(op, rhs, src, comments, cc, indent, buf),
+        frontend::Node::RecvExpr(e, _) => fmt_recv(e, src, comments, cc, indent, buf),
+        frontend::Node::TryExpr(e, _) => fmt_try(e, src, comments, cc, indent, buf),
+        frontend::Node::RecordLit(names, vals, _) => fmt_record_lit(names, vals, src, comments, cc, indent, buf),
+        frontend::Node::RecordUpdate(base, names, vals, _) => fmt_record_update(base, names, vals, src, comments, cc, indent, buf),
+        frontend::Node::FieldAccess(base, field, _) => fmt_field(base, field, src, comments, cc, indent, buf),
+        frontend::Node::Index(target, idx, _) => fmt_index_expr(target, idx, src, comments, cc, indent, buf),
+        frontend::Node::ListLit(elems, _) => fmt_list_lit(elems, src, comments, cc, indent, buf),
+        frontend::Node::TupleLit(elems, _) => fmt_tuple_lit(elems, src, comments, cc, indent, buf),
+        frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => fmt_fn_lit("", n, src, comments, cc, indent, buf),
+        frontend::Node::Block(stmts, sp) => fmt_block_expr(stmts, sp, src, comments, cc, indent, buf),
+        frontend::Node::IfExpr(cond, then, els, _) => fmt_if_expr(cond, then, els, src, comments, cc, indent, buf),
+        frontend::Node::MatchExpr(scrut, arms, sp) => fmt_match_expr(scrut, arms, sp, src, comments, cc, indent, buf),
+        frontend::Node::Call(callee, cargs, _) => fmt_call_expr(callee, cargs, src, comments, cc, indent, buf),
+        frontend::Node::VariantAccess(en, v, _) => fmt_variant_access(en, v, buf),
+        frontend::Node::PkgAccess(pkg, name, _) => fmt_pkg_access(pkg, name, buf),
+        frontend::Node::QualVariantAccess(pkg, en, v, _) => fmt_qual_variant(pkg, en, v, buf),
+        frontend::Node::TEName(p, name, _c, args, _) => fmt_te_name(p, name, args, src, comments, cc, indent, buf),
+        frontend::Node::TEList(el, _) => fmt_te_list(el, src, comments, cc, indent, buf),
+        frontend::Node::TERecord(names, tes, rowvar, _) => fmt_te_record(names, tes, rowvar, src, comments, cc, indent, buf),
+        _ => fmt_internal("unhandled expression node"),
+    }
+}
+
+fn fmt_pipe(lhs, target, args, sp, src, comments, mut cc, indent, mut buf) {
+    fmt_child(lhs, 1, src, comments, cc, indent, buf)
+    push(buf, " |> ")
+    fmt_expr(target, src, comments, cc, indent, buf)
+    if len(args) > 0 || span_end(target) < span_end2(sp) {
+        push(buf, "(")
+        let mut i = 0
+        while i < len(args) {
+            if i > 0 {
+                push(buf, ", ")
+            }
+            fmt_expr(args[i], src, comments, cc, indent, buf)
+            i = i + 1
+        }
+        push(buf, ")")
+    }
+}
+
+fn fmt_record_lit(names, vals, src, comments, mut cc, indent, mut buf) {
+    push(buf, "record ")
+    push(buf, chr(123))
+    let mut i = 0
+    while i < len(names) {
+        if i > 0 {
+            push(buf, ",")
+        }
+        push(buf, " ")
+        push(buf, names[i])
+        push(buf, ": ")
+        fmt_expr(vals[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    if len(names) > 0 {
+        push(buf, " ")
+    }
+    push(buf, chr(125))
+}
+
+fn fmt_record_update(base, names, vals, src, comments, mut cc, indent, mut buf) {
+    push(buf, "record ")
+    push(buf, chr(123))
+    push(buf, " ")
+    fmt_expr(base, src, comments, cc, indent, buf)
+    push(buf, " |")
+    let mut i = 0
+    while i < len(names) {
+        push(buf, " ")
+        push(buf, names[i])
+        push(buf, ": ")
+        fmt_expr(vals[i], src, comments, cc, indent, buf)
+        if i < len(names) - 1 {
+            push(buf, ",")
+        }
+        i = i + 1
+    }
+    push(buf, " ")
+    push(buf, chr(125))
+}
+
+fn fmt_list_lit(elems, src, comments, mut cc, indent, mut buf) {
+    push(buf, "[")
+    let mut i = 0
+    while i < len(elems) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        fmt_expr(elems[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    push(buf, "]")
+}
+
+fn fmt_tuple_lit(elems, src, comments, mut cc, indent, mut buf) {
+    push(buf, "(")
+    let mut i = 0
+    while i < len(elems) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        fmt_expr(elems[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    push(buf, ")")
+}
+
+fn fmt_call_expr(callee, cargs, src, comments, mut cc, indent, mut buf) {
+    fmt_child(callee, 9, src, comments, cc, indent, buf)
+    push(buf, "(")
+    let mut i = 0
+    while i < len(cargs) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        fmt_expr(cargs[i], src, comments, cc, indent, buf)
+        i = i + 1
+    }
+    push(buf, ")")
+}
+
+fn fmt_block_expr(stmts, sp, src, comments, mut cc, indent, mut buf) {
+    if len(stmts) == 0 && !comment_inside(comments, cc, span_end2(sp)) {
+        push(buf, "" + chr(123) + "}")
+    } else {
+        push(buf, "" + chr(123) + "\n")
+        let deeper = indent + 4
+        let mut i = 0
+        let mut pe = 0
+        while i < len(stmts) {
+            pe = flush_comments(comments, cc, span_start(stmts[i]), src, deeper, pe, buf)
+            if pe > 0 && src_blank_between(src, pe, span_start(stmts[i])) {
+                push(buf, "\n")
+            }
+            push_indent(buf, deeper)
+            fmt_stmt(stmts[i], src, comments, cc, deeper, buf)
+            pe = try_trailing(comments, cc, span_end(stmts[i]), src, buf)
+            push(buf, "\n")
+            i = i + 1
+        }
+        let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
+        push_indent(buf, indent)
+        push(buf, "}")
+    }
+}
+
+fn fmt_if_expr(cond, then, els, src, comments, mut cc, indent, mut buf) {
+    push(buf, "if ")
+    fmt_expr(cond, src, comments, cc, indent, buf)
+    push(buf, " ")
+    fmt_expr(then, src, comments, cc, indent, buf)
+    match els {
+        frontend::Node::NoNode => {},
+        _ => {
+            push(buf, " else ")
+            fmt_expr(els, src, comments, cc, indent, buf)
+        },
+    }
+}
+
+fn fmt_match_expr(scrut, arms, sp, src, comments, mut cc, indent, mut buf) {
+    push(buf, "match ")
+    fmt_expr(scrut, src, comments, cc, indent, buf)
+    push(buf, " " + chr(123) + "\n")
+    let deeper = indent + 4
+    let mut i = 0
+    let mut pe = 0
+    while i < len(arms) {
+        pe = flush_comments(comments, cc, span_start(arms[i]), src, deeper, pe, buf)
+        if pe > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+            push(buf, "\n")
+        }
+        push_indent(buf, deeper)
+        fmt_arm(arms[i], src, comments, cc, deeper, buf)
+        push(buf, ",")
+        pe = try_trailing(comments, cc, span_end(arms[i]), src, buf)
+        push(buf, "\n")
+        i = i + 1
+    }
+    let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
+    push_indent(buf, indent)
+    push(buf, "}")
+}
+
+fn fmt_binary(op, lhs, rhs, sp, n, src, comments, mut cc, indent, mut buf) {
+    if op == frontend::t_plus && span_is_interpolation(src, sp) {
+        if cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
+            push(buf, span_text(src, sp))
+            while cc[0] < len(comments) && tok_start(comments[cc[0]]) < span_end2(sp) {
+                cc[0] = cc[0] + 1
+            }
+        } else {
+            push(buf, "\"")
+            fmt_interp_parts(n, src, comments, cc, indent, buf)
+            push(buf, "\"")
+        }
+    } else {
+        let level = bin_prec(op)
+        fmt_child(lhs, level, src, comments, cc, indent, buf)
+        push(buf, " ")
+        push(buf, bin_op_text(op))
+        push(buf, " ")
+        fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
+    }
+}
+
+fn fmt_logical(op, lhs, rhs, src, comments, mut cc, indent, mut buf) {
+    let level = if op == frontend::t_and_and {
+        3
+    } else {
+        2
+    }
+    fmt_child(lhs, level, src, comments, cc, indent, buf)
+    push(buf, " ")
+    push(buf, bin_op_text(op))
+    push(buf, " ")
+    fmt_child(rhs, level + 1, src, comments, cc, indent, buf)
+}
+
+fn fmt_unary(op, rhs, src, comments, mut cc, indent, mut buf) {
+    push(buf, unary_op_text(op))
+    fmt_child(rhs, 8, src, comments, cc, indent, buf)
+}
+
+fn fmt_recv(e, src, comments, mut cc, indent, mut buf) {
+    push(buf, "<-")
+    fmt_child(e, 8, src, comments, cc, indent, buf)
+}
+
+fn fmt_try(e, src, comments, mut cc, indent, mut buf) {
+    fmt_child(e, 9, src, comments, cc, indent, buf)
+    push(buf, "?")
+}
+
+fn fmt_field(base, field, src, comments, mut cc, indent, mut buf) {
+    fmt_child(base, 9, src, comments, cc, indent, buf)
+    push(buf, ".")
+    push(buf, field)
+}
+
+fn fmt_index_expr(target, idx, src, comments, mut cc, indent, mut buf) {
+    fmt_child(target, 9, src, comments, cc, indent, buf)
+    push(buf, "[")
+    fmt_expr(idx, src, comments, cc, indent, buf)
+    push(buf, "]")
+}
+
+fn fmt_te_name(p, name, args, src, comments, mut cc, indent, mut buf) {
+    if p != "" {
+        push(buf, p)
+        push(buf, "::")
+    }
+    push(buf, name)
+    if len(args) > 0 {
+        push(buf, "(")
+        let mut ai = 0
+        while ai < len(args) {
+            if ai > 0 {
+                push(buf, ", ")
+            }
+            fmt_expr(args[ai], src, comments, cc, indent, buf)
+            ai = ai + 1
+        }
+        push(buf, ")")
+    }
+}
+
+fn fmt_te_list(el, src, comments, mut cc, indent, mut buf) {
+    push(buf, "[")
+    fmt_expr(el, src, comments, cc, indent, buf)
+    push(buf, "]")
+}
+
+fn fmt_te_record(names, tes, rowvar, src, comments, mut cc, indent, mut buf) {
+    push(buf, "record ")
+    push(buf, chr(123))
+    if len(names) > 0 {
+        push(buf, " ")
+    }
+    let mut ri = 0
+    while ri < len(names) {
+        if ri > 0 {
+            push(buf, ", ")
+        }
+        push(buf, names[ri])
+        push(buf, ": ")
+        fmt_expr(tes[ri], src, comments, cc, indent, buf)
+        ri = ri + 1
+    }
+    match rowvar {
+        frontend::Node::NoNode => {},
+        _ => {
+            push(buf, " | ")
+            fmt_expr(rowvar, src, comments, cc, indent, buf)
+        },
+    }
+    if len(names) > 0 || rowvar != frontend::Node::NoNode {
+        push(buf, " ")
+    }
+    push(buf, chr(125))
+}
+
+fn fmt_variant_access(en, v, mut buf) {
+    push(buf, en)
+    push(buf, "::")
+    push(buf, v)
+}
+
+fn fmt_pkg_access(pkg, name, mut buf) {
+    push(buf, pkg)
+    push(buf, "::")
+    push(buf, name)
+}
+
+fn fmt_qual_variant(pkg, en, v, mut buf) {
+    push(buf, pkg)
+    push(buf, "::")
+    push(buf, en)
+    push(buf, "::")
+    push(buf, v)
+}
+
+// flush_comments 注释回插：按原始位置放回注释
+// flush_comments reinserts comments: place comments back by original position
+fn flush_comments(comments, mut cc, limit, src, indent, pe0, mut buf) {
+    let mut pe = pe0
+    while cc[0] < len(comments) && tok_start(comments[cc[0]]) < limit {
+        let c = comments[cc[0]]
+        if pe > 0 && src_blank_between(src, pe, tok_start(c)) {
+            push(buf, "\n")
+        }
+        push_indent(buf, indent)
+        push(buf, frontend::tok_lex(c))
+        push(buf, "\n")
+        pe = tok_end(c)
+        cc[0] = cc[0] + 1
+    }
+    pe
+}
+
+// try_trailing 尝试行尾注释 / try_trailing tries a trailing comment
+fn try_trailing(comments, mut cc, code_end, src, mut buf) {
+    if cc[0] < len(comments) {
+        let c = comments[cc[0]]
+        let s = tok_start(c)
+        if s >= code_end && !src_has_newline(src, code_end, s) {
+            push(buf, " ")
+            push(buf, frontend::tok_lex(c))
+            cc[0] = cc[0] + 1
+            return tok_end(c)
+        }
+    }
+    code_end
+}
+
+// fmt_select_arm select 臂格式化 / fmt_select_arm formats a select arm
+fn fmt_select_arm(n, src, comments, mut cc, indent, mut buf) {
+    match n {
+        frontend::Node::SelectArm(is_send, bind, _, ch, val, body, _) => {
+            if is_send {
+                fmt_expr(ch, src, comments, cc, indent, buf)
+                push(buf, " <- ")
+                fmt_expr(val, src, comments, cc, indent, buf)
+            } else {
+                if bind != "" {
+                    push(buf, bind)
+                    push(buf, " = ")
+                }
+                push(buf, "<-")
+                fmt_expr(ch, src, comments, cc, indent, buf)
+            }
+            push(buf, " => ")
+            fmt_expr(body, src, comments, cc, indent, buf)
+        },
+        _ => fmt_internal("select arm is not a SelectArm"),
+    }
+}
+
+// fmt_fn_lit 函数字面量格式化 / fmt_fn_lit formats a function literal
+fn fmt_fn_lit(name, n, src, comments, mut cc, indent, mut buf) {
+    match n {
+        frontend::Node::FnLit(params, muts, _pspans, param_tys, ret_ty, body, _, crefs, _) => {
+            push(buf, "fn")
+            if name != "" {
+                push(buf, " ")
+                push(buf, name)
+            }
+            push(buf, "(")
+            let mut i = 0
+            while i < len(params) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                if muts[i] {
+                    push(buf, "mut ")
+                }
+                push(buf, params[i])
+                match param_tys[i] {
+                    frontend::Node::NoNode => {},
+                    te => {
+                        push(buf, ": ")
+                        fmt_type(te, buf)
+                    },
+                }
+                i = i + 1
+            }
+            push(buf, ")")
+            match ret_ty {
+                frontend::Node::NoNode => {},
+                te => {
+                    push(buf, " -> ")
+                    fmt_type(te, buf)
+                },
+            }
+            if len(crefs) > 0 {
+                push(buf, " capture(ref ")
+                let mut k = 0
+                while k < len(crefs) {
+                    if k > 0 {
+                        push(buf, ", ref ")
+                    }
+                    push(buf, crefs[k])
+                    k = k + 1
+                }
+                push(buf, ")")
+            }
+            push(buf, " ")
+            fmt_expr(body, src, comments, cc, indent, buf)
+        },
+        _ => fmt_internal("fn decl without fn literal"),
+    }
+}
+
+// push_indent 推入缩进 / push_indent pushes indentation
+fn push_indent(mut buf, mut n) {
+    while n > 0 {
+        push(buf, " ")
+        n = n - 1
+    }
+}
+
+// fmt_interp_parts 格式化插值各部分 / fmt_interp_parts formats interpolation parts
+fn fmt_interp_parts(n, src, comments, mut cc, indent, mut buf) {
+    match n {
+        frontend::Node::StrLit(seg, _) => fmt_interp_segment(seg, buf),
+        frontend::Node::Binary(op, with_expr, rhs, _) => match rhs {
+            frontend::Node::StrLit(seg, _) => match with_expr {
+                frontend::Node::Binary(op2, prefix, inner, _) => {
+                    if op != frontend::t_plus || op2 != frontend::t_plus {
+                        fmt_internal("malformed interpolation concat chain")
+                    }
+                    fmt_interp_parts(prefix, src, comments, cc, indent, buf)
+                    push(buf, "" + chr(123) + "")
+                    fmt_expr(inner, src, comments, cc, indent, buf)
+                    push(buf, "}")
+                    fmt_interp_segment(seg, buf)
+                },
+                _ => fmt_internal("malformed interpolation expression link"),
+            },
+            _ => fmt_internal("malformed interpolation segment link"),
+        },
+        _ => fmt_internal("malformed interpolation segment link"),
+    }
+}
+
+// fmt_interp_segment 格式化单个插值片段 / fmt_interp_segment formats one interpolation segment
+fn fmt_interp_segment(s, mut buf) {
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let c = char_at(s, i)
+        let esc = if c == "\\" {
+            "\\\\"
+        } else if c == "\n" {
+            "\\n"
+        } else if c == "\t" {
+            "\\t"
+        } else if c == "\"" {
+            "\\\""
+        } else if c == "" + chr(123) + "" {
+            "" + chr(123) + "" + chr(123) + ""
+        } else {
+            ""
+        }
+        if esc != "" {
+            push(buf, substr(s, seg, i - seg))
+            push(buf, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(buf, substr(s, seg, str_len(s) - seg))
+}
+
+// span_is_interpolation 判断区间是否为插值 / span_is_interpolation tells whether the span is interpolation
+fn span_is_interpolation(src, sp) {
+    let raw = span_text(src, sp)
+    match frontend::lex(raw) {
+        lib::LexOut::Lexed(toks, diags, _) => {
+            if len(diags) > 0 || len(toks) == 0 || frontend::tok_type(toks[0]) != frontend::t_interp_start {
+                false
+            } else {
+                let mut depth = 0
+                let mut i = 0
+                let mut done = false
+                let mut exact = false
+                while i < len(toks) && !done {
+                    let t = frontend::tok_type(toks[i])
+                    if t == frontend::t_interp_start {
+                        depth = depth + 1
+                    } else if t == frontend::t_interp_end {
+                        depth = depth - 1
+                        if depth == 0 {
+                            exact = tok_end(toks[i]) == str_len(raw)
+                            done = true
+                        }
+                    }
+                    i = i + 1
+                }
+                exact
+            }
+        },
+    }
+}
+
+// bin_op_text 二元操作符文本 / bin_op_text renders a binary operator
+fn bin_op_text(op) {
+    if op == frontend::t_plus {
+        "+"
+    } else if op == frontend::t_minus {
+        "-"
+    } else if op == frontend::t_star {
+        "*"
+    } else if op == frontend::t_slash {
+        "/"
+    } else if op == frontend::t_percent {
+        "%"
+    } else if op == frontend::t_eq_eq {
+        "=="
+    } else if op == frontend::t_bang_eq {
+        "!="
+    } else if op == frontend::t_lt {
+        "<"
+    } else if op == frontend::t_lt_eq {
+        "<="
+    } else if op == frontend::t_gt {
+        ">"
+    } else if op == frontend::t_gt_eq {
+        ">="
+    } else if op == frontend::t_and_and {
+        "&&"
+    } else if op == frontend::t_or_or {
+        "||"
+    } else {
+        fmt_internal("unknown operator token")
+        ""
+    }
+}
+
+// fmt_arm match 臂格式化 / fmt_arm formats a match arm
+fn fmt_arm(n, src, comments, mut cc, indent, mut buf) {
+    match n {
+        frontend::Node::MatchArm(pat, guard, body, _) => {
+            fmt_pat(pat, src, buf)
+            match guard {
+                frontend::Node::NoNode => {},
+                _ => {
+                    push(buf, " if ")
+                    fmt_expr(guard, src, comments, cc, indent, buf)
+                },
+            }
+            push(buf, " => ")
+            fmt_expr(body, src, comments, cc, indent, buf)
+        },
+        _ => fmt_internal("match arm is not a MatchArm"),
+    }
+}
+
+// fmt_pat 模式格式化 / fmt_pat formats a pattern
+fn fmt_pat(n, src, mut buf) {
+    match n {
+        frontend::Node::PatWildcard(_) => push(buf, "_"),
+        frontend::Node::PatLiteral(_, sp) => push(buf, span_text(src, sp)),
+        frontend::Node::PatBinding(name, _) => push(buf, name),
+        frontend::Node::PatVariant(pkg, en, v, binds, _) => {
+            if pkg != "" {
+                push(buf, pkg)
+                push(buf, "::")
+            }
+            if en != "" {
+                push(buf, en)
+                push(buf, "::")
+            }
+            push(buf, v)
+            if len(binds) > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(binds) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_pat(binds[i], src, buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        _ => fmt_internal("unhandled pattern node"),
+    }
+}
+
+// node_prec 表达式优先级（加括号决策） / node_prec computes expression precedence (parenthesization decision)
+fn node_prec(n) {
+    match n {
+        frontend::Node::Logical(op, _, _, _) => if op == frontend::t_and_and {
+            3
+        } else {
+            2
+        },
+        frontend::Node::Pipe(_, _, _, _) => 1,
+        frontend::Node::Binary(op, _, _, _) => bin_prec(op),
+        frontend::Node::Unary(_, _, _) => 8,
+        frontend::Node::RecvExpr(_, _) => 8,
+        frontend::Node::Call(_, _, _) => 9,
+        frontend::Node::Index(_, _, _) => 9,
+        frontend::Node::TryExpr(_, _) => 9,
+        frontend::Node::FieldAccess(_, _, _) => 9,
+        frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => 0,
+        frontend::Node::Block(_, _) => 0,
+        frontend::Node::IfExpr(_, _, _, _) => 0,
+        frontend::Node::MatchExpr(_, _, _) => 0,
+        _ => 10,
+    }
+}
+
+// tok_start 取 token 起点 / tok_start returns the token start
+fn tok_start(t) {
+    match t {
+        lib::Token::Tok(_, _, s, _) => s,
+    }
+}
+
+// span_start2 取双 span 起点 / span_start2 returns the two-span start
+fn span_start2(sp) {
+    match sp {
+        frontend::SpanT::Sp(s, _) => s,
+    }
+}
+
+// span_end2 取双 span 终点 / span_end2 returns the two-span end
+fn span_end2(sp) {
+    match sp {
+        frontend::SpanT::Sp(_, e) => e,
+    }
+}
+
+// span_text 取区间文本 / span_text returns the span text
+fn span_text(src, sp) {
+    match sp {
+        frontend::SpanT::Sp(s, e) => substr(src, s, e - s),
+    }
+}
+
+// fmt_stmt 语句格式化 / fmt_stmt formats a statement
+fn fmt_stmt(n, src, comments, mut cc, indent, mut buf) {
+    // 语句格式化：按形态输出，行尾注释回插
+    // Statement formatting: emit per shape, trailing comments reinserted
+    match n {
+        frontend::Node::ConstDecl(name, _, is_pub, ty, init, _) => fmt_const_decl(name, is_pub, ty, init, src, comments, cc, indent, buf),
+        frontend::Node::DestructLet(names, _, is_mut, init, _) => fmt_destruct_let(names, is_mut, init, src, comments, cc, indent, buf),
+        frontend::Node::LetStmt(name, _, is_mut, is_pub, ty, init, _) => fmt_let_stmt(name, is_mut, is_pub, ty, init, src, comments, cc, indent, buf),
+        frontend::Node::FnDecl(name, _, is_pub, fnlit, _) => fmt_fn_decl_stmt(name, is_pub, fnlit, src, comments, cc, indent, buf),
+        frontend::Node::MethodDecl(rt, name, _, fnlit, _) => fmt_method_decl(rt, name, fnlit, src, comments, cc, indent, buf),
+        frontend::Node::ReturnStmt(val, _) => fmt_return_stmt_fmt(val, src, comments, cc, indent, buf),
+        frontend::Node::AssignStmt(target, val, _) => fmt_assign_stmt_fmt(target, val, src, comments, cc, indent, buf),
+        frontend::Node::ExprStmt(e, _) => fmt_expr(e, src, comments, cc, indent, buf),
+        frontend::Node::WhileStmt(cond, body, _) => fmt_while_stmt_fmt(cond, body, src, comments, cc, indent, buf),
+        frontend::Node::ForStmt(v, _, idx, _, iter, _, body, _) => fmt_for_stmt_fmt(v, idx, iter, body, src, comments, cc, indent, buf),
+        frontend::Node::LabelStmt(lb, inner, _) => fmt_label_stmt_fmt(lb, inner, src, comments, cc, indent, buf),
+        frontend::Node::SpawnStmt(call, _) => fmt_spawn_stmt_fmt(call, src, comments, cc, indent, buf),
+        frontend::Node::DeferStmt(body, crefs, _) => fmt_defer_stmt(body, crefs, src, comments, cc, indent, buf),
+        frontend::Node::TypeAliasDecl(name, te, is_pub, _) => fmt_type_alias_fmt(name, te, is_pub, src, comments, cc, indent, buf),
+        frontend::Node::SendStmt(ch, val, _) => fmt_send_stmt_fmt(ch, val, src, comments, cc, indent, buf),
+        frontend::Node::BreakStmt(lb, _) => fmt_break_stmt_fmt(lb, buf),
+        frontend::Node::ContinueStmt(lb, _) => fmt_continue_stmt_fmt(lb, buf),
+        frontend::Node::ImportDecl(alias, _, _, psp, _) => fmt_import_decl_fmt(alias, psp, src, buf),
+        frontend::Node::EnumDecl(name, tparams, variants, is_pub, sp) => fmt_enum_decl(name, tparams, variants, is_pub, sp, src, comments, cc, indent, buf),
+        frontend::Node::SelectStmt(arms, has_default, dflt, dsp, sp) => fmt_select_stmt(arms, has_default, dflt, dsp, sp, src, comments, cc, indent, buf),
+        _ => fmt_internal("unhandled statement node"),
+    }
+}
+
+fn fmt_enum_decl(name, tparams, variants, is_pub, sp, src, comments, mut cc, indent, mut buf) {
+    if is_pub {
+        push(buf, "pub ")
+    }
+    push(buf, "enum ")
+    push(buf, name)
+    if len(tparams) > 0 {
+        push(buf, "(")
+        let mut i = 0
+        while i < len(tparams) {
+            if i > 0 {
+                push(buf, ", ")
+            }
+            push(buf, tparams[i])
+            i = i + 1
+        }
+        push(buf, ")")
+    }
+    push(buf, " " + chr(123) + "\n")
+    let deeper = indent + 4
+    let mut i = 0
+    let mut pe = 0
+    while i < len(variants) {
+        pe = flush_comments(comments, cc, span_start(variants[i]), src, deeper, pe, buf)
+        if pe > 0 && src_blank_between(src, pe, span_start(variants[i])) {
+            push(buf, "\n")
+        }
+        push_indent(buf, deeper)
+        fmt_variant(variants[i], buf)
+        push(buf, ",")
+        pe = try_trailing(comments, cc, span_end(variants[i]), src, buf)
+        push(buf, "\n")
+        i = i + 1
+    }
+    let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
+    push_indent(buf, indent)
+    push(buf, "}")
+}
+
+fn fmt_select_stmt(arms, has_default, dflt, dsp, sp, src, comments, mut cc, indent, mut buf) {
+    push(buf, "select " + chr(123) + "\n")
+    let deeper = indent + 4
+    let mut i = 0
+    let mut pe = 0
+    while i < len(arms) {
+        pe = flush_comments(comments, cc, span_start(arms[i]), src, deeper, pe, buf)
+        if pe > 0 && src_blank_between(src, pe, span_start(arms[i])) {
+            push(buf, "\n")
+        }
+        push_indent(buf, deeper)
+        fmt_select_arm(arms[i], src, comments, cc, deeper, buf)
+        push(buf, ",")
+        pe = try_trailing(comments, cc, span_end(arms[i]), src, buf)
+        push(buf, "\n")
+        i = i + 1
+    }
+    if has_default {
+        pe = flush_comments(comments, cc, span_start2(dsp), src, deeper, pe, buf)
+        if pe > 0 && src_blank_between(src, pe, span_start2(dsp)) {
+            push(buf, "\n")
+        }
+        push_indent(buf, deeper)
+        push(buf, "default => ")
+        fmt_expr(dflt, src, comments, cc, deeper, buf)
+        push(buf, ",")
+        pe = try_trailing(comments, cc, span_end(dflt), src, buf)
+        push(buf, "\n")
+    }
+    let _ = flush_comments(comments, cc, span_end2(sp) - 1, src, deeper, pe, buf)
+    push_indent(buf, indent)
+    push(buf, "}")
+}
+
+fn fmt_const_decl(name, is_pub, ty, init, src, comments, mut cc, indent, mut buf) {
+    if is_pub {
+        push(buf, "pub ")
+    }
+    push(buf, "const ")
+    push(buf, name)
+    if ty != frontend::Node::NoNode {
+        push(buf, ": ")
+        fmt_type(ty, buf)
+    }
+    push(buf, " = ")
+    fmt_expr(init, src, comments, cc, indent, buf)
+}
+
+fn fmt_destruct_let(names, is_mut, init, src, comments, mut cc, indent, mut buf) {
+    push(buf, "let ")
+    if is_mut {
+        push(buf, "mut ")
+    }
+    push(buf, "(")
+    let mut i = 0
+    while i < len(names) {
+        if i > 0 {
+            push(buf, ", ")
+        }
+        push(buf, names[i])
+        i = i + 1
+    }
+    push(buf, ") = ")
+    fmt_expr(init, src, comments, cc, indent, buf)
+}
+
+fn fmt_let_stmt(name, is_mut, is_pub, ty, init, src, comments, mut cc, indent, mut buf) {
+    if is_pub {
+        push(buf, "pub ")
+    }
+    push(buf, "let ")
+    if is_mut {
+        push(buf, "mut ")
+    }
+    push(buf, name)
+    if ty != frontend::Node::NoNode {
+        push(buf, ": ")
+        fmt_type(ty, buf)
+    }
+    push(buf, " = ")
+    fmt_expr(init, src, comments, cc, indent, buf)
+}
+
+fn fmt_fn_decl_stmt(name, is_pub, fnlit, src, comments, mut cc, indent, mut buf) {
+    if is_pub {
+        push(buf, "pub ")
+    }
+    fmt_fn_lit(name, fnlit, src, comments, cc, indent, buf)
+}
+
+fn fmt_for_stmt_fmt(v, idx, iter, body, src, comments, mut cc, indent, mut buf) {
+    push(buf, "for ")
+    if idx != "" {
+        push(buf, idx)
+        push(buf, ", ")
+    }
+    push(buf, v)
+    push(buf, " in ")
+    fmt_expr(iter, src, comments, cc, indent, buf)
+    push(buf, " ")
+    fmt_expr(body, src, comments, cc, indent, buf)
+}
+
+fn fmt_while_stmt_fmt(cond, body, src, comments, mut cc, indent, mut buf) {
+    push(buf, "while ")
+    fmt_expr(cond, src, comments, cc, indent, buf)
+    push(buf, " ")
+    fmt_expr(body, src, comments, cc, indent, buf)
+}
+
+fn fmt_method_decl(_rt, name, fnlit, src, comments, mut cc, indent, mut buf) {
+    match fnlit {
+        frontend::Node::FnLit(params, muts, _, param_tys, ret_ty, body, _, _, _) => {
+            push(buf, "fn (")
+            if len(params) > 0 {
+                push(buf, params[0])
+                push(buf, ": ")
+                fmt_type(param_tys[0], buf)
+            }
+            push(buf, ") ")
+            push(buf, name)
+            push(buf, "(")
+            let mut i = 1
+            while i < len(params) {
+                if i > 1 {
+                    push(buf, ", ")
+                }
+                if muts[i] {
+                    push(buf, "mut ")
+                }
+                push(buf, params[i])
+                match param_tys[i] {
+                    frontend::Node::NoNode => {},
+                    te => {
+                        push(buf, ": ")
+                        fmt_type(te, buf)
+                    },
+                }
+                i = i + 1
+            }
+            push(buf, ")")
+            match ret_ty {
+                frontend::Node::NoNode => {},
+                te => {
+                    push(buf, " -> ")
+                    fmt_type(te, buf)
+                },
+            }
+            push(buf, " ")
+            fmt_expr(body, src, comments, cc, indent, buf)
+        },
+        _ => fmt_internal("method without fn literal"),
+    }
+}
+
+fn fmt_defer_stmt(body, crefs, src, comments, mut cc, indent, mut buf) {
+    push(buf, "defer ")
+    if len(crefs) > 0 {
+        push(buf, "capture(ref ")
+        let mut k = 0
+        while k < len(crefs) {
+            if k > 0 {
+                push(buf, ", ref ")
+            }
+            push(buf, crefs[k])
+            k = k + 1
+        }
+        push(buf, ") ")
+    }
+    fmt_expr(body, src, comments, cc, indent, buf)
+}
+
+fn fmt_return_stmt_fmt(val, src, comments, mut cc, indent, mut buf) {
+    push(buf, "return")
+    match val {
+        frontend::Node::NoNode => {},
+        _ => {
+            push(buf, " ")
+            fmt_expr(val, src, comments, cc, indent, buf)
+        },
+    }
+}
+
+fn fmt_assign_stmt_fmt(target, val, src, comments, mut cc, indent, mut buf) {
+    fmt_expr(target, src, comments, cc, indent, buf)
+    push(buf, " = ")
+    fmt_expr(val, src, comments, cc, indent, buf)
+}
+
+fn fmt_label_stmt_fmt(lb, inner, src, comments, mut cc, indent, mut buf) {
+    push(buf, lb)
+    push(buf, ": ")
+    fmt_stmt(inner, src, comments, cc, indent, buf)
+}
+
+fn fmt_spawn_stmt_fmt(call, src, comments, mut cc, indent, mut buf) {
+    push(buf, "spawn ")
+    fmt_expr(call, src, comments, cc, indent, buf)
+}
+
+fn fmt_type_alias_fmt(name, te, is_pub, src, comments, mut cc, indent, mut buf) {
+    if is_pub {
+        push(buf, "pub ")
+    }
+    push(buf, "type ")
+    push(buf, name)
+    push(buf, " = ")
+    fmt_expr(te, src, comments, cc, indent, buf)
+}
+
+fn fmt_send_stmt_fmt(ch, val, src, comments, mut cc, indent, mut buf) {
+    fmt_expr(ch, src, comments, cc, indent, buf)
+    push(buf, " <- ")
+    fmt_expr(val, src, comments, cc, indent, buf)
+}
+
+fn fmt_break_stmt_fmt(lb, mut buf) {
+    push(buf, "break")
+    if lb != "" {
+        push(buf, " ")
+        push(buf, lb)
+    }
+}
+
+fn fmt_continue_stmt_fmt(lb, mut buf) {
+    push(buf, "continue")
+    if lb != "" {
+        push(buf, " ")
+        push(buf, lb)
+    }
+}
+
+fn fmt_import_decl_fmt(alias, psp, src, mut buf) {
+    push(buf, "import ")
+    if alias != "" {
+        push(buf, alias)
+        push(buf, " ")
+    }
+    push(buf, span_text(src, psp))
+}
+
+// tok_end 取 token 终点 / tok_end returns the token end
+fn tok_end(t) {
+    match t {
+        lib::Token::Tok(_, _, _, e) => e,
+    }
+}
+
+// span_start 取区间起点 / span_start returns the span start
+fn span_start(n) {
+    match frontend::span_of(n) {
+        frontend::SpanT::Sp(s, _) => s,
+    }
+}
+
+// span_end 取区间终点 / span_end returns the span end
+fn span_end(n) {
+    match frontend::span_of(n) {
+        frontend::SpanT::Sp(_, e) => e,
+    }
+}
+
+// fmt_variant 枚举变体格式化 / fmt_variant formats an enum variant
+fn fmt_variant(n, mut buf) {
+    match n {
+        frontend::Node::EnumVariantDecl(name, arity, vtypes, _) => {
+            push(buf, name)
+            if arity > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(vtypes) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_type(vtypes[i], buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        _ => fmt_internal("enum variant is not an EnumVariantDecl"),
+    }
+}
+
+// fmt_type 类型表达式格式化 / fmt_type formats a type expression
+fn fmt_type(n, mut buf) {
+    // 类型表达式格式化：list/record/tuple/fn 签名/具名
+    // Type-expression formatting: list, record, tuple, fn signatures, named
+    match n {
+        frontend::Node::TEName(pkg, name, constraint, targs, _) => {
+            if pkg != "" {
+                push(buf, pkg)
+                push(buf, "::")
+            }
+            push(buf, name)
+            if constraint != "" {
+                push(buf, ":")
+                push(buf, constraint)
+            }
+            if len(targs) > 0 {
+                push(buf, "(")
+                let mut i = 0
+                while i < len(targs) {
+                    if i > 0 {
+                        push(buf, ", ")
+                    }
+                    fmt_type(targs[i], buf)
+                    i = i + 1
+                }
+                push(buf, ")")
+            }
+        },
+        frontend::Node::TEList(el, _) => {
+            push(buf, "[")
+            fmt_type(el, buf)
+            push(buf, "]")
+        },
+        frontend::Node::TEFn(params, ret, _) => {
+            push(buf, "fn(")
+            let mut i = 0
+            while i < len(params) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_type(params[i], buf)
+                i = i + 1
+            }
+            push(buf, ") -> ")
+            fmt_type(ret, buf)
+        },
+        frontend::Node::TETuple(ets, _) => {
+            push(buf, "(")
+            let mut i = 0
+            while i < len(ets) {
+                if i > 0 {
+                    push(buf, ", ")
+                }
+                fmt_type(ets[i], buf)
+                i = i + 1
+            }
+            push(buf, ")")
+        },
+        frontend::Node::TERecord(fnames, ftypes, row, _) => {
+            push(buf, "record ")
+            push(buf, chr(123))
+            let mut i = 0
+            while i < len(fnames) {
+                if i > 0 {
+                    push(buf, ",")
+                }
+                push(buf, " ")
+                push(buf, fnames[i])
+                push(buf, ": ")
+                fmt_type(ftypes[i], buf)
+                i = i + 1
+            }
+            match row {
+                frontend::Node::NoNode => {},
+                _ => {
+                    if len(fnames) > 0 {
+                        push(buf, ",")
+                    }
+                    push(buf, " | ")
+                    fmt_type(row, buf)
+                },
+            }
+            if len(fnames) > 0 {
+                push(buf, " ")
+            }
+            push(buf, chr(125))
+        },
+        _ => fmt_internal("unhandled type expression node"),
+    }
+}
+
+// unary_op_text 一元操作符文本 / unary_op_text renders a unary operator
+fn unary_op_text(op) {
+    if op == frontend::t_minus {
+        "-"
+    } else if op == frontend::t_bang {
+        "!"
+    } else {
+        fmt_internal("unknown unary operator token")
+        ""
+    }
+}
+
+// fmt_internal 报格式化器内部错误 / fmt_internal reports a formatter internal error
+fn fmt_internal(msg) {
+    assert(false, "internal error: fmt: " + msg)
+}
+
+// fmt_child 子表达式格式化（加括号决策） / fmt_child formats a child expression (parens decision)
+fn fmt_child(n, need, src, comments, mut cc, indent, mut buf) {
+    if node_prec(n) < need {
+        push(buf, "(")
+        fmt_expr(n, src, comments, cc, indent, buf)
+        push(buf, ")")
+    } else {
+        fmt_expr(n, src, comments, cc, indent, buf)
+    }
 }

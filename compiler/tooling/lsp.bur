@@ -1,6 +1,11 @@
-// lsp.bur — LSP 服务器：JSON-RPC 传输、文档同步、诊断推送与 hover。
-// LSP server: JSON-RPC transport, document sync, diagnostics push, hover.
+// lsp.bur — 语言服务器：stdin/stdout JSON-RPC、文档 overlay、诊断推送与 hover。
+// The language server: JSON-RPC over stdin/stdout, document overlays,
+// diagnostic publishing and hover.
+
 import json "std/json"
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/module"
 
 // lsp_serve 是 LSP 主循环 / lsp_serve is the LSP main loop
 pub fn lsp_serve() {
@@ -48,5 +53,545 @@ pub fn lsp_serve() {
                 running = false
             },
         }
+    }
+}
+
+// lsp_check_document 类型检查单个文档 / lsp_check_document typechecks a document
+fn lsp_check_document(_uri, src) {
+    let mut all_diags = []
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            all_diags = concat(all_diags, ldiags)
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    all_diags = concat(all_diags, pdiags)
+                    match frontend::fold_consts(stmts) {
+                        frontend::FoldOut::FoldedScript(folded, fdiags) => {
+                            all_diags = concat(all_diags, fdiags)
+                            match frontend::typecheck_script(folded) {
+                                lib::CheckOut::Checked(cdiags, _, _, _, _) => {
+                                    all_diags = concat(all_diags, cdiags)
+                                },
+                            }
+                        },
+                        _ => {},
+                    }
+                },
+            }
+        },
+    }
+    lsp_convert_diags(all_diags, src)
+}
+
+// lsp_publish_diagnostics 发布诊断通知 / lsp_publish_diagnostics publishes a diagnostics notification
+fn lsp_publish_diagnostics(uri, diags) {
+    lsp_write_message(jobj(["jsonrpc", "method", "params"], [json::Json::JStr("2.0"), json::Json::JStr("textDocument/publishDiagnostics"), jobj(["uri", "diagnostics"], [json::Json::JStr(uri), json::Json::JArr(diags)])]))
+}
+
+// lsp_diag_severity 映射诊断严重度 / lsp_diag_severity maps diagnostic severity
+fn lsp_diag_severity(is_err) {
+    if is_err {
+        1
+    } else {
+        2
+    }
+}
+
+// lsp_convert_diags 诊断转 LSP Diagnostic / lsp_convert_diags converts diagnostics to LSP Diagnostics
+fn lsp_convert_diags(diags, src) {
+    lsp_convert_diags_starts(diags, lsp_line_starts(src))
+}
+
+// lsp_convert_diags_starts 带行起始表的诊断转换
+// lsp_convert_diags_starts converts diagnostics with line starts
+fn lsp_convert_diags_starts(diags, starts) {
+    let mut out = []
+    for d in diags {
+        match d {
+            lib::DiagT::Diag(ie, _code, msg, help, s, e) => {
+                let sp = lsp_offset_to_pos(starts, s)
+                let ep = lsp_offset_to_pos(starts, e)
+                let mut message = msg
+                if str_len(help) > 0 {
+                    message = msg + "\n= help: " + help
+                }
+                push(out, jobj(["range", "severity", "source", "message"], [jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(sp[0]), json::Json::JInt(sp[1])]), jobj(["line", "character"], [json::Json::JInt(ep[0]), json::Json::JInt(ep[1])])]), json::Json::JInt(lsp_diag_severity(ie)), json::Json::JStr("bur"), json::Json::JStr(message)]))
+            },
+            lib::DiagT::DiagX(ie, _code, msg, help, s, e, _, _) => {
+                let sp = lsp_offset_to_pos(starts, s)
+                let ep = lsp_offset_to_pos(starts, e)
+                let mut message = msg
+                if str_len(help) > 0 {
+                    message = msg + "\n= help: " + help
+                }
+                push(out, jobj(["range", "severity", "source", "message"], [jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(sp[0]), json::Json::JInt(sp[1])]), jobj(["line", "character"], [json::Json::JInt(ep[0]), json::Json::JInt(ep[1])])]), json::Json::JInt(lsp_diag_severity(ie)), json::Json::JStr("bur"), json::Json::JStr(message)]))
+            },
+        }
+    }
+    out
+}
+
+// lsp_handle_did_open 处理 didOpen / lsp_handle_did_open handles didOpen
+fn lsp_handle_did_open(params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let text = jstr_field(td, "text")
+    module::lsp_doc_set(uri, text)
+    lsp_check_module(uri)
+}
+
+// lsp_handle_did_change 处理 didChange / lsp_handle_did_change handles didChange
+fn lsp_handle_did_change(params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let changes = jarr_field(params, "contentChanges")
+    if len(changes) > 0 {
+        let text = jstr_field(changes[len(changes) - 1], "text")
+        module::lsp_doc_set(uri, text)
+        lsp_check_module(uri)
+    }
+}
+
+// lsp_handle_did_close 处理 didClose / lsp_handle_did_close handles didClose
+fn lsp_handle_did_close(params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    module::lsp_doc_remove(uri)
+    lsp_publish_diagnostics(uri, [])
+}
+
+// lsp_find_module_root 查找模块根 / lsp_find_module_root finds the module root
+fn lsp_find_module_root(file_path) {
+    let mut dir = lsp_parent_dir(file_path)
+    let mut steps = 0
+    while dir != "" && steps < 100 {
+        if file_exists(dir + "/bur.mod") {
+            return dir
+        }
+        if module::lsp_get_root_path() != "" && dir == module::lsp_get_root_path() {
+            return ""
+        }
+        dir = lsp_parent_dir(dir)
+        steps = steps + 1
+    }
+    ""
+}
+
+// lsp_respond 回复一条消息 / lsp_respond responds to a message
+fn lsp_respond(id, result) {
+    lsp_write_message(jobj(["jsonrpc", "id", "result"], [json::Json::JStr("2.0"), id, result]))
+}
+
+// lsp_handle_initialize 处理 initialize / lsp_handle_initialize handles initialize
+fn lsp_handle_initialize(id, params) {
+    let root_uri = jstr_field(params, "rootUri")
+    if root_uri != "" {
+        module::lsp_set_root_path(lsp_normalize_root(lsp_uri_to_path(root_uri)))
+    } else {
+        let root_path = jstr_field(params, "rootPath")
+        if root_path != "" {
+            module::lsp_set_root_path(lsp_normalize_root(root_path))
+        }
+    }
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
+}
+
+// lsp_read_headers 读头直到空行 / lsp_read_headers reads headers up to the blank line
+fn lsp_read_headers() {
+    let header_end = chr(13) + "\n" + chr(13) + "\n"
+    let mut buf = ""
+    let mut tail = ""
+    while true {
+        let b = read_stdin(1)
+        if str_len(b) == 0 {
+            return ""
+        }
+        buf = buf + b
+        tail = tail + b
+        if str_len(tail) > 4 {
+            tail = substr(tail, str_len(tail) - 4, 4)
+        }
+        if tail == header_end {
+            return substr(buf, 0, str_len(buf) - 4)
+        }
+    }
+    ""
+}
+
+// lsp_parse_content_length 解析 Content-Length / lsp_parse_content_length parses Content-Length
+fn lsp_parse_content_length(headers) {
+    let crlf = chr(13) + "\n"
+    let lines = split(headers, crlf)
+    let mut result = -1
+    for line in lines {
+        if result < 0 && str_contains(line, "Content-Length:") {
+            let val = trim(substr(line, 15, str_len(line) - 15))
+            match parse_int(val) {
+                Some(n) => {
+                    result = n
+                },
+                None => {},
+            }
+        }
+    }
+    result
+}
+
+// lsp_handle_hover 处理 hover / lsp_handle_hover handles hover
+fn lsp_handle_hover(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match module::lsp_doc_get(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    let ty = frontend::lsp_type_at(path, offset)
+    if ty == "" {
+        lsp_respond(id, json::Json::JNull)
+    } else {
+        lsp_respond(id, jobj(["contents"], [jobj(["kind", "value"], [json::Json::JStr("markdown"), json::Json::JStr("```bur\n" + ty + "\n```")])]))
+    }
+}
+
+// lsp_handle_definition 处理 go-to-definition / lsp_handle_definition handles textDocument/definition
+fn lsp_handle_definition(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match module::lsp_doc_get(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    match frontend::lsp_def_at(path, offset) {
+        Some(t) => {
+            let (doff, dfile) = t
+            let dpath = dfile
+            let dstarts = lsp_line_starts_for(dpath, [], [])
+            let dpos = lsp_offset_to_pos(dstarts, doff)
+            lsp_respond(id, jobj(["uri", "range"], [json::Json::JStr(lsp_path_to_uri(dpath)), jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(dpos[0]), json::Json::JInt(dpos[1])]), jobj(["line", "character"], [json::Json::JInt(dpos[0]), json::Json::JInt(dpos[1])])])]))
+        },
+        None => {
+            lsp_respond(id, json::Json::JNull)
+        },
+    }
+}
+
+// lsp_read_exact 从 stdin 精确读 n 字节（LSP transport）
+// lsp_read_exact reads exactly n bytes from stdin (LSP transport)
+fn lsp_read_exact(n) {
+    let mut buf = ""
+    let mut remaining = n
+    while remaining > 0 {
+        let chunk = read_stdin(remaining)
+        if str_len(chunk) == 0 {
+            return ""
+        }
+        buf = buf + chunk
+        remaining = remaining - str_len(chunk)
+    }
+    buf
+}
+
+// jstr_field 取字符串字段 / jstr_field reads a string field
+fn jstr_field(v, key) {
+    match jobj_get(v, key) {
+        Some(x) => jstr(x),
+        None => "",
+    }
+}
+
+// jobj_field 取对象字段 / jobj_field reads an object field
+fn jobj_field(v, key) {
+    match jobj_get(v, key) {
+        Some(x) => x,
+        _ => json::Json::JNull,
+    }
+}
+
+// jarr_field 取数组字段 / jarr_field reads an array field
+fn jarr_field(v, key) {
+    match jobj_get(v, key) {
+        Some(x) => {
+            match x {
+                json::Json::JArr(items) => items,
+                _ => [],
+            }
+        },
+        None => [],
+    }
+}
+
+// jobj 构造 JSON 对象 / jobj builds a JSON object
+fn jobj(keys, vals) {
+    json::Json::JObj(keys, vals)
+}
+
+// jobj_get 按键取 JSON 对象值 / jobj_get reads a JSON object value by key
+fn jobj_get(v, key) {
+    match v {
+        json::Json::JObj(keys, vals) => json::get(keys, vals, key),
+        _ => None,
+    }
+}
+
+// jstr 解包 JSON 字符串 / jstr unwraps a JSON string
+fn jstr(v) {
+    match v {
+        json::Json::JStr(s) => s,
+        _ => "",
+    }
+}
+
+// jint 解包 JSON int / jint unwraps a JSON int
+fn jint(v) {
+    match v {
+        json::Json::JInt(n) => n,
+        _ => 0,
+    }
+}
+
+// lsp_check_module 检查整个模块（didOpen 全量检查） / lsp_check_module checks a module (didOpen full check)
+fn lsp_check_module(open_uri) {
+    let open_path = lsp_uri_to_path(open_uri)
+    let root = lsp_find_module_root(open_path)
+    if root == "" {
+        match module::lsp_doc_get(open_uri) {
+            Some(text) => lsp_publish_diagnostics(open_uri, lsp_check_document(open_uri, text)),
+            None => {},
+        }
+        return
+    }
+    match module::load_module(root) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            lsp_publish_module_diags(open_path, diags, dfiles, [], [])
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let mut all_diags = concat(ldiags, [])
+            let mut all_files = concat(lfiles, [])
+            match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                frontend::FoldOut::FoldedPkgs(folded, fdiags, ffiles) => {
+                    all_diags = concat(all_diags, fdiags)
+                    all_files = concat(all_files, ffiles)
+                    frontend::lsp_set_recording(true)
+                    match module::typecheck_cached(folded, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                        lib::CheckOut::Checked(cdiags, cfiles, _, _, _) => {
+                            all_diags = concat(all_diags, cdiags)
+                            all_files = concat(all_files, cfiles)
+                        },
+                    }
+                    frontend::lsp_set_recording(false)
+                },
+                _ => {},
+            }
+            lsp_publish_module_diags(open_path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts)
+        },
+    }
+}
+
+// lsp_read_message 读一条 JSON-RPC 消息 / lsp_read_message reads one JSON-RPC message
+pub fn lsp_read_message() {
+    let headers = lsp_read_headers()
+    if str_len(headers) == 0 {
+        return None
+    }
+    let clen = lsp_parse_content_length(headers)
+    if clen <= 0 {
+        return None
+    }
+    let body = lsp_read_exact(clen)
+    if str_len(body) == 0 {
+        return None
+    }
+    match json::parse(body) {
+        Ok(v) => Some(v),
+        Err(_) => None,
+    }
+}
+
+// lsp_write_message 写一条 JSON-RPC 消息 / lsp_write_message writes one JSON-RPC message
+pub fn lsp_write_message(v) {
+    let crlf = chr(13) + "\n"
+    let body = json::render(v)
+    print("Content-Length: " + str(str_len(body)) + crlf + crlf + body)
+}
+
+// lsp_uri_to_path 把 file:// URI 转路径 / lsp_uri_to_path converts a file:// URI to a path
+fn lsp_uri_to_path(uri) {
+    let p = "file://"
+    let pn = str_len(p)
+    if str_len(uri) > pn && substr(uri, 0, pn) == p {
+        substr(uri, pn, str_len(uri) - pn)
+    } else {
+        uri
+    }
+}
+
+// lsp_path_to_uri 把路径转 file:// URI / lsp_path_to_uri converts a path to a file:// URI
+fn lsp_path_to_uri(path) {
+    "file://" + path
+}
+
+// lsp_line_starts 计算行起始偏移（诊断行列映射用）
+// lsp_line_starts computes line-start offsets (for diagnostic line/column mapping)
+fn lsp_line_starts(src) {
+    let mut starts = [0]
+    let mut i = 0
+    let n = str_len(src)
+    while i < n {
+        if byte_at(src, i) == 10 {
+            push(starts, i + 1)
+        }
+        i = i + 1
+    }
+    starts
+}
+
+// lsp_offset_to_pos 字节偏移转行列 / lsp_offset_to_pos converts a byte offset to line/column
+fn lsp_offset_to_pos(starts, offset) {
+    let mut lo = 0
+    let mut hi = len(starts) - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= offset {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    [lo, offset - starts[lo]]
+}
+
+// lsp_publish_one 发布单个文件的诊断 / lsp_publish_one publishes one file's diagnostics
+fn lsp_publish_one(path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
+    let mut file_diags = []
+    let mut dj = 0
+    while dj < len(all_diags) {
+        if all_files[dj] == path {
+            push(file_diags, all_diags[dj])
+        }
+        dj = dj + 1
+    }
+    let starts = lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts)
+    lsp_publish_diagnostics(lsp_path_to_uri(path), lsp_convert_diags_starts(file_diags, starts))
+}
+
+// lsp_publish_module_diags 发布模块诊断 / lsp_publish_module_diags publishes module diagnostics
+fn lsp_publish_module_diags(open_path, all_diags, all_files, pkgs_fpaths, pkgs_lstarts) {
+    let mut pub_files = []
+    let mut seen = map()
+    let mut pi = 0
+    while pi < len(pkgs_fpaths) {
+        let mut fi = 0
+        while fi < len(pkgs_fpaths[pi]) {
+            let f = pkgs_fpaths[pi][fi]
+            match get(seen, f) {
+                None => {
+                    put(seen, f, true)
+                    push(pub_files, f)
+                },
+                _ => {},
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    let mut di = 0
+    while di < len(all_files) {
+        let f = all_files[di]
+        match get(seen, f) {
+            None => {
+                put(seen, f, true)
+                push(pub_files, f)
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+    match get(seen, open_path) {
+        None => {
+            put(seen, open_path, true)
+            push(pub_files, open_path)
+        },
+        _ => {},
+    }
+    for f in pub_files {
+        if !lib::str_has_prefix(f, "<std:") {
+            lsp_publish_one(f, all_diags, all_files, pkgs_fpaths, pkgs_lstarts)
+        }
+    }
+}
+
+// lsp_normalize_root 规范化工作区根路径 / lsp_normalize_root normalizes the workspace root
+fn lsp_normalize_root(p) {
+    let n = str_len(p)
+    if n > 1 && byte_at(p, n - 1) == 47 {
+        substr(p, 0, n - 1)
+    } else {
+        p
+    }
+}
+
+// lsp_parent_dir 取父目录 / lsp_parent_dir returns the parent directory
+fn lsp_parent_dir(path) {
+    let mut i = str_len(path) - 1
+    while i > 0 && byte_at(path, i) != 47 {
+        i = i - 1
+    }
+    if i <= 0 {
+        ""
+    } else {
+        substr(path, 0, i)
+    }
+}
+
+// lsp_line_starts_for 取文件的行起始表 / lsp_line_starts_for gets a file's line starts
+fn lsp_line_starts_for(path, pkgs_fpaths, pkgs_lstarts) {
+    match module::lsp_doc_get(lsp_path_to_uri(path)) {
+        Some(text) => {
+            return lsp_line_starts(text)
+        },
+        None => {},
+    }
+    let mut pi = 0
+    while pi < len(pkgs_fpaths) {
+        let mut fi = 0
+        while fi < len(pkgs_fpaths[pi]) {
+            if pkgs_fpaths[pi][fi] == path {
+                return pkgs_lstarts[pi][fi]
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    match module::lsp_overlay_read(path) {
+        Ok(s) => lsp_line_starts(s),
+        Err(_) => [0],
     }
 }

@@ -1,10 +1,12 @@
-// cli/run.bur — run/check 路径与折叠。
-// cli/run.bur — run/check paths and folding.
+// run.bur — run / check / dis 子命令：单文件与模块两条入口。
+// The run, check and dis subcommands, over both the single-file and module entries.
 
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/tooling"
 import "burryn.dev/compiler/frontend"
 import "burryn.dev/compiler/bytecode"
+import "burryn.dev/compiler/module"
+import "burryn.dev/compiler/backends/c"
 
 // dispatch 把文件或目录分派到 run/check/dis
 // dispatch sends a file or dir to run/check/dis
@@ -64,6 +66,175 @@ fn run_file(path, mode, argv) {
                         },
                     }
                 },
+            }
+        },
+    }
+}
+
+// run_module 模块管线（目录入口） / run_module runs the module pipeline (directory entry)
+fn run_module(dir0, mode, argv) {
+    let dir = strip_trailing_slash(dir0)
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, binds, chan_fors, _) => {
+                    if mode == mode_check {
+                        if run_check_f(cdiags, cfiles, binds) {
+                            exit(exit_static)
+                        }
+                        return
+                    }
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
+                            exit(exit_static)
+                        },
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => {
+                            if mode == mode_dis {
+                                tooling::dump_disasm(0, fnames, fa, fu, fc, fspans, fk, eq, ev, ea, [])
+                            } else {
+                                bytecode::run_program(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, argv, ls_files, ls_files, ls_tables)
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// run_check check 模式：类型检查 / run_check runs the typecheck mode
+fn run_check(cdiags, path, binds) {
+    let mut has_err = false
+    for line in binds {
+        println(line)
+    }
+    for d in cdiags {
+        if diag_is_error(d) {
+            has_err = true
+        }
+        println(tooling::render_diag(d, path))
+    }
+    has_err
+}
+
+// run_check_f 按文件 check / run_check_f checks per file
+fn run_check_f(cdiags, cfiles, binds) {
+    let mut has_err = false
+    for line in binds {
+        println(line)
+    }
+    let mut i = 0
+    while i < len(cdiags) {
+        if diag_is_error(cdiags[i]) {
+            has_err = true
+        }
+        println(tooling::render_diag(cdiags[i], cfiles[i]))
+        i = i + 1
+    }
+    has_err
+}
+
+// dev_dis 处理 dev dis / dev_dis handles dev dis
+fn dev_dis(src) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
+                                        }
+                                        if !errs {
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, _, fa, fu, fc, fs, fk, eq, ev, ea) => tooling::dump_disasm(0, fnames, fa, fu, fc, fs, fk, eq, ev, ea, lib::line_starts(src)),
+                                            }
+                                        }
+                                    },
+                                },
+                                None => {},
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+// dev_emit_c 处理 dev emit-c / dev_emit_c handles dev emit-c
+fn dev_emit_c(src, path) {
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if len(ldiags) > 0 {
+                for d in ldiags {
+                    println(tooling::dump_diag(d))
+                }
+            } else {
+                match frontend::parse(toks) {
+                    frontend::ParseOut::Parsed(stmts, pdiags) => {
+                        if len(pdiags) > 0 {
+                            for d in pdiags {
+                                println(tooling::dump_diag(d))
+                            }
+                        } else {
+                            match fold_script_for_dev(stmts) {
+                                Some(checked_stmts) => match frontend::typecheck_script(checked_stmts) {
+                                    lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                                        let mut errs = false
+                                        for d in cdiags {
+                                            println(tooling::dump_diag(d))
+                                            if diag_is_error(d) {
+                                                errs = true
+                                            }
+                                        }
+                                        if !errs {
+                                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                                bytecode::CompileOut::CompileFailed(d, _) => println(tooling::dump_diag(d)),
+                                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(c::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)])),
+                                            }
+                                        }
+                                    },
+                                },
+                                None => {},
+                            }
+                        }
+                    },
+                }
             }
         },
     }

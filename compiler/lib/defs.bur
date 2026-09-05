@@ -1,5 +1,8 @@
-// defs.bur — 编译器共享定义：Token/诊断/常量值与字节码 opcode 编号表。
-// Shared compiler definitions: tokens, diagnostics, constants, and the opcode table.
+// defs.bur — 编译器共享定义：Token/诊断/常量值与字节码 opcode 编号表，
+// 附行号表、前缀判定与转义小工具。
+// Shared compiler definitions: token, diagnostic, constant-value and bytecode
+// opcode tables, plus line-table, prefix and escaping helpers.
+
 pub enum Token {
     Tok(int, str, int, int),
 }
@@ -45,4 +48,85 @@ pub enum CVal {
     CEnumType(int),
     CSingleton(int, int),
     CCtor(int, int),
+}
+
+// line_starts 生成行起始表 / line_starts builds a line-start table
+pub fn line_starts(src) {
+    let mut ix = [0]
+    let mut i = 0
+    while i < str_len(src) {
+        if char_at(src, i) == "\n" {
+            push(ix, i + 1)
+        }
+        i = i + 1
+    }
+    ix
+}
+
+// line_of 偏移转行号 / line_of maps an offset to a line number
+pub fn line_of(starts, off) {
+    let o = if off < 0 {
+        0
+    } else {
+        off
+    }
+    let mut line = 0
+    let mut i = 0
+    while i < len(starts) {
+        if starts[i] <= o {
+            line = i + 1
+        }
+        i = i + 1
+    }
+    line
+}
+
+// str_has_prefix 前缀检查 / str_has_prefix checks a prefix
+pub fn str_has_prefix(s, prefix) {
+    let n = str_len(s)
+    let m = str_len(prefix)
+    n >= m && substr(s, 0, m) == prefix
+}
+
+// hex_digit 生成 16 进制数字字符 / hex_digit renders a hex digit character
+fn hex_digit(n) {
+    if n < 10 {
+        str(n)
+    } else {
+        chr(97 + n - 10)
+    }
+}
+
+// go_quote Go 风格字符串转义 / go_quote escapes a string Go-style
+pub fn go_quote(s) {
+    let mut parts = ["\""]
+    let mut seg = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let o = byte_at(s, i)
+        let esc = if o == 34 {
+            "\\\""
+        } else if o == 92 {
+            "\\\\"
+        } else if o == 10 {
+            "\\n"
+        } else if o == 9 {
+            "\\t"
+        } else if o == 13 {
+            "\\r"
+        } else if o < 32 || o == 127 {
+            "\\x" + hex_digit(o / 16) + hex_digit(o % 16)
+        } else {
+            ""
+        }
+        if esc != "" {
+            push(parts, substr(s, seg, i - seg))
+            push(parts, esc)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(s, seg, str_len(s) - seg))
+    push(parts, "\"")
+    join(parts, "")
 }

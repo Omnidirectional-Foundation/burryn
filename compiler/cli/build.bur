@@ -1,7 +1,16 @@
-// cli/build.bur — build/compile/native。
-// cli/build.bur — build/compile/native.
+// build.bur — build 子命令：解析后端与输出选项，走 C 或 x86 路径，
+// 调 cc 编译各单元并链接为原生二进制。
+// The build subcommand: parses backend and output flags, takes the C or x86 path,
+// then drives cc over the units and links a native binary.
 
 import "burryn.dev/compiler/backends/x86"
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/backends/c"
+import "burryn.dev/compiler/tooling"
+import "burryn.dev/compiler/frontend"
+import "burryn.dev/compiler/bytecode"
+import "burryn.dev/compiler/module"
+
 // build_cmd build 子命令 / build_cmd handles the build subcommand
 // build_cmd 解析 build 参数（backend/输出），分派 C 或 x86 后端
 // build_cmd parses build flags (backend/output), dispatching to the C or x86 backend
@@ -132,5 +141,408 @@ fn build_input(input, emit_c, out, backend) {
     } else {
         eprintln("error: backend '" + backend + "' is not yet implemented")
         exit(exit_static)
+    }
+}
+
+// compile_to_c 编译为 C（--emit c 或默认路径） / compile_to_c compiles to C (--emit c or the default path)
+fn compile_to_c(input) {
+    if is_dir(input) {
+        compile_module_to_c(strip_trailing_slash(input))
+    } else {
+        compile_file_to_c(input)
+    }
+}
+
+// compile_file_to_c 单文件转 C 源码 / compile_file_to_c compiles a single file to C
+fn compile_file_to_c(path) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => c::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)]),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// compile_module_to_c 模块转 C 源码 / compile_module_to_c compiles a module to C
+fn compile_module_to_c(dir) {
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
+                            exit(exit_static)
+                        },
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => c::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables),
+                    }
+                },
+            }
+        },
+    }
+}
+
+// compile_to_x86 编译为 x86 ELF / compile_to_x86 compiles to an x86 ELF
+fn compile_to_x86(input) {
+    if is_dir(input) {
+        eprintln("error: x86 backend does not support modules yet")
+        exit(exit_static)
+    } else {
+        compile_file_to_x86(input)
+    }
+}
+
+// compile_file_to_x86 单文件转 x86 二进制
+// compile_file_to_x86 compiles a single file to an x86 binary
+fn compile_file_to_x86(path) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    // 注入 float 运行时（dtoa/strtod 大整数核心），供 parse_float / float 格式化使用。
+    // 注入源码必须排在用户源码之前：float_rt 的顶层常量（TWO_52 等）经 def_global
+    // 初始化，x86 的 float 格式化在运行期调用 format_float，若常量尚未定义则读到 0
+    // 并触发除法陷阱（idiv by zero）。C/VM 的 println 走 runtime native 不依赖注入，
+    // 但注入顺序对三者统一无害。
+    // inject the float runtime (bigint dtoa/strtod core) for parse_float / float
+    // formatting. The injected source must precede user code: float_rt's top-level
+    // constants (TWO_52 etc.) are initialized via def_global, and x86 float formatting
+    // calls format_float at runtime; reading a not-yet-defined constant yields 0 and
+    // triggers an idiv trap. C/VM println goes through runtime natives and does not
+    // depend on the injection, but the ordering is harmless for all three.
+    let injected = match read_file("compiler/lib/float_rt.bur") {
+        Ok(s) => s,
+        Err(_) => "",
+    }
+    // 首行 shebang 只在文本偏移 1 处被识别（lexer.bur），注入把用户代码推到中间；
+    // 编译产物是 ELF 不需要 shebang，把 #! 换为 // 注释以保持行号与列偏移。
+    // The first-line shebang is only recognized at text offset 1 (lexer.bur), and
+    // injection pushes user code to the middle; the ELF output needs no shebang,
+    // so #! becomes a // comment, keeping line and column offsets intact.
+    let src2 = if str_len(src) >= 2 && substr(src, 0, 2) == "#!" {
+        "//" + substr(src, 2, str_len(src) - 2)
+    } else {
+        src
+    }
+    match frontend::lex(injected + src2) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => x86::x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// build_native 调 cc 产出原生二进制 / build_native invokes cc to produce a native binary
+fn build_native(files, out) {
+    for f in files {
+        match write_file(f[0], f[1]) {
+            Ok(_) => {},
+            Err(msg) => {
+                cleanup_native(files, [], [])
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+    }
+    let cc = find_cc()
+    if cc == "" {
+        eprintln("error: no C compiler found (install clang/cc/gcc)")
+        eprintln("hint: run without a toolchain using `bur run`")
+        exit(exit_static)
+    }
+    let mut objs = []
+    for f in files {
+        if ends_with(f[0], ".c") {
+            match exec(cc, ["-O1", "-g1", "-c", f[0], "-Iruntime"]) {
+                Ok(o) => match o {
+                    Output(code, _, err) => {
+                        if code != 0 {
+                            cleanup_native(files, objs, [])
+                            eprint_raw(err)
+                            eprintln("error: C compiler failed")
+                            exit(exit_static)
+                        }
+                        push(objs, obj_name(f[0]))
+                    },
+                },
+                Err(msg) => {
+                    cleanup_native(files, objs, [])
+                    eprintln("error: " + msg)
+                    exit(exit_static)
+                },
+            }
+        }
+    }
+    let mut runtime_objs = []
+    for r in ["runtime/burrt_impl.c", "runtime/burrt_natives.c"] {
+        match exec(cc, ["-O1", "-g1", "-c", r, "-Iruntime"]) {
+            Ok(o) => match o {
+                Output(code, _, err) => {
+                    if code != 0 {
+                        cleanup_native(files, objs, runtime_objs)
+                        eprint_raw(err)
+                        eprintln("error: C compiler failed")
+                        exit(exit_static)
+                    }
+                    push(runtime_objs, obj_name(r))
+                },
+            },
+            Err(msg) => {
+                cleanup_native(files, objs, runtime_objs)
+                eprintln("error: " + msg)
+                exit(exit_static)
+            },
+        }
+    }
+    let mut args = ["-O1", "-g1", "-o", out]
+    for o in objs {
+        push(args, o)
+    }
+    for o in runtime_objs {
+        push(args, o)
+    }
+    push(args, "-lm")
+    let mut link_ok = false
+    match exec(cc, args) {
+        Ok(o) => match o {
+            Output(code, _, err) => {
+                if code != 0 {
+                    eprint_raw(err)
+                    eprintln("error: C compiler failed")
+                } else {
+                    link_ok = true
+                }
+            },
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+        },
+    }
+    cleanup_native(files, objs, runtime_objs)
+    if !link_ok {
+        exit(exit_static)
+    }
+}
+
+// obj_name .c 源文件路径 → 目标 .o 名 / obj_name maps a .c source path to its .o name
+fn obj_name(c) {
+    let b = base_name(c)
+    if ends_with(b, ".c") {
+        substr(b, 0, str_len(b) - 2) + ".o"
+    } else {
+        b + ".o"
+    }
+}
+
+// cleanup_native 删除构建中间产物 / cleanup_native removes build intermediates
+fn cleanup_native(files, objs, runtime_objs) {
+    let mut rm_args = []
+    for f in files {
+        push(rm_args, f[0])
+        if ends_with(f[0], ".c") {
+            push(rm_args, obj_name(f[0]))
+        }
+    }
+    for o in objs {
+        push(rm_args, o)
+    }
+    for o in runtime_objs {
+        push(rm_args, o)
+    }
+    match exec("rm", rm_args) {
+        Ok(_) => {},
+        Err(_) => {},
+    }
+}
+
+// default_out_name 默认输出名（去 .bur 后缀）
+// default_out_name derives the default output name (drop the .bur suffix)
+fn default_out_name(path) {
+    let p = strip_trailing_slash(path)
+    let base = base_name(p)
+    if ends_with(base, ".bur") {
+        substr(base, 0, str_len(base) - 4)
+    } else {
+        base
+    }
+}
+
+// base_name 取路径末段 / base_name returns the last path segment
+fn base_name(p) {
+    let mut start = 0
+    let mut i = 0
+    while i < str_len(p) {
+        if char_at(p, i) == "/" {
+            start = i + 1
+        }
+        i = i + 1
+    }
+    substr(p, start, str_len(p) - start)
+}
+
+// eprint_raw 原样打印到 stderr / eprint_raw prints verbatim to stderr
+fn eprint_raw(s) {
+    if str_len(s) > 0 {
+        eprintln(s)
+    }
+}
+
+// find_cc 探测 clang/cc/gcc / find_cc probes for clang/cc/gcc
+// clang 优先：自举链编 program.c 的峰值内存约为 gcc 一半（实测 2.0GB vs 3.8GB），
+// 8GB 级机器上「编译器进程 + cc 子进程」叠加时 clang 可全程存活，gcc 必 OOM。
+// clang first: peak RSS compiling the bootstrap's program.c is about half of
+// gcc's (measured 2.0GB vs 3.8GB); on 8GB boxes clang survives the compiler-
+// process-plus-cc overlap that OOM-kills gcc.
+fn find_cc() {
+    let candidates = ["clang", "cc", "gcc"]
+    let mut found = ""
+    for name in candidates {
+        if found == "" && cc_works(name) {
+            found = name
+        }
+    }
+    found
+}
+
+// cc_works 判断 cc 是否可用 / cc_works tells whether cc is usable
+fn cc_works(name) {
+    match exec(name, ["--version"]) {
+        Ok(o) => match o {
+            Output(code, _, _) => code == 0,
+        },
+        Err(_) => false,
+    }
+}
+
+// self_exe 取自身可执行路径 / self_exe returns the own executable path
+fn self_exe() {
+    match exec("sh", ["-c", "readlink /proc/$PPID/exe"]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    trim(so)
+                } else {
+                    ""
+                }
+            },
+        },
+        Err(_) => "",
+    }
+}
+
+// dev_build_dir 处理 dev build-dir / dev_build_dir handles dev build-dir
+fn dev_build_dir(dir) {
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            let mut i = 0
+            while i < len(diags) {
+                println(tooling::dump_diag_f(diags[i], dfiles[i]))
+                i = i + 1
+            }
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            let mut i = 0
+            while i < len(ldiags) {
+                println(tooling::dump_diag_f(ldiags[i], lfiles[i]))
+                i = i + 1
+            }
+            match fold_packages_for_dev(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
+                Some(checked_stmts) => match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                    lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                        let mut errs = false
+                        i = 0
+                        while i < len(cdiags) {
+                            println(tooling::dump_diag_f(cdiags[i], cfiles[i]))
+                            if diag_is_error(cdiags[i]) {
+                                errs = true
+                            }
+                            i = i + 1
+                        }
+                        if !errs {
+                            let ls_files = concat_lists(pkgs_fpaths)
+                            let ls_tables = concat_lists(pkgs_lstarts)
+                            match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, f) => println(tooling::dump_diag_f(d, f)),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => print(c::cgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables)),
+                            }
+                        }
+                    },
+                },
+                None => {},
+            }
+        },
     }
 }
