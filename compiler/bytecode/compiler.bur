@@ -6,6 +6,9 @@
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
+// BcCtx 各发射 helper 共用的上下文 / BcCtx is the context shared by the emission helpers
+type BcCtx = record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }
+
 // 编译输出：常量表/代码/函数表等平行结构，供 VM 加载
 // Compiled output: parallel tables (constants, code, functions) for the VM
 pub enum CompileOut {
@@ -328,7 +331,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
     Compiled(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities)
 }
 
-fn cp_assign(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, global_mut, pkg_decls, cur_pkg, ch, target, val, sp, cp_expr) {
+fn cp_assign(ctx: BcCtx, global_mut, pkg_decls, cur_pkg, ch, target, val, sp, cp_expr) {
     match target {
         frontend::Node::Ident(name, _) => {
             match cp_expr(ch, val) {
@@ -400,7 +403,7 @@ fn cp_assign(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     }
 }
 
-fn cp_block_stmts(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, blk, cp_stmt) {
+fn cp_block_stmts(ctx: BcCtx, ch, blk, cp_stmt) {
     begin_scope(ctx, ch)
     match blk {
         frontend::Node::Block(ss, bsp) => {
@@ -419,7 +422,7 @@ fn cp_block_stmts(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f
     Ok(true)
 }
 
-fn cp_block_expr(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, blk, cp_expr, cp_stmt) {
+fn cp_block_expr(ctx: BcCtx, ch, blk, cp_expr, cp_stmt) {
     begin_scope(ctx, ch)
     match blk {
         frontend::Node::Block(ss, bsp) => {
@@ -489,7 +492,7 @@ fn declare_enum(mut en_qual, mut en_vnames, mut en_varities, mut en_prefix, mut 
     len(en_qual) - 1
 }
 
-fn next_slot(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch) {
+fn next_slot(ctx: BcCtx, ch) {
     let n = n_locals(ctx.c_l_name, ch)
     if n > 0 {
         ctx.c_l_slot[ch][n - 1] + 1 + (ctx.c_temps[ch] - ctx.c_l_tempsbelow[ch][n - 1])
@@ -498,7 +501,7 @@ fn next_slot(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     }
 }
 
-fn declare_local(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, name, is_mut, sp) {
+fn declare_local(ctx: BcCtx, ch, name, is_mut, sp) {
     let slot = next_slot(ctx, ch)
     if slot > 65534 {
         return frontend::perr("E2003", "", "too many locals", sp)
@@ -512,38 +515,38 @@ fn declare_local(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
 // 含 c_fn；勿对 ctx 标 mut（E0597）。
 // Includes c_fn; do not mark ctx mut (E0597).
 
-fn emit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, b, sp) {
+fn emit(ctx: BcCtx, ch, b, sp) {
     push(ctx.f_code[ctx.c_fn[ch]], b)
     push(ctx.f_spans[ctx.c_fn[ch]], sp)
 }
 
-fn emit_u16(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, sp) {
+fn emit_u16(ctx: BcCtx, ch, v, sp) {
     emit(ctx, ch, v / 256, sp)
     emit(ctx, ch, v % 256, sp)
 }
 
-fn code_len(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch) {
+fn code_len(ctx: BcCtx, ch) {
     len(ctx.f_code[ctx.c_fn[ch]])
 }
 
-fn add_const(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cv) {
+fn add_const(ctx: BcCtx, ch, cv) {
     push(ctx.f_consts[ctx.c_fn[ch]], cv)
     len(ctx.f_consts[ctx.c_fn[ch]]) - 1
 }
 
-fn emit_const(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cv, sp) {
+fn emit_const(ctx: BcCtx, ch, cv, sp) {
     let idx = add_const(ctx, ch, cv)
     emit(ctx, ch, lib::op_const, sp)
     emit_u16(ctx, ch, idx, sp)
 }
 
-fn emit_jump(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, op, sp) {
+fn emit_jump(ctx: BcCtx, ch, op, sp) {
     emit(ctx, ch, op, sp)
     emit_u16(ctx, ch, 65535, sp)
     code_len(ctx, ch) - 2
 }
 
-fn patch_jump(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, at) {
+fn patch_jump(ctx: BcCtx, ch, at) {
     let dist = code_len(ctx, ch) - (at + 2)
     if dist > 65535 {
         return frontend::perr("E2001", "", "jump too large", frontend::SpanT::Sp(0, 0))
@@ -553,7 +556,7 @@ fn patch_jump(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_con
     Ok(true)
 }
 
-fn emit_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, to, sp) {
+fn emit_loop(ctx: BcCtx, ch, to, sp) {
     emit(ctx, ch, lib::op_loop, sp)
     let dist = code_len(ctx, ch) + 2 - to
     if dist > 65535 {
@@ -563,7 +566,7 @@ fn emit_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     Ok(true)
 }
 
-fn emit_variant(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, en_varities, ch, eh, idx, sp) {
+fn emit_variant(ctx: BcCtx, en_varities, ch, eh, idx, sp) {
     if en_varities[eh][idx] == 0 {
         emit_const(ctx, ch, lib::CVal::CSingleton(eh, idx), sp)
     } else {
@@ -571,7 +574,7 @@ fn emit_variant(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_c
     }
 }
 
-fn emit_variant_of(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, en_vnames, en_qual, en_varities, ch, eh, variant, sp) {
+fn emit_variant_of(ctx: BcCtx, en_vnames, en_qual, en_varities, ch, eh, variant, sp) {
     let mut i = 0
     while i < len(en_vnames[eh]) {
         if en_vnames[eh][i] == variant {
@@ -583,7 +586,7 @@ fn emit_variant_of(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], 
     frontend::perr("E2016", "", "enum \"" + en_qual[eh] + "\" has no variant \"" + variant + "\"", sp)
 }
 
-fn emit_variant_test(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, eh, idx, scrut_slot, sp) {
+fn emit_variant_test(ctx: BcCtx, ch, eh, idx, scrut_slot, sp) {
     emit(ctx, ch, lib::op_get_local, sp)
     emit_u16(ctx, ch, scrut_slot, sp)
     emit_const(ctx, ch, lib::CVal::CEnumType(eh), sp)
@@ -592,7 +595,7 @@ fn emit_variant_test(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]]
     Ok(emit_jump(ctx, ch, lib::op_jump_if_false_pop, sp))
 }
 
-fn end_scope(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, sp) {
+fn end_scope(ctx: BcCtx, ch, sp) {
     ctx.c_scope_depth[ch] = ctx.c_scope_depth[ch] - 1
     while n_locals(ctx.c_l_name, ch) > 0 && ctx.c_l_depth[ch][n_locals(ctx.c_l_name, ch) - 1] > ctx.c_scope_depth[ch] {
         if ctx.c_l_captured[ch][n_locals(ctx.c_l_name, ch) - 1] {
@@ -604,7 +607,7 @@ fn end_scope(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     }
 }
 
-fn end_scope_expr(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, sp) {
+fn end_scope_expr(ctx: BcCtx, ch, sp) {
     ctx.c_scope_depth[ch] = ctx.c_scope_depth[ch] - 1
     let mut n = 0
     while n_locals(ctx.c_l_name, ch) > 0 && ctx.c_l_depth[ch][n_locals(ctx.c_l_name, ch) - 1] > ctx.c_scope_depth[ch] {
@@ -670,7 +673,7 @@ fn local_enum(enum_by, en_prefix, cur_pkg, name) {
     }
 }
 
-fn cp_ident(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, en_varities, en_vnames, _en_qual, en_prefix, enum_by, global_mut, pkg_decls, cur_pkg, ch, name, sp) {
+fn cp_ident(ctx: BcCtx, en_varities, en_vnames, _en_qual, en_prefix, enum_by, global_mut, pkg_decls, cur_pkg, ch, name, sp) {
     let li = resolve_local(ctx.c_l_name, ctx.c_l_slot, ch, name)
     if li >= 0 {
         emit(ctx, ch, lib::op_get_local, sp)
@@ -704,7 +707,7 @@ fn cp_ident(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
     Ok(true)
 }
 
-fn cp_variant_access(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, enum_by, en_prefix, en_vnames, en_qual, en_varities, cur_pkg, cur_aliases, ch, en, vr, sp) {
+fn cp_variant_access(ctx: BcCtx, enum_by, en_prefix, en_vnames, en_qual, en_varities, cur_pkg, cur_aliases, ch, en, vr, sp) {
     let apath = alias_path(cur_aliases, en)
     if apath != "" {
         let idx = add_const(ctx, ch, lib::CVal::CStr(apath + "." + vr))
@@ -721,14 +724,14 @@ fn cp_variant_access(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]]
     }
 }
 
-fn cp_pkg_access(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, pkg, name, sp) {
+fn cp_pkg_access(ctx: BcCtx, ch, pkg, name, sp) {
     let idx = add_const(ctx, ch, lib::CVal::CStr(pkg + "." + name))
     emit(ctx, ch, lib::op_get_global, sp)
     emit_u16(ctx, ch, idx, sp)
     Ok(true)
 }
 
-fn cp_qual_variant_access(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, enum_by, en_vnames, en_qual, en_varities, cur_aliases, ch, pkg, en, vr, sp) {
+fn cp_qual_variant_access(ctx: BcCtx, enum_by, en_vnames, en_qual, en_varities, cur_aliases, ch, pkg, en, vr, sp) {
     let apath = alias_path(cur_aliases, pkg)
     let full = if apath != "" {
         apath + "." + en
@@ -746,7 +749,7 @@ fn cp_qual_variant_access(ctx: record { f_code: [[int]], f_spans: [[frontend::Sp
 }
 
 // cp_op1 编译单操作数后发射 op / cp_op1 compiles one operand, then emits op
-fn cp_op1(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, a, op, sp, cp_expr) {
+fn cp_op1(ctx: BcCtx, ch, a, op, sp, cp_expr) {
     match cp_expr(ch, a) {
         Ok(_) => {},
         Err(d) => {
@@ -759,7 +762,7 @@ fn cp_op1(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
 
 // cp_op2 编译两个操作数后发射 op，第二个操作数在临时槽计数抬高时编译
 // cp_op2 compiles two operands then emits op, the second under a bumped temp count
-fn cp_op2(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, a, b, op, sp, cp_expr) {
+fn cp_op2(ctx: BcCtx, ch, a, b, op, sp, cp_expr) {
     match cp_expr(ch, a) {
         Ok(_) => {},
         Err(d) => {
@@ -778,7 +781,7 @@ fn cp_op2(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
     Ok(true)
 }
 
-fn cp_record_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, names, vals, sp, cp_expr) {
+fn cp_record_lit(ctx: BcCtx, ch, names, vals, sp, cp_expr) {
     let ord = field_sort_order(names)
     for k in ord {
         match cp_expr(ch, vals[k]) {
@@ -799,7 +802,7 @@ fn cp_record_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
     Ok(true)
 }
 
-fn cp_record_update(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, base, names, vals, sp, cp_expr) {
+fn cp_record_update(ctx: BcCtx, ch, base, names, vals, sp, cp_expr) {
     match cp_expr(ch, base) {
         Ok(_) => {},
         Err(d) => {
@@ -826,7 +829,7 @@ fn cp_record_update(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]],
     Ok(true)
 }
 
-fn cp_field_access(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, base, field, sp, cp_expr) {
+fn cp_field_access(ctx: BcCtx, ch, base, field, sp, cp_expr) {
     match cp_expr(ch, base) {
         Ok(_) => {},
         Err(d) => {
@@ -839,7 +842,7 @@ fn cp_field_access(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], 
     Ok(true)
 }
 
-fn cp_call(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, method_calls, cur_file, ch, callee, cargs, sp, cp_expr) {
+fn cp_call(ctx: BcCtx, method_calls, cur_file, ch, callee, cargs, sp, cp_expr) {
     let mut m_obj = frontend::Node::NoNode
     let mpath = match callee {
         frontend::Node::FieldAccess(obj, _, _) => {
@@ -911,7 +914,7 @@ fn cp_call(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts
     }
 }
 
-fn cp_tuple_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, elems, sp, cp_expr) {
+fn cp_tuple_lit(ctx: BcCtx, ch, elems, sp, cp_expr) {
     for el in elems {
         match cp_expr(ch, el) {
             Ok(_) => {},
@@ -930,7 +933,7 @@ fn cp_tuple_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_c
     Ok(true)
 }
 
-fn cp_list_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, elems, sp, cp_expr) {
+fn cp_list_lit(ctx: BcCtx, ch, elems, sp, cp_expr) {
     for el in elems {
         match cp_expr(ch, el) {
             Ok(_) => {},
@@ -949,22 +952,22 @@ fn cp_list_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     Ok(true)
 }
 
-fn cp_int_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, sp) {
+fn cp_int_lit(ctx: BcCtx, ch, v, sp) {
     emit_const(ctx, ch, lib::CVal::CInt(v), sp)
     Ok(true)
 }
 
-fn cp_float_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, sp) {
+fn cp_float_lit(ctx: BcCtx, ch, v, sp) {
     emit_const(ctx, ch, lib::CVal::CFloat(v), sp)
     Ok(true)
 }
 
-fn cp_str_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, sp) {
+fn cp_str_lit(ctx: BcCtx, ch, v, sp) {
     emit_const(ctx, ch, lib::CVal::CStr(v), sp)
     Ok(true)
 }
 
-fn cp_bool_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, sp) {
+fn cp_bool_lit(ctx: BcCtx, ch, v, sp) {
     emit(ctx, ch, if v {
         lib::op_true
     } else {
@@ -973,7 +976,7 @@ fn cp_bool_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     Ok(true)
 }
 
-fn cp_unary(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, op, rhs, sp, cp_expr) {
+fn cp_unary(ctx: BcCtx, ch, op, rhs, sp, cp_expr) {
     match cp_expr(ch, rhs) {
         Ok(_) => {},
         Err(d) => {
@@ -988,7 +991,7 @@ fn cp_unary(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
     Ok(true)
 }
 
-fn cp_binary(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, op, lhs, rhs, sp, cp_expr) {
+fn cp_binary(ctx: BcCtx, ch, op, lhs, rhs, sp, cp_expr) {
     match cp_expr(ch, lhs) {
         Ok(_) => {},
         Err(d) => {
@@ -1030,7 +1033,7 @@ fn cp_binary(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     Ok(true)
 }
 
-fn cp_logical(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, op, lhs, rhs, sp, cp_expr) {
+fn cp_logical(ctx: BcCtx, ch, op, lhs, rhs, sp, cp_expr) {
     match cp_expr(ch, lhs) {
         Ok(_) => {},
         Err(d) => {
@@ -1053,7 +1056,7 @@ fn cp_logical(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_con
 }
 
 // cp_for for 代码生成 / cp_for codegens the for statement
-fn cp_for(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, idx, iter, body, sp, cp_expr, cp_stmt) {
+fn cp_for(ctx: BcCtx, ch, v, idx, iter, body, sp, cp_expr, cp_stmt) {
     begin_scope(ctx, ch)
     match cp_expr(ch, iter) {
         Ok(_) => {},
@@ -1127,7 +1130,7 @@ fn cp_for(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts:
     Ok(true)
 }
 
-fn cp_for_chan(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, v, iter, body, sp, cp_expr, cp_stmt) {
+fn cp_for_chan(ctx: BcCtx, ch, v, iter, body, sp, cp_expr, cp_stmt) {
     begin_scope(ctx, ch)
     match cp_expr(ch, iter) {
         Ok(_) => {},
@@ -1174,7 +1177,7 @@ fn cp_for_chan(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     Ok(true)
 }
 
-fn new_func(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, name, file, arity) {
+fn new_func(ctx: BcCtx, name, file, arity) {
     push(ctx.f_name, name)
     push(ctx.f_file, file)
     push(ctx.f_arity, arity)
@@ -1185,7 +1188,7 @@ fn new_func(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
     len(ctx.f_name) - 1
 }
 
-fn new_compiler(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, enc, fh) {
+fn new_compiler(ctx: BcCtx, enc, fh) {
     push(ctx.c_enclosing, enc)
     push(ctx.c_fn, fh)
     push(ctx.c_scope_depth, 0)
@@ -1209,7 +1212,7 @@ fn new_compiler(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_c
     len(ctx.c_fn) - 1
 }
 
-fn cp_function(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, cur_file, ch, lit, cp_expr, cp_stmt) {
+fn cp_function(ctx: BcCtx, cur_file, ch, lit, cp_expr, cp_stmt) {
     match lit {
         frontend::Node::FnLit(params, muts, _, _, _, body, name, crefs, lsp) => {
             let fh = new_func(ctx, name, cur_file, len(params))
@@ -1263,7 +1266,7 @@ fn cp_function(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
 }
 
 // define_global 定义全局变量 / define_global defines a global
-fn define_global(emit_ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, mut global_mut, _c_fn, enum_by, cur_pkg, ch, name, is_mut, sp) {
+fn define_global(emit_ctx: BcCtx, mut global_mut, _c_fn, enum_by, cur_pkg, ch, name, is_mut, sp) {
     let qual = qualify(cur_pkg, name)
     let exists = match get(global_mut, qual) {
         Some(_) => true,
@@ -1318,7 +1321,7 @@ fn register_enum_decl(mut en_qual, mut en_vnames, mut en_varities, mut en_prefix
     Ok(declare_enum(en_qual, en_vnames, en_varities, en_prefix, enum_by, global_mut, qual, cur_pkg, vnames, varities))
 }
 
-fn cp_if(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cond, then, els, sp, cp_expr, cp_stmt) {
+fn cp_if(ctx: BcCtx, ch, cond, then, els, sp, cp_expr, cp_stmt) {
     let mut cur_cond = cond
     let mut cur_then = then
     let mut cur_els = els
@@ -1363,7 +1366,7 @@ fn cp_if(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: 
     Ok(true)
 }
 
-fn push_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, base, cont_to) {
+fn push_loop(ctx: BcCtx, ch, base, cont_to) {
     push(ctx.c_lp_base[ch], base)
     push(ctx.c_lp_contto[ch], cont_to)
     push(ctx.c_lp_breaks[ch], [])
@@ -1371,7 +1374,7 @@ fn push_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     push(ctx.c_lp_labels[ch], ctx.c_lbl_pending[ch])
 }
 
-fn pop_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch) {
+fn pop_loop(ctx: BcCtx, ch) {
     let _ = pop(ctx.c_lp_base[ch])
     let _ = pop(ctx.c_lp_contto[ch])
     let _ = pop(ctx.c_lp_breaks[ch])
@@ -1379,7 +1382,7 @@ fn pop_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_const
     let _ = pop(ctx.c_lp_labels[ch])
 }
 
-fn labeled_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
+fn labeled_loop(ctx: BcCtx, ch, lb, sp) {
     let mut li = len(ctx.c_lp_labels[ch]) - 1
     while li >= 0 {
         if ctx.c_lp_labels[ch][li] == lb {
@@ -1400,7 +1403,7 @@ fn labeled_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_c
     frontend::perr("E2018", "", "no loop labeled `" + lb + "` in scope", sp)
 }
 
-fn unwind_to_loop(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, sp) {
+fn unwind_to_loop(ctx: BcCtx, ch, sp) {
     if len(ctx.c_lp_base[ch]) == 0 {
         return frontend::perr("E2013", "", "break/continue outside of a loop", sp)
     }
@@ -1457,7 +1460,7 @@ fn field_sort_order(names) {
 // cp_match match 代码生成：变体测试（枚举身份 + tag）与字段提取，无哈希、无反射
 // cp_match codegens match: variant tests (enum identity + tag) and field
 // extraction, no hashing, no reflection
-fn cp_match(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, enum_by, en_prefix, en_vnames, en_varities, cur_pkg, cur_aliases, ch, scrut, arms, msp, cp_expr) {
+fn cp_match(ctx: BcCtx, enum_by, en_prefix, en_vnames, en_varities, cur_pkg, cur_aliases, ch, scrut, arms, msp, cp_expr) {
     begin_scope(ctx, ch)
     match cp_expr(ch, scrut) {
         Ok(_) => {},
@@ -1669,7 +1672,7 @@ fn alias_path(cur_aliases, name) {
 }
 
 // push_local 压入局部变量记录 / push_local records a local
-fn push_local(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, name, depth, slot, is_mut, tempsbelow) {
+fn push_local(ctx: BcCtx, ch, name, depth, slot, is_mut, tempsbelow) {
     push(ctx.c_l_name[ch], name)
     push(ctx.c_l_depth[ch], depth)
     push(ctx.c_l_slot[ch], slot)
@@ -1679,7 +1682,7 @@ fn push_local(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_con
 }
 
 // pop_local 弹出局部变量记录 / pop_local removes a local
-fn pop_local(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch) {
+fn pop_local(ctx: BcCtx, ch) {
     let _ = pop(ctx.c_l_name[ch])
     let _ = pop(ctx.c_l_depth[ch])
     let _ = pop(ctx.c_l_slot[ch])
@@ -1706,12 +1709,12 @@ fn resolve_local(c_l_name, _c_l_slot, ch, name) {
     hit
 }
 
-fn begin_scope(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch) {
+fn begin_scope(ctx: BcCtx, ch) {
     ctx.c_scope_depth[ch] = ctx.c_scope_depth[ch] + 1
 }
 
 // cp_select select 代码生成 / cp_select codegens select
-fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, arms, has_default, dflt, dsp, sp, cp_expr) {
+fn cp_select(ctx: BcCtx, ch, arms, has_default, dflt, dsp, sp, cp_expr) {
     let base_temps = ctx.c_temps[ch]
     for arm in arms {
         match arm {
@@ -1835,7 +1838,7 @@ fn cp_select(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_cons
     Ok(true)
 }
 
-fn cp_spawn_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, call, sp, cp_expr) {
+fn cp_spawn_stmt(ctx: BcCtx, ch, call, sp, cp_expr) {
     match call {
         frontend::Node::Call(callee, cargs, _) => {
             match cp_expr(ch, callee) {
@@ -1866,13 +1869,13 @@ fn cp_spawn_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
     }
 }
 
-fn cp_defer_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, cur_file, ch, body, crefs, sp, cp_expr, cp_stmt) {
+fn cp_defer_stmt(ctx: BcCtx, cur_file, ch, body, crefs, sp, cp_expr, cp_stmt) {
     cp_function(ctx, cur_file, ch, frontend::Node::FnLit([], [], [], [], frontend::Node::NoNode, body, "<defer>", crefs, sp), cp_expr, cp_stmt)?
     emit(ctx, ch, lib::op_defer, sp)
     Ok(true)
 }
 
-fn cp_for_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, chan_fors, cur_file, ch, v, idx, iter, body, sp, cp_expr, cp_stmt) {
+fn cp_for_stmt(ctx: BcCtx, chan_fors, cur_file, ch, v, idx, iter, body, sp, cp_expr, cp_stmt) {
     let fstart = match sp {
         frontend::SpanT::Sp(fs, _) => fs,
     }
@@ -1883,7 +1886,7 @@ fn cp_for_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     }
 }
 
-fn cp_break_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
+fn cp_break_stmt(ctx: BcCtx, ch, lb, sp) {
     let li = if lb == "" {
         unwind_to_loop(ctx, ch, sp)?
     } else {
@@ -1893,7 +1896,7 @@ fn cp_break_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
     Ok(true)
 }
 
-fn cp_continue_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, sp) {
+fn cp_continue_stmt(ctx: BcCtx, ch, lb, sp) {
     let li = if lb == "" {
         unwind_to_loop(ctx, ch, sp)?
     } else {
@@ -1907,7 +1910,7 @@ fn cp_continue_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]],
     }
 }
 
-fn cp_label_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, lb, inner, cp_stmt) {
+fn cp_label_stmt(ctx: BcCtx, ch, lb, inner, cp_stmt) {
     let saved = ctx.c_lbl_pending[ch]
     ctx.c_lbl_pending[ch] = lb
     match cp_stmt(ch, inner) {
@@ -1920,7 +1923,7 @@ fn cp_label_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
     Ok(true)
 }
 
-fn cp_return_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, val, sp, cp_expr) {
+fn cp_return_stmt(ctx: BcCtx, ch, val, sp, cp_expr) {
     match val {
         frontend::Node::NoNode => emit(ctx, ch, lib::op_unit, sp),
         _ => {
@@ -1936,7 +1939,7 @@ fn cp_return_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f
     Ok(true)
 }
 
-fn add_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, index, is_local, is_mut, name, sp) {
+fn add_upvalue(ctx: BcCtx, ch, index, is_local, is_mut, name, sp) {
     let mut i = 0
     while i < len(ctx.c_u_index[ch]) {
         if ctx.c_u_index[ch][i] == index && ctx.c_u_islocal[ch][i] == is_local {
@@ -1955,7 +1958,7 @@ fn add_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_co
     Ok(len(ctx.c_u_index[ch]) - 1)
 }
 
-fn resolve_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, name, sp) {
+fn resolve_upvalue(ctx: BcCtx, ch, name, sp) {
     if ctx.c_enclosing[ch] < 0 {
         return Ok(-1)
     }
@@ -1972,7 +1975,7 @@ fn resolve_upvalue(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], 
     Ok(-1)
 }
 
-fn cp_while(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cond, body, sp, cp_expr, cp_stmt) {
+fn cp_while(ctx: BcCtx, ch, cond, body, sp, cp_expr, cp_stmt) {
     let start = code_len(ctx, ch)
     push_loop(ctx, ch, next_slot(ctx, ch), start)
     match cp_expr(ch, cond) {
