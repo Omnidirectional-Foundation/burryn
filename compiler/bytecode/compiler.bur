@@ -90,7 +90,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             frontend::Node::Call(callee, cargs, sp) => cp_call(emit_ctx, method_calls, cur_file, ch, callee, cargs, sp, cp_expr_ref),
             // 索引：target 与下标入栈后 INDEX_GET
             // Indexing: push the target and index, then INDEX_GET
-            frontend::Node::Index(target, idx, sp) => cp_index(emit_ctx, ch, target, idx, sp, cp_expr_ref),
+            frontend::Node::Index(target, idx, sp) => cp_op2(emit_ctx, ch, target, idx, lib::op_index_get, sp, cp_expr_ref),
             frontend::Node::TupleLit(elems, sp) => cp_tuple_lit(emit_ctx, ch, elems, sp, cp_expr_ref),
             frontend::Node::ListLit(elems, sp) => cp_list_lit(emit_ctx, ch, elems, sp, cp_expr_ref),
             frontend::Node::FnLit(_, _, _, _, _, _, _, _, _) => cp_function(emit_ctx, cur_file, ch, e, cp_expr_ref, cp_stmt_ref),
@@ -104,8 +104,8 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             frontend::Node::VariantAccess(en, vr, sp) => cp_variant_access(emit_ctx, enum_by, en_prefix, en_vnames, en_qual, en_varities, cur_pkg, cur_aliases, ch, en, vr, sp),
             frontend::Node::PkgAccess(pkg, name, sp) => cp_pkg_access(emit_ctx, ch, pkg, name, sp),
             frontend::Node::QualVariantAccess(pkg, en, vr, sp) => cp_qual_variant_access(emit_ctx, enum_by, en_vnames, en_qual, en_varities, cur_aliases, ch, pkg, en, vr, sp),
-            frontend::Node::TryExpr(inner, sp) => cp_try_expr(emit_ctx, ch, inner, sp, cp_expr_ref),
-            frontend::Node::RecvExpr(cch, sp) => cp_recv_expr(emit_ctx, ch, cch, sp, cp_expr_ref),
+            frontend::Node::TryExpr(inner, sp) => cp_op1(emit_ctx, ch, inner, lib::op_try, sp, cp_expr_ref),
+            frontend::Node::RecvExpr(cch, sp) => cp_op1(emit_ctx, ch, cch, lib::op_recv, sp, cp_expr_ref),
             // record 字面量：字段值入栈后构造对象
             // Record literals: push field values, then build the object
             frontend::Node::RecordLit(names, vals, sp) => cp_record_lit(emit_ctx, ch, names, vals, sp, cp_expr_ref),
@@ -195,7 +195,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
                 emit_u16(emit_ctx, ch, idx, sp)
                 Ok(true)
             },
-            frontend::Node::ExprStmt(e, sp) => cp_expr_stmt(emit_ctx, ch, e, sp, cp_expr_ref),
+            frontend::Node::ExprStmt(e, sp) => cp_op1(emit_ctx, ch, e, lib::op_pop, sp, cp_expr_ref),
             frontend::Node::AssignStmt(target, val, sp) => cp_assign(emit_ctx, global_mut, pkg_decls, cur_pkg, ch, target, val, sp, cp_expr_ref),
             frontend::Node::ReturnStmt(val, sp) => cp_return_stmt(emit_ctx, ch, val, sp, cp_expr_ref),
             frontend::Node::WhileStmt(cond, body, sp) => cp_while(emit_ctx, ch, cond, body, sp, cp_expr_ref, cp_stmt_ref),
@@ -205,7 +205,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             frontend::Node::LabelStmt(lb, inner, _) => cp_label_stmt(emit_ctx, ch, lb, inner, cp_stmt_ref),
             frontend::Node::SpawnStmt(call, sp) => cp_spawn_stmt(emit_ctx, ch, call, sp, cp_expr_ref),
             frontend::Node::DeferStmt(body, crefs, sp) => cp_defer_stmt(emit_ctx, cur_file, ch, body, crefs, sp, cp_expr_ref, cp_stmt_ref),
-            frontend::Node::SendStmt(cch, val, sp) => cp_send_stmt(emit_ctx, ch, cch, val, sp, cp_expr_ref),
+            frontend::Node::SendStmt(cch, val, sp) => cp_op2(emit_ctx, ch, cch, val, lib::op_send, sp, cp_expr_ref),
             frontend::Node::SelectStmt(arms, has_default, dflt, dsp, sp) => cp_select(emit_ctx, ch, arms, has_default, dflt, dsp, sp, cp_expr_ref),
             _ => Ok(true),
         }
@@ -745,25 +745,36 @@ fn cp_qual_variant_access(ctx: record { f_code: [[int]], f_spans: [[frontend::Sp
     emit_variant_of(ctx, en_vnames, en_qual, en_varities, ch, eh, vr, sp)
 }
 
-fn cp_try_expr(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, inner, sp, cp_expr) {
-    match cp_expr(ch, inner) {
+// cp_op1 编译单操作数后发射 op / cp_op1 compiles one operand, then emits op
+fn cp_op1(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, a, op, sp, cp_expr) {
+    match cp_expr(ch, a) {
         Ok(_) => {},
         Err(d) => {
             return Err(d)
         },
     }
-    emit(ctx, ch, lib::op_try, sp)
+    emit(ctx, ch, op, sp)
     Ok(true)
 }
 
-fn cp_recv_expr(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cch, sp, cp_expr) {
-    match cp_expr(ch, cch) {
+// cp_op2 编译两个操作数后发射 op，第二个操作数在临时槽计数抬高时编译
+// cp_op2 compiles two operands then emits op, the second under a bumped temp count
+fn cp_op2(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, a, b, op, sp, cp_expr) {
+    match cp_expr(ch, a) {
         Ok(_) => {},
         Err(d) => {
             return Err(d)
         },
     }
-    emit(ctx, ch, lib::op_recv, sp)
+    ctx.c_temps[ch] = ctx.c_temps[ch] + 1
+    match cp_expr(ch, b) {
+        Ok(_) => {},
+        Err(d) => {
+            return Err(d)
+        },
+    }
+    ctx.c_temps[ch] = ctx.c_temps[ch] - 1
+    emit(ctx, ch, op, sp)
     Ok(true)
 }
 
@@ -898,25 +909,6 @@ fn cp_call(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts
             Ok(true)
         },
     }
-}
-
-fn cp_index(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, target, idx, sp, cp_expr) {
-    match cp_expr(ch, target) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    ctx.c_temps[ch] = ctx.c_temps[ch] + 1
-    match cp_expr(ch, idx) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    ctx.c_temps[ch] = ctx.c_temps[ch] - 1
-    emit(ctx, ch, lib::op_index_get, sp)
-    Ok(true)
 }
 
 fn cp_tuple_lit(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, elems, sp, cp_expr) {
@@ -1880,25 +1872,6 @@ fn cp_defer_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
     Ok(true)
 }
 
-fn cp_send_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, cch, val, sp, cp_expr) {
-    match cp_expr(ch, cch) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    ctx.c_temps[ch] = ctx.c_temps[ch] + 1
-    match cp_expr(ch, val) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    ctx.c_temps[ch] = ctx.c_temps[ch] - 1
-    emit(ctx, ch, lib::op_send, sp)
-    Ok(true)
-}
-
 fn cp_for_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, chan_fors, cur_file, ch, v, idx, iter, body, sp, cp_expr, cp_stmt) {
     let fstart = match sp {
         frontend::SpanT::Sp(fs, _) => fs,
@@ -1944,17 +1917,6 @@ fn cp_label_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_
         },
     }
     ctx.c_lbl_pending[ch] = saved
-    Ok(true)
-}
-
-fn cp_expr_stmt(ctx: record { f_code: [[int]], f_spans: [[frontend::SpanT]], f_consts: [[lib::CVal]], c_fn: [int], c_l_name: [[str]], c_l_depth: [[int]], c_l_slot: [[int]], c_l_mut: [[bool]], c_l_captured: [[bool]], c_l_tempsbelow: [[int]], c_scope_depth: [int], c_lp_base: [[int]], c_lp_contto: [[int]], c_lp_breaks: [[[int]]], c_lp_conts: [[[int]]], c_lp_labels: [[str]], c_lbl_pending: [str], c_temps: [int], c_u_index: [[int]], c_u_islocal: [[bool]], c_u_mut: [[bool]], c_u_name: [[str]], c_enclosing: [int], f_nupvals: [int], f_name: [str], f_file: [str], f_arity: [int] }, ch, e, sp, cp_expr) {
-    match cp_expr(ch, e) {
-        Ok(_) => {},
-        Err(d) => {
-            return Err(d)
-        },
-    }
-    emit(ctx, ch, lib::op_pop, sp)
     Ok(true)
 }
 
