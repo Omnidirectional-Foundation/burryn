@@ -397,17 +397,21 @@ jobs:
         with:
           name: gen1
 
-      - name: Build darwin hello
+      - name: Build darwin programs
         run: |
           set -euo pipefail
           chmod +x gen1
-          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o hello-mac
+          mkdir -p macho-out
+          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o macho-out/hello-mac
+          ./gen1 build --backend x86 --os darwin testdata/regression/clock.bur -o macho-out/clock-mac
+          ./gen1 build --backend x86 --os darwin examples/basics/fib.bur -o macho-out/fib-mac
+          ./gen1 build --backend x86 --os darwin examples/basics/float_arith.bur -o macho-out/float_arith-mac
 
-      - name: Upload hello-mac
+      - name: Upload macho programs
         uses: actions/upload-artifact@v4
         with:
-          name: x86-macho-hello
-          path: hello-mac
+          name: x86-macho-progs
+          path: macho-out
           if-no-files-found: error
           retention-days: 7
 
@@ -420,26 +424,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download hello-mac
+      - name: Download macho programs
         uses: actions/download-artifact@v4
         with:
-          name: x86-macho-hello
+          name: x86-macho-progs
+          path: macho-out
 
       - name: Run and compare golden
         run: |
           set -euo pipefail
-          codesign -f -s - hello-mac
-          codesign --verify --strict --verbose=2 hello-mac
-          chmod +x hello-mac
-          xattr -cr hello-mac 2>/dev/null || true
+          codesign -f -s - macho-out/hello-mac
+          codesign --verify --strict --verbose=2 macho-out/hello-mac
+          chmod +x macho-out/hello-mac
+          xattr -cr macho-out/hello-mac 2>/dev/null || true
           echo "--- spctl:"
-          spctl --assess --type execute -vvv hello-mac || true
+          spctl --assess --type execute -vvv macho-out/hello-mac || true
           echo "--- unsigned control:"
-          cp hello-mac hello-unsigned
+          cp macho-out/hello-mac hello-unsigned
           codesign --remove-signature hello-unsigned || true
           ./hello-unsigned && echo "UNSIGNED RUNS" || echo "unsigned rc=$?"
           echo "--- signed run:"
-          if ./hello-mac > actual.txt; then
+          if ./macho-out/hello-mac > actual.txt; then
             diff examples/basics/hello.golden actual.txt
           else
             rc=$?
@@ -451,6 +456,19 @@ jobs:
             for f in $(ls -t ~/Library/Logs/DiagnosticReports/hello-mac*.ips 2>/dev/null | head -1); do cat "$f"; done
             exit "$rc"
           fi
+
+      - name: Run clock and corpus slice
+        run: |
+          set -euo pipefail
+          check_one() {
+            codesign -f -s - "macho-out/$1"
+            chmod +x "macho-out/$1"
+            "macho-out/$1" > "actual-$1.txt"
+            diff "$2" "actual-$1.txt"
+          }
+          check_one clock-mac testdata/regression/clock.golden
+          check_one fib-mac examples/basics/fib.golden
+          check_one float_arith-mac examples/basics/float_arith.golden
 
   runtime:
     needs: []
