@@ -842,25 +842,38 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             // Otherwise consecutive CLOSUREs overwrite p_pending_sub, and a
             // later GET_LOCAL of an older slot writes the wrong closure
             // handle into local_sub (compose labeled as to_s).
-            let cslot = len(ptshadow_ps) - 1
-            if cslot >= len(p_local_sub) {
-                while len(p_local_sub) <= cslot {
-                    push(p_local_sub, -1)
-                }
+            // 顶层 fn/let 声明的闭包进全局（后跟 DEF_GLOBAL/SET_GLOBAL），不占局部槽：
+            // 此时按栈深绑定会污染 ppos_types，后续读无关局部槽命中陈旧 closure 类型。
+            // Closures of top-level fn/let declarations go to globals (followed by
+            // DEF_GLOBAL/SET_GLOBAL) and occupy no local slot: binding by stack depth
+            // would poison ppos_types, serving stale closure types to later slot reads.
+            let cend = pit + 3 + 3 * ctx.f_nupvals[p_sub]
+            let cglobal = if cend < len(pcode) {
+                pcode[cend] == lib::op_def_global || pcode[cend] == lib::op_set_global
+            } else {
+                false
             }
-            p_local_sub[cslot] = p_sub
-            if cslot >= len(ppos_types) {
-                while len(ppos_types) <= cslot {
-                    push(ppos_types, "")
+            if !cglobal {
+                let cslot = len(ptshadow_ps) - 1
+                if cslot >= len(p_local_sub) {
+                    while len(p_local_sub) <= cslot {
+                        push(p_local_sub, -1)
+                    }
                 }
-            }
-            ppos_types[cslot] = "closure:" + str(p_sub)
-            if cslot >= len(ppos_auth) {
-                while len(ppos_auth) <= cslot {
-                    push(ppos_auth, false)
+                p_local_sub[cslot] = p_sub
+                if cslot >= len(ppos_types) {
+                    while len(ppos_types) <= cslot {
+                        push(ppos_types, "")
+                    }
                 }
+                ppos_types[cslot] = "closure:" + str(p_sub)
+                if cslot >= len(ppos_auth) {
+                    while len(ppos_auth) <= cslot {
+                        push(ppos_auth, false)
+                    }
+                }
+                ppos_auth[cslot] = true
             }
-            ppos_auth[cslot] = true
             p_pending_sub = -1
         } else if pop == lib::op_get_upval {
             push(pshadow_ps, "")
