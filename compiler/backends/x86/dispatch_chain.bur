@@ -1,0 +1,43 @@
+// dispatch_chain.bur — syscall 分派链骨架。
+// dispatch_chain.bur — syscall dispatch chain skeleton.
+
+// sys_dispatch_chain 由 (调用号, case 字节) 两张等长表拼出分派器主体。
+// sys_dispatch_chain assembles a dispatcher from equal-length number and case tables.
+// 链体逐条 cmp rax,imm32 + je rel32，未命中落 ud2；每条 case 一律以 jmp rel32
+// 收束到尾声，落点与跳距全部由表长推出。
+// The chain tests with cmp rax,imm32 + je rel32 and falls through to ud2 on a
+// miss; every case ends with a jmp rel32 to the epilogue, and all targets and
+// displacements are derived from the tables.
+// head 是分派前的寄存器保存序列，epilogue 是与之配对的恢复序列。
+// head saves registers before dispatch; epilogue is its matching restore.
+pub fn sys_dispatch_chain(head, nums, cases, epilogue) {
+    let n = len(nums)
+    // cmp rax,imm32 六字节 + je rel32 六字节 / six-byte cmp plus six-byte je
+    let arm = 12
+    let default_case = e1(15) + e1(11)
+
+    let mut offs = []
+    let mut acc = n * arm + str_len(default_case)
+    let mut i = 0
+    while i < n {
+        push(offs, acc)
+        acc = acc + str_len(cases[i]) + 5
+        i = i + 1
+    }
+    let epi_off = acc
+
+    let mut chain = head
+    let mut k = 0
+    while k < n {
+        chain = chain + e1(72) + e1(61) + e4(nums[k]) + e1(15) + e1(132) + e4(offs[k] - (k + 1) * arm)
+        k = k + 1
+    }
+
+    let mut body = ""
+    let mut j = 0
+    while j < n {
+        body = body + cases[j] + e1(233) + e4(epi_off - offs[j] - str_len(cases[j]) - 5)
+        j = j + 1
+    }
+    chain + default_case + body + epilogue
+}

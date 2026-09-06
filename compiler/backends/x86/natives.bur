@@ -1,0 +1,1518 @@
+// natives.bur — native 函数的机器码实现：字符串、列表、映射、文件、网络、
+// 进程、时间与格式化。
+// Machine-code implementations of the natives: strings, lists, maps, files,
+// networking, processes, time and formatting.
+
+// x86gen_tcp_accept_native 内联 tcp_accept：accept syscall + O_NONBLOCK + EAGAIN/EINTR 重试，
+// 返回 Result<int, str>。fd 非阻塞：EAGAIN → waitset 注册 POLLIN → park；唤醒后重试
+// x86gen_tcp_accept_native inlines tcp_accept: the accept syscall with O_NONBLOCK and
+// EAGAIN/EINTR retry, returning Result<int, str>. The fd is non-blocking: EAGAIN registers
+// POLLIN on the waitset and parks; on wake it retries
+fn x86gen_tcp_accept_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 8)
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 8, 1)
+    let retry_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall()
+    let ok_path = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path))
+    let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
+    sub_ri32(rsp, 8) + retry_seq + err_check + fd_park + retry_back + ok_path + fail
+}
+
+// x86gen_tcp_dial_native 内联 tcp_dial：socket/connect/getsockopt syscalls，返回 Result<int, str>。
+// fd 非阻塞：EINPROGRESS/EAGAIN → waitset 注册 POLLOUT → park；唤醒后 getsockopt(SO_ERROR) 验连通
+// x86gen_tcp_dial_native inlines tcp_dial: socket/connect/getsockopt syscalls, returning
+// Result<int, str>. The fd is non-blocking: EINPROGRESS/EAGAIN registers POLLOUT on the waitset
+// and parks; on wake, getsockopt(SO_ERROR) confirms the connection
+fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 32)
+    // park 后 r9 不可靠：fd 一律从 [rsp+8] 重载（VM 语义：fd 是 int，不参与 GC 指针更新）
+    // r9 is unreliable after park: reload the fd from [rsp+8] everywhere (VM semantics: an fd is
+    // an int, so GC pointer updates never apply)
+    let close_ops = mov_rm(rdi, rsp, 8) + sys_mov_rax(3) + syscall()
+    let fail_close = close_ops + fail
+    let sockaddr = x86gen_sockaddr_at()
+    let connect_ok = mov_rm(rax, rsp, 8) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    // sockcheck：getsockopt(SO_ERROR) == 0 才算连通；失败走 fail_close
+    // sockcheck: getsockopt(SO_ERROR) == 0 confirms the connection; failures go to fail_close
+    let sockcheck = mov_rm(rdi, rsp, 8) + mov_ri64(rsi, 1) + mov_ri64(rdx, 4) + lea(r10, rsp, 12) + lea(r8, rsp, 4) + mov_ri32(rcx, 4) + mov_mr32(rsp, 4, rcx) + sys_mov_rax(55) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(mov_rm32(rcx, rsp, 12)) + str_len(test_rr(rcx, rcx)) + str_len(je_rel32(0)) + str_len(connect_ok)) + mov_rm32(rcx, rsp, 12) + test_rr(rcx, rcx) + jne_rel32(str_len(connect_ok))
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, rsp, 8, 4)
+    let connect_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 115)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + str_len(sockcheck)) + neg_r(rax) + mov_ri64(rdx, 115) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0))) + jmp_rel32(str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
+    let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
+    head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close
+}
+
+// x86gen_bool_convert_at 生成 bool→str 转换：true/false 常量字符串
+// x86gen_bool_convert_at emits bool-to-str: true/false constant strings
+// bool-to-str: the constant strings true/false
+fn x86gen_bool_convert_at(off) {
+    let fpath = mov_rr(r11, r12) + mov_ri64(r10, 5) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 435728179558) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + gc_rec(r11, mov_rr(rsi, r10)) + mov_mr(r15, off, r11)
+    let tpath = mov_rr(r11, r12) + mov_ri64(r10, 4) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 1702195828) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + gc_rec(r11, mov_rr(rsi, r10)) + mov_mr(r15, off, r11) + jmp_rel32(str_len(fpath))
+    mov_rm(rax, r15, off) + test_rr(rax, rax) + je_rel32(str_len(tpath)) + tpath + fpath
+}
+
+// x86gen_unit_convert_at 生成 unit→str 转换：()
+// x86gen_unit_convert_at emits unit-to-str: ()
+// unit-to-str: ()
+fn x86gen_unit_convert_at(off) {
+    mov_rm(rax, r15, off) + mov_rr(r11, r12) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_ri64(rdx, 10536) + mov_mr(r11, 8, rdx) + add_ri32(r10, 8) + add_rr(r12, r10) + gc_rec(r11, mov_rr(rsi, r10)) + mov_mr(r15, off, r11)
+}
+
+// x86gen_chr_native 内联 chr：UTF-8 编码（1-4 字节码点分派）
+// x86gen_chr_native inlines chr: UTF-8 encoding (1-4 byte codepoint dispatch)
+// chr inline: UTF-8 encoding (1-4 byte code point dispatch)
+fn x86gen_chr_native() {
+    let p1 = mov_rr(r11, r12) + mov_mr(r11, 8, rax) + mov_ri64(r10, 1) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 16) + vs_pop_n(1)
+    let p2 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 192) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_ri64(r10, 2) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 24) + vs_pop_n(1)
+    let p3 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 12) + shr_rcl(rax) + mov_ri64(r9, 224) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 10, rax) + mov_ri64(r10, 3) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 32) + vs_pop_n(1)
+    let p4 = mov_rr(r11, r12) + mov_rr(r8, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 18) + shr_rcl(rax) + mov_ri64(r9, 240) + or_rr(rax, r9) + mov_mr(r11, 8, rax) + mov_rr(rax, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 12) + shr_rcl(rax) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 9, rax) + mov_rr(rax, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 6) + shr_rcl(rax) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 10, rax) + mov_rr(rax, r8) + mov_ri64(r9, 63) + and_rr(rax, r9) + mov_ri64(r9, 128) + or_rr(rax, r9) + mov_mr(r11, 11, rax) + mov_ri64(r10, 4) + mov_mr(r11, 0, r10) + mov_mr(r15, 0 - 16, r11) + add_ri32(r12, 40) + vs_pop_n(1)
+    let chk1 = mov_ri64(r9, 128) + cmp_rr(rax, r9) + jge_rel32(str_len(p1) + 5)
+    let chk2 = mov_ri64(r9, 2048) + cmp_rr(rax, r9) + jge_rel32(str_len(p2) + 5)
+    let chk3 = mov_ri64(r9, 65536) + cmp_rr(rax, r9) + jge_rel32(str_len(p3) + 5)
+    let jmp1 = jmp_rel32(str_len(chk2) + str_len(p2) + 5 + str_len(chk3) + str_len(p3) + 5 + str_len(p4))
+    let jmp2 = jmp_rel32(str_len(chk3) + str_len(p3) + 5 + str_len(p4))
+    let jmp3 = jmp_rel32(str_len(p4))
+    mov_rm(rax, r15, 0 - 8) + chk1 + p1 + jmp1 + chk2 + p2 + jmp2 + chk3 + p3 + jmp3 + p4
+}
+
+// x86gen_clock_native 内联 clock：CLOCK_MONOTONIC 减去启动时刻，返回相对启动的秒（float 盒）
+// x86gen_clock_native inlines clock: CLOCK_MONOTONIC minus the startup instant, seconds since
+// start (float box)
+// clock inline: monotonic since startup (startup timestamp lives at [rbx + 8*n_globals])
+fn x86gen_clock_native(n_globals) {
+    let ts = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall()
+    let diff_sec = mov_rm(rax, rsp, 0) + mov_rm(rdx, rcx, 0) + sub_rr(rax, rdx) + cvtsi2sd_xmm(0, rax)
+    let diff_nsec = mov_rm(rax, rsp, 8) + mov_rm(rdx, rcx, 8) + sub_rr(rax, rdx) + cvtsi2sd_xmm(1, rax)
+    let frac = mov_ri64(rax, 0x41CDCD6500000000) + movq_xmm_gpr(2, rax) + divsd_xmm(1, 2) + addsd_xmm(0, 1)
+    let fin = movq_gpr_xmm(rax, 0) + add_ri32(rsp, 16)
+    let box = mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8)
+    let ret = mov_mr(r15, 0 - 8, r11)
+    ts + lea(rcx, rbx, 8 * n_globals) + diff_sec + diff_nsec + frac + fin + box + ret
+}
+
+// x86gen_exec_poll_native 内联 exec_poll：单次排空，未完成 → None，完成 → Some(Result)
+// x86gen_exec_poll_native inlines exec_poll: one drain, None when incomplete, Some(Result) when
+// complete
+// exec_poll inline: single pump, None or Some(Result); invalid or consumed handle exits 4
+fn x86gen_exec_poll_native() {
+    let invalid = sys_mov_rdi(4) + sys_mov_rax(60) + syscall()
+    let pump = x86gen_proc_pump()
+    let result = x86gen_proc_result_inst()
+    let some_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_rr(rax, rcx)
+    let none_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_rr(rax, rcx)
+    let store = mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let none_tail = none_inst + store + jmp_rel32(str_len(invalid))
+    let some_tail = result + some_inst + jmp_rel32(str_len(none_inst))
+    let comp_check = mov_rm(rax, r9, proc_complete) + test_rr(rax, rax) + je_rel32(str_len(some_tail))
+    let setup = mov_rr(r9, rax)
+    let consumed = mov_rm(rdx, rax, proc_consumed) + test_rr(rdx, rdx) + jne_rel32(str_len(setup) + str_len(pump) + str_len(comp_check) + str_len(some_tail) + str_len(none_tail))
+    let head = mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + jle_rel32(str_len(consumed) + str_len(setup) + str_len(pump) + str_len(comp_check) + str_len(some_tail) + str_len(none_tail) + str_len(invalid))
+    head + consumed + setup + pump + comp_check + some_tail + none_tail + invalid
+}
+
+// x86gen_str_convert_at 生成通用 int→str 转换（作用于 [r15+off]，str()/拼接复用）
+// x86gen_str_convert_at emits the shared int-to-str conversion
+// (operates on [r15+off]; reused by str() and concat)
+// Generic int-to-str conversion at [r15+off] (shared by str() and concat)
+fn x86gen_str_convert_at(off) {
+    let div_loop = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
+    let div_jne = jne_rel32(0 - (str_len(div_loop) + 6))
+    let neg_write = mov_ri64(rdx, 45) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 1)
+    let alloc = mov_rr(rdx, r10) + add_rr(rdx, r8) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rcx, rdx, 8) + add_rr(r12, rcx) + gc_rec(r11, mov_rr(rsi, rcx)) + lea(rdi, r11, 8) + test_rr(r8, r8) + je_rel32(str_len(neg_write)) + neg_write
+    let pop_loop = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
+    let pop_jne = jne_rel32(0 - (str_len(pop_loop) + 6))
+    let neg_path = mov_ri64(r8, 1) + neg_r(rax)
+    let head = mov_rm(rax, r15, off) + xor_rr(r8, r8) + test_rr(rax, rax) + jge_rel32(str_len(neg_path))
+    let loop_start = xor_rr(r10, r10)
+    head + neg_path + loop_start + div_loop + div_jne + alloc + pop_loop + pop_jne + mov_mr(r15, off, r11)
+}
+
+// x86gen_defer_loop 生成函数返回时的 defer 链执行（LIFO，闭包无参调用，链头在 [rsp]）
+// x86gen_defer_loop emits the defer-chain execution at function return (LIFO, zero-arg closure
+// calls, head at [rsp])
+fn x86gen_defer_loop() {
+    let body = mov_rm(r8, rax, 0) + mov_rm(r9, rax, 8) + mov_mr(rsp, 0, r8) + mov_mr(r15, 0, r9) + add_ri32(r15, 8) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rcx, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax) + sub_ri32(r15, 8)
+    let loop_head = mov_rm(rax, rsp, 0) + test_rr(rax, rax) + je_rel32(str_len(body) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + 5))
+    loop_head + body + back
+}
+
+// x86gen_err_inst 构造 Err("os error") 实例（rax 返回）
+// x86gen_err_inst builds an Err("os error") instance (returned in rax)
+fn x86gen_err_inst() {
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_rr(rax, rcx)
+    err_str + err_inst
+}
+
+// x86gen_exec_native 内联 exec：spawn + 同步排空循环
+// x86gen_exec_native inlines exec: spawn plus a synchronous drain loop
+// exec inline: spawn, drain to completion, build the Result
+fn x86gen_exec_native() {
+    let spawn_seq = x86gen_exec_spawn_native()
+    let pump = x86gen_proc_pump()
+    let result = x86gen_proc_result_inst()
+    let err = x86gen_err_inst()
+    let store = mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let err_tail = err + store
+    let done_seq = result + jmp_rel32(str_len(err))
+    // 1ms 休眠（近似 poll 阻塞等待子进程）/ 1ms sleep (approximating a blocking poll on the child)
+    let ns = sub_ri32(rsp, 16) + mov_ri64(rdx, 0) + mov_mr(rsp, 0, rdx) + mov_ri64(rdx, 1000000) + mov_mr(rsp, 8, rdx) + mov_rr(rdi, rsp) + xor_rr(rsi, rsi) + sys_mov_rax(35) + syscall() + add_ri32(rsp, 16)
+    let loop_head = mov_rm(rax, r9, proc_complete) + test_rr(rax, rax) + jne_rel32(str_len(pump) + str_len(ns) + 5)
+    let loop_back = jmp_rel32(0 - (str_len(loop_head) + str_len(pump) + str_len(ns) + 5))
+    let fail_test = test_rr(rax, rax) + jl_rel32(str_len(mov_rr(r9, rax)) + str_len(loop_head) + str_len(pump) + str_len(ns) + 5 + str_len(done_seq))
+    spawn_seq + fail_test + mov_rr(r9, rax) + loop_head + pump + ns + loop_back + done_seq + err_tail
+}
+
+// x86gen_exec_start_native 内联 exec_start：spawn → Ok(handle) / x86gen_exec_start_native inlines
+// exec_start: spawn into Ok(handle)
+// exec_start inline: spawn, return Ok(handle)
+fn x86gen_exec_start_native() {
+    let spawn_seq = x86gen_exec_spawn_native()
+    let err = x86gen_err_inst()
+    let store = mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let err_tail = err + store
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_rr(rax, rcx)
+    let ok_tail = ok_inst + jmp_rel32(str_len(err))
+    spawn_seq + test_rr(rax, rax) + jl_rel32(str_len(ok_inst) + 5) + ok_tail + err_tail
+}
+
+// x86gen_fd_park_at 生成 fd 等待序列：waitset 注册（[base+off] 的 fd + events 低 16 位）→
+// 置 FB_BLOCKED_FD → push 恢复点 → 保存 ctx → 回调度器。唤醒后从下一条指令继续
+// x86gen_fd_park_at emits the fd-wait sequence: waitset registration (fd at [base+off] with
+// events low 16 bits), set FB_BLOCKED_FD, push the resume point, save ctx, re-enter the
+// scheduler. The fiber resumes at the following instruction
+fn x86gen_fd_park_at(sched_addr, waitset_add_addr, base, off, events) {
+    let park_save = mov_mr(rdi, FB_RSP, rsp) + mov_mr(rdi, FB_RBP, rbp) + mov_mr(rdi, FB_R14, r14) + mov_mr(rdi, FB_R15, r15)
+    let park_tail = mov_ri64(r8, sched_addr) + jmp_r(r8)
+    let park_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(park_save) + str_len(park_tail)) + push_r(r8)
+    let set_status = mov_ri64(r8, FB_BLOCKED_FD) + mov_mr(rdi, FB_STATUS, r8)
+    let add_call = mov_rm(rax, base, off) + mov_ri64(rcx, events) + mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_ri64(r8, waitset_add_addr) + call_r(r8)
+    add_call + set_status + park_push + park_save + park_tail
+}
+
+// x86gen_range_native 内联 range：整数区间列表 / x86gen_range_native inlines range: an integer interval list
+// range inline: integer interval list
+fn x86gen_range_native() {
+    let fill_loop = mov_mr(rdi, 0, rax) + add_ri32(rdi, 8) + add_ri32(rax, 1) + sub_ri32(r9, 1)
+    let fill_jne = jne_rel32(0 - (str_len(fill_loop) + 6))
+    let fill_all = fill_loop + fill_jne
+    mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rr(rax, r9) + sub_rr(rax, r8) + mov_rr(rcx, rax) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + test_rr(rcx, rcx) + je_rel32(str_len(fill_all)) + mov_rr(rdi, r10) + mov_rr(rax, r8) + mov_rr(r9, rcx) + fill_all + mov_rr(r10, rcx) + mov_ri32(rcx, 3) + shl_rcl(r10) + add_ri32(r10, 24) + gc_rec(r11, mov_rr(rsi, r10)) + add_rr(r10, r11) + mov_rr(r12, r10) + vs_pop_n(3) + vs_push(r11)
+}
+
+// x86gen_file_exists_native 内联 file_exists：stat syscall，返回 bool
+// x86gen_file_exists_native inlines file_exists: the stat syscall, returning a bool
+// file_exists inline: stat syscall returning a bool
+fn x86gen_file_exists_native() {
+    let not_found = mov_ri64(rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let found = mov_ri64(rax, 1) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1) + jmp_rel32(str_len(not_found))
+    let head = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + sub_ri32(rsp, 144) + mov_rr(rsi, rsp) + sys_mov_rax(4) + syscall() + add_ri32(rsp, 144)
+    head + test_rr(rax, rax) + jne_rel32(str_len(found)) + found + not_found
+}
+
+// x86gen_read_file_native 内联 read_file：open/fstat/read/close syscall，返回 Result<str, str>
+// x86gen_read_file_native inlines read_file: open/fstat/read/close syscalls, returning Result<str,
+// str>
+// read_file inline: open/fstat/read/close syscalls into Result<str, str>
+fn x86gen_read_file_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let empty_str = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8)
+    let alloc = mov_rr(r8, r12) + mov_mr(r8, 0, r10) + lea(rax, r8, 8) + add_rr(r12, r10) + add_ri32(r12, 8)
+    let fail1 = err_str + err_inst
+    let fail2 = sys_mov_rax(3) + syscall() + err_str + err_inst
+    let empty_path = sys_mov_rax(3) + syscall() + add_ri32(rsp, 144) + empty_str + ok_inst + jmp_rel32(str_len(fail2) + str_len(fail1))
+    let read_seq = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdx, r10) + sys_mov_rax(0) + syscall() + mov_rr(rax, r8) + sys_mov_rax(3) + syscall() + add_ri32(rsp, 144) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(empty_path) + str_len(fail2) + str_len(fail1))
+    let fstat_ok = mov_rm(r10, rsp, 48) + xor_rr(r9, r9) + cmp_rr(r10, r9) + jle_rel32(str_len(alloc) + str_len(read_seq)) + alloc + read_seq + empty_path
+    let fstat_seq = mov_rr(rdi, rax) + sub_ri32(rsp, 144) + mov_rr(rsi, rsp) + sys_mov_rax(5) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(fstat_ok)) + fstat_ok + fail2
+    let open_fail = test_rr(rax, rax) + jl_rel32(str_len(fstat_seq)) + fstat_seq + fail1
+    let head = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + open_fail
+    head
+}
+
+// x86gen_float_const 生成 float 字面量装箱：movabs 位模式 + 新盒 / x86gen_float_const boxes a float literal:
+// movabs bits + fresh box
+fn x86gen_float_const(bits) {
+    mov_rr(r11, r12) + mov_ri64(rax, bits) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + vs_push(r11)
+}
+
+// x86gen_float_cmp 生成装箱 float 比较：结果 bool 落 r15-16（cmpsd 掩码 → neg → 0/1）
+// x86gen_float_cmp emits a boxed float comparison: bool to [r15-16] (cmpsd mask negated to 0/1)
+// cmp 取值：eq/neq/lt/le/gt/ge
+fn x86gen_float_cmp(cmp) {
+    let c = if cmp == "eq" {
+        cmpsd_xmm(0, 1, 0)
+    } else if cmp == "neq" {
+        cmpsd_xmm(0, 1, 4)
+    } else if cmp == "lt" {
+        cmpsd_xmm(0, 1, 1)
+    } else if cmp == "le" {
+        cmpsd_xmm(0, 1, 2)
+    } else if cmp == "gt" {
+        cmpsd_xmm(1, 0, 1)
+    } else {
+        cmpsd_xmm(1, 0, 2)
+    }
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_rm(rcx, rcx, 0) + movq_xmm_gpr(0, rax) + movq_xmm_gpr(1, rcx) + c + movq_gpr_xmm(rax, 0) + neg_r(rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+}
+
+// x86gen_float_neg 生成装箱 float 取负：0.0 - x（匹配 VM，±0.0 都得 +0.0），新盒落 r15-8
+// x86gen_float_neg emits boxed float negation: 0.0 - x (matches the VM; +/-0.0 both yield +0.0),
+// fresh box at [r15-8]
+fn x86gen_float_neg() {
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + movq_xmm_gpr(1, rax) + xor_rr(rax, rax) + movq_xmm_gpr(0, rax) + subsd_xmm(0, 1) + movq_gpr_xmm(rax, 0) + x86gen_float_box_rax(0 - 8)
+}
+
+// x86gen_float_binop 生成装箱 float 二元运算：两盒读位模式 → SSE 运算 → 新盒落 r15-16
+// x86gen_float_binop emits a boxed float binary op: unbox both, SSE op, fresh box at [r15-16]
+fn x86gen_float_binop(op) {
+    let bin = if op == "add" {
+        addsd_xmm(0, 1)
+    } else if op == "sub" {
+        subsd_xmm(0, 1)
+    } else if op == "mul" {
+        mulsd_xmm(0, 1)
+    } else {
+        divsd_xmm(0, 1)
+    }
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_rm(rcx, rcx, 0) + movq_xmm_gpr(0, rax) + movq_xmm_gpr(1, rcx) + bin + movq_gpr_xmm(rax, 0) + x86gen_float_box_rax(0 - 16) + vs_pop_n(1)
+}
+
+// x86gen_float_box_rax 生成"把 rax 的位模式装箱并写回 r15+off" / x86gen_float_box_rax boxes rax's bit pattern
+// and writes the pointer to [r15+off]
+fn x86gen_float_box_rax(off) {
+    mov_rr(r11, r12) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + mov_mr(r15, off, r11)
+}
+
+// x86gen_prologue 生成函数序言：保存 caller 基、按 arity 建帧基、递减 budget；
+// 用尽时 call yield 块（call 推入的返回地址即插桩点，恢复后 ret 直接弹回继续）
+// x86gen_prologue emits the prologue: save the caller base, build the frame base by
+// arity, drain the budget; on exhaustion call the yield block (the call's return
+// address is the instrumentation point, so resume rets straight back)
+fn x86gen_prologue(arity, _locals, yield_addr, lifted) {
+    let yield_call = mov_ri64(rdx, yield_addr) + call_r(rdx)
+    let budget = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_rm(rcx, rax, FB_BUDGET) + sub_ri32(rcx, 1) + mov_mr(rax, FB_BUDGET, rcx) + test_rr(rcx, rcx) + jg_rel32(str_len(yield_call)) + yield_call
+    // 提升参数：入口把参数值搬进 cell，槽 = cell 指针（此后 get/set_local 统一解引用）
+    // lifted params: at entry move the param value into a cell, the slot holds the
+    // cell pointer (get/set_local dereference uniformly afterwards)
+    let mut lift_code = ""
+    let mut pslot = 1
+    while pslot <= arity {
+        if pslot < len(lifted) && lifted[pslot] {
+            lift_code = lift_code + mov_rr(r11, r12) + mov_rm(rax, r14, 8 * pslot) + mov_mr(r11, 0, rax) + add_ri32(r12, 8) + gc_rec(r11, mov_ri64(rsi, 8)) + mov_mr(r14, 8 * pslot, r11)
+        }
+        pslot = pslot + 1
+    }
+    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1)) + sub_ri32(rsp, 8) + xor_rr(rax, rax) + mov_mr(rsp, 0, rax) + budget + lift_code
+}
+
+// x86gen_epilogue 生成函数尾声：返回值落栈并恢复帧
+// x86gen_epilogue emits the epilogue: push the return value and restore the frame
+// Function epilogue: place the return value and restore the frame
+fn x86gen_epilogue() {
+    mov_rm(rax, r15, 0 - 8) + mov_rr(r15, r14) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + mov_rr(r14, rbp) + add_ri32(rsp, 8) + pop_r(rbp) + ret()
+}
+
+// x86gen_list_format_at 生成列表格式化（两遍：先算总长，再写内容）
+// x86gen_list_format_at emits list formatting (two passes: total length, then contents)
+// List formatting (two passes: total length, then contents). str/int/float elements use
+// inline handlers; bool/unit/container elements call the prebuilt elem_code formatter
+fn x86gen_list_format_at(off, elem_type, elem_code, ff_h) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let h1 = mov_rm(r9, r15, off) + mov_rm(r8, r9, 0) + mov_rm(r10, r9, 16) + mov_ri64(rcx, 2) + xor_rr(r11, r11)
+    let int1_loop = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+    let int1_loop_jne = jne_rel32(0 - (str_len(int1_loop) + 6))
+    let int1 = mov_rr(rax, rdx) + xor_rr(rsi, rsi)
+    let int1_add = add_rr(rcx, rsi) + jmp_rel32(0)
+    let str1 = mov_rm(rsi, rdx, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+    let e1_load = mov_rr(rax, rcx) + mov_rr(rsi, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r10) + mov_rm(rdx, rsi, 0) + mov_rr(rcx, rax)
+    let sep1_bytes = add_ri32(rcx, 2)
+    let sep1 = test_rr(r11, r11) + je_rel32(str_len(sep1_bytes)) + sep1_bytes
+    let next1_wo = add_ri32(r11, 1)
+    let int1_neg = add_ri32(rcx, 1) + neg_r(rax)
+    let int1_head = test_rr(rax, rax) + jge_rel32(str_len(int1_neg))
+    let float1 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rcx) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + add_rr(rcx, rsi)
+    // 非 str/int/float 元素：拷入值栈临时槽，调元素 formatter，读 box 长度
+    // non-str/int/float elements: copy into a value-stack temp slot, call the element formatter,
+    // read the box length
+    let wrap1 = push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rcx) + vs_push(rdx) + elem_code + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + add_rr(rcx, rsi)
+    let tail1 = if elem_type == "float" {
+        float1
+    } else if elem_type == "str" {
+        str1
+    } else if elem_type == "int" {
+        int1 + int1_head + int1_neg + int1_loop + int1_loop_jne + int1_add
+    } else {
+        wrap1
+    }
+    let test1 = cmp_rr(r11, r8) + jae_rel32(str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5)
+    let next1 = next1_wo + jmp_rel32(0 - (str_len(test1) + str_len(sep1) + str_len(e1_load) + str_len(tail1) + str_len(next1_wo) + 5))
+    let alloc_zone = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + mb(91) + add_ri32(rdi, 1) + xor_rr(r11, r11)
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int2_neg = mb(45) + add_ri32(rdi, 1) + neg_r(rax)
+    let int2_head = test_rr(rax, rax) + jge_rel32(str_len(int2_neg))
+    let int2 = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + int2_head + int2_neg + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    let str2 = mb(34) + add_ri32(rdi, 1) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rcx, rdx, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+    let float2 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rdi) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + rep_movsb()
+    // pass 2 非 str/int/float 元素：写元素 formatter 结果字节
+    // pass 2 non-str/int/float elements: write the element formatter result bytes
+    let wrap2 = push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rdi) + vs_push(rdx) + elem_code + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + rep_movsb()
+    let e2_load = mov_rr(rsi, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, r10) + mov_rm(rdx, rsi, 0)
+    let sep2_bytes = mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+    let sep2 = test_rr(r11, r11) + je_rel32(str_len(sep2_bytes)) + sep2_bytes
+    let next2_wo = add_ri32(r11, 1)
+    let tail2 = if elem_type == "float" {
+        float2
+    } else if elem_type == "str" {
+        str2
+    } else if elem_type == "int" {
+        int2
+    } else {
+        wrap2
+    }
+    let test2 = cmp_rr(r11, r8) + jae_rel32(str_len(sep2) + str_len(e2_load) + str_len(tail2) + str_len(next2_wo) + 5)
+    let next2 = next2_wo + jmp_rel32(0 - (str_len(test2) + str_len(sep2) + str_len(e2_load) + str_len(tail2) + str_len(next2_wo) + 5))
+    let endfill = mb(93) + add_ri32(rdi, 1) + mov_mr(r15, off, r9)
+    h1 + test1 + sep1 + e1_load + tail1 + next1 + alloc_zone + test2 + sep2 + e2_load + tail2 + next2 + endfill
+}
+
+// x86gen_get_map_native 内联 get：按键查 map / x86gen_get_map_native inlines get: look up a map key
+// get inline: lookup by key
+fn x86gen_get_map_native(key_is_str) {
+    let some_body = mov_rm(rax, r9, 0) + mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let none = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2) + jmp_rel32(str_len(some_body))
+    let advance = add_ri32(r10, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
+    let access = mov_rm(rdx, r10, 0)
+    let body = if key_is_str {
+        let klen = mov_rm(rcx, rax, 0)
+        let clen = mov_rm(rdi, rdx, 0)
+        let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(none))
+        access + mov_rm(rax, r15, 0 - 8) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
+    } else {
+        access + mov_rm(rax, r15, 0 - 8) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(none))
+    }
+    let loop_head = cmp_rr(r11, r8) + jae_rel32(str_len(body) + str_len(advance) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
+    let head = mov_rm(rax, r15, 0 - 16) + mov_rm(r8, rax, 0) + mov_rm(r10, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
+    head + loop_head + body + advance + back + none + some_body
+}
+
+// x86gen_delete_map_native 内联 delete：删除键 / x86gen_delete_map_native inlines delete: remove a key
+// delete inline: remove a key
+fn x86gen_delete_map_native(key_is_str) {
+    let finish = xor_rr(rax, rax) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let kshift = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdi, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
+    let keys_block = mov_rr(rdx, r10) + sub_rr(rdx, r11) + sub_ri32(rdx, 1) + test_rr(rdx, rdx) + jle_rel32(str_len(kshift)) + kshift
+    let vshift = mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdi, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
+    let vals_block = mov_rr(rdx, r10) + sub_rr(rdx, r11) + sub_ri32(rdx, 1) + test_rr(rdx, rdx) + jle_rel32(str_len(vshift)) + vshift
+    let len_dec = mov_rm(rax, r15, 0 - 16) + sub_ri32(r10, 1) + mov_mr(rax, 0, r10)
+    let found_body = keys_block + vals_block + len_dec
+    let not_found = jmp_rel32(str_len(found_body))
+    let advance = add_ri32(r8, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
+    let access = mov_rm(rdx, r8, 0)
+    let body = if key_is_str {
+        let klen = mov_rm(rcx, rax, 0)
+        let clen = mov_rm(rdi, rdx, 0)
+        let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(not_found))
+        access + mov_rm(rax, r15, 0 - 8) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
+    } else {
+        access + mov_rm(rax, r15, 0 - 8) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(not_found))
+    }
+    let loop_head = cmp_rr(r11, r10) + jae_rel32(str_len(body) + str_len(advance) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
+    let head = mov_rm(rax, r15, 0 - 16) + mov_rm(r10, rax, 0) + mov_rm(r8, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
+    head + loop_head + body + advance + back + not_found + found_body + finish
+}
+
+// x86gen_map_format_at 生成 map 格式化（插入序输出）
+// x86gen_map_format_at emits map formatting (insertion-order output)
+// Map formatting (insertion order)
+fn x86gen_map_format_at(off, key_is_str, val_is_str, val_is_float, ff_h) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let sep1_bytes = add_ri32(rcx, 2)
+    let sep1 = test_rr(r11, r11) + je_rel32(str_len(sep1_bytes)) + sep1_bytes
+    let key_len = if key_is_str {
+        mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+    } else {
+        let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+        let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+        mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+    }
+    let colon1 = add_ri32(rcx, 2)
+    let val_len = if val_is_float {
+        push_r(r8) + push_r(r10) + push_r(r9) + push_r(rcx) + mov_rm(rax, r9, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r9) + pop_r(r10) + pop_r(r8) + add_rr(rcx, rsi)
+    } else if val_is_str {
+        mov_rm(rax, r9, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+    } else {
+        let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+        let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+        mov_rm(rax, r9, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+    }
+    let advance1 = add_ri32(r11, 1) + add_ri32(r10, 8) + add_ri32(r9, 8)
+    let loop1_test = cmp_rr(r11, r8) + jae_rel32(str_len(sep1) + str_len(key_len) + str_len(colon1) + str_len(val_len) + str_len(advance1) + 5)
+    let back1 = jmp_rel32(0 - (str_len(loop1_test) + str_len(sep1) + str_len(key_len) + str_len(colon1) + str_len(val_len) + str_len(advance1) + 5))
+    let loop1 = loop1_test + sep1 + key_len + colon1 + val_len + advance1 + back1
+    let h1 = mov_rm(r9, r15, off) + mov_rm(r8, r9, 0) + mov_rm(r10, r9, 16) + mov_rm(r9, r9, 24) + mov_ri64(rcx, 2) + xor_rr(r11, r11)
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    let key_write = if key_is_str {
+        let kaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rax, rdx, 0)
+        kaddr + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+    } else {
+        let kaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rdx, rdx, 0)
+        kaddr + int_write
+    }
+    let colon2 = mb(58) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+    let val_write = if val_is_float {
+        let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rax, rdx, 0)
+        vaddr + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + rep_movsb()
+    } else if val_is_str {
+        let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rax, rdx, 0)
+        vaddr + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+    } else {
+        let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rdx, rdx, 0)
+        vaddr + int_write
+    }
+    let sep2_bytes = mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+    let sep2 = test_rr(r11, r11) + je_rel32(str_len(sep2_bytes)) + sep2_bytes
+    let advance2 = add_ri32(r11, 1)
+    let loop2_test = cmp_rr(r11, r8) + jae_rel32(str_len(sep2) + str_len(key_write) + str_len(colon2) + str_len(val_write) + str_len(advance2) + 5)
+    let back2 = jmp_rel32(0 - (str_len(loop2_test) + str_len(sep2) + str_len(key_write) + str_len(colon2) + str_len(val_write) + str_len(advance2) + 5))
+    let loop2 = loop2_test + sep2 + key_write + colon2 + val_write + advance2 + back2
+    let alloc_zone = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9) + mb(123) + add_ri32(rdi, 1) + xor_rr(r11, r11)
+    let reload2 = mov_rm(r10, r15, off) + mov_rm(r8, r10, 0) + mov_rm(r10, r10, 16)
+    let endfill = mb(125) + add_ri32(rdi, 1) + pop_r(r9) + mov_mr(r15, off, r9)
+    h1 + loop1 + alloc_zone + reload2 + loop2 + endfill
+}
+
+// x86gen_keys_map_native 内联 keys：键列表 / x86gen_keys_map_native inlines keys: the key list
+// keys inline: list of keys
+fn x86gen_keys_map_native() {
+    let tail = mov_rm(rdx, r11, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(r12, rdx) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r10) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + tail
+}
+
+// x86gen_put_map_native 内联 put：插入或更新键 / x86gen_put_map_native inlines put: insert or update a key
+// put inline: insert or update a key
+fn x86gen_put_map_native(key_is_str) {
+    let done = xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + vs_pop_n(3)
+    let found = mov_rm(rax, r15, 0 - 8) + mov_mr(r9, 0, rax)
+    let not_found = mov_rm(rax, r15, 0 - 24) + mov_rm(rsi, rax, 16) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rsi, rdx) + mov_rm(r8, r15, 0 - 16) + mov_mr(rsi, 0, r8) + mov_rm(r9, rax, 24) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r9, rdx) + mov_rm(r8, r15, 0 - 8) + mov_mr(r9, 0, r8) + mov_rm(rdx, rax, 0) + add_ri32(rdx, 1) + mov_mr(rax, 0, rdx) + jmp_rel32(str_len(found))
+    let advance = add_ri32(r8, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
+    let access = mov_rm(rdx, r8, 0)
+    let body = if key_is_str {
+        let klen = mov_rm(rcx, rax, 0)
+        let clen = mov_rm(rdi, rdx, 0)
+        let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(not_found))
+        access + mov_rm(rax, r15, 0 - 16) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
+    } else {
+        access + mov_rm(rax, r15, 0 - 16) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(not_found))
+    }
+    let loop_head = cmp_rr(r11, r10) + jae_rel32(str_len(body) + str_len(advance) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
+    let post_head = mov_rm(r10, rax, 0) + mov_rm(r8, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
+    let g_min = add_ri32(r10, 4)
+    let g_keys = mov_rr(r11, r12) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r11) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
+    let g_vals = mov_rm(rsi, rax, 24) + mov_rr(rdi, r12) + mov_rr(r9, r12) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
+    let g_hdr = mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_mr(rax, 24, r9)
+    let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(str_len(g_min)) + g_min + g_keys + g_vals + g_hdr
+    let head1 = mov_rm(rax, r15, 0 - 24) + mov_rm(rcx, rax, 0) + mov_rm(rdx, rax, 8) + cmp_rr(rcx, rdx) + jne_rel32(str_len(growth))
+    head1 + growth + post_head + loop_head + body + advance + back + not_found + found + done
+}
+
+// x86gen_map_native 内联 map()：空 map / x86gen_map_native inlines map(): an empty map
+// map() inline: empty map
+fn x86gen_map_native() {
+    mov_rr(r11, r12) + xor_rr(rdx, rdx) + mov_mr(r11, 0, rdx) + mov_mr(r11, 8, rdx) + mov_mr(r11, 16, rdx) + mov_mr(r11, 24, rdx) + add_ri32(r12, 32) + mov_mr(r15, 0 - 8, r11)
+}
+
+// x86gen_args_native 内联 args：读启动栈 argv，构造 str 列表（排除 argv[0]）
+// x86gen_args_native inlines args: read argv from the startup stack, build a string list
+// (excluding argv[0])
+// args inline: read argv from the startup stack (excluding argv[0])
+fn x86gen_args_native() {
+    let head = mov_rm(rax, rbx, 0 - 8) + mov_rm(r8, rax, 0) + sub_ri32(r8, 1) + mov_rr(r11, r12) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, r8) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rcx, r8) + mov_ri64(rsi, 3) + shl_rcl(rcx) + add_ri32(rcx, 24) + add_rr(r12, rcx) + xor_rr(rdx, rdx)
+    let load = mov_rr(rsi, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, rax) + add_ri32(rsi, 16) + mov_rm(rsi, rsi, 0)
+    let sl_test = e1(128) + e1(62) + e1(0)
+    let sl_yes = add_ri32(rsi, 1) + add_ri32(r9, 1)
+    let sl_je = je_rel32(str_len(sl_yes) + 5)
+    let sl_loop = sl_test + sl_je + sl_yes + jmp_rel32(0 - (str_len(sl_test) + str_len(sl_je) + str_len(sl_yes) + 5))
+    let mkstr = sub_rr(rsi, r9) + mov_rr(rcx, r12) + mov_mr(rcx, 0, r9) + lea(rdi, rcx, 8) + add_rr(r12, r9) + add_ri32(r12, 8) + mov_mr(r10, 0, rcx) + add_ri32(r10, 8) + mov_rr(rcx, r9) + rep_movsb()
+    let body = load + xor_rr(r9, r9) + sl_loop + mkstr + add_ri32(rdx, 1)
+    let test = cmp_rr(rdx, r8) + jae_rel32(str_len(body) + 5)
+    let back = jmp_rel32(0 - (str_len(test) + str_len(body) + 5))
+    head + test + body + back + mov_mr(r15, 0 - 8, r11)
+}
+
+// x86gen_stdin_nb_native 内联 stdin_nb：fcntl 非阻塞 + 单次 read，返回 Result<str, str>
+// x86gen_stdin_nb_native inlines stdin_nb: fcntl non-blocking plus a single read into Result<str,
+// str>
+// stdin_nb inline: fcntl non-blocking plus a single read into Result<str, str>
+fn x86gen_stdin_nb_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let eagain_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 7955997313370251103) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let empty_str = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8)
+    let empty_ok = empty_str + ok_inst
+    let tail = add_rr(rsp, r9) + err_str + err_inst + jmp_rel32(str_len(empty_ok))
+    let eagain_tail = add_rr(rsp, r9) + eagain_str + err_inst + jmp_rel32(str_len(tail) + str_len(empty_ok))
+    let ok_tail = add_rr(rsp, r9) + ok_inst + jmp_rel32(str_len(eagain_tail) + str_len(tail) + str_len(empty_ok))
+    let make_str = mov_rr(r8, r12) + mov_mr(r8, 0, rax) + mov_rr(rsi, rsp) + lea(rdi, r8, 8) + mov_rr(rcx, rax) + rep_movsb() + add_ri32(r12, 8) + add_rr(r12, rax)
+    let errno_seq = mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(make_str) + str_len(ok_tail)) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(make_str) + str_len(ok_tail)) + jmp_rel32(str_len(make_str) + str_len(ok_tail) + str_len(eagain_tail))
+    let read_seq = sub_rr(rsp, r9) + xor_rr(rdi, rdi) + mov_rr(rsi, rsp) + mov_rr(rdx, r9) + sys_mov_rax(0) + syscall() + test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(errno_seq)) + neg_r(rax) + errno_seq
+    let read_path = read_seq + make_str + ok_tail + eagain_tail + tail
+    let set_nonblock = xor_rr(rdi, rdi) + mov_ri64(rsi, 3) + xor_rr(rdx, rdx) + sys_mov_rax(72) + syscall() + mov_rr(r8, rax) + mov_ri64(rdx, 2048) + or_rr(rdx, r8) + xor_rr(rdi, rdi) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(set_nonblock) + str_len(read_path)) + set_nonblock + read_path + empty_ok
+    head
+}
+
+// x86gen_set_nonblock_at 生成 fcntl 设置 O_NONBLOCK 的代码：[base+off] 的 fd
+// x86gen_set_nonblock_at emits fcntl setting O_NONBLOCK on the fd at [base+off]
+fn x86gen_set_nonblock_at(base, off) {
+    let get = mov_rm(rdi, base, off) + mov_ri64(rsi, 3) + xor_rr(rdx, rdx) + sys_mov_rax(72) + syscall()
+    let set = mov_rm(rdi, base, off) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
+    get + mov_rr(r8, rax) + mov_ri64(rdx, 2048) + or_rr(rdx, r8) + set
+}
+
+// x86gen_parse_ip_at 解析 [r15+off] 的 str 为 IPv4 四字节（内存序）到 [rsp+0..3]
+// 成功 rax=0，失败 rax=-1。寄存器：rsi 字符指针、rdi 结束、r8 移位数(0/8/16/24)、r9 累加、r10 段值、r11 段位数
+// x86gen_parse_ip_at parses the str at [r15+off] as four IPv4 bytes (memory order) into [rsp]
+// Returns rax=0 on success, rax=-1 on failure
+fn x86gen_parse_ip_at(off) {
+    let fail = mov_ri64(rax, -1)
+    let s0 = xor_rr(r10, r10) + xor_rr(r11, r11)
+    let d1cmp = cmp_rr(rsi, rdi)
+    let d2a1 = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 48) + cmp_rr(rax, rcx)
+    let d2b1 = sub_ri32(rax, 48) + mov_ri64(rcx, 9) + cmp_rr(rax, rcx)
+    let d3a = mov_ri64(rcx, 10) + imul_rr(r10, rcx) + add_rr(r10, rax) + add_ri32(r11, 1) + mov_ri64(rcx, 3) + cmp_rr(r11, rcx)
+    let d4add = add_ri32(rsi, 1)
+    let s1t = test_rr(r11, r11)
+    let s2 = mov_ri64(rcx, 255) + cmp_rr(r10, rcx)
+    let s3a = mov_rr(rcx, r8) + mov_rr(rax, r10) + shl_rcl(rax) + or_rr(r9, rax) + add_ri32(r8, 8)
+    let s3cmp = cmp_rr(rsi, rdi)
+    let s4a1 = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 46) + cmp_rr(rax, rcx)
+    let s4b1 = add_ri32(rsi, 1) + mov_ri64(rcx, 32) + cmp_rr(r8, rcx)
+    let f1succ = mov_mr(rsp, 0, r9) + xor_rr(rax, rax) + jmp_rel32(str_len(fail))
+    let f1jne = mov_ri64(rcx, 32) + cmp_rr(r8, rcx) + jne_rel32(str_len(f1succ))
+    let d1jae = jae_rel32(str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d2ajl = jl_rel32(str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d2bja = ja_rel32(str_len(d3a) + 6 + str_len(d4add) + 5)
+    let d4jmp = jmp_rel32(0 - (str_len(d1cmp) + 6 + str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5))
+    let s1je = je_rel32(str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s2ja = ja_rel32(str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s3je = je_rel32(str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5)
+    let s4ajne = jne_rel32(str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let s4bjae = jae_rel32(5 + str_len(f1jne) + str_len(f1succ))
+    let s5jmp = jmp_rel32(0 - (str_len(s0) + str_len(d1cmp) + 6 + str_len(d2a1) + 6 + str_len(d2b1) + 6 + str_len(d3a) + 6 + str_len(d4add) + 5 + str_len(s1t) + 6 + str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5))
+    let d3ja = ja_rel32(str_len(d4add) + 5 + str_len(s1t) + 6 + str_len(s2) + 6 + str_len(s3a) + str_len(s3cmp) + 6 + str_len(s4a1) + 6 + str_len(s4b1) + 6 + 5 + str_len(f1jne) + str_len(f1succ))
+    let head = mov_rm(r9, r15, off) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rm(rdi, r9, 0) + add_rr(rdi, rsi) + xor_rr(r8, r8) + xor_rr(r9, r9) + s0 + d1cmp + d1jae + d2a1 + d2ajl + d2b1 + d2bja + d3a + d3ja + d4add + d4jmp + s1t + s1je + s2 + s2ja + s3a + s3cmp + s3je + s4a1 + s4ajne + s4b1 + s4bjae + s5jmp + f1jne + f1succ + fail
+    head
+}
+
+// x86gen_sockaddr_at 构建 sockaddr_in（AF_INET）到 [rsp+16..31]：r9 = port、[rsp+0..3] = IP 四字节
+// x86gen_sockaddr_at builds an AF_INET sockaddr_in at [rsp+16..31]: r9 = port, [rsp+0..3] = four
+// IP bytes
+fn x86gen_sockaddr_at() {
+    let f1 = mov_ri64(rax, 2) + mov_mr(rsp, 16, rax)
+    let f2 = mov_rr(rax, r9) + mov_ri64(rcx, 8) + mov_rr(rdx, rax) + shr_rcl(rdx) + mov_ri64(rcx, 255) + and_rr(rdx, rcx) + and_rr(rax, rcx) + mov_ri64(rcx, 8) + shl_rcl(rdx) + or_rr(rax, rdx) + mov_mr(rsp, 18, rax)
+    let f3 = mov_rm(rax, rsp, 0) + mov_mr(rsp, 20, rax)
+    let f4 = xor_rr(rax, rax) + mov_mr(rsp, 24, rax)
+    f1 + f2 + f3 + f4
+}
+
+// x86gen_net_close_native 内联 net_close：close syscall，返回 unit
+// x86gen_net_close_native inlines net_close: a close syscall, returning unit
+fn x86gen_net_close_native() {
+    // close 前 fcntl(F_GETFD) 校验句柄：无效/已关闭 fd 走 trap（VM 语义：invalid or closed handle）
+    // validate the handle with fcntl(F_GETFD) before closing; invalid/closed fds trap
+    let ok_tail = xor_rr(rax, rax) + mov_mr(r15, 0 - 8, rax) + vs_pop_n(1)
+    let close_ops = mov_rm(rdi, r15, 0 - 8) + sys_mov_rax(3) + syscall()
+    let trap_seq = x86gen_trap_exit("net_close: invalid or closed handle")
+    let check_seq = mov_rm(rdi, r15, 0 - 8) + mov_ri64(rsi, 1) + sys_mov_rax(72) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(close_ops) + str_len(ok_tail) + str_len(jmp_rel32(str_len(trap_seq))))
+    check_seq + close_ops + ok_tail + jmp_rel32(str_len(trap_seq)) + trap_seq
+}
+
+// x86gen_net_nb_native 内联 net_nb(op, h, str, max)：accept/read/write 单次非阻塞尝试，
+// 返回 Result<str, str>。EAGAIN → Err("__eagain")（VM 语义），EINTR 重试，从不 park
+// x86gen_net_nb_native inlines net_nb(op, h, str, max): a single non-blocking accept/read/write
+// attempt returning Result<str, str>. EAGAIN yields Err("__eagain") (VM semantics), EINTR
+// retries, and the sequence never parks
+fn x86gen_net_nb_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, rcx) + vs_pop_n(4)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, rcx) + vs_pop_n(4)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let eagain_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 7955997313370251103) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 8)
+    let eagain = eagain_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    // wr_zero：len == 0 → Ok("0")（VM 语义：0 字节的十进制字符串）
+    // wr_zero: len == 0 yields Ok("0") (VM semantics: the decimal string of 0 bytes)
+    let wr_zero = mov_rr(r8, r12) + mov_ri64(r10, 1) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 48) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(eagain) + str_len(fail))
+    let wr_jmp = jmp_rel32(str_len(wr_zero) + str_len(eagain) + str_len(fail))
+    let wr_ok = mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
+    let wr_send = mov_rm(rdi, r15, 0 - 24) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdx, rax) + sys_mov_rax(1) + syscall()
+    let wr_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(wr_send))) + jmp_rel32(str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero) + str_len(eagain))
+    let wr_head = mov_rm(r9, r15, 0 - 16) + mov_rm(rax, r9, 0) + test_rr(rax, rax) + je_rel32(str_len(wr_send) + str_len(wr_err) + str_len(wr_ok) + str_len(wr_jmp))
+    let wr_path_len = str_len(wr_head) + str_len(wr_send) + str_len(wr_err) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)
+    // rd_zero_body：max == 0 → Ok("")（VM 语义：立即空串）
+    // rd_zero_body: max == 0 yields Ok("") (VM semantics: an immediate empty string)
+    let rd_zero_body = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(wr_path_len + str_len(eagain) + str_len(fail))
+    let rd_jmp = jmp_rel32(str_len(rd_zero_body) + wr_path_len + str_len(eagain) + str_len(fail))
+    let rd_ok_body = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8)
+    let rd_read = mov_rm(rdi, r15, 0 - 24) + mov_rm(r8, r15, 0 - 40) + lea(rsi, r8, 8) + mov_rm(rdx, r15, 0 - 8) + sys_mov_rax(0) + syscall()
+    let rd_alloc = mov_rr(r8, r12) + mov_mr(r8, 0, r9) + add_ri32(r12, 8) + add_rr(r12, r9) + mov_mr(r15, 0 - 40, r8)
+    let rd_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body) + wr_path_len) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(rd_read))) + jmp_rel32(str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body) + wr_path_len + str_len(eagain))
+    let rd_head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jl_rel32(6 + str_len(rd_alloc) + str_len(rd_read) + str_len(rd_err) + str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body) + wr_path_len + str_len(eagain)) + je_rel32(str_len(rd_alloc) + str_len(rd_read) + str_len(rd_err) + str_len(rd_ok_body) + str_len(rd_jmp))
+    let rd_path_len = str_len(rd_head) + str_len(rd_alloc) + str_len(rd_read) + str_len(rd_err) + str_len(rd_ok_body) + str_len(rd_jmp) + str_len(rd_zero_body)
+    // acc_ok_body：accepted fd 置 O_NONBLOCK，handle 转十进制 str 后包 Ok（VM 语义：Ok(handle 串)）
+    // acc_ok_body: sets O_NONBLOCK on the accepted fd, converts the handle to a decimal str and
+    // wraps Ok (VM semantics: Ok(handle string))
+    let acc_ok_body = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
+    let acc_err = err_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
+    let acc_seq = mov_rm(rdi, r15, 0 - 24) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall() + test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err)) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err) + str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(syscall()) + str_len(sys_mov_rax(43)) + str_len(xor_rr(rdx, rdx)) + str_len(xor_rr(rsi, rsi)) + str_len(mov_rm(rdi, r15, 0 - 24)))) + jmp_rel32(0)
+    let acc_jmp = jmp_rel32(rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
+    let acc_path_len = str_len(acc_seq) + str_len(acc_err) + str_len(acc_ok_body) + str_len(acc_jmp)
+    let wr_path = wr_head + wr_send + wr_err + wr_ok + wr_jmp + wr_zero
+    let rd_path = rd_head + rd_alloc + rd_read + rd_err + rd_ok_body + rd_jmp + rd_zero_body
+    let acc_path = acc_seq + acc_err + acc_ok_body + acc_jmp
+    // head：按 op 分派（0=accept, 1=read, 2=write）；2 的 fall-through 会进 acc_path，须显式跳
+    // head: dispatches on op (0=accept, 1=read, 2=write); op 2 must jump explicitly since
+    // fall-through would enter acc_path
+    let head = sub_ri32(rsp, 8) + mov_rm(rax, r15, 0 - 32) + test_rr(rax, rax) + je_rel32(str_len(mov_ri64(rdx, 1)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 2)) + str_len(cmp_rr(rax, rdx)) + str_len(jne_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 1) + cmp_rr(rax, rdx) + je_rel32(acc_path_len + str_len(mov_ri64(rdx, 2)) + str_len(cmp_rr(rax, rdx)) + str_len(jne_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 2) + cmp_rr(rax, rdx) + jne_rel32(str_len(jmp_rel32(0)) + acc_path_len + rd_path_len + wr_path_len + str_len(eagain)) + jmp_rel32(acc_path_len + rd_path_len)
+    head + acc_path + rd_path + wr_path + eagain + fail
+}
+
+// x86gen_net_read_native 内联 net_read：read syscall 进新 str，返回 Result<str, str>。
+// fd 非阻塞：EAGAIN → waitset 注册 POLLIN → park；唤醒后重试；EINTR 直接重试
+// x86gen_net_read_native inlines net_read: a read syscall into a fresh str, returning Result<str,
+// str>. The fd is non-blocking: EAGAIN registers POLLIN on the waitset and parks; on wake it
+// retries; EINTR retries directly
+fn x86gen_net_read_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    // alloc_seq 先按 max 分配 str（len 头 + 字节区），root 存 [r15-24]；park 后 GC 会更新 root，
+    // retry_seq 从 root 重载 buf 指针（r8 在 park 间不可靠）
+    // alloc_seq allocates the str for max bytes (len header plus byte area), rooting it at
+    // [r15-24]; GC updates the root across a park, so retry_seq reloads the buf pointer from it
+    // (r8 is unreliable across a park)
+    let alloc_seq = mov_rr(r8, r12) + mov_mr(r8, 0, r11) + add_ri32(r12, 8) + add_rr(r12, r11) + mov_mr(r15, 0 - 24, r8)
+    let retry_seq = mov_rm(rdi, r15, 0 - 16) + mov_rm(r8, r15, 0 - 24) + lea(rsi, r8, 8) + mov_rm(rdx, r15, 0 - 8) + sys_mov_rax(0) + syscall() + test_rr(rax, rax)
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 1)
+    // zero_ok：max == 0 → Ok("")（VM 语义：立即返回空串，不进系统调用）
+    // zero_ok: max == 0 yields Ok("") (VM semantics: an immediate empty string, no syscall)
+    let zero_ok = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(fail))
+    // ok_path：n >= 0（含 0 = EOF）→ Ok(str)，落 len 后跳 END（跳过 zero_ok + fail）
+    // ok_path: n >= 0 (0 is EOF) yields Ok(str); after storing the length it jumps to END (past
+    // zero_ok and fail)
+    let ok_path = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(zero_ok) + str_len(fail))
+    let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path) + str_len(zero_ok))
+    let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
+    let max_check = mov_rm(r11, r15, 0 - 8) + test_rr(r11, r11) + jl_rel32(6 + str_len(alloc_seq) + str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + str_len(retry_back) + str_len(ok_path) + str_len(zero_ok)) + je_rel32(str_len(alloc_seq) + str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + str_len(retry_back) + str_len(ok_path))
+    max_check + alloc_seq + retry_seq + err_check + fd_park + retry_back + ok_path + zero_ok + fail
+}
+
+// x86gen_net_write_native 内联 net_write：循环 write syscall 直到写完，返回 Result<unit, str>。
+// fd 非阻塞：EAGAIN → waitset 注册 POLLOUT → park；唤醒后跳回 loop_check 重试；
+// 偏移累加存 [r15-24]（syscall 毁 rcx，w_adv 从内存重载）
+// x86gen_net_write_native inlines net_write: looping write syscalls until done, returning
+// Result<unit, str>. The fd is non-blocking: EAGAIN registers POLLOUT on the waitset and parks;
+// on wake it jumps back to loop_check to retry. The byte offset accumulates in [r15-24] (syscall
+// clobbers rcx, so w_adv reloads it from memory)
+fn x86gen_net_write_native(sched_addr, waitset_add_addr) {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    let done = ok_inst + jmp_rel32(str_len(fail))
+    let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 4)
+    // w_adv：off += n；随后的 w_adv_jmp 跳回 loop_check（两处 5 = 各自 jmp_rel32 长度）
+    // w_adv: off += n; the following w_adv_jmp jumps back to loop_check (the two 5s are the
+    // jmp_rel32 lengths of w_adv_jmp and fd_park_jmp)
+    let w_adv = mov_rm(rcx, r15, 0 - 24) + add_rr(rcx, rax) + mov_mr(r15, 0 - 24, rcx)
+    // w_err_len 是 w_err 的固定长度（neg/mov/cmp/je/je/jmp），供 loop_check/w2/w_adv_jmp/
+    // fd_park_jmp 前向引用破环；内含 6 = je_rel32 长度、5 = jmp_rel32 长度
+    // w_err_len is the fixed length of w_err (neg/mov/cmp/je/je/jmp), used by loop_check/w2/
+    // w_adv_jmp/fd_park_jmp to break forward-reference cycles; it embeds 6 for je_rel32 and 5
+    // for jmp_rel32
+    let w_err_len = str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))
+    let w1 = mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, r9, 0) + mov_rm(rcx, r15, 0 - 24) + sub_rr(rdx, rcx) + mov_rm(rdi, r15, 0 - 16) + mov_rr(rsi, r9) + add_rr(rsi, rcx) + add_ri32(rsi, 8) + sys_mov_rax(1) + syscall() + test_rr(rax, rax)
+    // w2：n > 0 → w_adv；n == 0 → fail（VM 语义：write returned zero bytes）
+    // w2: n > 0 goes to w_adv; n == 0 fails (VM semantics: write returned zero bytes)
+    let w2 = jg_rel32(6 + w_err_len) + je_rel32(w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done) + str_len(fail))
+    let loop_check = mov_rm(r9, r15, 0 - 8) + mov_rm(rax, r9, 0) + mov_rm(rcx, r15, 0 - 24) + cmp_rr(rcx, rax) + jae_rel32(str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5)
+    let w_err = neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(w_adv) + 5) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + 6 + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(w1) + str_len(w2) + str_len(loop_check))) + jmp_rel32(str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done))
+    let w_adv_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5))
+    let fd_park_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5))
+    // head：off 清零存 [r15-24]，jmp 进 loop_check（同 net_loopback 的 off 槽用法）
+    // head: zeroes off into [r15-24] and jumps into loop_check (same off-slot usage as
+    // net_loopback)
+    let head = xor_rr(rcx, rcx) + mov_mr(r15, 0 - 24, rcx) + jmp_rel32(0)
+    head + loop_check + w1 + w2 + w_err + w_adv + w_adv_jmp + fd_park + fd_park_jmp + done + fail
+}
+
+// x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）
+// x86gen_ord_native inlines ord: decode the first codepoint (1-4 byte UTF-8)
+// ord inline: decode the first code point (1-4 byte UTF-8)
+fn x86gen_ord_native() {
+    let pre = mov_rm(rcx, r15, 0 - 8) + lea(rsi, rcx, 8) + xor_rr(rax, rax) + e1(172)
+    let t_ascii = mov_rr(rdx, rax) + mov_ri64(r9, 128) + and_rr(rdx, r9)
+    let t_2 = mov_rr(rdx, rax) + mov_ri64(r9, 224) + and_rr(rdx, r9) + mov_ri64(r9, 192) + cmp_rr(rdx, r9)
+    let t_3 = mov_rr(rdx, rax) + mov_ri64(r9, 240) + and_rr(rdx, r9) + mov_ri64(r9, 224) + cmp_rr(rdx, r9)
+    let dec_2 = mov_ri64(r9, 31) + and_rr(rax, r9) + mov_ri64(r8, 1)
+    let dec_3 = mov_ri64(r9, 15) + and_rr(rax, r9) + mov_ri64(r8, 2)
+    let dec_4 = mov_ri64(r9, 7) + and_rr(rax, r9) + mov_ri64(r8, 3)
+    let cont_test = test_rr(r8, r8)
+    let cont_body = mov_ri64(rcx, 6) + shl_rcl(rax) + mov_rr(r9, rax) + e1(172) + mov_ri64(rcx, 63) + and_rr(rax, rcx) + or_rr(r9, rax) + mov_rr(rax, r9) + sub_ri32(r8, 1)
+    let done = mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let cont_back = jmp_rel32(0 - (str_len(cont_test) + 6 + str_len(cont_body) + 5))
+    let cont = cont_test + je_rel32(str_len(cont_body) + 5) + cont_body + cont_back
+    let try3_jne = jne_rel32(str_len(dec_2) + 5)
+    let cont2_jmp = jmp_rel32(str_len(t_3) + 6 + str_len(dec_3) + 5 + str_len(dec_4))
+    let try4_jne = jne_rel32(str_len(dec_3) + 5)
+    let cont3_jmp = jmp_rel32(str_len(dec_4))
+    let ascii_je = je_rel32(str_len(t_2) + 6 + str_len(dec_2) + 5 + str_len(t_3) + 6 + str_len(dec_3) + 5 + str_len(dec_4) + str_len(cont))
+    pre + t_ascii + ascii_je + t_2 + try3_jne + dec_2 + cont2_jmp + t_3 + try4_jne + dec_3 + cont3_jmp + dec_4 + cont + done
+}
+
+// x86gen_parse_int_native 内联 parse_int：带符号十进制扫描 + 逐位溢出检查
+// x86gen_parse_int_native inlines parse_int: signed decimal scan with digit-wise overflow checks
+// parse_int inline: signed decimal scan with per-digit overflow checks
+fn x86gen_parse_int_native() {
+    let trim = x86gen_trim_native()
+    let head = mov_rm(r9, r15, 0 - 8) + mov_rm(r8, r9, 0) + lea(rsi, r9, 8) + mov_rr(rdi, rsi) + add_rr(rdi, r8) + mov_ri64(r11, 1) + xor_rr(r10, r10)
+    let none = mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 8, rcx)
+    let positive = mov_rr(rax, r10) + mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 8, rcx) + jmp_rel32(str_len(none))
+    let success_neg = neg_r(r10)
+    let success = test_rr(r11, r11) + jge_rel32(str_len(success_neg)) + success_neg
+    let accumulate = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + sub_ri32(rax, 48) + mov_ri64(rcx, 10) + imul_rr(r10, rcx) + add_rr(r10, rax) + add_ri32(rsi, 1)
+    let overflow_check = mov_rr(rdx, rax) + mov_rr(rax, r8) + sub_rr(rax, rdx) + xor_rr(rdx, rdx) + mov_ri64(rcx, 10) + div_r(rcx) + cmp_rr(r10, rax) + ja_rel32(str_len(accumulate) + 5 + str_len(success) + str_len(positive))
+    let digit_parse = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + sub_ri32(rax, 48) + mov_ri64(rcx, 9) + cmp_rr(rax, rcx) + ja_rel32(str_len(overflow_check) + str_len(accumulate) + 5 + str_len(success) + str_len(positive))
+    let loop_head = cmp_rr(rsi, rdi) + jae_rel32(str_len(digit_parse) + str_len(overflow_check) + str_len(accumulate) + 5)
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(digit_parse) + str_len(overflow_check) + str_len(accumulate) + 5))
+    let limit_neg = add_ri32(r8, 1)
+    let limit_set = mov_ri64(r8, 9223372036854775807) + test_rr(r11, r11) + jge_rel32(str_len(limit_neg))
+    let digit_check = cmp_rr(rsi, rdi) + jae_rel32(str_len(limit_set) + str_len(limit_neg) + str_len(loop_head) + str_len(digit_parse) + str_len(overflow_check) + str_len(accumulate) + 5 + str_len(success) + str_len(positive))
+    let minus = mov_ri64(r11, 1) + neg_r(r11) + add_ri32(rsi, 1)
+    let plus = add_ri32(rsi, 1) + jmp_rel32(str_len(minus))
+    let sign_jmp = jmp_rel32(str_len(plus) + str_len(minus))
+    let minus_cmp = mov_ri64(rcx, 45) + cmp_rr(rax, rcx) + je_rel32(str_len(sign_jmp) + str_len(plus))
+    let sign_read = mov_rm(rax, rsi, 0) + mov_ri64(rcx, 255) + and_rr(rax, rcx) + mov_ri64(rcx, 43) + cmp_rr(rax, rcx) + je_rel32(str_len(minus_cmp) + str_len(sign_jmp))
+    let empty_check = cmp_rr(rsi, rdi) + jae_rel32(str_len(sign_read) + str_len(minus_cmp) + str_len(sign_jmp) + str_len(plus) + str_len(minus) + str_len(digit_check) + str_len(limit_set) + str_len(limit_neg) + str_len(loop_head) + str_len(digit_parse) + str_len(overflow_check) + str_len(accumulate) + 5 + str_len(success) + str_len(positive))
+    trim + head + empty_check + sign_read + minus_cmp + sign_jmp + plus + minus + digit_check + limit_set + limit_neg + loop_head + digit_parse + overflow_check + accumulate + back + success + positive + none
+}
+
+// x86gen_nul_path_at 拷贝 [r15+off] 的 str 到 bump 分配缓冲并补 NUL，r11 返回路径指针
+// x86gen_nul_path_at copies the str at [r15+off] to a bump-allocated buffer with a NUL; r11 holds
+// the path
+// NUL-terminated path copy at [r15+off]; r11 returns the path pointer
+fn x86gen_nul_path_at(off) {
+    let nul_write = xor_rr(rax, rax) + e1(136) + e1(7) + add_rr(r12, r10) + add_ri32(r12, 1)
+    let copy = mov_rm(r10, r9, 0) + mov_rr(r11, r12) + lea(rsi, r9, 8) + mov_rr(rdi, r11) + mov_rr(rcx, r10) + rep_movsb()
+    mov_rm(r9, r15, off) + copy + nul_write
+}
+
+// proc 结构堆布局 / proc struct heap layout: pid, outfd, errfd, failfd, ob_len, eb_len, out_ptr/cap,
+// err_ptr/cap, child_err, have_err, code, complete, consumed
+// stdout/stderr 缓冲为堆上动态增长缓冲（初始 8KB，满则倍增），不再固定 8KB 上限
+// 默认 PATH 常量（无 PATH 环境变量时）/"PATH" 缺席时回退的默认 PATH
+let proc_pid = 0
+let proc_outfd = 8
+let proc_errfd = 16
+let proc_failfd = 24
+let proc_ob_len = 32
+let proc_eb_len = 40
+let proc_out_ptr = 48
+let proc_out_cap = 56
+let proc_err_ptr = 64
+let proc_err_cap = 72
+let proc_child_err = 80
+let proc_have_err = 88
+let proc_code = 96
+let proc_complete = 104
+let proc_consumed = 112
+let proc_size = 120
+let pipe2_nonblock_cloexec = 526336
+
+// x86gen_proc_pump 内联排空：failfd/outfd/errfd 非阻塞读，双管 EOF 后 wait4 收尸
+// x86gen_proc_pump inlines draining: non-blocking reads of failfd/outfd/errfd, wait4 once both
+// pipes hit EOF
+// proc pump inline: r9 = proc 基址（全程保留）
+fn x86gen_proc_pump() {
+    // 单管排空：读到 EAGAIN 或 EOF；缓冲满则倍增缓冲继续收集，不丢弃
+    // drain one pipe: read until EAGAIN or EOF; on a full buffer, double it and keep collecting
+    fn drain_fd(fd_off, len_off, ptr_off, cap_off) capture(ref store, ref exited, ref signaled, ref code_seq, ref hav, ref failfd_close, ref wait_block, ref out_drain, ref err_drain, ref err_check, ref out_check, ref failfd_read, ref failfd_drain, ref failfd_head) {
+        let cap = mov_rm(r10, r9, cap_off) + mov_rm(rdx, r9, len_off) + sub_rr(r10, rdx)
+        let grow = mov_rm(r10, r9, cap_off) + add_rr(r10, r10) + mov_rr(r11, r12) + add_rr(r12, r10) + mov_rm(rsi, r9, ptr_off) + mov_rr(rdi, r11) + mov_rm(rcx, r9, len_off) + rep_movsb() + mov_mr(r9, ptr_off, r11) + mov_mr(r9, cap_off, r10) + sub_rr(r10, rdx)
+        let append = mov_rm(rsi, r9, ptr_off) + add_rr(rsi, rdx) + mov_rr(rdx, r10)
+        let cap_branch = test_rr(r10, r10) + jg_rel32(str_len(grow))
+        let read = mov_rr(rdi, r8) + xor_rr(rax, rax) + syscall()
+        let append_seq = mov_rm(rdx, r9, len_off) + add_rr(rdx, rax) + mov_mr(r9, len_off, rdx)
+        let append_result = test_rr(r10, r10) + jle_rel32(str_len(append_seq)) + append_seq
+        let eof = mov_rr(rdi, r8) + sys_mov_rax(3) + syscall() + mov_ri64(rax, 0 - 1) + mov_mr(r9, fd_off, rax)
+        let dispatch = test_rr(rax, rax) + jg_rel32(6 + 5) + je_rel32(5 + str_len(append_result) + 5) + jmp_rel32(str_len(append_result) + 5 + str_len(eof))
+        let back = jmp_rel32(0 - (str_len(cap) + str_len(cap_branch) + str_len(grow) + str_len(append) + str_len(read) + 20 + str_len(append_result) + 5))
+        let head = mov_rm(r8, r9, fd_off) + test_rr(r8, r8) + jl_rel32(str_len(cap) + str_len(cap_branch) + str_len(grow) + str_len(append) + str_len(read) + 20 + str_len(append_result) + 5 + str_len(eof))
+        head + cap + cap_branch + grow + append + read + dispatch + append_result + back + eof
+    }
+    // wait4 状态换算：正常退出 code = (st>>8)&0xff，信号退出 code = 128 + termsig
+    // wait4 status: normal exit code = (st>>8)&0xff, signaled code = 128 + termsig
+    let store = mov_mr(r9, proc_code, rax) + mov_ri64(rax, 1) + mov_mr(r9, proc_complete, rax)
+    let exited = mov_rr(rax, rcx) + mov_ri32(rcx, 8) + shr_rcl(rax) + mov_ri64(r8, 255) + and_rr(rax, r8)
+    let signaled = mov_rr(rax, rdx) + add_ri32(rax, 128)
+    let code_seq = test_rr(rdx, rdx) + je_rel32(str_len(signaled) + 5) + signaled + jmp_rel32(str_len(exited)) + exited + store
+    let hav = mov_ri64(rax, 1) + mov_mr(r9, proc_have_err, rax)
+    let failfd_close = mov_rm(rdi, r9, proc_failfd) + sys_mov_rax(3) + syscall() + mov_ri64(rax, 0 - 1) + mov_mr(r9, proc_failfd, rax)
+    // 双管 EOF 后：终读 failfd（exec 成功时 CLOEXEC 已关），wait4 收尸
+    // after both pipes EOF: final failfd read (CLOEXEC closed it on exec success), then wait4
+    let wait_block = mov_rm(rdi, r9, proc_failfd) + lea(rsi, r9, proc_child_err) + sys_mov_rdx(4) + xor_rr(rax, rax) + syscall() + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + jne_rel32(str_len(hav)) + hav + failfd_close + sub_ri32(rsp, 16) + mov_rm(rdi, r9, proc_pid) + mov_rr(rsi, rsp) + xor_rr(rdx, rdx) + mov_ri64(r10, 0) + sys_mov_rax(61) + syscall() + mov_rm(rdx, rsp, 0) + mov_rr(rcx, rdx) + mov_ri64(rax, 127) + and_rr(rdx, rax) + code_seq + add_ri32(rsp, 16)
+    let out_drain = drain_fd(proc_outfd, proc_ob_len, proc_out_ptr, proc_out_cap)
+    let err_drain = drain_fd(proc_errfd, proc_eb_len, proc_err_ptr, proc_err_cap)
+    let err_check = mov_rm(r8, r9, proc_errfd) + test_rr(r8, r8) + jge_rel32(str_len(wait_block))
+    let out_check = mov_rm(r8, r9, proc_outfd) + test_rr(r8, r8) + jge_rel32(str_len(err_check) + str_len(wait_block))
+    let failfd_read = mov_rm(rdi, r9, proc_failfd) + lea(rsi, r9, proc_child_err) + sys_mov_rdx(4) + xor_rr(rax, rax) + syscall()
+    let failfd_drain = failfd_read + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + jne_rel32(str_len(hav)) + hav + test_rr(rax, rax) + jl_rel32(str_len(failfd_close)) + failfd_close
+    let failfd_head = mov_rm(r8, r9, proc_failfd) + test_rr(r8, r8) + jl_rel32(str_len(failfd_drain))
+    sub_ri32(rsp, 8192) + failfd_head + failfd_drain + out_drain + err_drain + out_check + err_check + wait_block + add_ri32(rsp, 8192)
+}
+
+// x86gen_proc_result_inst 从 proc 构造 Result 实例（rax 返回，置 consumed）
+// x86gen_proc_result_inst builds the Result instance from a proc (returned in rax, marks consumed)
+fn x86gen_proc_result_inst() {
+    let ob_str = mov_rm(r10, r9, proc_ob_len) + mov_rr(r11, r12) + mov_mr(r11, 0, r10) + mov_rm(rsi, r9, proc_out_ptr) + lea(rdi, r11, 8) + mov_rr(rcx, r10) + rep_movsb() + add_rr(r12, r10) + add_ri32(r12, 8)
+    let eb_str = mov_rm(r10, r9, proc_eb_len) + mov_rr(r8, r12) + mov_mr(r8, 0, r10) + mov_rm(rsi, r9, proc_err_ptr) + lea(rdi, r8, 8) + mov_rr(rcx, r10) + rep_movsb() + add_rr(r12, r10) + add_ri32(r12, 8)
+    let out_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 2) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_rm(rax, r9, proc_code) + mov_mr(rcx, 16, rax) + mov_mr(rcx, 24, r11) + mov_mr(rcx, 32, r8) + add_ri32(r12, 40)
+    let ok_inst = mov_rr(rax, r12) + mov_ri64(rdx, 1) + mov_mr(rax, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rax, 8, rdx) + mov_mr(rax, 16, rcx) + add_ri32(r12, 24)
+    let ok_path = ob_str + eb_str + out_inst + ok_inst
+    let err_path = x86gen_err_inst()
+    let cons = mov_ri64(rdx, 1) + mov_mr(r9, proc_consumed, rdx)
+    let branch = mov_rm(r8, r9, proc_have_err) + test_rr(r8, r8) + je_rel32(str_len(err_path) + 5) + err_path + jmp_rel32(str_len(ok_path)) + ok_path + cons
+    branch
+}
+
+// x86gen_push_native 内联 push：容量不足时翻倍增长并复制
+// x86gen_push_native inlines push: double-and-copy when the capacity is short
+// push inline: double capacity and copy when full
+fn x86gen_push_native() {
+    let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(4) + add_ri32(r10, 4) + mov_rr(r11, r12) + mov_rm(rsi, rax, 16) + mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_rr(rdi, r11) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r10) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx)
+    let store = mov_rm(rcx, rax, 0) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_mr(r11, 0, r9) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + xor_rr(r11, r11) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
+    mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rcx, rax, 0) + mov_rm(r10, rax, 8) + cmp_rr(rcx, r10) + jne_rel32(str_len(growth)) + growth + store
+}
+
+// x86gen_pop_native 内联 pop：长度减一，返回末元素
+// x86gen_pop_native inlines pop: decrement the length, return the last element
+// pop inline: decrement length, return the last element
+fn x86gen_pop_native() {
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 0) + sub_ri32(rcx, 1) + mov_mr(rax, 0, rcx) + mov_rm(r11, rax, 16) + mov_rr(rdx, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r11, rdx) + mov_rm(r9, r11, 0) + mov_mr(r15, 0 - 16, r9) + vs_pop_n(1)
+}
+
+// x86gen_read_dir_native 内联 read_dir：open/getdents64/close syscall + 名字排序，返回 Result<[str], str>
+// x86gen_read_dir_native inlines read_dir: open/getdents64/close syscalls with name sorting,
+// returning Result<[str], str>
+// read_dir inline: getdents64 syscalls into a sorted name list
+fn x86gen_read_dir_native() {
+    // 固定 os error 错误串 + 枚举包装
+    // fixed os error string plus enum wrapping
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let fail = err_str + err_inst
+    // Ok 结果：list 对象在 r11
+    // Ok result: list object in r11
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r11) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
+    let close = sys_mov_rax(3) + syscall()
+    // 子序列：is_dotdot（rcx=名字指针 → r9=布尔）、strcmp_lt（rsi/rdi → r8=a<b）、strlen（rcx → rdx=长度）
+    // sub-sequences: is_dotdot, strcmp_lt, strlen
+    let mov_r9_1 = mov_ri64(r9, 1)
+    let is_dotdot = e1(138) + e1(1) + e1(60) + e1(46) + jne_rel32(30) + e1(128) + e1(121) + e1(1) + e1(0) + je_rel32(28) + e1(128) + e1(121) + e1(1) + e1(46) + jne_rel32(10) + e1(128) + e1(121) + e1(2) + e1(0) + je_rel32(8) + xor_rr(r9, r9) + jmp_rel32(str_len(mov_r9_1)) + mov_r9_1
+    let setb_r8 = rex(0, 0, 0, r8) + e1(15) + e1(146) + modrm_reg(0, r8)
+    let xor_r8 = xor_rr(r8, r8)
+    let strcmp_tail = setb_r8 + jmp_rel32(str_len(xor_r8)) + xor_r8
+    let movzx_al = movzx_eax_al()
+    let test_rax = test_rr(rax, rax)
+    let strcmp_head = e1(172) + e1(174) + jne_rel32(str_len(movzx_al) + str_len(test_rax) + 11) + movzx_al + test_rax + je_rel32(5)
+    let strcmp_loop = strcmp_head + jmp_rel32(0 - (str_len(strcmp_head) + 5)) + strcmp_tail
+    let add_rdx = add_ri32(rdx, 1)
+    let strlen_head = mov_rr(rdi, rcx) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
+    let strlen_body = e1(174) + je_rel32(str_len(add_rdx) + 5) + add_rdx
+    let strlen_loop = strlen_head + strlen_body + jmp_rel32(0 - (str_len(strlen_body) + 5))
+    // getdents64 调用：fd=r8, 缓冲=rsp, 8192 字节
+    // getdents64 call: fd=r8, buffer=rsp, 8192 bytes
+    let getd = mov_rr(rdi, r8) + mov_rr(rsi, rsp) + sys_mov_rdx(8192) + sys_mov_rax(217) + syscall()
+    // 地址计算：rax = names 数组基址 + idx*8（idx 槽 [r15-32]，基址槽 [r15-24]）
+    // address calc: rax = names base + idx*8
+    let addr_idx = mov_rm(rax, r15, 0 - 32) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(r9, r15, 0 - 24) + add_rr(rax, r9)
+    // 收集：单 pass 读目录，非点名字按 strcmp 顺序收集
+    // collect: single pass over the directory, gathering non-dot names
+    let collect_seq = mov_mr(r15, 0 - 64, rsi) + strlen_loop + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + mov_rr(rsi, rcx) + mov_rr(rcx, rdx) + rep_movsb() + xor_rr(rax, rax) + e1(170) + add_rr(r12, rdx) + add_ri32(r12, 9) + mov_rm(rsi, r15, 0 - 64) + addr_idx + mov_mr(rax, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
+    let inner_tail = mov_rm(rdx, r15, 0 - 40) + add_rr(rsi, rdx)
+    let inner_work = mov_rr(rcx, rsp) + add_rr(rcx, rsi) + add_ri32(rcx, 19) + mov_rr(rax, rsp) + add_rr(rax, rsi) + add_ri32(rax, 16) + mov_rm(rdx, rax, 0) + mov_ri64(r9, 65535) + and_rr(rdx, r9) + mov_mr(r15, 0 - 40, rdx) + is_dotdot + test_rr(r9, r9) + jne_rel32(str_len(collect_seq)) + collect_seq + inner_tail
+    let inner_cond = mov_rm(rdx, r15, 0 - 16) + cmp_rr(rsi, rdx) + jge_rel32(str_len(inner_work) + 5)
+    let inner_loop = inner_cond + inner_work + jmp_rel32(0 - (str_len(inner_cond) + str_len(inner_work) + 5))
+    let collect_body = mov_mr(r15, 0 - 16, rax) + xor_rr(rsi, rsi) + inner_loop
+    let collect_head = getd + test_rr(rax, rax) + jle_rel32(str_len(collect_body) + 5)
+    let collect_loop = collect_head + collect_body + jmp_rel32(0 - (str_len(collect_head) + str_len(collect_body) + 5))
+    // 选择排序：names[0..count) 按 strcmp 升序，count=r10，槽 i=[r15-32] min=[r15-40] j=[r15-16]
+    // selection sort over names[0..count), count=r10
+    let min_store = mov_rm(rax, r15, 0 - 16) + mov_mr(r15, 0 - 40, rax)
+    let addr_min = mov_rm(rax, r15, 0 - 40) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(r9, r15, 0 - 24) + add_rr(rax, r9)
+    let cmp_j = mov_rm(rax, r15, 0 - 16) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(r9, r15, 0 - 24) + add_rr(rax, r9) + mov_rm(r9, rax, 0) + lea(rsi, r9, 8) + addr_min + mov_rm(r9, rax, 0) + lea(rdi, r9, 8) + strcmp_loop + test_rr(r8, r8) + je_rel32(str_len(min_store)) + min_store
+    let addr_idx_keep_r9 = mov_rm(rax, r15, 0 - 32) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(rcx, r15, 0 - 24) + add_rr(rax, rcx)
+    let swap_seq = addr_idx + mov_rm(r9, rax, 0) + mov_rm(rax, r15, 0 - 40) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(rdx, r15, 0 - 24) + add_rr(rax, rdx) + mov_rm(rdx, rax, 0) + addr_idx_keep_r9 + mov_mr(rax, 0, rdx) + mov_rm(rax, r15, 0 - 40) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(rdx, r15, 0 - 24) + add_rr(rax, rdx) + mov_mr(rax, 0, r9)
+    let j_work = cmp_j + mov_rm(rax, r15, 0 - 16) + add_ri32(rax, 1) + mov_mr(r15, 0 - 16, rax)
+    let j_cond = mov_rm(rdx, r15, 0 - 16) + cmp_rr(rdx, r10) + jge_rel32(str_len(j_work) + 5)
+    let j_loop = j_cond + j_work + jmp_rel32(0 - (str_len(j_cond) + str_len(j_work) + 5))
+    let i_work = mov_mr(r15, 0 - 40, rax) + add_ri32(rax, 1) + mov_mr(r15, 0 - 16, rax) + j_loop + swap_seq + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
+    let i_cond = mov_rm(rax, r15, 0 - 32) + cmp_rr(rax, r10) + jge_rel32(str_len(i_work) + 5)
+    let outer_loop = i_cond + i_work + jmp_rel32(0 - (str_len(i_cond) + str_len(i_work) + 5))
+    // 构建 list：把名字 NUL 缓冲拷贝成 str 对象
+    // build: copy each name NUL buffer into a str object
+    let build_work = addr_idx + mov_mr(r15, 0 - 16, rax) + mov_rm(r9, rax, 0) + mov_rm(rdx, r9, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + lea(rsi, r9, 8) + mov_rr(rcx, rdx) + rep_movsb() + add_rr(r12, rdx) + add_ri32(r12, 8) + mov_rm(r9, r15, 0 - 40) + mov_rm(r9, r9, 16) + mov_rm(rax, r15, 0 - 32) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(r9, rax) + mov_mr(r9, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
+    let build_cond = mov_rm(rax, r15, 0 - 32) + cmp_rr(rax, r10) + jge_rel32(str_len(build_work) + 5)
+    let build_loop = build_cond + build_work + jmp_rel32(0 - (str_len(build_cond) + str_len(build_work) + 5))
+    // 主流程拼装
+    // main assembly
+    let list_alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, r11) + mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(r12, rax) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
+    let empty_ok = mov_rr(r11, r12) + xor_rr(rax, rax) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + ok_inst + jmp_rel32(str_len(fail))
+    let build_tail = mov_rm(r11, r15, 0 - 40) + ok_inst + jmp_rel32(str_len(empty_ok) + str_len(fail))
+    let main_done = close + add_ri32(rsp, 8192) + mov_rm(r10, r15, 0 - 32) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + test_rr(r10, r10) + je_rel32(str_len(list_alloc) + str_len(build_loop) + str_len(build_tail)) + outer_loop + list_alloc + build_loop + build_tail
+    let names_alloc = mov_rr(r9, r12) + mov_mr(r15, 0 - 24, r9) + add_ri32(r12, 16384) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
+    let main_tail = sub_ri32(rsp, 8192) + names_alloc + collect_loop + main_done + empty_ok
+    let open_fail = test_rr(rax, rax) + jl_rel32(str_len(main_tail))
+    let head = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail + main_tail + fail
+    head
+}
+
+// x86gen_record_format_at 生成 record 格式化：字段名 + 值
+// x86gen_record_format_at emits record formatting: field names plus values
+// Record formatting: field names and values
+fn x86gen_record_format_at(off, names, ftypes, ff_h) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_loop_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_loop_jne) + str_len(write2))
+    let int_write = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
+    let mut p1 = mov_rm(r10, r15, off) + lea(r10, r10, 16) + mov_ri64(rcx, 9)
+    let mut p1f = ""
+    let mut pi = 0
+    while pi < len(names) {
+        if pi > 0 {
+            p1f = p1f + add_ri32(rcx, 2)
+        }
+        p1f = p1f + add_ri32(rcx, str_len(names[pi]) + 2)
+        if ftypes[pi] == "str" {
+            p1f = p1f + mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
+        } else if ftypes[pi] == "float" {
+            p1f = p1f + push_r(r10) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r10) + add_rr(rcx, rsi)
+        } else {
+            let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+            let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
+            p1f = p1f + mov_rm(rax, r10, 0) + xor_rr(rsi, rsi) + dl + dl_jne + add_rr(rcx, rsi)
+        }
+        p1f = p1f + add_ri32(r10, 8)
+        pi = pi + 1
+    }
+    p1f = p1f + add_ri32(rcx, 2)
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + push_r(r9)
+    let p2h = mov_rm(r10, r15, off) + lea(r10, r10, 16)
+    let mut p2f = ""
+    let pre = "record " + chr(123) + " "
+    let mut pb = 0
+    while pb < str_len(pre) {
+        p2f = p2f + mb(byte_at(pre, pb)) + add_ri32(rdi, 1)
+        pb = pb + 1
+    }
+    let mut qi = 0
+    while qi < len(names) {
+        if qi > 0 {
+            p2f = p2f + mb(44) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+        }
+        let mut nb = 0
+        while nb < str_len(names[qi]) {
+            p2f = p2f + mb(byte_at(names[qi], nb)) + add_ri32(rdi, 1)
+            nb = nb + 1
+        }
+        p2f = p2f + mb(58) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
+        if ftypes[qi] == "str" {
+            p2f = p2f + mov_rm(rax, r10, 0) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
+        } else if ftypes[qi] == "float" {
+            p2f = p2f + push_r(r9) + push_r(r10) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r10) + pop_r(r9) + rep_movsb()
+        } else {
+            p2f = p2f + mov_rm(rdx, r10, 0) + int_write
+        }
+        p2f = p2f + add_ri32(r10, 8)
+        qi = qi + 1
+    }
+    p2f = p2f + mb(32) + add_ri32(rdi, 1) + mb(125) + add_ri32(rdi, 1)
+    let p2t = pop_r(r9) + mov_mr(r15, off, r9)
+    p1 + p1f + alloc + p2h + p2f + p2t
+}
+
+// x86gen_record_eq 生成 record 相等：逐字段比较
+// x86gen_record_eq emits record equality: field-by-field comparison
+// Record equality: field-by-field compare
+fn x86gen_record_eq(ftypes) {
+    let mut body = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_ri64(r11, 1)
+    body = body + mov_rm(rax, r9, 0) + mov_rm(rcx, r10, 0) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+    let mut fi = 0
+    while fi < len(ftypes) {
+        if ftypes[fi] == "str" {
+            let sbody = lea(rsi, rsi, 8) + lea(rdi, rdi, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(rax)
+            body = body + mov_rm(rsi, r9, 16 + 8 * fi) + mov_rm(rdi, r10, 16 + 8 * fi) + mov_rm(rdx, rsi, 0) + mov_rm(r8, rdi, 0) + xor_rr(rax, rax) + cmp_rr(rdx, r8) + jne_rel32(str_len(sbody)) + sbody + and_rr(r11, rax)
+        } else {
+            body = body + mov_rm(rax, r9, 16 + 8 * fi) + mov_rm(rcx, r10, 16 + 8 * fi) + xor_rr(rdx, rdx) + cmp_rr(rax, rcx) + sete(rdx) + and_rr(r11, rdx)
+        }
+        fi = fi + 1
+    }
+    let done = mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+    body + done
+}
+
+// x86gen_sleep_native 内联 sleep：nanosleep syscall，毫秒精度
+// x86gen_sleep_native inlines sleep: the nanosleep syscall, millisecond precision
+// sleep inline: timer-table park with a deadline; sleep(0) is a plain yield (matching
+// the C runtime's bur_schedule + bur_switch_to_sched)
+fn x86gen_sleep_native(sched_addr, timer_add_addr) {
+    let unit_ret = xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let park_save = mov_mr(rdi, FB_RSP, rsp) + mov_mr(rdi, FB_RBP, rbp) + mov_mr(rdi, FB_R14, r14) + mov_mr(rdi, FB_R15, r15)
+    let park_tail = mov_ri64(r8, sched_addr) + jmp_r(r8)
+    let park_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(park_save) + str_len(park_tail)) + push_r(r8)
+    let set_status = mov_ri64(r8, FB_BLOCKED_TIMER) + mov_mr(rdi, FB_STATUS, r8)
+    let timer_add_call = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_ri64(r8, timer_add_addr) + call_r(r8)
+    let timer_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rcx, rsp, 0) + mov_ri64(r8, 1000000000) + imul_rr(rcx, r8) + mov_rm(r8, rsp, 8) + add_rr(rcx, r8) + add_rr(rdx, rcx) + mov_rr(rax, rdx) + add_ri32(rsp, 16)
+    let timer_deadline = mov_rr(rax, r9) + mov_ri64(rcx, 1000000) + imul_rr(rax, rcx) + mov_rr(rdx, rax)
+    let timer_path = timer_deadline + timer_now + timer_add_call + set_status + park_push + park_save + park_tail
+    let y_join = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
+    let y_first = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
+    let y_to_join = jmp_rel32(str_len(y_join))
+    let y_tail_link = mov_mr(rcx, FB_READY_NEXT, rax)
+    let y_branch = test_rr(rcx, rcx) + je_rel32(str_len(y_tail_link) + str_len(y_to_join))
+    let y_tail = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0)
+    let y_set_ready = xor_rr(rcx, rcx) + mov_mr(rax, FB_STATUS, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
+    let y_cur = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0)
+    let y_save = mov_mr(rax, FB_RSP, rsp) + mov_mr(rax, FB_RBP, rbp) + mov_mr(rax, FB_R14, r14) + mov_mr(rax, FB_R15, r15)
+    let yield_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(y_save) + str_len(y_set_ready) + str_len(y_tail) + str_len(y_branch) + str_len(y_tail_link) + str_len(y_to_join) + str_len(y_first) + str_len(y_join) + str_len(mov_ri64(r8, 0)) + str_len(jmp_r(r8))) + push_r(r8)
+    let yield_seq = y_cur + yield_push + y_save + y_set_ready + y_tail + y_branch + y_tail_link + y_to_join + y_first + y_join + mov_ri64(r8, sched_addr) + jmp_r(r8)
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jg_rel32(str_len(yield_seq)) + yield_seq + timer_path + unit_ret
+    head
+}
+
+// x86gen_contains_native 内联 contains：8B 值线性扫描
+// x86gen_contains_native inlines contains: linear scan of 8-byte values
+// contains inline: linear scan over 8-byte values
+fn x86gen_contains_native() {
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rsi, r9, 0) + mov_rm(r10, r9, 16) + xor_rr(r11, r11)
+    let found = mov_ri64(rax, 1) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let notfound = mov_ri64(rax, 0) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + jmp_rel32(str_len(found))
+    let inc = add_ri32(r11, 1)
+    let access = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rdx, rdx, 0) + cmp_rr(rdx, r8) + je_rel32(str_len(inc) + 5 + str_len(notfound))
+    let test = cmp_rr(r11, rsi) + jae_rel32(str_len(access) + str_len(inc) + 5)
+    let back = jmp_rel32(0 - (str_len(test) + str_len(access) + str_len(inc) + 5))
+    head + test + access + inc + back + notfound + found
+}
+
+// x86gen_slice_native 内联 slice：复制 [start, end) 元素到新列表
+// x86gen_slice_native inlines slice: copy [start, end) elements into a new list
+// slice inline: copy elements [start, end) into a new list
+fn x86gen_slice_native() {
+    mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + sub_rr(r9, r8) + mov_rm(r10, rax, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rr(r11, r12) + mov_mr(r11, 0, r9) + mov_mr(r11, 8, r9) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rsi, rdx) + mov_rr(rdi, r10) + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + add_rr(rdx, r11) + mov_rr(r12, rdx) + mov_mr(r15, 0 - 32, r11) + vs_pop_n(3)
+}
+
+// x86gen_exec_spawn_native 内联 spawn：pipe2×3 + fork，子进程 execvp PATH 解析，父进程建 proc 结构
+// x86gen_exec_spawn_native inlines spawn: three pipe2 plus fork, child-side execvp PATH
+// resolution, parent builds the proc struct
+// exec spawn inline: pipe2 x3 + fork + child execvp PATH walk
+// 输入：[r15-8] = cmd str, [r15-16] = args list；输出：rax = proc 指针（失败 -1）
+fn x86gen_exec_spawn_native() {
+    // c1 关闭 [rsp+off] 的 fd（pipe2 写 4 字节 int 槽）/ c1 closes the fd at [rsp+off] (pipe2 writes 4-byte
+    // int slots)
+    let c1 = fn(off) {
+        mov_rm32(rdi, rsp, off) + sys_mov_rax(3) + syscall()
+    }
+    // copy_one：rcx = 源 str，堆上建 NUL 结尾副本，rdx 返回指针（破坏 rcx/rdx/rsi/rdi/r9）
+    // copy_one: rcx = source str, builds a NUL-terminated heap copy, rdx returns the pointer
+    // (clobbers rcx/rdx/rsi/rdi/r9)
+    fn copy_one() capture(ref c1, ref def_path, ref defb, ref di, ref argv_alloc, ref cmd_copy, ref body, ref cond, ref back, ref argv_loop, ref null_tail, ref pipe1, ref pipe2, ref pipe3, ref envp_load, ref fail_write, ref found_seq, ref env_adv, ref default_seq, ref b5, ref b4, ref b3, ref b2, ref b1, ref env_loop_head, ref env_loop_back, ref env_scan, ref strlen_add, ref strlen_head, ref strlen_body, ref strlen_loop, ref cmd_len_seq, ref dir_len, ref cand_base, ref src_tmp, ref r8_next, ref src, ref bump, ref dst, ref copy_dir, ref slash, ref copy_cmd, ref nul, ref save_cand, ref exec_seq, ref flag_set, ref eacces, ref seg_end_body, ref seg_end_len, ref nul_chk, ref seg_body, ref scan_back, ref seg_head, ref seg_back, ref seg_end, ref set13, ref path_end, ref walk, ref direct, ref nul_je, ref slash_body, ref slash_head, ref slash_back, ref dup1, ref dup2, ref child_closes, ref child_seq, ref init_out, ref init_err, ref parent_ok, ref fork_fail, ref parent_seq, ref done_seq, ref fork_seq, ref f3, ref f2, ref f1, ref skip_fail, ref p3_fail, ref p2_fail, ref p1_fail, ref pipes) {
+        let copy = mov_rm(r9, rcx, 0) + mov_rr(rdx, r12) + lea(rsi, rcx, 8) + mov_rr(rdi, rdx) + mov_rr(rcx, r9) + rep_movsb()
+        let nul = xor_rr(rax, rax) + e1(136) + e1(7) + add_rr(r12, r9) + add_ri32(r12, 1)
+        copy + nul
+    }
+    // 默认 PATH 缓冲 / the default PATH buffer
+    let def_path = "/usr/local/bin:/usr/bin:/bin"
+    let mut defb = mov_rr(r8, r12) + add_ri32(r12, 24) + mov_rr(rdi, r8)
+    let mut di = 0
+    while di < 23 {
+        defb = defb + mov_ri64(rax, byte_at(def_path, di)) + e1(136) + e1(7) + add_ri32(rdi, 1)
+        di = di + 1
+    }
+    defb = defb + xor_rr(rax, rax) + e1(136) + e1(7) + mov_mr(rsp, 48, r8)
+    // argv 数组（堆，r11）+ 各参数 NUL 副本 / the argv array on the heap (r11) plus per-arg NUL copies
+    let argv_alloc = mov_rm(r8, r15, 0 - 8) + mov_rm(r10, r8, 0) + mov_mr(rsp, 40, r10) + add_ri32(r10, 2) + mov_rr(r11, r12) + mov_rr(rdx, r10) + mov_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r12, rdx) + mov_mr(rsp, 32, r11)
+    let cmd_copy = mov_rm(rcx, r15, 0 - 16) + copy_one() + mov_mr(r11, 0, rdx)
+    let body = mov_rm(rsi, r8, 16) + mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rsi, rax) + mov_rm(rcx, rsi, 0) + copy_one() + mov_rr(rcx, r10) + add_ri32(rcx, 1) + mov_rr(rax, rcx) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r11) + mov_mr(rax, 0, rdx) + add_ri32(r10, 1)
+    let cond = mov_rm(r9, rsp, 40) + cmp_rr(r10, r9) + jge_rel32(str_len(body) + 5)
+    let back = jmp_rel32(0 - (str_len(cond) + str_len(body) + 5))
+    let argv_loop = xor_rr(r10, r10) + cond + body + back
+    let null_tail = mov_rm(r9, rsp, 40) + add_ri32(r9, 1) + mov_rr(rax, r9) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r11) + xor_rr(rdx, rdx) + mov_mr(rax, 0, rdx)
+    // pipe2×3（O_NONBLOCK|O_CLOEXEC）；失败链在 fork 后（f1→f2→f3 逐级关闭），成功跳过
+    // three pipe2 calls (O_NONBLOCK|O_CLOEXEC); the failure chain sits after fork_seq, success
+    // skips it
+    let pipe1 = mov_rr(rdi, rsp) + mov_ri64(rsi, pipe2_nonblock_cloexec) + sys_mov_rax(293) + syscall()
+    let pipe2 = lea(rdi, rsp, 8) + mov_ri64(rsi, pipe2_nonblock_cloexec) + sys_mov_rax(293) + syscall()
+    let pipe3 = lea(rdi, rsp, 16) + mov_ri64(rsi, pipe2_nonblock_cloexec) + sys_mov_rax(293) + syscall()
+    // envp 指针：[rbx-8] = 启动栈，envp = orig + 8*(argc+1)（跳过 argv 的 NULL 结尾）
+    // envp from the startup stack: envp = orig + 8*(argc+1) (past the argv NULL terminator)
+    let envp_load = mov_rm(rdx, rbx, 0 - 8) + mov_rm(rcx, rdx, 0) + mov_rr(rax, rcx) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rdx, rax) + add_ri32(rdx, 16)
+    // 失败路径：errno 写 [rsp+88]（4 字节）后写 failp[1] 并 _exit(127)
+    // failure path: write errno (4 bytes at [rsp+88]) to failp[1], then _exit(127)
+    let fail_write = mov_rm32(rdi, rsp, 20) + lea(rsi, rsp, 60) + sys_mov_rdx(4) + sys_mov_rax(1) + syscall() + sys_mov_rdi(127) + sys_mov_rax(60) + syscall()
+    // PATH 环境扫描（"PATH=" 前缀）/ scan the environment for a "PATH=" entry
+    let found_seq = lea(r9, r9, 5) + mov_mr(rsp, 48, r9)
+    let env_adv = add_ri32(rsi, 8)
+    let default_seq = mov_rm(r9, rsp, 48)
+    let b5 = rex(0, 0, 0, r9) + e1(128) + e1(121) + e1(4) + e1(61) + jne_rel32(str_len(found_seq))
+    let b4 = rex(0, 0, 0, r9) + e1(128) + e1(121) + e1(3) + e1(72) + jne_rel32(str_len(b5) + str_len(found_seq))
+    let b3 = rex(0, 0, 0, r9) + e1(128) + e1(121) + e1(2) + e1(84) + jne_rel32(str_len(b4) + str_len(b5) + str_len(found_seq))
+    let b2 = rex(0, 0, 0, r9) + e1(128) + e1(121) + e1(1) + e1(65) + jne_rel32(str_len(b3) + str_len(b4) + str_len(b5) + str_len(found_seq))
+    let b1 = rex(0, 0, 0, r9) + e1(128) + e1(57) + e1(80) + jne_rel32(str_len(b2) + str_len(b3) + str_len(b4) + str_len(b5) + str_len(found_seq))
+    let env_loop_head = mov_rm(r9, rsi, 0) + test_rr(r9, r9) + je_rel32(str_len(b1) + str_len(b2) + str_len(b3) + str_len(b4) + str_len(b5) + str_len(found_seq) + str_len(env_adv) + 5)
+    let env_loop_back = jmp_rel32(0 - (str_len(env_loop_head) + str_len(b1) + str_len(b2) + str_len(b3) + str_len(b4) + str_len(b5) + str_len(found_seq) + str_len(env_adv) + 5))
+    let env_scan = envp_load + mov_rr(rsi, rdx) + env_loop_head + b1 + b2 + b3 + b4 + b5 + found_seq + env_adv + env_loop_back + default_seq
+    // strlen：rdi = 串指针，rdx = 长度 / strlen over a NUL-terminated buffer
+    let strlen_add = add_ri32(rdx, 1)
+    let strlen_head = mov_rr(rdi, r9) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
+    let strlen_body = e1(174) + je_rel32(str_len(strlen_add) + 5) + strlen_add
+    let strlen_loop = strlen_head + strlen_body + jmp_rel32(0 - (str_len(strlen_body) + 5))
+    let cmd_len_seq = mov_rm(r11, rsp, 32) + mov_rm(r9, r11, 0) + xor_rr(r8, r8) + strlen_loop + mov_rr(r10, rdx)
+    // 候选路径构建：dir + "/" + cmd + NUL / candidate path build: dir + "/" + cmd + NUL
+    let dir_len = mov_rr(rcx, rdi) + sub_rr(rcx, rsi) + sub_ri32(rcx, 1) + sub_rr(rcx, r8)
+    let cand_base = mov_rr(rdx, r12)
+    let src_tmp = mov_rr(rax, rsi) + add_rr(rax, r8)
+    let r8_next = mov_rr(r8, rdi) + sub_rr(r8, rsi)
+    let src = mov_rr(rsi, rax)
+    let bump = mov_rr(rax, rcx) + add_rr(rax, r10) + add_ri32(rax, 2) + add_rr(r12, rax)
+    let dst = mov_rr(rdi, rdx)
+    let copy_dir = rep_movsb()
+    let slash = mov_ri64(rax, 47) + e1(136) + e1(7) + add_ri32(rdi, 1)
+    let copy_cmd = mov_rr(rsi, r9) + mov_rr(rcx, r10) + rep_movsb()
+    let nul = xor_rr(rax, rax) + e1(136) + e1(7) + add_ri32(rdi, 1)
+    let save_cand = mov_mr(rsp, 64, rdx)
+    let exec_seq = envp_load + mov_rm(rdi, rsp, 64) + mov_rm(rsi, rsp, 32) + sys_mov_rax(59) + syscall()
+    let flag_set = mov_ri64(rax, 1) + mov_mr(rsp, 56, rax)
+    let eacces = mov_ri64(r9, 0 - 13) + cmp_rr(rax, r9) + jne_rel32(str_len(flag_set)) + flag_set
+    let seg_end_body = dir_len + cand_base + src_tmp + r8_next + src + bump + dst + copy_dir + slash + copy_cmd + nul + save_cand + exec_seq + eacces
+    let seg_end_len = str_len(seg_end_body) + 5
+    // 段扫描：al=58(':')，scasb 终止判定；rdi 指向终止符后 / segment scan with scasb against ':', rdi ends past
+    // the terminator
+    let nul_chk = e1(128) + e1(127) + sb(0 - 1) + e1(0) + je_rel32(5 + seg_end_len)
+    let seg_body = e1(174) + je_rel32(str_len(nul_chk) + 5) + nul_chk
+    let scan_back = jmp_rel32(0 - (str_len(seg_body) + 5))
+    let seg_head = mov_rm(rsi, rsp, 48) + mov_rm(r11, rsp, 32) + mov_rm(r9, r11, 0) + mov_ri64(rax, 58) + mov_rr(rdi, rsi) + add_rr(rdi, r8)
+    let seg_back = jmp_rel32(0 - (str_len(seg_head) + str_len(seg_body) + 5 + str_len(seg_end_body) + 5))
+    let seg_end = seg_end_body + seg_back
+    // 路径走到头：无 EACCES 记忆 → ENOENT(2)，有 → EACCES(13) / end of PATH: EACCES remembered -> 13, else
+    // ENOENT(2)
+    let set13 = mov_ri64(rax, 13)
+    let path_end = mov_ri64(rax, 2) + mov_rm(rdx, rsp, 56) + test_rr(rdx, rdx) + je_rel32(str_len(set13) + 5) + set13 + mov_mr(rsp, 60, rax)
+    let walk = cmd_len_seq + env_scan + seg_head + seg_body + scan_back + seg_end + path_end
+    // 直接 execve（含 '/'）失败：写 errno 后走 fail_write / direct execve (cmd contains '/') failure: write
+    // errno, then fail_write
+    let direct = envp_load + mov_rm(r11, rsp, 32) + mov_rm(rdi, r11, 0) + mov_rm(rsi, rsp, 32) + sys_mov_rax(59) + syscall() + neg_r(rax) + mov_mr(rsp, 60, rax) + jmp_rel32(str_len(walk))
+    // 斜杠扫描：'/' → 直接 execve；NUL → PATH 走查 / slash scan: '/' -> direct execve, NUL -> PATH walk
+    let nul_je = e1(132) + e1(192) + je_rel32(5 + str_len(direct))
+    let slash_body = e1(172) + e1(60) + e1(47) + je_rel32(str_len(nul_je) + 5) + nul_je
+    let slash_head = mov_rm(r11, rsp, 32) + mov_rm(rsi, r11, 0)
+    let slash_back = jmp_rel32(0 - (str_len(slash_body) + 5))
+    // 子进程：dup2 到 1/2，关读端与写端（留 failp[1]），PATH 解析后 execve / child: dup2 to 1/2, close read/write
+    // ends (keep failp[1]), PATH-resolve then execve
+    let dup1 = mov_rm32(rdi, rsp, 4) + mov_ri64(rsi, 1) + sys_mov_rax(33) + syscall()
+    let dup2 = mov_rm32(rdi, rsp, 12) + mov_ri64(rsi, 2) + sys_mov_rax(33) + syscall()
+    let child_closes = c1(0) + c1(4) + c1(8) + c1(12) + c1(16)
+    let child_seq = dup1 + dup2 + child_closes + slash_head + slash_body + slash_back + direct + walk + fail_write
+    // 父进程：关写端，建 proc 结构（失败关读端）/ parent: close write ends, build the proc struct (on failure close
+    // read ends)
+    let init_out = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_out_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_out_cap, rax)
+    let init_err = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_err_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_err_cap, rax)
+    let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
+    let fork_fail = c1(0) + c1(8) + c1(16) + mov_ri64(rax, 0 - 1)
+    let parent_seq = mov_mr(rsp, 24, rax) + c1(4) + c1(12) + c1(20) + test_rr(rax, rax) + jl_rel32(str_len(parent_ok) + 5) + parent_ok + jmp_rel32(str_len(fork_fail)) + fork_fail
+    let done_seq = add_ri32(rsp, 80)
+    let fork_seq = sys_mov_rax(57) + syscall() + test_rr(rax, rax) + jne_rel32(str_len(child_seq)) + child_seq + parent_seq + done_seq
+    // 管道失败链：f3 跳过整个 fork 直接回收栈 / pipe failure chain: f3 skips the whole fork and restores the stack
+    let f3 = c1(0) + c1(4) + c1(8) + c1(12) + c1(16) + c1(20) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(fork_seq) - str_len(done_seq))
+    let f2 = c1(0) + c1(4) + c1(8) + c1(12) + f3
+    let f1 = c1(0) + c1(4) + f2
+    let skip_fail = jmp_rel32(str_len(f1) + str_len(f2) + str_len(f3))
+    let p3_fail = test_rr(rax, rax) + jl_rel32(5 + str_len(f1) + str_len(f2))
+    let p2_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(f1))
+    let p1_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5)
+    let pipes = pipe1 + p1_fail + pipe2 + p2_fail + pipe3 + p3_fail + skip_fail + f1 + f2 + f3
+    sub_ri32(rsp, 80) + defb + argv_alloc + cmd_copy + argv_loop + null_tail + pipes + fork_seq
+}
+
+// x86gen_split_native 内联 split：按分隔符拆分 / x86gen_split_native inlines split: divide by a separator
+// split inline: split on a separator
+fn x86gen_split_native() {
+    let push = mov_mr(r15, 0 - 24, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rdi, r15, 0 - 24) + mov_rr(r11, r12) + sub_rr(r11, rdi) + gc_rec(rdi, mov_rr(rsi, r11)) + mov_rm(rdi, r15, 0 - 8) + mov_rm(rsi, r15, 0 - 24) + mov_mr(rdi, 0, rsi) + add_ri32(rdi, 8) + mov_mr(r15, 0 - 8, rdi)
+    let done = mov_rr(rcx, r8) + sub_rr(rcx, rdx) + push + mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + sub_rr(rsi, rdi) + sub_ri32(rsi, 24) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shr_rcl(rsi) + mov_mr(rdi, 0, rsi) + mov_mr(r15, 0 - 24, rdi) + vs_pop_n(2)
+    let matched = mov_rr(rcx, rax) + sub_rr(rcx, rdx) + push + mov_rm(r11, r10, 0) + add_rr(rax, r11) + mov_rr(rdx, rax)
+    let no_match = add_ri32(rax, 1)
+    let loop_tail = mov_rr(rsi, r9) + add_rr(rsi, rax) + add_ri32(rsi, 8) + mov_rr(rdi, r10) + add_ri32(rdi, 8) + mov_rr(rcx, r11) + repe_cmpsb() + je_rel32(str_len(no_match) + 5)
+    let cond_ja = mov_rm(r11, r10, 0) + mov_rr(rcx, rax) + add_rr(rcx, r11) + cmp_rr(rcx, r8) + ja_rel32(str_len(loop_tail) + str_len(no_match) + 5 + str_len(matched) + 5)
+    let cond_je = test_rr(r11, r11) + je_rel32(str_len(cond_ja) + str_len(loop_tail) + str_len(no_match) + 5 + str_len(matched) + 5)
+    let loop_head = cond_je + cond_ja + loop_tail
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(no_match) + 5))
+    let matched_back = jmp_rel32(0 - (str_len(loop_head) + str_len(no_match) + 5 + str_len(matched) + 5))
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + mov_rr(rdi, r12) + xor_rr(rax, rax) + mov_mr(rdi, 0, rax) + mov_mr(rdi, 8, rax) + mov_mr(rdi, 16, rax) + mov_rr(rdx, r8) + add_ri32(rdx, 1) + mov_mr(rdi, 8, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + mov_rr(rax, rdi) + add_ri32(rax, 24) + mov_mr(rdi, 16, rax) + add_rr(r12, rdx) + mov_mr(r15, 0 - 16, rdi) + mov_rr(rsi, rdi) + add_ri32(rsi, 24) + mov_mr(r15, 0 - 8, rsi) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
+    head + loop_head + no_match + back + matched + matched_back + done
+}
+
+// x86gen_str_find_native 内联 str_contains/str_index_of：子串查找
+// x86gen_str_find_native inlines str_contains/str_index_of: substring search
+// str_contains/str_index_of inline: substring search
+fn x86gen_str_find_native(as_option) {
+    let some = if as_option {
+        mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    } else {
+        mov_ri64(rax, 1) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    }
+    let none = if as_option {
+        mov_rr(rcx, r12) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + add_ri32(r12, 16) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2) + jmp_rel32(str_len(some))
+    } else {
+        mov_ri64(rax, 0) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + jmp_rel32(str_len(some))
+    }
+    let next = add_ri32(rax, 1)
+    let loop_tail = mov_rr(rsi, r9) + add_rr(rsi, rax) + add_ri32(rsi, 8) + mov_rr(rdi, r10) + add_ri32(rdi, 8) + mov_rr(rcx, r11) + test_rr(rcx, rcx) + repe_cmpsb() + je_rel32(str_len(next) + 5 + str_len(none))
+    let loop_head = mov_rr(rcx, rax) + add_rr(rcx, r11) + cmp_rr(rcx, r8) + ja_rel32(str_len(loop_tail) + str_len(next) + 5) + loop_tail
+    let back = jmp_rel32(0 - (str_len(loop_head) + str_len(next) + 5))
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + xor_rr(rax, rax)
+    head + loop_head + next + back + none + some
+}
+
+// x86gen_read_stdin_native 内联 read_stdin：read syscall，同步阻塞读 stdin 为 str
+// x86gen_read_stdin_native inlines read_stdin: a synchronous read syscall into a str
+// read_stdin inline: synchronous read of stdin into a str
+fn x86gen_read_stdin_native() {
+    let empty_str = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_mr(r15, 0 - 16, r8) + vs_pop_n(1)
+    let read_seq = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + lea(rsi, r8, 8) + mov_rr(rdx, r9) + xor_rr(rdi, rdi) + sys_mov_rax(0) + syscall() + mov_mr(r8, 0, rax) + add_ri32(r12, 8) + add_rr(r12, rax) + mov_mr(r15, 0 - 16, r8) + vs_pop_n(1)
+    let skip = jmp_rel32(str_len(empty_str))
+    let head = mov_rm(r9, r15, 0 - 8) + test_rr(r9, r9) + jle_rel32(str_len(read_seq + skip)) + read_seq + skip + empty_str
+    head
+}
+
+// x86gen_str_native 内联 str(int)：带符号十进制，逐位除 10 + 负号
+// x86gen_str_native inlines str(int): signed decimal, digit-wise /10 plus the sign
+// str(int) inline: signed decimal, digit-by-digit div-10 with a minus sign
+fn x86gen_str_native() {
+    let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
+    let loop_jne = jne_rel32(0 - (str_len(loop_body) + 6))
+    let neg_write = mov_ri64(rdx, 45) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 1)
+    let alloc = mov_rr(rdx, r10) + add_rr(rdx, r8) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rcx, rdx, 8) + add_rr(r12, rcx) + gc_rec(r11, mov_rr(rsi, rcx)) + lea(rdi, r11, 8) + test_rr(r8, r8) + je_rel32(str_len(neg_write)) + neg_write
+    let pop_body = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
+    let pop_jne = jne_rel32(0 - (str_len(pop_body) + 6))
+    let neg_path = mov_ri64(r8, 1) + neg_r(rax)
+    let head = mov_rm(rax, r15, 0 - 8) + xor_rr(r8, r8) + test_rr(rax, rax) + jge_rel32(str_len(neg_path))
+    let loop_start = xor_rr(r10, r10)
+    head + neg_path + loop_start + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
+}
+
+// x86gen_str_const_at 在堆上构造编译期字符串并写回 [r15+off]
+// x86gen_str_const_at builds a compile-time string on the heap and stores it at [r15+off]
+fn x86gen_str_const_at(off, s) {
+    let mut store = mov_rr(r11, r12) + mov_ri64(r9, str_len(s)) + mov_mr(r11, 0, r9) + lea(rdi, r11, 8)
+    let mut ci = 0
+    while ci < str_len(s) {
+        store = store + mov_ri64(r10, byte_at(s, ci)) + mov_mr(rdi, 0, r10) + add_ri32(rdi, 1)
+        ci = ci + 1
+    }
+    store = store + add_rr(r12, r9) + add_ri32(r12, 8) + mov_mr(r15, off, r11)
+    store
+}
+
+// x86gen_concat_native 内联 concat：两列表拼接 / x86gen_concat_native inlines concat: join two lists
+// concat inline: concatenate two lists
+fn x86gen_concat_native() {
+    mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rcx, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rcx, rdx) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rm(rsi, r9, 16) + mov_rr(rdi, r10) + mov_rm(rdx, r9, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rsi, r8, 16) + mov_rm(rdx, r8, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rax, r9, 0) + mov_rm(rdx, r8, 0) + add_rr(rax, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + add_rr(rax, r11) + mov_rr(r12, rax) + mov_mr(r15, 0 - 24, r11) + vs_pop_n(2)
+}
+
+// x86gen_eq_str 生成字符串相等比较 / x86gen_eq_str emits string equality
+// String equality compare
+fn x86gen_eq_str() {
+    let cmp_body = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + sete(r10)
+    let done = mov_mr(r15, 0 - 16, r10) + vs_pop_n(1)
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
+}
+
+// x86gen_tcp_listen_native 内联 tcp_listen：socket/bind/listen syscalls，返回 Result<int, str>
+// x86gen_tcp_listen_native inlines tcp_listen: socket/bind/listen syscalls, returning Result<int,
+// str>
+fn x86gen_tcp_listen_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst + add_ri32(rsp, 32)
+    let fail_close = mov_rr(rdi, r9) + sys_mov_rax(3) + syscall() + fail
+    let listen_ok = mov_rr(rax, r9) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    let listen_fail = test_rr(rax, rax) + jl_rel32(str_len(listen_ok))
+    let listen_seq = mov_rr(rdi, r9) + mov_ri64(rsi, 128) + sys_mov_rax(50) + syscall()
+    let bind_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(49) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let reuse_seq = mov_ri64(rax, 1) + mov_mr(rsp, 4, rax) + mov_rr(rdi, r9) + mov_ri64(rsi, 1) + mov_ri64(rdx, 2) + lea(r10, rsp, 4) + mov_ri64(r8, 4) + sys_mov_rax(54) + syscall()
+    // listener fd 置 O_NONBLOCK：accept 返回 EAGAIN 才能 park（VM 语义：socket 出生即非阻塞）
+    // set O_NONBLOCK on the listener fd: accept must return EAGAIN to park (VM semantics: sockets
+    // are born non-blocking)
+    let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let sockaddr = x86gen_sockaddr_at()
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
+    head + sockaddr + socket_seq + nonblock_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close
+}
+
+// x86gen_chan_format_at 生成 chan→str 转换：<chan cap=<cap> len=<len>>
+// x86gen_chan_format_at emits chan-to-str: <chan cap=<cap> len=<len>>
+fn x86gen_chan_format_at(off) {
+    let mb_al = e1(136) + e1(7)
+    let mb = fn(c) {
+        e1(198) + e1(7) + sb(c)
+    }
+    let dl_loop = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
+    let dl_jne = jne_rel32(0 - (str_len(dl_loop) + 6))
+    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
+    let int2_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
+    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
+    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
+    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_jne) + str_len(write2))
+    let int2_at = fn(r, foff) {
+        mov_rm(rax, r, foff) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_jne + write2
+    }
+    let l1 = mov_rm(r9, r15, off) + mov_rr(r10, r9) + mov_ri64(rcx, 16) + mov_rm(rax, r10, CH_CAP) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi) + mov_rm(rax, r10, CH_BUFLEN) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi)
+    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + gc_rec(r9, mov_rr(rsi, rcx))
+    let lit_head = mov_ri64(rdx, 7017488302826087228) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 8) + mov_ri64(rdx, 15728) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 2)
+    let lit_mid = mov_ri64(rdx, 263845145632) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 5)
+    let l2 = lit_head + int2_at(r10, CH_CAP) + lit_mid + int2_at(r10, CH_BUFLEN) + mb(62) + add_ri32(rdi, 1)
+    l1 + alloc + l2 + mov_mr(r15, off, r9)
+}
+
+// x86gen_trap_exit 发射 trap：文本按 8B 块写入 [rsp-n..] + write(2) + exit 4
+// x86gen_trap_exit emits a trap: the message in 8-byte chunks at [rsp-n..] + write(2) + exit 4
+fn x86gen_trap_exit(msg) {
+    let mlen = str_len(msg)
+    let nchunks = (mlen + 7) / 8
+    let mut code = ""
+    let mut ci = 0
+    while ci < nchunks {
+        let mut ask = 8
+        if mlen - ci * 8 < 8 {
+            ask = mlen - ci * 8
+        }
+        let chunk = substr(msg, ci * 8, ask)
+        let clen = str_len(chunk)
+        let mut v = 0
+        let mut mul = 1
+        let mut bj = 0
+        while bj < clen {
+            v = v + ord(substr(chunk, bj, 1)) * mul
+            if bj + 1 < clen {
+                mul = mul * 256
+            }
+            bj = bj + 1
+        }
+        code = code + mov_ri64(rax, v) + mov_mr(rsp, 0 - 8 * (nchunks - ci), rax)
+        ci = ci + 1
+    }
+    code + mov_ri64(rdi, 2) + lea(rsi, rsp, 0 - 8 * nchunks) + mov_ri64(rdx, mlen) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 4) + mov_ri64(rax, 60) + syscall()
+}
+
+// x86gen_join_native 内联 join：字符串列表用分隔符连接
+// x86gen_join_native inlines join: connect a string list with a separator
+// join inline: join string lists with a separator
+fn x86gen_join_native() {
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + xor_rr(rdx, rdx) + xor_rr(rax, rax)
+    let done_copy = vs_pop_n(2)
+    let pass2_elem = mov_rr(rsi, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rm(rcx, r9, 16) + add_rr(rcx, rsi) + mov_rm(rcx, rcx, 0) + mov_rr(rsi, rcx) + add_ri32(rsi, 8) + mov_rm(rdx, rcx, 0) + mov_rr(rcx, rdx) + rep_movsb()
+    let pass2_no = mov_rr(rsi, r10) + add_ri32(rsi, 8) + mov_rr(rcx, r11) + rep_movsb()
+    let pass2_je = test_rr(rax, rax) + je_rel32(str_len(pass2_no))
+    let pass2_head = cmp_rr(rax, r8) + jge_rel32(str_len(pass2_je) + str_len(pass2_no) + str_len(pass2_elem) + 9)
+    let loop_copy_body = pass2_je + pass2_no + pass2_elem + add_ri32(rax, 1)
+    let back_copy = jmp_rel32(0 - (str_len(pass2_head) + str_len(loop_copy_body) + 5))
+    let loop_copy = pass2_head + loop_copy_body + back_copy
+    let done_len_tail = mov_mr(r15, 0 - 24, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rdx) + add_rr(r12, rdx) + add_ri32(r12, 8) + mov_rm(rdi, r15, 0 - 24) + add_ri32(rdi, 8) + xor_rr(rax, rax)
+    let pass1_elem = mov_rr(rsi, rax) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rm(rcx, r9, 16) + add_rr(rcx, rsi) + mov_rm(rcx, rcx, 0) + mov_rm(rsi, rcx, 0) + add_rr(rdx, rsi)
+    let pass1_no = add_rr(rdx, r11)
+    let pass1_je = test_rr(rax, rax) + je_rel32(str_len(pass1_no))
+    let pass1_head = cmp_rr(rax, r8) + jge_rel32(str_len(pass1_je) + str_len(pass1_no) + str_len(pass1_elem) + 9)
+    let loop_len_body = pass1_je + pass1_no + pass1_elem + add_ri32(rax, 1)
+    let back_len = jmp_rel32(0 - (str_len(pass1_head) + str_len(loop_len_body) + 5))
+    let loop_len = pass1_head + loop_len_body + back_len
+    head + loop_len + done_len_tail + loop_copy + done_copy
+}
+
+// x86gen_trim_native 内联 trim：去首尾空白 / x86gen_trim_native inlines trim: strip leading and trailing
+// whitespace
+// trim inline: strip leading/trailing whitespace
+fn x86gen_trim_native() {
+    let read = mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rax, rsi, 0) + mov_ri64(r10, 255) + and_rr(rax, r10)
+    let done = sub_rr(rcx, rdx) + mov_mr(r15, 0 - 16, r12) + mov_rr(rdi, r12) + mov_mr(rdi, 0, rcx) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rr(rdi, r12) + add_ri32(rdi, 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + rep_movsb() + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + add_rr(r12, rcx) + add_ri32(r12, 8) + mov_rm(rsi, r15, 0 - 16) + mov_mr(r15, 0 - 16, rsi) + vs_pop_n(1)
+    let yes2 = sub_ri32(rcx, 1)
+    let no2 = jmp_rel32(str_len(yes2) + 5)
+    let jb2 = sub_ri32(rax, 9) + sub_ri32(rax, 5) + jb_rel32(str_len(no2))
+    let je2 = mov_rr(r10, rax) + sub_ri32(r10, 32) + test_rr(r10, r10) + je_rel32(str_len(jb2) + str_len(no2))
+    let tail2 = mov_rr(rsi, r9) + add_rr(rsi, rcx) + add_ri32(rsi, 7) + mov_rm(rax, rsi, 0) + mov_ri64(r10, 255) + and_rr(rax, r10) + je2 + jb2 + no2 + yes2
+    let cond2 = cmp_rr(rcx, rdx) + jle_rel32(str_len(tail2) + 5)
+    let back2 = jmp_rel32(0 - (str_len(cond2) + str_len(tail2) + 5))
+    let loop2 = cond2 + tail2 + back2
+    let yes1 = add_ri32(rdx, 1)
+    let no1 = jmp_rel32(str_len(yes1) + 5)
+    let jb1 = sub_ri32(rax, 9) + sub_ri32(rax, 5) + jb_rel32(str_len(no1))
+    let je1 = mov_rr(r10, rax) + sub_ri32(r10, 32) + test_rr(r10, r10) + je_rel32(str_len(jb1) + str_len(no1))
+    let tail1 = read + je1 + jb1 + no1 + yes1
+    let cond1 = cmp_rr(rdx, rcx) + jge_rel32(str_len(tail1) + 5)
+    let back1 = jmp_rel32(0 - (str_len(cond1) + str_len(tail1) + 5))
+    let loop1 = cond1 + tail1 + back1
+    let head = mov_rm(r9, r15, 0 - 8) + mov_rm(r8, r9, 0) + xor_rr(rdx, rdx) + mov_rr(rcx, r8)
+    head + loop1 + loop2 + done
+}
+
+// x86gen_write_file_native 内联 write_file：open/write/close syscall，返回 Result<unit, str>
+// x86gen_write_file_native inlines write_file: open/write/close syscalls, returning Result<unit,
+// str>
+// write_file inline: open/write/close syscalls into Result<unit, str>
+fn x86gen_write_file_native() {
+    let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    let fail = err_str + err_inst
+    let write_seq = mov_rm(r9, r15, 0 - 8) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rm(rdx, r9, 0) + mov_rr(rdi, r8) + sys_mov_rax(1) + syscall() + sys_mov_rax(3) + syscall() + ok_inst + jmp_rel32(str_len(fail))
+    let open_fail = test_rr(rax, rax) + jl_rel32(str_len(write_seq)) + write_seq + fail
+    let head = x86gen_nul_path_at(0 - 16) + mov_rr(rdi, r11) + sys_mov_rsi(577) + sys_mov_rdx(420) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail
+    head
+}
