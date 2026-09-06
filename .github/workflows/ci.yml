@@ -518,3 +518,45 @@ jobs:
           set -euo pipefail
           cc --version | head -n 1
           cc -c runtime/burrt_impl.c runtime/burrt_natives.c
+
+  # This job name is the required status check anchor for main branch protection:
+  # required checks match by context name, so renaming or deleting this job leaves
+  # every PR into main stuck at "Expected — Waiting for status to be reported".
+  # main has enforce_admins on, so the owner cannot unblock it in the UI either;
+  # only removing the required check via API recovers.
+  # 该 job 名是 main 分支保护 required status check 的锚点：required check 按
+  # context 名匹配，改名或删除会让所有进 main 的 PR 卡在
+  # "Expected — Waiting for status to be reported"；main 开了 enforce_admins，
+  # 届时 owner 在 UI 上也解不开，只能发 API 摘掉该 required check。
+  gate:
+    needs:
+      [gohost, seed, bur-base, gen1, check, fixpoint, testdata, examples, std,
+       multibackend, x86-pe-build, x86-pe-run, x86-macho-build, x86-macho-run,
+       runtime]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert every job reported success
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' <<< "$RESULTS"
+          # Every job but seed runs unconditionally, so anything short of
+          # success means the chain broke; seed alone is bypassed on a
+          # bur-base cache hit. Without this a failed bur-base skips the whole
+          # verification chain, and skipped required checks count as passing.
+          # 除 seed 外每个 job 都无条件运行，非 success 即链断；seed 只在
+          # bur-base cache 命中时被绕过。没有这一条，bur-base 失败会让整条
+          # 验证链跳过，而被跳过的 required check 算通过。
+          failed=$(jq -r '
+            to_entries[]
+            | select(.value.result != "success")
+            | select(.key != "seed" or .value.result != "skipped")
+            | "\(.key)=\(.value.result)"' <<< "$RESULTS")
+          if [ -n "$failed" ]; then
+            echo "gate: these jobs did not pass:" >&2
+            echo "$failed" >&2
+            exit 1
+          fi
