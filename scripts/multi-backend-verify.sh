@@ -128,4 +128,7 @@ fi
 if [ -n "$GAPS" ]; then
     echo "KNOWN-GAP (backend rejects):$GAPS"
 fi
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi
 exit 0
