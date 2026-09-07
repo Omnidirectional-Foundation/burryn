@@ -57,7 +57,7 @@ S8 全阶段 2026-11-23 收线。内部顺序：先收 S8.1，再 S8.5，再 S8.
 完成条件 = 两目标可编 + spawn / sleep / fs / net / exec 语料在 macOS 与 Windows 真机 job 全绿 + 共用验收闸持续全绿；hello 级全绿即收的 hollow 版不算完成。
 **不含**加固填字段（UUID、DllCharacteristics flag 位不阻塞收线）；PIE 与节拆分属序列化层本职，在完成线之内。
 
-**S8.6 x86 模块包（定案）**：模块包并入 S8，不另开编号。`compile_to_x86` 的 `is_dir` 拒收去掉，三目标共用这条路径。
+**S8.6 x86 模块包（定案）**：模块包并入 S8，不另开编号。`compile_to_x86` 的 `is_dir` 拒收去掉，三目标共用这条路径。它涉及跨编译单元的符号解析与寻址模型，推迟等于将来重写，故不推迟。
 
 **x86 自举仍不在 S8 内**：用 x86 编 compiler 不是后端完工的必要条件——[`architecture.md`](architecture.md) §3.5 的自举判定已由 C 路径满足。
 
