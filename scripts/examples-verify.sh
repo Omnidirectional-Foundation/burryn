@@ -6,7 +6,10 @@
 set -u
 cd "$(dirname "$0")/.."
 
-BUR=${BUR:-./bur}
+if [ -z "${BUR:-}" ]; then
+    echo "BUR is not set; invoke as BUR=<compiler> $0 ..." >&2
+    exit 2
+fi
 fails=0
 
 if ! SKIP=stdin.bur ./scripts/golden-verify.sh \
