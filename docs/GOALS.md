@@ -56,6 +56,10 @@ S8 全阶段 2026-11-23 收线。内部顺序：先收 S8.1，再 S8.5，再 S8.
 **S8.5 实心版（定案）**：PE 与 Mach-O 序列化层，与 S8.1 同一后端的另外两个目标（`bur build --backend x86 --os windows|darwin`）；Mach-O 不另开编号，与 PE 同属 S8.5。
 完成条件 = 两目标可编 + spawn / sleep / fs / net / exec 语料在 macOS 与 Windows 真机 job 全绿 + 共用验收闸持续全绿；hello 级全绿即收的 hollow 版不算完成。
 **不含**加固填字段（UUID、DllCharacteristics flag 位不阻塞收线）；PIE 与节拆分属序列化层本职，在完成线之内。
+PE 侧分阶段（非常驻小任务，按此顺序）：fd↔HANDLE 映射表（含 write 改查表）
+→ 文件臂 → net 臂（WSAStartup＋SOCKET/HANDLE 类型分流）→ exec 臂；
+Mach-O 侧全程裸 syscall 直通，无需 fd 表。
+**含**崩溃可诊断性（定案）：PE 补 `.pdata` / unwind（异常目录 [3]，现状下 WER 不介入、无 dump、无栈回溯），Mach-O 补对等项（`LC_FUNCTION_STARTS` / `__unwind_info`，现状十条命令里没有）。它是序列化层本职，随 S8.5 落地；不阻塞语料口径（纯计算程序不受影响），但别掉出清单。
 
 **S8.6 x86 模块包（定案）**：模块包并入 S8，不另开编号。`compile_to_x86` 的 `is_dir` 拒收去掉，三目标共用这条路径。它涉及跨编译单元的符号解析与寻址模型，推迟等于将来重写，故不推迟。
 
