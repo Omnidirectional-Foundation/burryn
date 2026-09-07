@@ -401,8 +401,8 @@ jobs:
         with:
           name: gen1
 
-      # P0 probes: hello + the pure slice (fib, float_arith, expected green)
-      # + clock (sleep path needs poll(7): expected SIGILL, evidence only).
+      # PE corpus: hello + pure slice (fib, float_arith) + yield, all hard-gated;
+      # clock stays evidence-only until the Sleep arm actually works (see report).
       - name: Build windows programs
         run: |
           set -euo pipefail
@@ -411,6 +411,7 @@ jobs:
           ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-out/hello.exe
           ./gen1 build --backend x86 --os windows examples/basics/fib.bur -o pe-out/fib.exe
           ./gen1 build --backend x86 --os windows examples/basics/float_arith.bur -o pe-out/float_arith.exe
+          ./gen1 build --backend x86 --os windows examples/concurrency/yield.bur -o pe-out/yield.exe
           ./gen1 build --backend x86 --os windows testdata/regression/clock.bur -o pe-out/clock.exe
 
       - name: Upload windows programs
@@ -453,9 +454,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/float_arith.golden actual-float_arith.txt
 
-      # Evidence only: the sleep path parks into poll(7), which the PE
-      # dispatcher lacks, so clock is expected to die on ud2 (0xC000001D).
-      # This step never fails the job; P2 (WSAPoll arm) turns it green.
+      - name: Run spawn slice (hard gate)
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\yield.exe > actual-yield.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/concurrency/yield.golden actual-yield.txt
+
+      # Evidence only: the sleep path parks into poll(7); clock still dies with
+      # 0xC000001D even after the P2 Sleep arm landed, so the arm itself is now
+      # the suspect (see the S8.5 report). This step never fails the job; it
+      # turns green (hard gate like yield) once sleep really works.
       - name: Probe sleep path (expected crash, evidence only)
         shell: pwsh
         continue-on-error: true
