@@ -401,17 +401,23 @@ jobs:
         with:
           name: gen1
 
-      - name: Build windows hello
+      # P0 probes: hello + the pure slice (fib, float_arith, expected green)
+      # + clock (sleep path needs poll(7): expected SIGILL, evidence only).
+      - name: Build windows programs
         run: |
           set -euo pipefail
           chmod +x gen1
-          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o hello.exe
+          mkdir -p pe-out
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-out/hello.exe
+          ./gen1 build --backend x86 --os windows examples/basics/fib.bur -o pe-out/fib.exe
+          ./gen1 build --backend x86 --os windows examples/basics/float_arith.bur -o pe-out/float_arith.exe
+          ./gen1 build --backend x86 --os windows testdata/regression/clock.bur -o pe-out/clock.exe
 
-      - name: Upload hello.exe
+      - name: Upload windows programs
         uses: actions/upload-artifact@v4
         with:
-          name: x86-pe-hello
-          path: hello.exe
+          name: x86-pe-progs
+          path: pe-out
           if-no-files-found: error
           retention-days: 7
 
@@ -424,17 +430,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download hello.exe
+      - name: Download windows programs
         uses: actions/download-artifact@v4
         with:
-          name: x86-pe-hello
+          name: x86-pe-progs
+          path: pe-out
 
       - name: Run and compare golden
         shell: pwsh
         run: |
-          cmd /c ".\hello.exe > actual.txt"
+          cmd /c ".\pe-out\hello.exe > actual.txt"
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/hello.golden actual.txt
+
+      - name: Run pure corpus slice
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\fib.exe > actual-fib.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/basics/fib.golden actual-fib.txt
+          cmd /c ".\pe-out\float_arith.exe > actual-float_arith.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/basics/float_arith.golden actual-float_arith.txt
+
+      # Evidence only: the sleep path parks into poll(7), which the PE
+      # dispatcher lacks, so clock is expected to die on ud2 (0xC000001D).
+      # This step never fails the job; P2 (WSAPoll arm) turns it green.
+      - name: Probe sleep path (expected crash, evidence only)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cmd /c ".\pe-out\clock.exe > actual-clock.txt 2>&1"
+          echo "clock.exe exit code: $LASTEXITCODE"
+          Get-Content actual-clock.txt -ErrorAction SilentlyContinue | Select-Object -First 5
 
   x86-macho-build:
     needs: gen1
@@ -459,6 +487,9 @@ jobs:
           ./gen1 build --backend x86 --os darwin testdata/regression/clock.bur -o macho-out/clock-mac
           ./gen1 build --backend x86 --os darwin examples/basics/fib.bur -o macho-out/fib-mac
           ./gen1 build --backend x86 --os darwin examples/basics/float_arith.bur -o macho-out/float_arith-mac
+          ./gen1 build --backend x86 --os darwin examples/concurrency/yield.bur -o macho-out/yield-mac
+          ./gen1 build --backend x86 --os darwin examples/io/sleep.bur -o macho-out/sleep-mac
+          ./gen1 build --backend x86 --os darwin examples/concurrency/pipeline.bur -o macho-out/pipeline-mac
 
       - name: Upload macho programs
         uses: actions/upload-artifact@v4
@@ -522,6 +553,9 @@ jobs:
           check_one clock-mac testdata/regression/clock.golden
           check_one fib-mac examples/basics/fib.golden
           check_one float_arith-mac examples/basics/float_arith.golden
+          check_one yield-mac examples/concurrency/yield.golden
+          check_one sleep-mac examples/io/sleep.golden
+          check_one pipeline-mac examples/concurrency/pipeline.golden
 
   runtime:
     needs: []
