@@ -79,18 +79,38 @@ pub fn pe_build_imports(fns, idata_off) {
 // survives; result returns in rax. Every IAT target loads through
 // mov_ri64(r10, …): r10 is the operand of call qword [r10] and of mul/div r10,
 // and a hand-written REX.B is easily mistyped as REX.R, silently hitting rdx.
-// 支持号：1 write→WriteFile、60 exit→ExitProcess、9 mmap→VirtualAlloc、
-// 228 clock_gettime→QPC/QPF 合成 timespec、7 poll→Sleep（仅 nfds==0 的 timer
-// 等待；nfds>0 仍 ud2，WSAPoll 翻译随 P4 落地）、10 mprotect→VirtualProtect；
+// 支持号：1 write→WriteFile（经 fd 表查句柄）、60 exit→ExitProcess、
+// 9 mmap→VirtualAlloc、228 clock_gettime→QPC/QPF 合成 timespec、
+// 7 poll→Sleep（仅 nfds==0 的 timer 等待；nfds>0 仍 ud2，WSAPoll 翻译随 P4 落地）、
+// 10 mprotect→VirtualProtect、3 close→CloseHandle（销 fd 表槽）；
 // 其余 ud2 立即崩溃暴露缺口。
-// Supported: 1 write→WriteFile, 60 exit→ExitProcess, 9 mmap→VirtualAlloc,
-// 228 clock_gettime→QPC/QPF synthesizing timespec, 7 poll→Sleep (nfds==0 timer
-// waits only; nfds>0 still hits ud2, the WSAPoll translation lands with P4),
-// 10 mprotect→VirtualProtect; anything else hits ud2.
-// iat 为八个 IAT 槽的绝对地址：GetStdHandle / WriteFile / ExitProcess /
+// Supported: 1 write→WriteFile (via the fd table), 60 exit→ExitProcess,
+// 9 mmap→VirtualAlloc, 228 clock_gettime→QPC/QPF synthesizing timespec,
+// 7 poll→Sleep (nfds==0 timer waits only; nfds>0 still hits ud2, the WSAPoll
+// translation lands with P4), 10 mprotect→VirtualProtect, 3 close→CloseHandle
+// (frees the fd table slot); anything else hits ud2.
+// iat 为九个 IAT 槽的绝对地址：GetStdHandle / WriteFile / ExitProcess /
 // VirtualAlloc / QueryPerformanceCounter / QueryPerformanceFrequency /
-// Sleep / VirtualProtect。
-// iat holds eight absolute IAT addresses in that order.
+// Sleep / VirtualProtect / CloseHandle。
+// iat holds nine absolute IAT addresses in that order.
+
+// pe_fd_lookup 把 rdi 的小整数 fd 换成表槽地址（r11）；miss（负数 / ≥64 /
+// 槽空闲）返 -EBADF 并跳过调用方剩余 skip_after 字节。0/1/2 槽首次使用时懒初始化
+// （GetStdHandle(-10-fd) 存句柄，kind=0）；open 从不返回 0-2。
+// pe_fd_lookup resolves the small-int fd in rdi to the table slot (r11); on a
+// miss (negative / >=64 / free slot) it returns -EBADF and skips the caller's
+// remaining skip_after bytes. Slots 0-2 initialize lazily on first use
+// (GetStdHandle(-10-fd), kind=0); open never hands out 0-2.
+fn pe_fd_lookup(iat, skip_after) {
+    let miss = mov_ri64(rax, 0 - 9) + jmp_rel32(skip_after)
+    let lazy = mov_ri64(rcx, 0 - 10) + sub_rr(rcx, rdi) + mov_ri64(r10, iat[0]) + e1(65) + e1(255) + e1(18) + mov_mr(r11, 0, rax) + xor_rr(r10, r10) + mov_mr(r11, 8, r10)
+    let free_chk = mov_ri64(r10, 2) + cmp_rr(rdi, r10) + ja_rel32(str_len(lazy))
+    let kind_chk = mov_rm(rax, r11, 8) + mov_ri64(r10, 0 - 1) + cmp_rr(rax, r10) + jne_rel32(str_len(free_chk) + str_len(lazy))
+    let slot = mov_rr(r11, rdi) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10)
+    let bound = mov_ri64(r10, 64) + cmp_rr(rdi, r10) + jae_rel32(str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy))
+    test_rr(rdi, rdi) + jl_rel32(str_len(bound) + str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy)) + bound + slot + kind_chk + free_chk + lazy + miss
+}
+
 pub fn pe_build_dispatcher(iat) {
     // 先压 SysV 仍活寄存器，再 16 字节对齐并开出 Win64 影子空间与局部量
     // Save still-live SysV regs, then 16-byte-align and open Win64 shadow plus locals
@@ -100,10 +120,22 @@ pub fn pe_build_dispatcher(iat) {
     // Epilogue: rsp back to the save area, then pop
     let epilogue = e1(72) + e1(141) + e1(101) + e1(208) + e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(201) + e1(195)
 
-    // write(fd=rdi, buf=rsi, len=rdx)：句柄 1→STD_OUTPUT 其余→STD_ERROR；
-    // GetStdHandle 的 rcx 与 WriteFile 的四寄存器槽按 Win64 装填；长度先存局部
-    // write: handle 1→STD_OUTPUT else STD_ERROR; Win64 rcx/rdx/r8/r9; length in a local
-    let write_case = e1(73) + e1(199) + e1(195) + e1(245) + e1(255) + e1(255) + e1(255) + e1(72) + e1(131) + e1(255) + e1(1) + e1(116) + e1(7) + e1(73) + e1(199) + e1(195) + e1(244) + e1(255) + e1(255) + e1(255) + e1(72) + e1(137) + e1(84) + e1(36) + e1(56) + e1(76) + e1(137) + e1(217) + mov_ri64(r10, iat[0]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(137) + e1(193) + e1(72) + e1(137) + e1(242) + e1(76) + e1(139) + e1(68) + e1(36) + e1(56) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + e1(76) + e1(141) + e1(76) + e1(36) + e1(48) + mov_ri64(r10, iat[1]) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + e1(116) + e1(7) + e1(72) + e1(139) + e1(68) + e1(36) + e1(56) + e1(235) + e1(4) + e1(72) + e1(131) + e1(200) + e1(255)
+    // write(fd=rdi, buf=rsi, len=rdx)：fd 经表查句柄（0/1/2 懒初始化后与旧
+    // GetStdHandle 每次调用同值）；WriteFile 四寄存器槽按 Win64 装填；长度先存局部
+    // write(fd=rdi, buf=rsi, len=rdx): fd resolves through the table (lazy
+    // slots 0-2 hold the same handles the old per-call GetStdHandle returned);
+    // Win64 rcx/rdx/r8/r9; length in a local
+    let write_tail = mov_rm(rcx, r11, 0) + e1(72) + e1(137) + e1(242) + e1(76) + e1(139) + e1(68) + e1(36) + e1(56) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + e1(76) + e1(141) + e1(76) + e1(36) + e1(48) + mov_ri64(r10, iat[1]) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + e1(116) + e1(7) + e1(72) + e1(139) + e1(68) + e1(36) + e1(56) + e1(235) + e1(4) + e1(72) + e1(131) + e1(200) + e1(255)
+    let write_body = mov_rm(rsi, rsp, 8) + mov_rm(rdx, rsp, 16) + write_tail
+    let write_case = mov_mr(rsp, 8, rsi) + mov_mr(rsp, 16, rdx) + pe_fd_lookup(iat, str_len(write_body)) + write_body
+
+    // close(fd=rdi)：查表→CloseHandle→标空闲；miss 在 lookup 内返 -EBADF。
+    // CloseHandle 返回值不纠缠（与现有 close 路径忽略错误一致）。
+    // close(fd=rdi): table lookup → CloseHandle → mark free; misses return
+    // -EBADF inside the lookup. CloseHandle's own result is ignored, matching
+    // the existing close paths.
+    let close_tail = mov_rm(rcx, r11, 0) + mov_ri64(r10, iat[8]) + e1(65) + e1(255) + e1(18) + mov_ri64(r10, 0 - 1) + mov_mr(r11, 8, r10) + xor_rr(rax, rax)
+    let close_case = pe_fd_lookup(iat, str_len(close_tail)) + close_tail
 
     // exit(code=rdi)：ExitProcess 不返回；int3 兜底
     // exit(code=rdi): ExitProcess never returns; int3 as a guard
@@ -142,7 +174,7 @@ pub fn pe_build_dispatcher(iat) {
     let mp_ret = test_rr(rax, rax) + je_rel32(str_len(xor_rr(rax, rax)) + 5 + str_len(mov_ri64(rax, 0 - 1))) + xor_rr(rax, rax) + jmp_rel32(str_len(mov_ri64(rax, 0 - 1))) + mov_ri64(rax, 0 - 1)
     let mprotect_case = mov_rr(rcx, rdi) + mov_ri64(r8, 64) + test_rr(rdx, rdx) + jne_rel32(str_len(mov_ri64(r8, 1))) + mov_ri64(r8, 1) + mov_rr(rdx, rsi) + lea(r9, rsp, 40) + mov_ri64(r10, iat[7]) + e1(65) + e1(255) + e1(18) + mp_ret
 
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case], epilogue)
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case], epilogue)
 }
 
 // pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 单节表

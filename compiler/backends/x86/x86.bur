@@ -533,18 +533,27 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         // import table follow _start. The dispatcher length is value-independent,
         // so it is measured once with zero addresses and rebuilt with real IAT
         // addresses; the slot value follows without backpatching.
-        let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect"]
+        let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle"]
         // 分派器接在 _start 之后；槽与导入表 RVA 都从真实内容偏移算起
         // The dispatcher follows _start; the slot and import RVAs derive from
         // the true content offsets.
         let disp_off = start_off + str_len(start_bytes)
-        let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0, 0, 0])
+        let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0, 0, 0, 0])
         let idata_off = disp_off + str_len(disp_probe)
         let iat_abs0 = img_base() + idata_off + pe_import_desc_size(len(import_names)) + pe_ilt_size(len(import_names))
-        let dispatcher = pe_build_dispatcher([iat_abs0, iat_abs0 + 8, iat_abs0 + 16, iat_abs0 + 24, iat_abs0 + 32, iat_abs0 + 40, iat_abs0 + 48, iat_abs0 + 56])
+        let dispatcher = pe_build_dispatcher([iat_abs0, iat_abs0 + 8, iat_abs0 + 16, iat_abs0 + 24, iat_abs0 + 32, iat_abs0 + 40, iat_abs0 + 48, iat_abs0 + 56, iat_abs0 + 64])
         let runtime_with_thunk = runtime_bytes + e8(img_base() + disp_off)
+        // fd 表：全 0xFF 填充（kind=-1 空闲），Windows 独有尾区
+        // fd table: filled with 0xFF (kind=-1 means free), a Windows-only tail
+        let mut fd_fill = ""
+        let mut ffi = 0
+        while ffi < FD_CAP * FD_ENTRY {
+            fd_fill = fd_fill + byte_chr(255)
+            ffi = ffi + 1
+        }
+        let runtime_with_fd = runtime_with_thunk + fd_fill
         let imports = pe_build_imports(import_names, idata_off)
-        emit_pe(runtime_with_thunk + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports, start_off, idata_off, str_len(imports))
+        emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports, start_off, idata_off, str_len(imports))
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
         // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），
