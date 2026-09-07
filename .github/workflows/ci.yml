@@ -401,8 +401,8 @@ jobs:
         with:
           name: gen1
 
-      # PE corpus: hello + pure slice (fib, float_arith) + yield, all hard-gated;
-      # clock stays evidence-only until the Sleep arm actually works (see report).
+      # PE corpus: hello + pure slice (fib, float_arith) + yield + timer slice
+      # (clock, sleep), all hard-gated against their goldens.
       - name: Build windows programs
         run: |
           set -euo pipefail
@@ -413,6 +413,7 @@ jobs:
           ./gen1 build --backend x86 --os windows examples/basics/float_arith.bur -o pe-out/float_arith.exe
           ./gen1 build --backend x86 --os windows examples/concurrency/yield.bur -o pe-out/yield.exe
           ./gen1 build --backend x86 --os windows testdata/regression/clock.bur -o pe-out/clock.exe
+          ./gen1 build --backend x86 --os windows examples/io/sleep.bur -o pe-out/sleep.exe
 
       - name: Upload windows programs
         uses: actions/upload-artifact@v4
@@ -461,17 +462,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/concurrency/yield.golden actual-yield.txt
 
-      # Evidence only: the sleep path parks into poll(7); clock still dies with
-      # 0xC000001D even after the P2 Sleep arm landed, so the arm itself is now
-      # the suspect (see the S8.5 report). This step never fails the job; it
-      # turns green (hard gate like yield) once sleep really works.
-      - name: Probe sleep path (expected crash, evidence only)
+      - name: Run timer slice (hard gate)
         shell: pwsh
-        continue-on-error: true
         run: |
-          cmd /c ".\pe-out\clock.exe > actual-clock.txt 2>&1"
-          echo "clock.exe exit code: $LASTEXITCODE"
-          Get-Content actual-clock.txt -ErrorAction SilentlyContinue | Select-Object -First 5
+          cmd /c ".\pe-out\clock.exe > actual-clock.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text testdata/regression/clock.golden actual-clock.txt
+          cmd /c ".\pe-out\sleep.exe > actual-sleep.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/io/sleep.golden actual-sleep.txt
 
   x86-macho-build:
     needs: gen1
