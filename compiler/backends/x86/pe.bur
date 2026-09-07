@@ -126,7 +126,11 @@ pub fn pe_build_dispatcher(iat) {
     // to a Sleep(0) yield; nfds>0 falls into ud2 (P4 brings WSAPoll).
     let slp_arg = mov_rr(rcx, rdx) + test_rr(rdx, rdx) + jge_rel32(str_len(xor_rr(rcx, rcx))) + xor_rr(rcx, rcx)
     let slp_call = mov_ri64(r10, iat[6]) + e1(65) + e1(255) + e1(18) + xor_rr(rax, rax)
-    let poll_case = test_rr(rsi, rsi) + jne_rel32(str_len(slp_arg) + str_len(slp_call)) + slp_arg + slp_call + e1(15) + e1(11)
+    // 成功路径必须跳过兜底 ud2 再落到链尾的 epi 跳转（对照 mp_ret 的写法）；
+    // jne 的目标同步后移一个 jmp 的长度。
+    // The success path must hop over the fallback ud2 before reaching the
+    // chain's epi jump (cf. mp_ret); the jne target moves by one jmp length.
+    let poll_case = test_rr(rsi, rsi) + jne_rel32(str_len(slp_arg) + str_len(slp_call) + 5) + slp_arg + slp_call + jmp_rel32(2) + e1(15) + e1(11)
 
     // mprotect(addr=rdi, len=rsi, prot=rdx)：唯一调用方传 prot=0（fiber guard）；
     // 0→PAGE_NOACCESS，其余→PAGE_EXECUTE_READWRITE；成功返 0，失败返 -1。
