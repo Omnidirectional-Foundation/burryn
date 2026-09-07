@@ -355,6 +355,38 @@ jobs:
           mv gen1 bur
           BUR=./bur ./scripts/multi-backend-verify.sh
 
+  x86-repro:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      # x86 artifact reproducibility, not the C three-generation fixpoint:
+      # there is no x86 self-chain. The same compiler building the same
+      # source twice must emit byte-identical output (no timestamps,
+      # no hash-order leaks in the serializers).
+      - name: Build each target twice and compare
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build --backend x86 examples/basics/hello.bur -o elf-a
+          ./gen1 build --backend x86 examples/basics/hello.bur -o elf-b
+          cmp elf-a elf-b
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-a.exe
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-b.exe
+          cmp pe-a.exe pe-b.exe
+          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o macho-a
+          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o macho-b
+          cmp macho-a macho-b
+
   x86-pe-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -531,8 +563,8 @@ jobs:
   gate:
     needs:
       [gohost, seed, bur-base, gen1, check, fixpoint, testdata, examples, std,
-       multibackend, x86-pe-build, x86-pe-run, x86-macho-build, x86-macho-run,
-       runtime]
+       multibackend, x86-repro, x86-pe-build, x86-pe-run, x86-macho-build,
+        x86-macho-run, runtime]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
