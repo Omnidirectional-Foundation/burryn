@@ -308,6 +308,12 @@ fn compile_file_to_x86(path) {
     }
 }
 
+// cc_opt C 优化等级：-O1 是内存上限决定的，不是性能选择。
+// 实测编 program.c 峰值 clang 2.0GB / gcc 3.8GB；-O2 编 18MB 单文件 cc1 峰值约 16GB，8GB 级机器必 OOM。
+// cc_opt is the C optimization level: -O1 is set by the memory ceiling, not by performance.
+// Measured program.c peaks are clang 2.0GB vs gcc 3.8GB; -O2 on the 18MB single file peaked cc1 at ~16GB, OOMing any 8GB-class box.
+let cc_opt = "-O1"
+
 // build_native 调 cc 产出原生二进制 / build_native invokes cc to produce a native binary
 fn build_native(files, out) {
     for f in files {
@@ -329,7 +335,7 @@ fn build_native(files, out) {
     let mut objs = []
     for f in files {
         if lib::str_has_suffix(f[0], ".c") {
-            match exec(cc, ["-O1", "-g1", "-c", f[0], "-Iruntime"]) {
+            match exec(cc, [cc_opt, "-g1", "-c", f[0], "-Iruntime"]) {
                 Ok(o) => match o {
                     Output(code, _, err) => {
                         if code != 0 {
@@ -351,7 +357,7 @@ fn build_native(files, out) {
     }
     let mut runtime_objs = []
     for r in ["runtime/burrt_impl.c", "runtime/burrt_natives.c"] {
-        match exec(cc, ["-O1", "-g1", "-c", r, "-Iruntime"]) {
+        match exec(cc, [cc_opt, "-g1", "-c", r, "-Iruntime"]) {
             Ok(o) => match o {
                 Output(code, _, err) => {
                     if code != 0 {
@@ -370,7 +376,7 @@ fn build_native(files, out) {
             },
         }
     }
-    let mut args = ["-O1", "-g1", "-o", out]
+    let mut args = [cc_opt, "-g1", "-o", out]
     for o in objs {
         push(args, o)
     }
@@ -476,6 +482,9 @@ fn find_cc() {
         if found == "" && cc_works(name) {
             found = name
         }
+    }
+    if found != "" && found != "clang" {
+        eprintln("warning: building with `" + found + "` instead of clang (higher peak cc memory)")
     }
     found
 }

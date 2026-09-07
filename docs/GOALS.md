@@ -1,6 +1,6 @@
 # GOALS — Burryn 路线与里程碑
 
-> v0.6 · active · 2026-08-29
+> v0.7 · active · 2026-09-06 ~ 09-07
 > 状态：前瞻规划 · 编号 `S<n>[.<m>]`
 > 相关文档：[`architecture.md`](architecture.md) 实现权威 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
@@ -25,7 +25,7 @@
 | **S5 删 Go** | CLI 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已实现 |
 | **S6 生态工具链** | S6.1–S6.8：依赖、fmt、test、诊断、std/json、runtime IO、checker 债 | 已实现 |
 | **S7 语言特性扩展** | S7.1–S7.8（S7.4 命名参数已否决，编号保留） | 已实现 |
-| **S8 后端与重型类型** | S8.1 Linux ELF 单文件；S8.5 PE 与 Mach-O 序列化层；S8.2 语法冻结、S8.3 row poly、S8.4 封闭 record 按名合一、S8.7 类型别名均已实现 | 部分实现 |
+| **S8 后端与重型类型** | S8.1 Linux ELF 单文件已实现；S8.5 PE 与 Mach-O 序列化层；S8.2 语法冻结、S8.3 row poly、S8.4 封闭 record 按名合一、S8.7 类型别名均已实现 | 部分实现 |
 | **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 hover / go-to-def / completion / formatting / signature-help；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
 | **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 未实现 |
 
@@ -35,9 +35,9 @@ stdlib 按「够自举用 + owner 真实脚本需求」生长。
 
 ## 3. S8 剩余
 
-S8.2 / S8.3 / S8.4 / S8.7 已实现；S8.1 与 S8.5 未实现。
+S8.1 / S8.2 / S8.3 / S8.4 / S8.7 已实现；S8.5 未实现。
 
-**S8.1 完成线（定案）**：Linux ELF 单文件程序后端（`bur build --backend x86 <file.bur>`）。
+**S8.1 完成线（定案，已实现）**：Linux ELF 单文件程序后端（`bur build --backend x86 <file.bur>`）。
 完成条件 = fiber 感知 IO + `net_nb` 落地 + multi-backend 已知缺陷清零或显式登记为语言级限制。
 **不含**模块包、**不含**用 x86 编 compiler（x86 自举）、**不含** PE 与 Mach-O（归 S8.5）。
 自举判定维持 [`architecture.md`](architecture.md) §3.5：编译器由本语言写成且能编译自己；输出 C 再经 cc 落地，完全算自举。
