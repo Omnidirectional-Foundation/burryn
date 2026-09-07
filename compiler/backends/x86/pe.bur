@@ -80,12 +80,17 @@ pub fn pe_build_imports(fns, idata_off) {
 // mov_ri64(r10, …): r10 is the operand of call qword [r10] and of mul/div r10,
 // and a hand-written REX.B is easily mistyped as REX.R, silently hitting rdx.
 // 支持号：1 write→WriteFile、60 exit→ExitProcess、9 mmap→VirtualAlloc、
-// 228 clock_gettime→QPC/QPF 合成 timespec；其余 ud2 立即崩溃暴露缺口。
+// 228 clock_gettime→QPC/QPF 合成 timespec、7 poll→Sleep（仅 nfds==0 的 timer
+// 等待；nfds>0 仍 ud2，WSAPoll 翻译随 P4 落地）、10 mprotect→VirtualProtect；
+// 其余 ud2 立即崩溃暴露缺口。
 // Supported: 1 write→WriteFile, 60 exit→ExitProcess, 9 mmap→VirtualAlloc,
-// 228 clock_gettime→QPC/QPF synthesizing timespec; anything else hits ud2.
-// iat 为六个 IAT 槽的绝对地址：GetStdHandle / WriteFile / ExitProcess /
-// VirtualAlloc / QueryPerformanceCounter / QueryPerformanceFrequency。
-// iat holds six absolute IAT addresses in that order.
+// 228 clock_gettime→QPC/QPF synthesizing timespec, 7 poll→Sleep (nfds==0 timer
+// waits only; nfds>0 still hits ud2, the WSAPoll translation lands with P4),
+// 10 mprotect→VirtualProtect; anything else hits ud2.
+// iat 为八个 IAT 槽的绝对地址：GetStdHandle / WriteFile / ExitProcess /
+// VirtualAlloc / QueryPerformanceCounter / QueryPerformanceFrequency /
+// Sleep / VirtualProtect。
+// iat holds eight absolute IAT addresses in that order.
 pub fn pe_build_dispatcher(iat) {
     // 先压 SysV 仍活寄存器，再 16 字节对齐并开出 Win64 影子空间与局部量
     // Save still-live SysV regs, then 16-byte-align and open Win64 shadow plus locals
@@ -114,7 +119,26 @@ pub fn pe_build_dispatcher(iat) {
     // with quotient/remainder split multiply (same shape as bur_mono_ns)
     let clock_case = e1(72) + e1(141) + e1(76) + e1(36) + e1(32) + mov_ri64(r10, iat[4]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(141) + e1(76) + e1(36) + e1(40) + mov_ri64(r10, iat[5]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(139) + e1(68) + e1(36) + e1(32) + e1(72) + e1(49) + e1(210) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(72) + e1(105) + e1(192) + e4(1000000000) + e1(73) + e1(137) + e1(193) + e1(72) + e1(137) + e1(208) + mov_ri64(r10, 1000000000) + e1(73) + e1(247) + e1(226) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(76) + e1(1) + e1(200) + mov_ri64(r10, 1000000000) + e1(72) + e1(49) + e1(210) + e1(73) + e1(247) + e1(242) + e1(72) + e1(137) + e1(6) + e1(72) + e1(137) + e1(86) + e1(8)
 
-    sys_dispatch_chain(head, [1, 60, 9, 228], [write_case, exit_case, mmap_case, clock_case], epilogue)
+    // poll(fds=rdi, nfds=rsi, timeout=rdx)：nfds==0 走 Sleep（timer 等待唯一可达
+    // 路径，单位同为毫秒）；负超时钳到 Sleep(0) 让步；nfds>0 落 ud2（P4 补 WSAPoll）。
+    // poll(fds=rdi, nfds=rsi, timeout=rdx): nfds==0 takes Sleep (the only
+    // reachable timer-wait path, same millisecond unit); negative timeouts clamp
+    // to a Sleep(0) yield; nfds>0 falls into ud2 (P4 brings WSAPoll).
+    let slp_arg = mov_rr(rcx, rdx) + test_rr(rdx, rdx) + jge_rel32(str_len(xor_rr(rcx, rcx))) + xor_rr(rcx, rcx)
+    let slp_call = mov_ri64(r10, iat[6]) + e1(65) + e1(255) + e1(18) + xor_rr(rax, rax)
+    let poll_case = test_rr(rsi, rsi) + jne_rel32(str_len(slp_arg) + str_len(slp_call)) + slp_arg + slp_call + e1(15) + e1(11)
+
+    // mprotect(addr=rdi, len=rsi, prot=rdx)：唯一调用方传 prot=0（fiber guard）；
+    // 0→PAGE_NOACCESS，其余→PAGE_EXECUTE_READWRITE；成功返 0，失败返 -1。
+    // out 参数用分派器局部 [+40]（各 case 互斥，可复用）。
+    // mprotect(addr=rdi, len=rsi, prot=rdx): the only caller passes prot=0 (the
+    // fiber guard); 0→PAGE_NOACCESS, anything else→PAGE_EXECUTE_READWRITE;
+    // 0 on success, -1 on failure. The out-param borrows dispatcher local [+40]
+    // (cases are mutually exclusive, so locals are reusable).
+    let mp_ret = test_rr(rax, rax) + je_rel32(str_len(xor_rr(rax, rax)) + 5 + str_len(mov_ri64(rax, 0 - 1))) + xor_rr(rax, rax) + jmp_rel32(str_len(mov_ri64(rax, 0 - 1))) + mov_ri64(rax, 0 - 1)
+    let mprotect_case = mov_rr(rcx, rdi) + mov_ri64(r8, 64) + test_rr(rdx, rdx) + jne_rel32(str_len(mov_ri64(r8, 1))) + mov_ri64(r8, 1) + mov_rr(rdx, rsi) + lea(r9, rsp, 40) + mov_ri64(r10, iat[7]) + e1(65) + e1(255) + e1(18) + mp_ret
+
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case], epilogue)
 }
 
 // pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 单节表
