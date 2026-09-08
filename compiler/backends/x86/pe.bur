@@ -103,17 +103,22 @@ pub fn pe_build_imports(fns, idata_off) {
 // (GetStdHandle(-10-fd), kind=0); open never hands out 0-2.
 fn pe_fd_lookup(iat, skip_after) {
     let miss = mov_ri64(rax, 0 - 9) + jmp_rel32(skip_after)
+    // 成功路径（kind 命中、懒初始化完成）必须跳过尾部的 miss 块再落入调用方
+    // body；与 poll_case 漏掉的那一跳同类错误，不得再犯。
+    // Success paths must hop over the trailing miss block before reaching the
+    // caller's body (the same bug class as the poll fallthrough into ud2).
+    let go_hit = jmp_rel32(str_len(miss))
     // 懒调用前后保 r11（槽地址）：Win64 被调用方寄存器，GetStdHandle 可毁；
     // rdi 用完即死，不保。push/pop 在 64B 保留区内平衡，epilogue 无感。
     // Preserve r11 (the slot) across the lazy call: Win64 caller-saved, and
     // GetStdHandle may clobber it; rdi is dead after this point. The push/pop
     // balances inside the reserved area, invisible to the epilogue.
     let lazy = push_r(r11) + mov_ri64(rcx, 0 - 10) + sub_rr(rcx, rdi) + mov_ri64(r10, iat[0]) + e1(65) + e1(255) + e1(18) + pop_r(r11) + mov_mr(r11, 0, rax) + xor_rr(r10, r10) + mov_mr(r11, 8, r10)
-    let free_chk = mov_ri64(r10, 2) + cmp_rr(rdi, r10) + ja_rel32(str_len(lazy))
-    let kind_chk = mov_rm(rax, r11, 8) + mov_ri64(r10, 0 - 1) + cmp_rr(rax, r10) + jne_rel32(str_len(free_chk) + str_len(lazy))
+    let free_chk = mov_ri64(r10, 2) + cmp_rr(rdi, r10) + ja_rel32(str_len(lazy) + str_len(go_hit))
+    let kind_chk = mov_rm(rax, r11, 8) + mov_ri64(r10, 0 - 1) + cmp_rr(rax, r10) + jne_rel32(str_len(free_chk) + str_len(lazy) + str_len(go_hit) + str_len(miss))
     let slot = mov_rr(r11, rdi) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10)
-    let bound = mov_ri64(r10, 64) + cmp_rr(rdi, r10) + jae_rel32(str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy))
-    test_rr(rdi, rdi) + jl_rel32(str_len(bound) + str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy)) + bound + slot + kind_chk + free_chk + lazy + miss
+    let bound = mov_ri64(r10, 64) + cmp_rr(rdi, r10) + jae_rel32(str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(go_hit))
+    test_rr(rdi, rdi) + jl_rel32(str_len(bound) + str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(go_hit)) + bound + slot + kind_chk + free_chk + lazy + go_hit + miss
 }
 
 pub fn pe_build_dispatcher(iat) {
