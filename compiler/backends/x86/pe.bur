@@ -94,6 +94,13 @@ pub fn pe_build_imports(fns, idata_off) {
 // Sleep / VirtualProtect / CloseHandle。
 // iat holds nine absolute IAT addresses in that order.
 
+// guarded_ud2: ud2 只许显式跳转进入，永不 fallthrough（成功路径掉陷阱类 bug
+// 的结构解，要求调用方把成功出口数全越过它）。
+// guarded_ud2: ud2 is reachable only by explicit jump, never by fallthrough.
+fn guarded_ud2() {
+    jmp_rel32(2) + e1(15) + e1(11)
+}
+
 // pe_fd_lookup 把 rdi 的小整数 fd 换成表槽地址（r11）；miss（负数 / ≥64 /
 // 槽空闲）返 -EBADF 并跳过调用方剩余 skip_after 字节。0/1/2 槽首次使用时懒初始化
 // （GetStdHandle(-10-fd) 存句柄，kind=0）；open 从不返回 0-2。
@@ -102,23 +109,23 @@ pub fn pe_build_imports(fns, idata_off) {
 // remaining skip_after bytes. Slots 0-2 initialize lazily on first use
 // (GetStdHandle(-10-fd), kind=0); open never hands out 0-2.
 fn pe_fd_lookup(iat, skip_after) {
+    // miss 块与越过它的 hop 分开命名：jl/jae/ja 只跨 hop（5B）落 miss 首，
+    // jne→HIT 才跨 hop+miss 落 body 首；合二为一必错一处（教训：比较 cmp 产物）。
+    // The hop and the miss block stay separately named: jl/jae/ja span only
+    // the hop onto miss, only jne→HIT spans hop+miss.
     let miss = mov_ri64(rax, 0 - 9) + jmp_rel32(skip_after)
-    // 成功路径（kind 命中、懒初始化完成）必须跳过尾部的 miss 块再落入调用方
-    // body；与 poll_case 漏掉的那一跳同类错误，不得再犯。
-    // Success paths must hop over the trailing miss block before reaching the
-    // caller's body (the same bug class as the poll fallthrough into ud2).
-    let go_hit = jmp_rel32(str_len(miss))
+    let hop = jmp_rel32(str_len(miss))
     // 懒调用前后保 r11（槽地址）：Win64 被调用方寄存器，GetStdHandle 可毁；
     // rdi 用完即死，不保。push/pop 在 64B 保留区内平衡，epilogue 无感。
     // Preserve r11 (the slot) across the lazy call: Win64 caller-saved, and
     // GetStdHandle may clobber it; rdi is dead after this point. The push/pop
     // balances inside the reserved area, invisible to the epilogue.
     let lazy = push_r(r11) + mov_ri64(rcx, 0 - 10) + sub_rr(rcx, rdi) + mov_ri64(r10, iat[0]) + e1(65) + e1(255) + e1(18) + pop_r(r11) + mov_mr(r11, 0, rax) + xor_rr(r10, r10) + mov_mr(r11, 8, r10)
-    let free_chk = mov_ri64(r10, 2) + cmp_rr(rdi, r10) + ja_rel32(str_len(lazy) + str_len(go_hit))
-    let kind_chk = mov_rm(rax, r11, 8) + mov_ri64(r10, 0 - 1) + cmp_rr(rax, r10) + jne_rel32(str_len(free_chk) + str_len(lazy) + str_len(go_hit) + str_len(miss))
+    let free_chk = mov_ri64(r10, 2) + cmp_rr(rdi, r10) + ja_rel32(str_len(lazy) + str_len(hop))
+    let kind_chk = mov_rm(rax, r11, 8) + mov_ri64(r10, 0 - 1) + cmp_rr(rax, r10) + jne_rel32(str_len(free_chk) + str_len(lazy) + str_len(hop) + str_len(miss))
     let slot = mov_rr(r11, rdi) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10)
-    let bound = mov_ri64(r10, 64) + cmp_rr(rdi, r10) + jae_rel32(str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(go_hit))
-    test_rr(rdi, rdi) + jl_rel32(str_len(bound) + str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(go_hit)) + bound + slot + kind_chk + free_chk + lazy + go_hit + miss
+    let bound = mov_ri64(r10, 64) + cmp_rr(rdi, r10) + jae_rel32(str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(hop))
+    test_rr(rdi, rdi) + jl_rel32(str_len(bound) + str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(hop)) + bound + slot + kind_chk + free_chk + lazy + hop + miss
 }
 
 pub fn pe_build_dispatcher(iat) {
@@ -180,7 +187,7 @@ pub fn pe_build_dispatcher(iat) {
     // jne 的目标同步后移一个 jmp 的长度。
     // The success path must hop over the fallback ud2 before reaching the
     // chain's epi jump (cf. mp_ret); the jne target moves by one jmp length.
-    let poll_case = test_rr(rsi, rsi) + jne_rel32(str_len(slp_arg) + str_len(slp_call) + 5) + slp_arg + slp_call + jmp_rel32(2) + e1(15) + e1(11)
+    let poll_case = test_rr(rsi, rsi) + jne_rel32(str_len(slp_arg) + str_len(slp_call) + str_len(guarded_ud2()) - 2) + slp_arg + slp_call + guarded_ud2()
 
     // mprotect(addr=rdi, len=rsi, prot=rdx)：唯一调用方传 prot=0（fiber guard）；
     // 0→PAGE_NOACCESS，其余→PAGE_EXECUTE_READWRITE；成功返 0，失败返 -1。
