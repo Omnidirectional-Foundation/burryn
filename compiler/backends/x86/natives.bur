@@ -219,6 +219,25 @@ fn x86gen_file_exists_native() {
     head + test_rr(rax, rax) + jne_rel32(str_len(found)) + found + not_found
 }
 
+// x86gen_fdtable_alloc 登记 HANDLE 进 fd 表：rax=句柄入，rax=槽号出（3 起），
+// 表满返 -1（落入调用方既有 jl 检查）。仅 windows 发射；它用 rdx 存句柄，
+// rcx/r9/r10/r11 作暂存（open 站点这些全死），r8/rdi/rsi 不动。
+// x86gen_fdtable_alloc registers a HANDLE in the fd table: HANDLE in rax,
+// slot index out (from 3), -1 when full (flowing into the caller's jl checks).
+// Emitted on windows only; it stashes the handle in rdx and uses rcx/r9/r10/
+// r11 as scratch (all dead at open sites), leaving r8/rdi/rsi alone.
+fn x86gen_fdtable_alloc() {
+    let full = mov_ri64(rax, 0 - 1)
+    let slot_at = mov_rr(r11, rcx) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10)
+    let found = mov_mr(r11, 0, rdx) + mov_ri64(r10, 0) + mov_mr(r11, 8, r10) + mov_rr(rax, rcx) + jmp_rel32(str_len(full))
+    let test_slot = mov_rm(r10, r11, 8) + mov_ri64(r9, 0 - 1) + cmp_rr(r10, r9) + jne_rel32(str_len(found))
+    let inc = add_ri32(rcx, 1)
+    let next = inc + jmp_rel32(0 - (5 + str_len(inc) + str_len(found) + str_len(test_slot) + str_len(slot_at)))
+    let chk_cap = mov_ri64(r10, 64) + cmp_rr(rcx, r10) + jae_rel32(str_len(slot_at) + str_len(test_slot) + str_len(found) + str_len(next))
+    let init = mov_rr(rdx, rax) + mov_ri64(rcx, 3)
+    init + chk_cap + slot_at + test_slot + found + next + full
+}
+
 // x86gen_read_file_native 内联 read_file：open/fstat/read/close syscall，返回 Result<str, str>
 // x86gen_read_file_native inlines read_file: open/fstat/read/close syscalls, returning Result<str,
 // str>
@@ -234,9 +253,24 @@ fn x86gen_read_file_native() {
     let empty_path = sys_mov_rax(3) + syscall() + add_ri32(rsp, 144) + empty_str + ok_inst + jmp_rel32(str_len(fail2) + str_len(fail1))
     let read_seq = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdx, r10) + sys_mov_rax(0) + syscall() + mov_rr(rax, r8) + sys_mov_rax(3) + syscall() + add_ri32(rsp, 144) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(empty_path) + str_len(fail2) + str_len(fail1))
     let fstat_ok = mov_rm(r10, rsp, 48) + xor_rr(r9, r9) + cmp_rr(r10, r9) + jle_rel32(str_len(alloc) + str_len(read_seq)) + alloc + read_seq + empty_path
-    let fstat_seq = mov_rr(rdi, rax) + sub_ri32(rsp, 144) + mov_rr(rsi, rsp) + sys_mov_rax(5) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(fstat_ok)) + fstat_ok + fail2
+    let fstat_buf = if target_os == "windows" {
+        // Windows fstat 臂只写 8B size 到 rsi；指到 +48 恰是调用方读位
+        // The Windows fstat arm writes only the 8B size through rsi; point it
+        // at +48, exactly where the caller reads.
+        lea(rsi, rsp, 48)
+    } else {
+        mov_rr(rsi, rsp)
+    }
+    let fstat_seq = mov_rr(rdi, rax) + sub_ri32(rsp, 144) + fstat_buf + sys_mov_rax(5) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(fstat_ok)) + fstat_ok + fail2
     let open_fail = test_rr(rax, rax) + jl_rel32(str_len(fstat_seq)) + fstat_seq + fail1
-    let head = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + open_fail
+    let head = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + (if target_os == "windows" {
+        // open 返回 HANDLE，须登记进 fd 表，read/fstat/close 查表才找得到
+        // open returns a HANDLE; register it so read/fstat/close table
+        // lookups can find it.
+        x86gen_fdtable_alloc()
+    } else {
+        ""
+    }) + open_fail
     head
 }
 
@@ -960,17 +994,36 @@ fn x86gen_read_dir_native() {
     let strlen_head = mov_rr(rdi, rcx) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
     let strlen_body = e1(174) + je_rel32(str_len(add_rdx) + 5) + add_rdx
     let strlen_loop = strlen_head + strlen_body + jmp_rel32(0 - (str_len(strlen_body) + 5))
-    // getdents64 调用：fd=r8, 缓冲=rsp, 8192 字节
-    // getdents64 call: fd=r8, buffer=rsp, 8192 bytes
-    let getd = mov_rr(rdi, r8) + mov_rr(rsi, rsp) + sys_mov_rdx(8192) + sys_mov_rax(217) + syscall()
+    // getdents64 调用：fd=r8, 缓冲=rsp, 8192 字节（darwin 缩到 8184，
+    // 尾 8B 作 getdirentries64 的 basep scratch）
+    // getdents64 call: fd=r8, buffer=rsp, 8192 bytes (8184 on darwin, with the
+    // tail 8B as the getdirentries64 basep scratch)
+    let mut getd_bufsize = sys_mov_rdx(8192)
+    let mut getd_basep = ""
+    let mut name_off = 19
+    let mut reclen_off = 16
+    let mut entry_len = strlen_loop
+    if target_os == "darwin" {
+        getd_bufsize = sys_mov_rdx(8184)
+        getd_basep = lea(r10, rsp, 8184)
+        // darwin struct dirent: d_ino(0..8) d_seekoff(8..16) d_reclen(16..18)
+        // d_namlen(18..20) d_type(20) d_name(21) — both offsets sit 8 bytes
+        // past the Linux dirent64 layout
+        name_off = 21
+        reclen_off = 16
+        // d_namlen @18 = name-3；-1 处是 d_type，不是长度
+        // d_namlen sits at name-3; name-1 is d_type, not the length
+        entry_len = mov_rm32(rdx, rcx, 0 - 3) + mov_ri64(r10, 65535) + and_rr(rdx, r10)
+    }
+    let getd = mov_rr(rdi, r8) + mov_rr(rsi, rsp) + getd_bufsize + getd_basep + sys_mov_rax(217) + syscall()
     // 地址计算：rax = names 数组基址 + idx*8（idx 槽 [r15-32]，基址槽 [r15-24]）
     // address calc: rax = names base + idx*8
     let addr_idx = mov_rm(rax, r15, 0 - 32) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(r9, r15, 0 - 24) + add_rr(rax, r9)
     // 收集：单 pass 读目录，非点名字按 strcmp 顺序收集
     // collect: single pass over the directory, gathering non-dot names
-    let collect_seq = mov_mr(r15, 0 - 64, rsi) + strlen_loop + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + mov_rr(rsi, rcx) + mov_rr(rcx, rdx) + rep_movsb() + xor_rr(rax, rax) + e1(170) + add_rr(r12, rdx) + add_ri32(r12, 9) + mov_rm(rsi, r15, 0 - 64) + addr_idx + mov_mr(rax, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
+    let collect_seq = mov_mr(r15, 0 - 64, rsi) + entry_len + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + mov_rr(rsi, rcx) + mov_rr(rcx, rdx) + rep_movsb() + xor_rr(rax, rax) + e1(170) + add_rr(r12, rdx) + add_ri32(r12, 9) + mov_rm(rsi, r15, 0 - 64) + addr_idx + mov_mr(rax, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
     let inner_tail = mov_rm(rdx, r15, 0 - 40) + add_rr(rsi, rdx)
-    let inner_work = mov_rr(rcx, rsp) + add_rr(rcx, rsi) + add_ri32(rcx, 19) + mov_rr(rax, rsp) + add_rr(rax, rsi) + add_ri32(rax, 16) + mov_rm(rdx, rax, 0) + mov_ri64(r9, 65535) + and_rr(rdx, r9) + mov_mr(r15, 0 - 40, rdx) + is_dotdot + test_rr(r9, r9) + jne_rel32(str_len(collect_seq)) + collect_seq + inner_tail
+    let inner_work = mov_rr(rcx, rsp) + add_rr(rcx, rsi) + add_ri32(rcx, name_off) + mov_rr(rax, rsp) + add_rr(rax, rsi) + add_ri32(rax, reclen_off) + mov_rm(rdx, rax, 0) + mov_ri64(r9, 65535) + and_rr(rdx, r9) + mov_mr(r15, 0 - 40, rdx) + is_dotdot + test_rr(r9, r9) + jne_rel32(str_len(collect_seq)) + collect_seq + inner_tail
     let inner_cond = mov_rm(rdx, r15, 0 - 16) + cmp_rr(rsi, rdx) + jge_rel32(str_len(inner_work) + 5)
     let inner_loop = inner_cond + inner_work + jmp_rel32(0 - (str_len(inner_cond) + str_len(inner_work) + 5))
     let collect_body = mov_mr(r15, 0 - 16, rax) + xor_rr(rsi, rsi) + inner_loop
@@ -994,17 +1047,38 @@ fn x86gen_read_dir_native() {
     let build_work = addr_idx + mov_mr(r15, 0 - 16, rax) + mov_rm(r9, rax, 0) + mov_rm(rdx, r9, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + lea(rsi, r9, 8) + mov_rr(rcx, rdx) + rep_movsb() + add_rr(r12, rdx) + add_ri32(r12, 8) + mov_rm(r9, r15, 0 - 40) + mov_rm(r9, r9, 16) + mov_rm(rax, r15, 0 - 32) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(r9, rax) + mov_mr(r9, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
     let build_cond = mov_rm(rax, r15, 0 - 32) + cmp_rr(rax, r10) + jge_rel32(str_len(build_work) + 5)
     let build_loop = build_cond + build_work + jmp_rel32(0 - (str_len(build_cond) + str_len(build_work) + 5))
+    // Windows 收尾：FindClose [rsp+320] 句柄 + 回收 328B 帧。
+    // Windows tail: FindClose the [rsp+320] handle, release the 328B frame.
+    let win_closeadd = mov_rm(rdi, rsp, 320) + sys_mov_rax(1002) + syscall() + add_ri32(rsp, 328)
     // 主流程拼装
     // main assembly
     let list_alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, r11) + mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(r12, rax) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
     let empty_ok = mov_rr(r11, r12) + xor_rr(rax, rax) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + ok_inst + jmp_rel32(str_len(fail))
     let build_tail = mov_rm(r11, r15, 0 - 40) + ok_inst + jmp_rel32(str_len(empty_ok) + str_len(fail))
-    let main_done = close + add_ri32(rsp, 8192) + mov_rm(r10, r15, 0 - 32) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + test_rr(r10, r10) + je_rel32(str_len(list_alloc) + str_len(build_loop) + str_len(build_tail)) + outer_loop + list_alloc + build_loop + build_tail
+    let mut main_done_closeadd = close + add_ri32(rsp, 8192)
+    if target_os == "windows" {
+        main_done_closeadd = win_closeadd
+    }
+    let main_done = main_done_closeadd + mov_rm(r10, r15, 0 - 32) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + test_rr(r10, r10) + je_rel32(str_len(list_alloc) + str_len(build_loop) + str_len(build_tail)) + outer_loop + list_alloc + build_loop + build_tail
     let names_alloc = mov_rr(r9, r12) + mov_mr(r15, 0 - 24, r9) + add_ri32(r12, 16384) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
     let main_tail = sub_ri32(rsp, 8192) + names_alloc + collect_loop + main_done + empty_ok
     let open_fail = test_rr(rax, rax) + jl_rel32(str_len(main_tail))
-    let head = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail + main_tail + fail
-    head
+    // Windows 全套：path + "/*" 堆串 → FindFirst → 句柄家 → names_alloc → 循环。
+    // Windows set: path + "/*" on the heap → FindFirst → handle home →
+    // names_alloc → loop. Star-string detail: [len+3] then path bytes then
+    // 2F 2A 00; r12 bumps past all of it.
+    let win_star = mov_rr(rcx, r11) + strlen_loop + mov_rr(r9, r11) + mov_rr(r11, r12) + mov_rr(r10, rdx) + add_ri32(r10, 3) + mov_mr(r11, 0, r10) + lea(rdi, r11, 8) + mov_rr(rsi, r9) + mov_rr(rcx, rdx) + rep_movsb() + mov_ri64(r10, 10799) + mov_mr(rdi, 0, r10) + mov_rr(r10, rdx) + add_ri32(r10, 3) + lea(r12, r11, 8) + add_rr(r12, r10) + lea(rcx, r11, 8)
+    let win_find_money = mov_mr(rsp, 320, rax)
+    let win_next = mov_rm(rdi, rsp, 320) + lea(rsi, rsp, 0) + sys_mov_rax(1001) + syscall() + test_rr(rax, rax)
+    let win_collect = is_dotdot + test_rr(r9, r9) + jne_rel32(str_len(collect_seq))
+    let win_top = lea(rcx, rsp, 44)
+    let win_loop = win_top + win_collect + collect_seq + win_next + jne_rel32(0 - (5 + str_len(win_next) + str_len(collect_seq) + str_len(win_collect) + str_len(win_top)))
+    let win_find = mov_rr(rdi, rcx) + lea(rsi, rsp, 0) + sys_mov_rax(1000) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(win_find_money) + str_len(names_alloc) + str_len(win_loop) + str_len(main_done) + str_len(empty_ok))
+    let mut head_w = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail + main_tail + fail
+    if target_os == "windows" {
+        head_w = x86gen_nul_path_at(0 - 8) + win_star + sub_ri32(rsp, 328) + win_find + win_find_money + names_alloc + win_loop + main_done + empty_ok + fail
+    }
+    head_w
 }
 
 // x86gen_record_format_at 生成 record 格式化：字段名 + 值
@@ -1129,14 +1203,36 @@ fn x86gen_sleep_native(sched_addr, timer_add_addr) {
 // x86gen_contains_native 内联 contains：8B 值线性扫描
 // x86gen_contains_native inlines contains: linear scan of 8-byte values
 // contains inline: linear scan over 8-byte values
-fn x86gen_contains_native() {
+fn x86gen_contains_native(is_str) {
     let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r8, r15, 0 - 8) + mov_rm(rsi, r9, 0) + mov_rm(r10, r9, 16) + xor_rr(r11, r11)
     let found = mov_ri64(rax, 1) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let notfound = mov_ri64(rax, 0) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + jmp_rel32(str_len(found))
     let inc = add_ri32(r11, 1)
-    let access = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rdx, rdx, 0) + cmp_rr(rdx, r8) + je_rel32(str_len(inc) + 5 + str_len(notfound))
-    let test = cmp_rr(r11, rsi) + jae_rel32(str_len(access) + str_len(inc) + 5)
-    let back = jmp_rel32(0 - (str_len(test) + str_len(access) + str_len(inc) + 5))
+    let back_len = 5
+    let to_found = str_len(inc) + back_len + str_len(notfound)
+    let access_idx = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rm(rdx, rdx, 0)
+    let int_cmp = cmp_rr(rdx, r8) + je_rel32(to_found)
+    // str 内容比较：指针相等速胜，否则比长再比字节；rsi（计数）经机器栈穿越
+    // cmpsb（repe 毁 rsi/rdi/rcx），两条出路各恢复一次。
+    // str content compare: pointer equality wins fast, else length then bytes;
+    // rsi (the count) rides across cmpsb on the machine stack (repe kills
+    // rsi/rdi/rcx), restored on both exits.
+    // rsi（循环界）经 push/pop 穿越 cmpsb，两出口共用一次恢复；
+    // 相等走 to_found，不等落 inc 继续扫，出口数与跳转数逐条对齐
+    // / rsi (the loop bound) crosses cmpsb via push/pop with one restore
+    // shared by both exits; equal goes to_found, unequal falls through to
+    // inc. Every exit pairs with exactly one jump.
+    let sc_to_found = jmp_rel32(to_found)
+    let sc_run = push_r(rsi) + lea(rsi, rdx, 8) + lea(rdi, r8, 8) + mov_rr(rcx, rax) + repe_cmpsb() + pop_r(rsi) + jne_rel32(str_len(sc_to_found)) + sc_to_found
+    let sc_lens = mov_rm(rax, rdx, 0) + mov_rm(rcx, r8, 0) + cmp_rr(rax, rcx) + jne_rel32(str_len(sc_run))
+    let sc_ptr = cmp_rr(rdx, r8) + je_rel32(str_len(sc_lens) + str_len(sc_run) + str_len(inc) + back_len + str_len(notfound))
+    let str_cmp = sc_ptr + sc_lens + sc_run
+    let mut access = access_idx + int_cmp
+    if is_str {
+        access = access_idx + str_cmp
+    }
+    let test = cmp_rr(r11, rsi) + jae_rel32(str_len(access) + str_len(inc) + back_len)
+    let back = jmp_rel32(0 - (str_len(test) + str_len(access) + str_len(inc) + back_len))
     head + test + access + inc + back + notfound + found
 }
 
@@ -1513,6 +1609,14 @@ fn x86gen_write_file_native() {
     let fail = err_str + err_inst
     let write_seq = mov_rm(r9, r15, 0 - 8) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rm(rdx, r9, 0) + mov_rr(rdi, r8) + sys_mov_rax(1) + syscall() + sys_mov_rax(3) + syscall() + ok_inst + jmp_rel32(str_len(fail))
     let open_fail = test_rr(rax, rax) + jl_rel32(str_len(write_seq)) + write_seq + fail
-    let head = x86gen_nul_path_at(0 - 16) + mov_rr(rdi, r11) + sys_mov_rsi(577) + sys_mov_rdx(420) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail
+    let head = x86gen_nul_path_at(0 - 16) + mov_rr(rdi, r11) + (if target_os == "darwin" {
+        sys_mov_rsi(1537)
+    } else {
+        sys_mov_rsi(577)
+    }) + sys_mov_rdx(420) + sys_mov_rax(2) + syscall() + (if target_os == "windows" {
+        x86gen_fdtable_alloc()
+    } else {
+        ""
+    }) + mov_rr(r8, rax) + open_fail
     head
 }
