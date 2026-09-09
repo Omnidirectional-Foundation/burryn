@@ -243,6 +243,24 @@ jobs:
           ./gen1 dev embed-std .
           git diff --exit-code compiler/lib/std_embed.bur
 
+      # ud2 may only be constructed inside guarded_ud2 (pe.bur) and the
+      # dispatch-chain default (dispatch_chain.bur). A bare ud2 anywhere else
+      # is one missing jmp away from a fallthrough-into-trap (rounds 10-16);
+      # new arms must route through the constructor.
+      - name: no bare ud2 emission
+        run: |
+          set -euo pipefail
+          bad=$(grep -rn 'e1(15) + e1(11)' compiler/backends/x86/ \
+            | grep -v '^\s*//' \
+            | grep -v 'jmp_rel32(2) + e1(15) + e1(11)' \
+            | grep -v 'default_case = e1(15) + e1(11)' \
+            || true)
+          if [ -n "$bad" ]; then
+            echo "bare ud2 outside guarded constructors:"
+            echo "$bad"
+            exit 1
+          fi
+
   fixpoint:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
