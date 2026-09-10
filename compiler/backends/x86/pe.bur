@@ -163,11 +163,16 @@ pub fn pe_build_dispatcher(iat) {
     let write_case = mov_mr(rsp, 48, rsi) + mov_mr(rsp, 56, rdx) + pe_fd_lookup(iat, str_len(write_body)) + write_body
 
     // close(fd=rdi)：查表→CloseHandle→标空闲；miss 在 lookup 内返 -EBADF。
-    // CloseHandle 返回值不纠缠（与现有 close 路径忽略错误一致）。
+    // CloseHandle 返回值不纠缠（与现有 close 路径忽略错误一致）。CloseHandle
+    // 是 Win64 调用，r11 volatile：槽地址先存分派器局部 +40（各 case 互斥，
+    // 同 mprotect 的 out 参），call 后取回再标空闲。
     // close(fd=rdi): table lookup → CloseHandle → mark free; misses return
     // -EBADF inside the lookup. CloseHandle's own result is ignored, matching
-    // the existing close paths.
-    let close_tail = mov_rm(rcx, r11, 0) + mov_ri64(r10, iat[8]) + e1(65) + e1(255) + e1(18) + mov_ri64(r10, 0 - 1) + mov_mr(r11, 8, r10) + xor_rr(rax, rax)
+    // the existing close paths. CloseHandle is a Win64 call and r11 is
+    // volatile: spill the slot address to dispatcher local +40 (cases are
+    // mutually exclusive, same as mprotect's out-param) and reload it after
+    // the call before marking the slot free.
+    let close_tail = mov_rm(rcx, r11, 0) + mov_mr(rsp, 40, r11) + mov_ri64(r10, iat[8]) + e1(65) + e1(255) + e1(18) + mov_rm(r11, rsp, 40) + mov_ri64(r10, 0 - 1) + mov_mr(r11, 8, r10) + xor_rr(rax, rax)
     let close_case = pe_fd_lookup(iat, str_len(close_tail)) + close_tail
 
     // stat(path=rdi)：GetFileAttributesA，存在返 0，不存在返 -1（调用方只看符号）。
