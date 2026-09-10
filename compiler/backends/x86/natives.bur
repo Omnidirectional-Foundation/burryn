@@ -253,14 +253,12 @@ fn x86gen_read_file_native() {
     let fail2 = sys_mov_rax(3) + syscall() + err_str + err_inst
     let empty_path = sys_mov_rax(3) + syscall() + add_ri32(rsp, 144) + empty_str + ok_inst + jmp_rel32(str_len(fail2) + str_len(fail1))
     let read_seq = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdx, r10) + sys_mov_rax(0) + syscall() + mov_rr(rax, r8) + sys_mov_rax(3) + syscall() + add_ri32(rsp, 144) + mov_rr(rax, r8) + ok_inst + jmp_rel32(str_len(empty_path) + str_len(fail2) + str_len(fail1))
-    // st_size 在 fstat 缓冲中的偏移：linux 48，darwin 144B struct 里 +96
-    // （+48 是 st_mtimespec，误读即 1.7e9 长度→round-trip MISMATCH）。
-    // windows 臂直写 8B 到 [rsp+48]，沿用 48。
-    // st_size offset in the fstat buffer: 48 on linux, +96 in darwin's 144B
-    // struct (+48 is st_mtimespec; misreading yields a 1.7e9 length and a
-    // round-trip MISMATCH). The windows arm writes 8B straight to [rsp+48].
-    let fstat_size_off = if target_os == "darwin" { 96 } else { 48 }
-    let fstat_ok = mov_rm(r10, rsp, fstat_size_off) + xor_rr(r9, r9) + cmp_rr(r10, r9) + jle_rel32(str_len(alloc) + str_len(read_seq)) + alloc + read_seq + empty_path
+    // fstat 缓冲统一按 Linux 布局读 size @+48：darwin 分派器把 BSD st_size
+    // （+80）拷到 +48，windows 臂把 8B size 直写该处（见 fstat_buf）。
+    // The fstat buffer is read in Linux layout on every target: the darwin
+    // dispatcher copies BSD st_size (+80) to +48, the windows arm writes
+    // the 8B size straight there (see fstat_buf).
+    let fstat_ok = mov_rm(r10, rsp, 48) + xor_rr(r9, r9) + cmp_rr(r10, r9) + jle_rel32(str_len(alloc) + str_len(read_seq)) + alloc + read_seq + empty_path
     let fstat_buf = if target_os == "windows" {
         // Windows fstat 臂只写 8B size 到 rsi；指到 +48 恰是调用方读位
         // The Windows fstat arm writes only the 8B size through rsi; point it
