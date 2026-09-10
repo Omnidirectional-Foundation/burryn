@@ -1059,7 +1059,15 @@ fn x86gen_read_dir_native() {
     // 主流程拼装
     // main assembly
     let list_alloc = mov_rr(r11, r12) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, r11) + mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(r12, rax) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
-    let empty_ok = mov_rr(r11, r12) + xor_rr(rax, rax) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + ok_inst + jmp_rel32(str_len(fail))
+    // Windows FindFirst 失败路径同样要还 328B 帧，否则 rsp 从此偏斜。
+    // The Windows FindFirst failure path must release the 328B frame too,
+    // otherwise rsp stays skewed for the rest of the program.
+    let fail_pad = if target_os == "windows" {
+        add_ri32(rsp, 328)
+    } else {
+        ""
+    }
+    let empty_ok = mov_rr(r11, r12) + xor_rr(rax, rax) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + add_ri32(r12, 24) + ok_inst + jmp_rel32(str_len(fail_pad) + str_len(fail))
     let build_tail = mov_rm(r11, r15, 0 - 40) + ok_inst + jmp_rel32(str_len(empty_ok) + str_len(fail))
     let mut main_done_closeadd = close + add_ri32(rsp, 8192)
     if target_os == "windows" {
@@ -1078,11 +1086,17 @@ fn x86gen_read_dir_native() {
     let win_next = mov_rm(rdi, rsp, 320) + lea(rsi, rsp, 0) + sys_mov_rax(1001) + syscall() + test_rr(rax, rax)
     let win_collect = is_dotdot + test_rr(r9, r9) + jne_rel32(str_len(collect_seq))
     let win_top = lea(rcx, rsp, 44)
-    let win_loop = win_top + win_collect + collect_seq + win_next + jne_rel32(0 - (5 + str_len(win_next) + str_len(collect_seq) + str_len(win_collect) + str_len(win_top)))
-    let win_find = mov_rr(rdi, rcx) + lea(rsi, rsp, 0) + sys_mov_rax(1000) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(win_find_money) + str_len(names_alloc) + str_len(win_loop) + str_len(main_done) + str_len(empty_ok))
+    let win_loop = win_top + win_collect + collect_seq + win_next + jne_rel32(0 - (6 + str_len(win_next) + str_len(collect_seq) + str_len(win_collect) + str_len(win_top)))
+    // Windows 补 ".."：Find* 枚举不返回点项，golden 契约（与 getdents 一致）
+    // 要求 ".." 在列；写到 find_data 尾部闲区，再走一次 collect_seq。
+    // Windows appends "..": Find* never lists dot entries, but the golden
+    // contract (matching getdents) requires ".." to be present; park the name
+    // in the find_data tail and run collect_seq once more.
+    let win_dotdot = mov_ri64(r10, 11822) + mov_mr(rsp, 312, r10) + lea(rcx, rsp, 312) + collect_seq
+    let win_find = mov_rr(rdi, rcx) + lea(rsi, rsp, 0) + sys_mov_rax(1000) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(win_find_money) + str_len(names_alloc) + str_len(win_loop) + str_len(win_dotdot) + str_len(main_done) + str_len(empty_ok))
     let mut head_w = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail + main_tail + fail
     if target_os == "windows" {
-        head_w = x86gen_nul_path_at(0 - 8) + win_star + sub_ri32(rsp, 328) + win_find + win_find_money + names_alloc + win_loop + main_done + empty_ok + fail
+        head_w = x86gen_nul_path_at(0 - 8) + win_star + sub_ri32(rsp, 328) + win_find + win_find_money + names_alloc + win_loop + win_dotdot + main_done + empty_ok + fail_pad + fail
     }
     head_w
 }
