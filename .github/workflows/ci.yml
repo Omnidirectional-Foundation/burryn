@@ -243,6 +243,24 @@ jobs:
           ./gen1 dev embed-std .
           git diff --exit-code compiler/lib/std_embed.bur
 
+      # ud2 may only be constructed inside guarded_ud2 (pe.bur) and the
+      # dispatch-chain default (dispatch_chain.bur). A bare ud2 anywhere else
+      # is one missing jmp away from a fallthrough-into-trap (rounds 10-16);
+      # new arms must route through the constructor.
+      - name: no bare ud2 emission
+        run: |
+          set -euo pipefail
+          bad=$(grep -rn 'e1(15) + e1(11)' compiler/backends/x86/ \
+            | grep -v '^\s*//' \
+            | grep -v 'jmp_rel32(2) + e1(15) + e1(11)' \
+            | grep -v 'default_case = e1(15) + e1(11)' \
+            || true)
+          if [ -n "$bad" ]; then
+            echo "bare ud2 outside guarded constructors:"
+            echo "$bad"
+            exit 1
+          fi
+
   fixpoint:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -401,8 +419,8 @@ jobs:
         with:
           name: gen1
 
-      # P0 probes: hello + the pure slice (fib, float_arith, expected green)
-      # + clock (sleep path needs poll(7): expected SIGILL, evidence only).
+      # PE corpus: hello + pure slice (fib, float_arith) + yield + timer slice
+      # (clock, sleep), all hard-gated against their goldens.
       - name: Build windows programs
         run: |
           set -euo pipefail
@@ -411,7 +429,10 @@ jobs:
           ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-out/hello.exe
           ./gen1 build --backend x86 --os windows examples/basics/fib.bur -o pe-out/fib.exe
           ./gen1 build --backend x86 --os windows examples/basics/float_arith.bur -o pe-out/float_arith.exe
+          ./gen1 build --backend x86 --os windows examples/concurrency/yield.bur -o pe-out/yield.exe
           ./gen1 build --backend x86 --os windows testdata/regression/clock.bur -o pe-out/clock.exe
+          ./gen1 build --backend x86 --os windows examples/io/fs.bur -o pe-out/fs.exe
+          ./gen1 build --backend x86 --os windows examples/io/sleep.bur -o pe-out/sleep.exe
 
       - name: Upload windows programs
         uses: actions/upload-artifact@v4
@@ -442,6 +463,7 @@ jobs:
           cmd /c ".\pe-out\hello.exe > actual.txt"
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/hello.golden actual.txt
+          if ((Get-Item actual.txt).Length -eq 0) { Write-Error "empty stdout from actual.txt"; exit 1 }
 
       - name: Run pure corpus slice
         shell: pwsh
@@ -449,20 +471,40 @@ jobs:
           cmd /c ".\pe-out\fib.exe > actual-fib.txt"
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/fib.golden actual-fib.txt
+          if ((Get-Item actual-fib.txt).Length -eq 0) { Write-Error "empty stdout from actual-fib.txt"; exit 1 }
           cmd /c ".\pe-out\float_arith.exe > actual-float_arith.txt"
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/float_arith.golden actual-float_arith.txt
+          if ((Get-Item actual-float_arith.txt).Length -eq 0) { Write-Error "empty stdout from actual-float_arith.txt"; exit 1 }
 
-      # Evidence only: the sleep path parks into poll(7), which the PE
-      # dispatcher lacks, so clock is expected to die on ud2 (0xC000001D).
-      # This step never fails the job; P2 (WSAPoll arm) turns it green.
-      - name: Probe sleep path (expected crash, evidence only)
+      - name: Run spawn slice (hard gate)
         shell: pwsh
-        continue-on-error: true
         run: |
-          cmd /c ".\pe-out\clock.exe > actual-clock.txt 2>&1"
-          echo "clock.exe exit code: $LASTEXITCODE"
-          Get-Content actual-clock.txt -ErrorAction SilentlyContinue | Select-Object -First 5
+          cmd /c ".\pe-out\yield.exe > actual-yield.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/concurrency/yield.golden actual-yield.txt
+          if ((Get-Item actual-yield.txt).Length -eq 0) { Write-Error "empty stdout from actual-yield.txt"; exit 1 }
+
+      - name: Run timer slice (hard gate)
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\clock.exe > actual-clock.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text testdata/regression/clock.golden actual-clock.txt
+          if ((Get-Item actual-clock.txt).Length -eq 0) { Write-Error "empty stdout from actual-clock.txt"; exit 1 }
+          cmd /c ".\pe-out\sleep.exe > actual-sleep.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/io/sleep.golden actual-sleep.txt
+          if ((Get-Item actual-sleep.txt).Length -eq 0) { Write-Error "empty stdout from actual-sleep.txt"; exit 1 }
+
+      - name: Run fs slice (hard gate)
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\fs.exe > actual-fs.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/io/fs.golden actual-fs.txt
+          if ((Get-Item actual-fs.txt).Length -eq 0) { Write-Error "empty stdout from actual-fs.txt"; exit 1 }
+          if ((Get-Item actual-sleep.txt).Length -eq 0) { Write-Error "empty stdout from actual-sleep.txt"; exit 1 }
 
   x86-macho-build:
     needs: gen1
@@ -490,6 +532,7 @@ jobs:
           ./gen1 build --backend x86 --os darwin examples/concurrency/yield.bur -o macho-out/yield-mac
           ./gen1 build --backend x86 --os darwin examples/io/sleep.bur -o macho-out/sleep-mac
           ./gen1 build --backend x86 --os darwin examples/concurrency/pipeline.bur -o macho-out/pipeline-mac
+          ./gen1 build --backend x86 --os darwin examples/io/fs.bur -o macho-out/fs-mac
 
       - name: Upload macho programs
         uses: actions/upload-artifact@v4
@@ -556,6 +599,7 @@ jobs:
           check_one yield-mac examples/concurrency/yield.golden
           check_one sleep-mac examples/io/sleep.golden
           check_one pipeline-mac examples/concurrency/pipeline.golden
+          check_one fs-mac examples/io/fs.golden
 
   runtime:
     needs: []

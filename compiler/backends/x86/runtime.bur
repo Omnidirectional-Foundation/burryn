@@ -274,7 +274,7 @@ fn x86gen_sched_block() {
     let pop_head = pop_load + empty_je
     // main_check 定义移至 sw_gate 之后：DONE 直达 exit0 的 je 需计入闸门长度
     // （main_check moved after sw_gate: the DONE fast-path je must skip the sweep gate）
-    // ===== poll_wait 段（布局：checks + fd_path + timer_path + timer_due + pop_ret）=====
+    // ===== poll_wait 段（布局：checks + fd_path + timer_due + pop_ret）=====
     // ---- timer_due：重算 now_ns → r10；遍历 timer 表，deadline<=now 的 schedule + 末项
     // 压缩；循环 do-while（n>0 回 body），r9=n、r11=游标 ----
     let td_done = mov_ri64(rcx, rt_slot(rt_timer_n)) + mov_mr(rcx, 0, r9) + jmp_rel32(0)
@@ -296,24 +296,9 @@ fn x86gen_sched_block() {
     let td_loop_check = td_loop_check_pre + td_loop_back
     let td_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(r9, rt_slot(rt_timer_n)) + mov_rm(r9, r9, 0) + mov_rr(r8, r9) + mov_ri64(r11, rt_slot(TIMER_BASE)) + test_rr(r8, r8) + je_rel32(str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check))
     let pw_timer_due = td_now + td_body + td_drop + td_next + td_loop_check + td_done
-    // ---- timer_path：clock_gettime + 扫描最小 deadline + 剩余时间 nanosleep ----
-    let tp_sleep_pre = sub_ri32(rsp, 16) + mov_rr(rax, rcx) + xor_rr(rdx, rdx) + mov_ri64(rcx, 1000000000) + div_r(rcx) + mov_mr(rsp, 0, rax) + mov_mr(rsp, 8, rdx) + mov_rr(rdi, rsp) + xor_rr(rsi, rsi) + sys_mov_rax(35) + syscall() + add_ri32(rsp, 16)
-    let tp_scan_done = mov_rr(rcx, r11) + sub_rr(rcx, r10) + test_rr(rcx, rcx) + jle_rel32(str_len(tp_sleep_pre) + 9)
-    let tp_sleep_back = jl_rel32(0 - (str_len(tp_scan_done) + str_len(tp_sleep_pre) + 9))
-    let tp_sleep_test = test_rr(rax, rax) + tp_sleep_back
-    let tp_sleep = tp_sleep_pre + tp_sleep_test
-    let tp_scan_skip_pre = add_ri32(r8, 16) + sub_ri32(r9, 1)
-    let tp_scan_upd = mov_rr(r11, rcx)
-    let tp_scan_body = mov_rm(rcx, r8, 0) + cmp_rr(rcx, r11) + jg_rel32(str_len(tp_scan_upd))
-    let tp_scan_check_pre = test_rr(r9, r9)
-    let tp_scan_back = jne_rel32(0 - (str_len(tp_scan_body) + str_len(tp_scan_upd) + str_len(tp_scan_skip_pre) + str_len(tp_scan_check_pre) + 6))
-    let tp_scan_check = tp_scan_check_pre + tp_scan_back
-    let tp_head = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + mov_ri64(r9, rt_slot(rt_timer_n)) + mov_rm(r9, r9, 0) + mov_ri64(r11, 9223372036854775807) + mov_ri64(r8, rt_slot(TIMER_BASE)) + test_rr(r9, r9) + je_rel32(str_len(tp_scan_body) + str_len(tp_scan_upd) + str_len(tp_scan_skip_pre) + str_len(tp_scan_check) + str_len(tp_scan_done) + str_len(tp_sleep))
-    let pw_timer_path = tp_head + tp_scan_body + tp_scan_upd + tp_scan_skip_pre + tp_scan_check + tp_scan_done + tp_sleep
     // ---- fd_path：timeout 计算（有 timer 则按最短 deadline）+ poll + 就绪清理
     // （反向遍历，就绪者 schedule + 末项压缩）+ timer 到期检查 ----
-    let fd_jne = jne_rel32(str_len(pw_timer_path))
-    let fd_done = mov_ri64(rcx, rt_slot(rt_timer_n)) + mov_rm(rcx, rcx, 0) + test_rr(rcx, rcx) + je_rel32(str_len(fd_jne) + str_len(pw_timer_path) + str_len(pw_timer_due)) + fd_jne
+    let fd_done = mov_ri64(rcx, rt_slot(rt_timer_n)) + mov_rm(rcx, rcx, 0) + test_rr(rcx, rcx) + je_rel32(str_len(pw_timer_due))
     let fd_next = sub_ri32(r9, 1)
     let fd_drop = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rcx, rsi, 0) + sub_ri32(rcx, 1) + mov_mr(rsi, 0, rcx)
     let fd_loop_copy = mov_rr(rdi, r11) + mov_ri32(rcx, 4) + shl_rcl(rdi) + add_rr(rdi, r8) + mov_rm(rsi, rdi, 0) + mov_mr(r10, 0, rsi) + mov_rm(rsi, rdi, 8) + mov_mr(r10, 8, rsi)
@@ -367,16 +352,16 @@ fn x86gen_sched_block() {
     let fd_none = mov_ri64(rdx, -1) + jmp_rel32(str_len(fd_tmo))
     let fd_head = mov_ri64(r9, rt_slot(rt_waitset_n)) + mov_rm(r9, r9, 0) + sub_ri32(r9, 1) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(fd_none))
     let pw_fd_path = fd_head + fd_none + fd_tmo + st_init + st_top + st_body + st_back + fd_poll_pre + fd_poll_test + cb_init + cb_top + cb_step + cb_back + fd_cursor + fd_loop_body + fd_drop + fd_next + fd_loop_check + fd_done
-    // ---- checks：waitset 非空 → fd_path；timer 非空 → timer_path；皆空 → dl ----
-    let checks_dl = jmp_rel32(str_len(pw_fd_path) + str_len(pw_timer_path) + str_len(pw_timer_due) + 5)
+    // ---- checks：waitset 或 timer 非空 → fd_path（timer 只调 poll 超时）；皆空 → dl ----
+    let checks_dl = jmp_rel32(str_len(pw_fd_path) + str_len(pw_timer_due) + 5)
     let checks_timer = mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(checks_dl))
     let checks_fd = mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(checks_timer) + str_len(checks_dl))
     let pw_checks = checks_fd + checks_timer + checks_dl
     // pw_pop_ret 回 pop_head：EIP = dl 起点，目标 = pop_head 起点；回跳需含自身 5B
     // （jmp_rel32 固定长度）；checks_dl 对它的引用用字面量 5，破 checks_dl → pw_pop_ret
     // → pw_checks 循环依赖
-    let pw_pop_ret = jmp_rel32(0 - (5 + str_len(pw_checks) + str_len(pw_fd_path) + str_len(pw_timer_path) + str_len(pw_timer_due) + str_len(exit0) + str_len(resume) + str_len(tail_clean) + str_len(pop_body) + str_len(pop_head)))
-    let poll_wait = pw_checks + pw_fd_path + pw_timer_path + pw_timer_due + pw_pop_ret
+    let pw_pop_ret = jmp_rel32(0 - (5 + str_len(pw_checks) + str_len(pw_fd_path) + str_len(pw_timer_due) + str_len(exit0) + str_len(resume) + str_len(tail_clean) + str_len(pop_body) + str_len(pop_head)))
+    let poll_wait = pw_checks + pw_fd_path + pw_timer_due + pw_pop_ret
     // ===== 非阻塞服务趟：就绪队列非空时也唤醒到期 timer 与就绪 fd，防 yield 自旋饿死阻塞者
     // （对齐 C 调度器每轮 bur_wake_due_timers() + bur_wait_poll(false)；复用既有段，rdx=0 超时）
     // ===== Nonblocking service pass: with a non-empty ready queue, still wake due timers and

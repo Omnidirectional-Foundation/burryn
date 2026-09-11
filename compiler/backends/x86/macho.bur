@@ -149,7 +149,46 @@ pub fn macho_build_dispatcher() {
     // mprotect(addr=rdi, len=rsi, prot=rdx): PROT_READ/WRITE/EXEC share values; passes through
     let mprotect_case = mov_ri64(rax, 33554506) + e1(15) + e1(5) + errno_tail
 
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case], epilogue)
+    // open(path=rdi, flags=rsi, mode=rdx)：BSD 号直通，参数寄存器与 Linux 同形。
+    // 注意调用方传 Linux 标志：write_file 在 darwin 下改传 1537
+    // （O_WRONLY|O_CREAT|O_TRUNC 的 BSD 值），见 read_file/write_file。
+    // open(path=rdi, flags=rsi, mode=rdx): BSD numbers pass through with the
+    // same argument registers as Linux. Callers pass Linux flags except
+    // write_file, which uses the BSD value 1537 on darwin (see its native).
+    let open_case = mov_ri64(rax, 33554437) + e1(15) + e1(5) + errno_tail
+
+    // read(fd=rdi, buf=rsi, len=rdx)：直通 / passthrough
+    let read_case = mov_ri64(rax, 33554435) + e1(15) + e1(5) + errno_tail
+
+    // close(fd=rdi)：直通 / passthrough
+    let close_case = mov_ri64(rax, 33554438) + e1(15) + e1(5) + errno_tail
+
+    // stat(path=rdi, struct=rsi)：直通，调用方只看返回值符号，结构体免翻译
+    // stat(path=rdi, struct=rsi): passes through; callers only check the sign,
+    // so the struct needs no translation
+    let stat_case = mov_ri64(rax, 33554620) + e1(15) + e1(5) + errno_tail
+
+    // fstat(fd=rdi, struct=rsi)：直通后把 BSD st_size（+72）拷到 Linux 位
+    // (+48)，调用方只读该偏移。裸 syscall 189 填的是内核 user64_stat（32 位
+    // ino、三组 timespec、120B）：24B 头已 8 对齐故 atime 起于 +24，
+    // size@72、blocks@80、blksize@88；libc struct stat 的 size@96 是带
+    // birthtime 的 stat64 布局，裸 189 不按它填。
+    // fstat(fd=rdi, struct=rsi): passes through, then copies the BSD st_size
+    // (+72) to the Linux offset (+48) the callers read. Raw syscall 189 fills
+    // the kernel user64_stat (32-bit ino, three timespecs, 120B): the 24B
+    // header stays 8-aligned so atime starts at +24, size@72, blocks@80,
+    // blksize@88. The libc struct stat's size@96 is the stat64 layout with
+    // birthtime, which raw 189 does not produce.
+    let fstat_copy = mov_rm(r10, rsi, 72) + mov_mr(rsi, 48, r10)
+    let fstat_case = mov_ri64(rax, 33554621) + e1(15) + e1(5) + errno_tail + fstat_copy
+
+    // getdirentries64(fd=rdi, buf=rsi, nbytes=rdx, basep=r10)：直通，调用方备
+    // scratch 作 basep；错误经 errno_tail 转负。
+    // getdirentries64(fd=rdi, buf=rsi, nbytes=rdx, basep=r10): passes through
+    // with a caller-provided basep scratch; errors convert negative.
+    let getdirentries_case = mov_ri64(rax, 33554776) + e1(15) + e1(5) + errno_tail
+
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 2, 0, 3, 4, 5, 217], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case], epilogue)
 }
 
 // macho_header 生成 mach_header_64 / macho_header builds the mach_header_64
