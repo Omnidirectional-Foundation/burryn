@@ -15,7 +15,21 @@ fn x86gen_tcp_accept_native(sched_addr, waitset_add_addr) {
     let fail = err_str + err_inst + add_ri32(rsp, 8)
     let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 8, 1)
     let retry_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall()
-    let ok_path = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    let ok_tail = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    // windows 登记 accepted SOCKET（kind=1）；表满时落 Err（ok_path 后紧跟 fail）
+    // on windows register the accepted SOCKET (kind 1); a full table falls
+    // into Err (fail sits right after ok_path)
+    let reg_chk = if target_os == "windows" {
+        test_rr(rax, rax) + jl_rel32(str_len(ok_tail))
+    } else {
+        ""
+    }
+    let reg_sock = if target_os == "windows" {
+        x86gen_fdtable_alloc() + x86gen_fdtable_mark_socket()
+    } else {
+        ""
+    }
+    let ok_path = reg_sock + reg_chk + ok_tail
     let err_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + 5) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0)) + str_len(fd_park)) + jmp_rel32(str_len(fd_park) + 5 + str_len(ok_path))
     let retry_back = jmp_rel32(0 - (str_len(retry_seq) + str_len(err_check) + str_len(fd_park) + 5))
     sub_ri32(rsp, 8) + retry_seq + err_check + fd_park + retry_back + ok_path + fail
@@ -45,7 +59,14 @@ fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
     let connect_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 115)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + str_len(sockcheck)) + neg_r(rax) + mov_ri64(rdx, 115) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0))) + jmp_rel32(str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
     let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
     let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
-    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    // windows 登记 SOCKET 进 fd 表（kind=1），见 tcp_listen 处说明
+    // on windows register the SOCKET in the fd table (kind 1), see tcp_listen
+    let reg_sock = if target_os == "windows" {
+        x86gen_fdtable_alloc() + x86gen_fdtable_mark_socket()
+    } else {
+        ""
+    }
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + reg_sock + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
     let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
     head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close
@@ -237,6 +258,18 @@ fn x86gen_fdtable_alloc() {
     let init = mov_rr(rdx, rax) + mov_ri64(rcx, 3)
     let body = init + chk_cap + slot_at + test_slot + found + next + full
     test_rr(rax, rax) + jl_rel32(str_len(body)) + body
+}
+
+// x86gen_fdtable_mark_socket 把 rax 里槽号对应表项的 kind 置 1（socket）。
+// rax 为负（socket 本体失败，alloc 按原样透传）时跳过标记；仅 windows 发射，
+// r10/r11 作暂存。
+// x86gen_fdtable_mark_socket marks the table entry for the slot in rax as
+// kind 1 (socket). A negative rax (socket itself failed, passed through
+// untouched by alloc) skips the mark; emitted on windows only, using r10/r11
+// as scratch
+fn x86gen_fdtable_mark_socket() {
+    let mark = mov_rr(r11, rax) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10) + mov_ri64(r10, 1) + mov_mr(r11, 8, r10)
+    test_rr(rax, rax) + jl_rel32(str_len(mark)) + mark
 }
 
 // x86gen_read_file_native 内联 read_file：open/fstat/read/close syscall，返回 Result<str, str>
@@ -731,7 +764,22 @@ fn x86gen_net_nb_native() {
     // acc_ok_body：accepted fd 置 O_NONBLOCK，handle 转十进制 str 后包 Ok（VM 语义：Ok(handle 串)）
     // acc_ok_body: sets O_NONBLOCK on the accepted fd, converts the handle to a decimal str and
     // wraps Ok (VM semantics: Ok(handle string))
-    let acc_ok_body = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
+    let acc_tail = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
+    // windows 登记 accepted SOCKET（kind=1）；表满时向前跳过 acc/rd/wr 落 fail
+    //（acc_jmp 固定 5B，见 acc_err 处同式）
+    // on windows register the accepted SOCKET (kind 1); a full table jumps
+    // forward past acc/rd/wr to fail (acc_jmp is a fixed 5B, same form as acc_err)
+    let reg_chk = if target_os == "windows" {
+        test_rr(rax, rax) + jl_rel32(str_len(acc_tail) + 5 + rd_path_len + wr_path_len + str_len(eagain))
+    } else {
+        ""
+    }
+    let reg_sock = if target_os == "windows" {
+        x86gen_fdtable_alloc() + x86gen_fdtable_mark_socket()
+    } else {
+        ""
+    }
+    let acc_ok_body = reg_sock + reg_chk + acc_tail
     let acc_err = err_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
     let acc_seq = mov_rm(rdi, r15, 0 - 24) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall() + test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err)) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err) + str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(syscall()) + str_len(sys_mov_rax(43)) + str_len(xor_rr(rdx, rdx)) + str_len(xor_rr(rsi, rsi)) + str_len(mov_rm(rdi, r15, 0 - 24)))) + jmp_rel32(0)
     let acc_jmp = jmp_rel32(rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
@@ -1507,7 +1555,17 @@ fn x86gen_tcp_listen_native() {
     // set O_NONBLOCK on the listener fd: accept must return EAGAIN to park (VM semantics: sockets
     // are born non-blocking)
     let nonblock_seq = mov_mr(rsp, 8, r9) + x86gen_set_nonblock_at(rsp, 8)
-    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    // windows 上 socket 返 SOCKET（非小整数）：登记进 fd 表并标 kind=1，
+    // 后续一律用槽号（accept/read/write/close/poll 经表分流）
+    // on windows socket returns a SOCKET (not a small int): register it in the
+    // fd table as kind 1, so everything downstream uses the slot index
+    // (accept/read/write/close/poll split through the table)
+    let reg_sock = if target_os == "windows" {
+        x86gen_fdtable_alloc() + x86gen_fdtable_mark_socket()
+    } else {
+        ""
+    }
+    let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + reg_sock + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let sockaddr = x86gen_sockaddr_at()
     let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)

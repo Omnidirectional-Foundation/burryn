@@ -525,34 +525,64 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let start_off = rt_region_size() + const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr)
     if target_os == "windows" {
-        // PE 装配：runtime 区尾的 8B 槽填分派器绝对地址；分派器与 kernel32
-        // 导入表依次接在 _start 后。分派器长度与值无关，先以零地址测长，
+        // PE 装配：runtime 区尾的 8B 槽填分派器绝对地址；分派器与 kernel32 +
+        // ws2_32 导入表依次接在 _start 后。分派器长度与值无关，先以零地址测长，
         // 再按真实 IAT 绝对址重发；槽值据此可算，无需回补。
         // PE assembly: the 8-byte slot at the end of the runtime area holds
-        // the dispatcher's absolute address; the dispatcher and the kernel32
-        // import table follow _start. The dispatcher length is value-independent,
-        // so it is measured once with zero addresses and rebuilt with real IAT
-        // addresses; the slot value follows without backpatching.
-        let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose"]
+        // the dispatcher's absolute address; the dispatcher and the kernel32 +
+        // ws2_32 import tables follow _start. The dispatcher length is
+        // value-independent, so it is measured once with zero addresses and
+        // rebuilt with real IAT addresses; the slot value follows without
+        // backpatching.
+        let import_dlls = ["kernel32.dll", "ws2_32.dll"]
+        let import_counts = [16, 14]
+        let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError"]
         // 分派器接在 _start 之后；槽与导入表 RVA 都从真实内容偏移算起
         // The dispatcher follows _start; the slot and import RVAs derive from
         // the true content offsets.
         let disp_off = start_off + str_len(start_bytes)
-        let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         let idata_off = disp_off + str_len(disp_probe)
-        let iat_abs0 = img_base() + idata_off + pe_import_desc_size(len(import_names)) + pe_ilt_size(len(import_names))
-        let dispatcher = pe_build_dispatcher([iat_abs0, iat_abs0 + 8, iat_abs0 + 16, iat_abs0 + 24, iat_abs0 + 32, iat_abs0 + 40, iat_abs0 + 48, iat_abs0 + 56, iat_abs0 + 64, iat_abs0 + 72, iat_abs0 + 80, iat_abs0 + 88, iat_abs0 + 96, iat_abs0 + 104, iat_abs0 + 112, iat_abs0 + 120])
+        let iat_abs0 = img_base() + idata_off + pe_import_desc_size(len(import_dlls)) + pe_ilt_size(len(import_names), len(import_dlls))
+        // IAT 逐 DLL 独立以零项收尾（同 pe_build_imports 的间隙说明），故各 DLL
+        // 的绝对地址列表要跳过每组之间的空槽，不能按扁平 n*8 连续算
+        // The IAT is zero-terminated per DLL (same gap as pe_build_imports), so
+        // each DLL's absolute-address run must skip the null slot between
+        // groups instead of assuming a flat, contiguous n*8 stride
+        let mut iat_addrs = []
+        let mut iat_doff = 0
+        let mut iat_di = 0
+        while iat_di < len(import_dlls) {
+            let mut iat_ci = 0
+            while iat_ci < import_counts[iat_di] {
+                push(iat_addrs, iat_abs0 + 8 * iat_doff)
+                iat_doff = iat_doff + 1
+                iat_ci = iat_ci + 1
+            }
+            iat_doff = iat_doff + 1
+            iat_di = iat_di + 1
+        }
+        let dispatcher = pe_build_dispatcher(iat_addrs)
         let runtime_with_thunk = runtime_bytes + e8(img_base() + disp_off)
-        // fd 表：全 0xFF 填充（kind=-1 空闲），Windows 独有尾区
-        // fd table: filled with 0xFF (kind=-1 means free), a Windows-only tail
+        // fd 表：全 0xFF 填充（kind=-1 空闲），Windows 独有尾区；其后 WSA 区全零
+        // （WSAStartup 未调标记 + 写区 + poll 暂存，见 layout.bur wsa_base）
+        // fd table: filled with 0xFF (kind=-1 means free), a Windows-only tail;
+        // the WSA area after it is zeroed (WSAStartup-not-run flag plus scratch,
+        // see layout.bur wsa_base)
         let mut fd_fill = ""
         let mut ffi = 0
         while ffi < FD_CAP * FD_ENTRY {
             fd_fill = fd_fill + byte_chr(255)
             ffi = ffi + 1
         }
-        let runtime_with_fd = runtime_with_thunk + fd_fill
-        let imports = pe_build_imports(import_names, idata_off)
+        let mut wsa_fill = ""
+        let mut wfi = 0
+        while wfi < WSA_REGION_LEN {
+            wsa_fill = wsa_fill + byte_chr(0)
+            wfi = wfi + 1
+        }
+        let runtime_with_fd = runtime_with_thunk + fd_fill + wsa_fill
+        let imports = pe_build_imports(import_dlls, import_counts, import_names, idata_off)
         emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports, start_off, idata_off, str_len(imports))
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
