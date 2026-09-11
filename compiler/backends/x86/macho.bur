@@ -114,14 +114,41 @@ pub fn emit_macho(text_content, entry_in_text, data_content) {
 // No imports and no API calls, so the frame only saves the six input registers
 // (mmap rewrites r10, clock rewrites rdi/rsi/rdx/r10, all restored by the
 // epilogue); no shadow space or frame pointer needed.
+// macho_errno_remap 把 darwin 特有 errno 换成调用方认的 Linux 号：EAGAIN
+// 35→11，EINPROGRESS 36→115；成功 0 与其余错误不动（EINTR 两边同为 4）。
+// macho_errno_remap translates darwin-specific errnos to the Linux numbers the
+// callers expect: EAGAIN 35→11, EINPROGRESS 36→115; success and the rest pass
+// through (EINTR is 4 on both sides)
+fn macho_errno_remap() {
+    let to_again = mov_ri64(rax, 0 - 11)
+    let chk_again = mov_ri64(r10, 0 - 35) + cmp_rr(rax, r10) + jne_rel32(str_len(to_again)) + to_again
+    let to_prog = mov_ri64(rax, 0 - 115)
+    let chk_prog = mov_ri64(r10, 0 - 36) + cmp_rr(rax, r10) + jne_rel32(str_len(to_prog)) + to_prog
+    chk_again + chk_prog
+}
+
+// macho_fcntl_nonblock 把 F_SETFL 参数里的 Linux O_NONBLOCK 位（2048）换成
+// BSD 位（4），其余位原样保留；GET 类命令不碰参数。
+// macho_fcntl_nonblock swaps the Linux O_NONBLOCK bit (2048) in an F_SETFL
+// argument for the BSD bit (4), keeping every other bit; GET commands leave
+// the argument alone
+fn macho_fcntl_nonblock() {
+    let set_bit = mov_ri64(r11, 4) + or_rr(rdx, r11)
+    let nb_test = test_rr(r10, r10) + je_rel32(str_len(set_bit)) + set_bit
+    let clr_linux = mov_ri64(r11, 0 - 2049) + and_rr(rdx, r11)
+    mov_rr(r10, rdx) + mov_ri64(r11, 2048) + and_rr(r10, r11) + clr_linux + nb_test
+}
+
 pub fn macho_build_dispatcher() {
     let head = e1(87) + e1(86) + e1(82) + e1(65) + e1(80) + e1(65) + e1(81) + e1(65) + e1(82)
     let epilogue = e1(65) + e1(90) + e1(65) + e1(89) + e1(65) + e1(88) + e1(90) + e1(94) + e1(95) + e1(195)
     let errno_tail = e1(115) + e1(3) + e1(72) + e1(247) + e1(216)
 
-    // write(fd=rdi, buf=rsi, len=rdx)：参数寄存器与 Linux 完全同形，任意 fd 直通
-    // write(fd=rdi, buf=rsi, len=rdx): argument registers match Linux exactly; every fd passes through
-    let write_case = mov_ri64(rax, 33554436) + e1(15) + e1(5) + errno_tail
+    // write(fd=rdi, buf=rsi, len=rdx)：参数寄存器与 Linux 完全同形，任意 fd 直通；
+    // 套接字上的 EAGAIN/EINPROGRESS 走 errno_remap
+    // write(fd=rdi, buf=rsi, len=rdx): argument registers match Linux exactly; every fd passes through;
+    // EAGAIN/EINPROGRESS on sockets goes through errno_remap
+    let write_case = mov_ri64(rax, 33554436) + e1(15) + e1(5) + errno_tail + macho_errno_remap()
 
     // exit(code=rdi)：BSD exit 不返回；int3 兜底
     // exit(code=rdi): BSD exit never returns; int3 as a guard
@@ -157,8 +184,11 @@ pub fn macho_build_dispatcher() {
     // write_file, which uses the BSD value 1537 on darwin (see its native).
     let open_case = mov_ri64(rax, 33554437) + e1(15) + e1(5) + errno_tail
 
-    // read(fd=rdi, buf=rsi, len=rdx)：直通 / passthrough
-    let read_case = mov_ri64(rax, 33554435) + e1(15) + e1(5) + errno_tail
+    // read(fd=rdi, buf=rsi, len=rdx)：直通；套接字上的 EAGAIN/EINPROGRESS
+    // 走 errno_remap（文件读从不触发）。
+    // read(fd=rdi, buf=rsi, len=rdx): passes through; EAGAIN/EINPROGRESS on
+    // sockets goes through errno_remap (file reads never trigger it)
+    let read_case = mov_ri64(rax, 33554435) + e1(15) + e1(5) + errno_tail + macho_errno_remap()
 
     // close(fd=rdi)：直通 / passthrough
     let close_case = mov_ri64(rax, 33554438) + e1(15) + e1(5) + errno_tail
@@ -188,7 +218,61 @@ pub fn macho_build_dispatcher() {
     // with a caller-provided basep scratch; errors convert negative.
     let getdirentries_case = mov_ri64(rax, 33554776) + e1(15) + e1(5) + errno_tail
 
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 2, 0, 3, 4, 5, 217], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case], epilogue)
+    // socket(domain=rdi, type=rsi, proto=rdx)：AF_INET/SOCK_STREAM 取值两边相同，直通
+    // socket(domain=rdi, type=rsi, proto=rdx): AF_INET/SOCK_STREAM share values; passes through
+    let socket_case = mov_ri64(rax, 33554529) + e1(15) + e1(5) + errno_tail
+
+    // bind(fd=rdi, addr=rsi, len=rdx)：sockaddr_in 布局两边相同，直通
+    // bind(fd=rdi, addr=rsi, len=rdx): sockaddr_in layout matches; passes through
+    let bind_case = mov_ri64(rax, 33554536) + e1(15) + e1(5) + errno_tail
+
+    // listen(fd=rdi, backlog=rsi)：直通 / passthrough
+    let listen_case = mov_ri64(rax, 33554538) + e1(15) + e1(5) + errno_tail
+
+    // connect(fd=rdi, addr=rsi, len=rdx)：直通；非阻塞建连的 EINPROGRESS 经
+    // errno_remap 换成调用方等的 115 后 park
+    // connect(fd=rdi, addr=rsi, len=rdx): passes through; EINPROGRESS on a
+    // non-blocking connect goes through errno_remap to the 115 the callers park on
+    let connect_case = mov_ri64(rax, 33554530) + e1(15) + e1(5) + errno_tail + macho_errno_remap()
+
+    // accept(fd=rdi, addr=rsi, len=rdx)：直通（NULL 地址沿用调用方传值）；
+    // 空轮询的 EAGAIN 经 errno_remap 换成 11 后 park
+    // accept(fd=rdi, addr=rsi, len=rdx): passes through (NULL addresses flow
+    // through as the callers pass them); EAGAIN on an empty queue goes through
+    // errno_remap to the 11 the callers park on
+    let accept_case = mov_ri64(rax, 33554462) + e1(15) + e1(5) + errno_tail + macho_errno_remap()
+
+    // setsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8)：调用方传 Linux
+    // 常量（SOL_SOCKET=1、SO_REUSEADDR=2），换成 BSD 值（0xFFFF、4）再直通
+    // setsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8): callers pass
+    // Linux constants (SOL_SOCKET=1, SO_REUSEADDR=2); translate to the BSD
+    // values (0xFFFF, 4), then pass through
+    let reuse_name = mov_ri64(rdx, 4)
+    let reuse_name_chk = mov_ri64(r11, 2) + cmp_rr(rdx, r11) + jne_rel32(str_len(reuse_name)) + reuse_name
+    let reuse_level = mov_ri64(rsi, 65535)
+    let reuse_level_chk = mov_ri64(r11, 1) + cmp_rr(rsi, r11) + jne_rel32(str_len(reuse_level)) + reuse_level
+    let setsockopt_case = reuse_level_chk + reuse_name_chk + mov_ri64(rax, 33554537) + e1(15) + e1(5) + errno_tail
+
+    // getsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8)：调用方传
+    // (SOL_SOCKET=1, SO_ERROR=4)，换成 (0xFFFF, 0x1007) 再直通
+    // getsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8): callers pass
+    // (SOL_SOCKET=1, SO_ERROR=4); translate to (0xFFFF, 0x1007), then pass through
+    let err_name = mov_ri64(rdx, 4103)
+    let err_name_chk = mov_ri64(r11, 4) + cmp_rr(rdx, r11) + jne_rel32(str_len(err_name)) + err_name
+    let err_level = mov_ri64(rsi, 65535)
+    let err_level_chk = mov_ri64(r11, 1) + cmp_rr(rsi, r11) + jne_rel32(str_len(err_level)) + err_level
+    let getsockopt_case = err_level_chk + err_name_chk + mov_ri64(rax, 33554550) + e1(15) + e1(5) + errno_tail
+
+    // fcntl(fd=rdi, cmd=rsi, arg=rdx)：F_GETFL/F_GETFD 直通；F_SETFL 先把 Linux
+    // O_NONBLOCK 位换成 BSD 位（调用方按 Linux 位拼参数）
+    // fcntl(fd=rdi, cmd=rsi, arg=rdx): F_GETFL/F_GETFD pass through; F_SETFL
+    // first swaps the Linux O_NONBLOCK bit for the BSD one (callers assemble
+    // the argument with Linux bits)
+    let fcntl_set = macho_fcntl_nonblock()
+    let fcntl_set_chk = mov_ri64(r11, 4) + cmp_rr(rsi, r11) + jne_rel32(str_len(fcntl_set)) + fcntl_set
+    let fcntl_case = fcntl_set_chk + mov_ri64(rax, 33554524) + e1(15) + e1(5) + errno_tail
+
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 2, 0, 3, 4, 5, 217, 41, 42, 43, 49, 50, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case, socket_case, connect_case, accept_case, bind_case, listen_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
 }
 
 // macho_header 生成 mach_header_64 / macho_header builds the mach_header_64
