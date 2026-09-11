@@ -168,16 +168,18 @@ pub fn macho_build_dispatcher() {
     // so the struct needs no translation
     let stat_case = mov_ri64(rax, 33554620) + e1(15) + e1(5) + errno_tail
 
-    // fstat(fd=rdi, struct=rsi)：直通后把 BSD st_size（+80）拷到 Linux 位
-    // (+48)，调用方只读该偏移。裸 syscall 189 填的是内核 user64_stat（LP64
-    // 旧版 struct stat，无 birthtime，128B）：mtime@48、ctime@64、size@80、
-    // blocks@88；libc struct stat 的 size@96 是 stat64 布局，裸 189 不按它填。
+    // fstat(fd=rdi, struct=rsi)：直通后把 BSD st_size（+72）拷到 Linux 位
+    // (+48)，调用方只读该偏移。裸 syscall 189 填的是内核 user64_stat（32 位
+    // ino、三组 timespec、120B）：24B 头已 8 对齐故 atime 起于 +24，
+    // size@72、blocks@80、blksize@88；libc struct stat 的 size@96 是带
+    // birthtime 的 stat64 布局，裸 189 不按它填。
     // fstat(fd=rdi, struct=rsi): passes through, then copies the BSD st_size
-    // (+80) to the Linux offset (+48) the callers read. Raw syscall 189 fills
-    // the kernel user64_stat (LP64 legacy struct stat, no birthtime, 128B):
-    // mtime@48, ctime@64, size@80, blocks@88. The libc struct stat's size@96
-    // is the stat64 layout, which raw 189 does not produce.
-    let fstat_copy = mov_rm(r10, rsi, 80) + mov_mr(rsi, 48, r10)
+    // (+72) to the Linux offset (+48) the callers read. Raw syscall 189 fills
+    // the kernel user64_stat (32-bit ino, three timespecs, 120B): the 24B
+    // header stays 8-aligned so atime starts at +24, size@72, blocks@80,
+    // blksize@88. The libc struct stat's size@96 is the stat64 layout with
+    // birthtime, which raw 189 does not produce.
+    let fstat_copy = mov_rm(r10, rsi, 72) + mov_mr(rsi, 48, r10)
     let fstat_case = mov_ri64(rax, 33554621) + e1(15) + e1(5) + errno_tail + fstat_copy
 
     // getdirentries64(fd=rdi, buf=rsi, nbytes=rdx, basep=r10)：直通，调用方备
