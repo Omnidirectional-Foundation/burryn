@@ -16,7 +16,7 @@ It has a hand-written lexer, recursive-descent parser, Hindley-Milner type infer
 `compiler/` reimplements the whole pipeline — lexer, parser, type checker, bytecode compiler, C code generator, VM, module loader, tooling, and the `bur` CLI — in Burryn itself.
 `bur` compiles itself to C, `cc` turns that into a native binary, and the resulting native `bur` compiles the same source to the same bytes again.
 A closed bootstrap fixpoint.
-The original Go implementation that seeded the bootstrap is archived on the `archive/go-host` branch.
+The original Go implementation that seeded the bootstrap is archived on the `seed/go-host` branch.
 
 ## Name
 
@@ -26,7 +26,7 @@ A **burr** is what forging leaves on metal.
 
 ## Prerequisites
 
-- A native `bur` binary, or **Go 1.26+** to bootstrap from `archive/go-host`
+- A native `bur` binary, or **Go 1.26+** to bootstrap from `seed/go-host`
 - A C99 compiler (`gcc` or `clang`) for `bur build` and for rebuilding `bur`
 - An x86-64 host to run what the native backend emits: Linux (ELF), Windows (PE) or macOS (Mach-O)
 
@@ -192,7 +192,7 @@ $ bur build compiler -o bur
 Bootstrap from scratch (archived Go host):
 
 ```sh
-$ git worktree add ../go-host archive/go-host
+$ git worktree add ../go-host seed/go-host
 $ (cd ../go-host && go build -o ../bur-seed .)
 $ (cd ../go-host && ../bur-seed build burc -o ../bur-base)
 $ ./bur-base build compiler -o bur
