@@ -500,7 +500,7 @@ pub fn pe_build_dispatcher(iat) {
     let pw_b_rev = mov_rm32(rdx, r9, 10) + mov_ri64(rcx, 65535) + and_rr(rdx, rcx)
     let pw_b_winc = mov_rm(rax, rsp, 48) + add_ri32(rax, 1) + mov_mr(rsp, 48, rax)
     let pw_b_hit = ws_ptr_at_w() + pw_b_rev + pw_b_z + pw_b_c1 + pw_b_c2 + pw_b_c3 + pw_b_wr + pw_b_winc
-    let pw_b_pred = mov_rm32(rcx, r8, 6) + mov_ri64(r10, 65535) + and_rr(rcx, r10) + test_rr(rcx, rcx) + jne_rel32(str_len(pw_b_hit)) + pw_b_hit
+    let pw_b_pred = mov_rm32(rcx, r8, 6) + mov_ri64(r10, 65535) + and_rr(rcx, r10) + test_rr(rcx, rcx) + jne_rel32(str_len(pw_b_hit))
     let pw_b_inc = mov_rm(rax, rsp, 40) + add_ri32(rax, 1) + mov_mr(rsp, 40, rax)
     let pw_b_body = pw_stage_entry() + pw_b_pred + pw_b_hit + pw_b_inc
     let pw_b_top = mov_rm(rax, rsp, 40) + cmp_rr(rax, rsi) + jge_rel32(str_len(pw_b_body) + 5)
@@ -525,7 +525,7 @@ pub fn pe_build_dispatcher(iat) {
     let pw_f_store_sock = mov_rm(rcx, r11, 0) + mov_mr(r9, 0, rcx)
     let pw_f_ev = mov_rm32(rdx, r8, 4) + mov_ri64(rcx, 65535) + and_rr(rdx, rcx)
     let pw_f_hit = pw_stage_entry() + pw_f_ev + ws_ptr_at_w() + pw_f_store_sock + pw_f_z + pw_f_c1 + pw_f_c2 + pw_f_store_ev + pw_f_zero + pw_f_store_rev0 + pw_f_winc
-    let pw_f_lookup = pe_fd_lookup(iat, str_len(pw_f_hit) + str_len(pw_f_hit_jmp) + str_len(pw_f_miss))
+    let pw_f_lookup = pe_fd_lookup(iat, str_len(pw_f_hit) + str_len(pw_f_hit_jmp))
     let pw_f_entry = pw_stage_entry() + mov_rm32(rcx, r8, 0) + mov_rr(rdi, rcx)
     let pw_f_inc = mov_rm(rax, rsp, 40) + add_ri32(rax, 1) + mov_mr(rsp, 40, rax)
     let pw_f_body = pw_f_entry + pw_f_lookup + pw_f_hit + pw_f_hit_jmp + pw_f_miss + pw_f_inc
@@ -533,7 +533,10 @@ pub fn pe_build_dispatcher(iat) {
     let pw_f_back = jmp_rel32(0 - (str_len(pw_f_top) + str_len(pw_f_body) + 5))
     let pw_f_loop = pw_f_top + pw_f_body + pw_f_back
     let poll_ws_init = mov_mr(rsp, 64, rdi) + mov_mr(rsp, 56, rdx) + xor_rr(rax, rax) + mov_mr(rsp, 40, rax) + mov_mr(rsp, 48, rax)
-    let poll_ws_block = poll_ws_init + pw_f_loop + pw_w_chk + pw_wzero + pw_call + pw_map + pw_b_loop
+    // 回写按同一顺序重走，i/w 归零：正向结束 i=nfds，不归零回写首判即 jge 退出。
+    // The writeback replays the same order with i/w reset: forward leaves i=nfds.
+    let pw_b_reset = xor_rr(rax, rax) + mov_mr(rsp, 40, rax) + mov_mr(rsp, 48, rax)
+    let poll_ws_block = poll_ws_init + pw_f_loop + pw_w_chk + pw_wzero + pw_call + pw_map + pw_b_reset + pw_b_loop
     // poll(fds=rdi, nfds=rsi, timeout=rdx)：nfds==0 走 Sleep（timer 等待唯一可达
     // 路径，单位同为毫秒）；负超时钳到 Sleep(0) 让步；nfds>0 走 WSAPoll。
     // poll(fds=rdi, nfds=rsi, timeout=rdx): nfds==0 takes Sleep (the only
