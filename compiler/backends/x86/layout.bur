@@ -157,11 +157,28 @@ pub fn img_base() {
     }
 }
 
-// rt_region_size 是 runtime 区长度：非 linux 目标在区尾多一个 8B 分派器地址槽。
-// rt_region_size is the runtime area length: non-linux targets append one extra
-// 8-byte dispatcher-address slot at the end of the area.
+// fd 表：Windows 独有尾区（thunk 槽之后），FD_CAP 项 × 16B [handle:8][kind:8]。
+// kind: -1 空闲 / 0 文件管道控制台 / 1 socket（P4 用，P3 只写不读）。
+// fd table: a Windows-only tail region past the thunk slot, FD_CAP entries of
+// [handle:8][kind:8]. kind: -1 free / 0 file-pipe-console / 1 socket (P4 reads it).
+pub let FD_CAP = 64
+pub let FD_ENTRY = 16
+
+// fd_base 返回 fd 表绝对基址（仅 windows 有意义，其余目标不调用）。
+// fd_base returns the fd table's absolute base (meaningful on windows only;
+// other targets never call it).
+pub fn fd_base() {
+    data_origin() + RUNTIME_SIZE + 8
+}
+
+// rt_region_size 是 runtime 区长度：darwin 在区尾多一个 8B 分派器地址槽；
+// windows 在槽之后再跟 fd 表。
+// rt_region_size is the runtime area length: darwin appends one extra 8-byte
+// dispatcher-address slot; windows appends the fd table after the slot.
 pub fn rt_region_size() {
-    if target_os == "linux" {
+    if target_os == "windows" {
+        RUNTIME_SIZE + 8 + FD_CAP * FD_ENTRY
+    } else if target_os == "linux" {
         RUNTIME_SIZE
     } else {
         RUNTIME_SIZE + 8
