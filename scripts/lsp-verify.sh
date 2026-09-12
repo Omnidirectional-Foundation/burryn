@@ -2,11 +2,14 @@
 # lsp-verify.sh — LSP 服务器行为验证：stdio JSON-RPC 驱动实测。
 # LSP server behaviour tests: drives JSON-RPC over stdio.
 # 断言：能力位、formatting 全文编辑与 fmt 引擎一致、已格式化空编辑、坏代码 null、
-# completion 作用域感知（内层可见外层、块出即遮蔽、global fn 标 Function）。
+# completion 作用域感知（内层可见外层、块出即遮蔽、global fn 标 Function）、
+# signature-help（activeParameter 按实参区间、参数在标签内定位、方法剔 receiver、
+# 调用外 null）。
 # Asserts: capability bits, formatting full-document edit parity with the fmt
-# engine, empty edits on already-clean input, null on broken code, and
-# scope-aware completion (inner sees outer, shadowing on block exit, global
-# functions tagged Function).
+# engine, empty edits on already-clean input, null on broken code, scope-aware
+# completion (inner sees outer, shadowing on block exit, global functions
+# tagged Function), and signature-help (activeParameter from argument spans,
+# parameter labels within the label, method receiver excluded, null off-call).
 # Usage: BUR=<compiler> ./scripts/lsp-verify.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -62,7 +65,8 @@ init = req("initialize", {"processId": None, "rootUri": "file:///tmp",
 caps = init["result"]["capabilities"]
 check("capabilities", caps.get("documentFormattingProvider") is True
       and caps.get("hoverProvider") is True
-      and caps.get("definitionProvider") is True)
+      and caps.get("definitionProvider") is True
+      and caps.get("signatureHelpProvider") is not None)
 send("initialized", {})
 
 uri = "file:///tmp/burryn-lsp-verify.bur"
@@ -99,15 +103,21 @@ mod_src = (
     "    x + 1\n"
     "}\n"
     "\n"
+    "fn add3(a, b, c) {\n"
+    "    a + b + c\n"
+    "}\n"
+    "\n"
     "let topv = 5\n"
     "\n"
     "fn main() {\n"
     "    let inner = topv + helper(1)\n"
+    "    let total = add3(1, topv, 3)\n"
     "    if inner > 0 {\n"
     "        let deep = 1\n"
     "        println(deep)\n"
     "    }\n"
     "    println(inner)\n"
+    "    println(total)\n"
     "}\n"
 )
 with open(mod_dir + "/main.bur", "w") as f:
@@ -131,6 +141,48 @@ outside = comp("println(inner)")
 check("completion outside block shadows deep",
       "inner" in outside and "helper" in outside and "topv" in outside
       and "deep" not in outside)
+
+# signature-help：activeParameter、标签内参数定位、方法剔 receiver、调用外 null
+def sigat(uri, ln, ch):
+    r = req("textDocument/signatureHelp", {"textDocument": {"uri": uri},
+                                           "position": {"line": ln, "character": ch}})
+    return r["result"]
+
+ln_add3 = next(i for i, l in enumerate(mlines) if "add3(1, topv" in l)
+sig1 = sigat(muri, ln_add3, mlines[ln_add3].index("topv"))
+check("signatureHelp 2nd arg -> active 1 with param span",
+      sig1 is not None and sig1["activeParameter"] == 1
+      and sig1["signatures"][0]["label"] == "add3(a, b, c)"
+      and sig1["signatures"][0]["parameters"][1]["label"] == [8, 9])
+sig0 = sigat(muri, ln_add3, mlines[ln_add3].index("(1,") + 1)
+check("signatureHelp 1st arg -> active 0",
+      sig0 is not None and sig0["activeParameter"] == 0)
+ln_top = next(i for i, l in enumerate(mlines) if l.strip() == "let topv = 5")
+check("signatureHelp outside call -> null", sigat(muri, ln_top, 4) is None)
+
+# 方法签名（receiver 剔除）：方法仅脚本模式可用，用单文件脚本 fixture
+suri = "file:///tmp/burryn-lsp-verify-sig.bur"
+ssrc = (
+    "enum Point { Point(float, float) }\n"
+    "\n"
+    "fn (p: Point) dist() {\n"
+    "    match p {\n"
+    "        Point(x, y) => x * x + y * y,\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "let p0 = Point::Point(3.0, 4.0)\n"
+    "println(p0.dist())\n"
+)
+send("textDocument/didOpen", {"textDocument": {"uri": suri, "languageId": "burryn",
+                                               "version": 1, "text": ssrc}})
+slines = ssrc.split("\n")
+ln_dist = next(i for i, l in enumerate(slines) if "p0.dist()" in l)
+sigm = sigat(suri, ln_dist, slines[ln_dist].index("p0.dist()"))
+check("signatureHelp method script excludes receiver",
+      sigm is not None and sigm["activeParameter"] == 0
+      and sigm["signatures"][0]["label"] == "Point.dist()"
+      and len(sigm["signatures"][0]["parameters"]) == 0)
 
 send("shutdown", None)
 req_wait = recv_any()
