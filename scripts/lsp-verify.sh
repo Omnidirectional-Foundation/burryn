@@ -1,9 +1,12 @@
 #!/bin/bash
 # lsp-verify.sh — LSP 服务器行为验证：stdio JSON-RPC 驱动实测。
 # LSP server behaviour tests: drives JSON-RPC over stdio.
-# 断言：能力位、formatting 全文编辑与 fmt 引擎一致、已格式化空编辑、坏代码返回 null。
+# 断言：能力位、formatting 全文编辑与 fmt 引擎一致、已格式化空编辑、坏代码 null、
+# completion 作用域感知（内层可见外层、块出即遮蔽、global fn 标 Function）。
 # Asserts: capability bits, formatting full-document edit parity with the fmt
-# engine, empty edits on already-clean input, null on broken code.
+# engine, empty edits on already-clean input, null on broken code, and
+# scope-aware completion (inner sees outer, shadowing on block exit, global
+# functions tagged Function).
 # Usage: BUR=<compiler> ./scripts/lsp-verify.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -14,7 +17,7 @@ if [ -z "${BUR:-}" ]; then
 fi
 
 if ! python3 - "$BUR" <<'PYEOF'
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 bur = sys.argv[1]
 p = subprocess.Popen([bur, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -85,6 +88,49 @@ if ok:
 
 check("formatting clean -> empty edits", fmt(r1[0]["newText"]) == [])
 check("formatting broken -> null", fmt("fn broken( {\n") is None)
+
+# completion：模块 fixture，作用域感知
+mod_dir = "/tmp/burryn-lsp-verify-mod"
+os.makedirs(mod_dir, exist_ok=True)
+with open(mod_dir + "/bur.mod", "w") as f:
+    f.write("module lspverify\n")
+mod_src = (
+    "fn helper(x) {\n"
+    "    x + 1\n"
+    "}\n"
+    "\n"
+    "let topv = 5\n"
+    "\n"
+    "fn main() {\n"
+    "    let inner = topv + helper(1)\n"
+    "    if inner > 0 {\n"
+    "        let deep = 1\n"
+    "        println(deep)\n"
+    "    }\n"
+    "    println(inner)\n"
+    "}\n"
+)
+with open(mod_dir + "/main.bur", "w") as f:
+    f.write(mod_src)
+muri = "file://" + mod_dir + "/main.bur"
+mlines = mod_src.split("\n")
+send("textDocument/didOpen", {"textDocument": {"uri": muri, "languageId": "burryn", "version": 1, "text": mod_src}})
+
+def comp(pat):
+    ln = next(i for i, l in enumerate(mlines) if pat in l)
+    ch = mlines[ln].index(pat.split("(")[0]) + 3
+    r = req("textDocument/completion", {"textDocument": {"uri": muri},
+                                        "position": {"line": ln, "character": ch}})
+    return {i["label"]: i["kind"] for i in r["result"]}
+
+inside = comp("println(deep)")
+check("completion inside block sees all",
+      inside.get("helper") == 3 and inside.get("topv") == 6
+      and inside.get("inner") == 6 and inside.get("deep") == 6)
+outside = comp("println(inner)")
+check("completion outside block shadows deep",
+      "inner" in outside and "helper" in outside and "topv" in outside
+      and "deep" not in outside)
 
 send("shutdown", None)
 req_wait = recv_any()
