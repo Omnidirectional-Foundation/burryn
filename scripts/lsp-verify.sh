@@ -66,7 +66,10 @@ caps = init["result"]["capabilities"]
 check("capabilities", caps.get("documentFormattingProvider") is True
       and caps.get("hoverProvider") is True
       and caps.get("definitionProvider") is True
-      and caps.get("signatureHelpProvider") is not None)
+      and caps.get("signatureHelpProvider") is not None
+      and caps.get("referencesProvider") is True
+      and caps.get("documentSymbolProvider") is True
+      and caps.get("completionProvider", {}).get("triggerCharacters") == [":"])
 send("initialized", {})
 
 uri = "file:///tmp/burryn-lsp-verify.bur"
@@ -99,6 +102,8 @@ os.makedirs(mod_dir, exist_ok=True)
 with open(mod_dir + "/bur.mod", "w") as f:
     f.write("module lspverify\n")
 mod_src = (
+    "import \"std/encoding\"\n"
+    "\n"
     "fn helper(x) {\n"
     "    x + 1\n"
     "}\n"
@@ -112,12 +117,15 @@ mod_src = (
     "fn main() {\n"
     "    let inner = topv + helper(1)\n"
     "    let total = add3(1, topv, 3)\n"
+    "    let sl = str_len(\"abc\")\n"
+    "    let hx = encoding::hex_encode(\"hi\")\n"
     "    if inner > 0 {\n"
     "        let deep = 1\n"
     "        println(deep)\n"
     "    }\n"
     "    println(inner)\n"
-    "    println(total)\n"
+    "    println(total + sl)\n"
+    "    println(hx)\n"
     "}\n"
 )
 with open(mod_dir + "/main.bur", "w") as f:
@@ -160,7 +168,54 @@ check("signatureHelp 1st arg -> active 0",
 ln_top = next(i for i, l in enumerate(mlines) if l.strip() == "let topv = 5")
 check("signatureHelp outside call -> null", sigat(muri, ln_top, 4) is None)
 
-# 方法签名（receiver 剔除）：方法仅脚本模式可用，用单文件脚本 fixture
+# pkg:: 成员补全：import std/encoding 后 :: 处列出 pub 成员
+ln_hex = next(i for i, l in enumerate(mlines) if "encoding::hex_encode" in l)
+pk = req("textDocument/completion", {"textDocument": {"uri": muri},
+                                     "position": {"line": ln_hex,
+                                                  "character": mlines[ln_hex].index("encoding::") + len("encoding::")}})
+pklabels = {i["label"] for i in (pk["result"] or [])}
+check("completion pkg:: lists pub members",
+      "hex_encode" in pklabels and "hex_decode" in pklabels
+      and "base64_encode" in pklabels)
+
+# native 内建签名：str_len 取类型标签；println 变参特例无签名
+ln_sl = next(i for i, l in enumerate(mlines) if "str_len(" in l)
+sigs = sigat(muri, ln_sl, mlines[ln_sl].index("str_len("))
+check("signatureHelp native builtin type label",
+      sigs is not None and sigs["signatures"][0]["label"] == "str_len(str) -> int"
+      and sigs["activeParameter"] == 0)
+ln_pl = next(i for i, l in enumerate(mlines) if l.strip() == "println(inner)")
+sigp = sigat(muri, ln_pl, mlines[ln_pl].index("println(") + 8)
+check("signatureHelp variadic native skipped", sigp is None)
+
+# references：声明与使用互查，includeDeclaration 开关
+def refs(ln, chv, inc):
+    r = req("textDocument/references", {"textDocument": {"uri": muri},
+                                        "position": {"line": ln, "character": chv},
+                                        "context": {"includeDeclaration": inc}})
+    return r["result"]
+
+r_all = refs(ln_top, 4, True)
+check("references from declaration = decl + 2 uses",
+      r_all is not None and len(r_all) == 3)
+ln_use1 = next(i for i, l in enumerate(mlines) if "topv + helper(1)" in l)
+r_use = refs(ln_use1, mlines[ln_use1].index("topv"), True)
+check("references from use finds the same set",
+      r_use is not None and len(r_use) == 3)
+r_exc = refs(ln_top, 4, False)
+check("references excludes declaration", r_exc is not None and len(r_exc) == 2)
+
+# documentSymbol：顶层声明清单与 SymbolKind
+ds = req("textDocument/documentSymbol", {"textDocument": {"uri": muri}})
+dsl = ds["result"] or []
+dmap = {s["name"]: s["kind"] for s in dsl}
+check("documentSymbol lists top-level decls",
+      dmap.get("helper") == 12 and dmap.get("add3") == 12
+      and dmap.get("main") == 12 and dmap.get("topv") == 14
+      and len(dsl) == 4)
+
+# 方法签名（receiver 剔除）：方法仅脚本模式可用，用单文件脚本 fixture；
+# 每次检查只保留最后一份文档的录制，故脚本用例必须放最后
 suri = "file:///tmp/burryn-lsp-verify-sig.bur"
 ssrc = (
     "enum Point { Point(float, float) }\n"

@@ -51,6 +51,10 @@ pub fn lsp_serve() {
                     lsp_handle_formatting(id, params)
                 } else if method == "textDocument/signatureHelp" {
                     lsp_handle_signature(id, params)
+                } else if method == "textDocument/references" {
+                    lsp_handle_references(id, params)
+                } else if method == "textDocument/documentSymbol" {
+                    lsp_handle_document_symbol(id, params)
                 } else if has_id {
                     lsp_write_message(jobj(["jsonrpc", "id", "error"], [json::Json::JStr("2.0"), id, jobj(["code", "message"], [json::Json::JInt(-32601), json::Json::JStr("Method not found")])]))
                 }
@@ -207,7 +211,7 @@ fn lsp_handle_initialize(id, params) {
             module::lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider", "signatureHelpProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj([], []), json::Json::JBool(true), jobj([], [])]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider", "signatureHelpProvider", "referencesProvider", "documentSymbolProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj(["triggerCharacters"], [json::Json::JArr([json::Json::JStr(":")])]), json::Json::JBool(true), jobj([], []), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
 }
 
 // lsp_read_headers 读头直到空行 / lsp_read_headers reads headers up to the blank line
@@ -317,6 +321,30 @@ fn lsp_handle_definition(id, params) {
     }
 }
 
+// lsp_is_ident_byte 判断是否标识符字节 / lsp_is_ident_byte tells whether c is an identifier byte
+fn lsp_is_ident_byte(c) {
+    c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 95
+}
+
+// lsp_pkg_prefix_at 取光标前 pkg:: 的包名（无则空串）/ lsp_pkg_prefix_at returns
+// the package name before pkg:: at the cursor, empty when absent
+fn lsp_pkg_prefix_at(text, offset) {
+    let mut i = offset
+    while i > 0 && lsp_is_ident_byte(byte_at(text, i - 1)) {
+        i = i - 1
+    }
+    if i >= 2 && byte_at(text, i - 1) == 58 && byte_at(text, i - 2) == 58 {
+        let mut j = i - 2
+        while j > 0 && lsp_is_ident_byte(byte_at(text, j - 1)) {
+            j = j - 1
+        }
+        if j < i - 2 {
+            return substr(text, j, i - 2 - j)
+        }
+    }
+    ""
+}
+
 // lsp_handle_completion 处理名字补全 / lsp_handle_completion handles textDocument/completion
 fn lsp_handle_completion(id, params) {
     let td = jobj_field(params, "textDocument")
@@ -326,8 +354,10 @@ fn lsp_handle_completion(id, params) {
     let ch = jint(jobj_field(pos, "character"))
     let path = lsp_uri_to_path(uri)
     let mut offset = -1
+    let mut doc = ""
     match lsp_doc_text(uri) {
         Some(text) => {
+            doc = text
             let starts = lsp_line_starts(text)
             if line >= 0 && line < len(starts) {
                 offset = starts[line] + ch
@@ -339,7 +369,8 @@ fn lsp_handle_completion(id, params) {
         lsp_respond(id, json::Json::JArr([]))
         return
     }
-    let items = frontend::lsp_completions_at(path, offset)
+    let pkg = lsp_pkg_prefix_at(doc, offset)
+    let items = frontend::lsp_completions_at(path, offset, pkg)
     let mut out = []
     for it in items {
         let (name, kind, isfn) = it
@@ -391,6 +422,75 @@ fn lsp_handle_signature(id, params) {
             lsp_respond(id, json::Json::JNull)
         },
     }
+}
+
+// lsp_handle_references 处理引用查找 / lsp_handle_references handles textDocument/references
+fn lsp_handle_references(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let ctx = jobj_field(params, "context")
+    let include = match jobj_get(ctx, "includeDeclaration") {
+        Some(bv) => jbool(bv, true),
+        None => true,
+    }
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match lsp_doc_text(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json::Json::JArr([]))
+        return
+    }
+    let refs = frontend::lsp_references_at(path, offset, include)
+    let mut out = []
+    for rf in refs {
+        let (rf_file, rstart, rend) = rf
+        let rstarts = lsp_line_starts_for(rf_file, [], [])
+        let rs = lsp_offset_to_pos(rstarts, rstart)
+        let rpe = lsp_offset_to_pos(rstarts, rend)
+        push(out, jobj(["uri", "range"], [json::Json::JStr(lsp_path_to_uri(rf_file)), jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(rs[0]), json::Json::JInt(rs[1])]), jobj(["line", "character"], [json::Json::JInt(rpe[0]), json::Json::JInt(rpe[1])])])]))
+    }
+    lsp_respond(id, json::Json::JArr(out))
+}
+
+// lsp_handle_document_symbol 处理文档符号 / lsp_handle_document_symbol handles textDocument/documentSymbol
+fn lsp_handle_document_symbol(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let mut syms = []
+    match lsp_doc_text(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            match frontend::lex(text) {
+                lib::LexOut::Lexed(toks, _, _) => {
+                    match frontend::parse(toks) {
+                        frontend::ParseOut::Parsed(stmts, _) => {
+                            for sym in frontend::lsp_document_symbols(stmts) {
+                                let (sname, skind, sstart, send, nstart, nend) = sym
+                                let ss = lsp_offset_to_pos(starts, sstart)
+                                let se = lsp_offset_to_pos(starts, send)
+                                let ns = lsp_offset_to_pos(starts, nstart)
+                                let ne = lsp_offset_to_pos(starts, nend)
+                                push(syms, jobj(["name", "kind", "range", "selectionRange"], [json::Json::JStr(sname), json::Json::JInt(skind), jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(ss[0]), json::Json::JInt(ss[1])]), jobj(["line", "character"], [json::Json::JInt(se[0]), json::Json::JInt(se[1])])]), jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(ns[0]), json::Json::JInt(ns[1])]), jobj(["line", "character"], [json::Json::JInt(ne[0]), json::Json::JInt(ne[1])])])]))
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        None => {},
+    }
+    lsp_respond(id, json::Json::JArr(syms))
 }
 
 // lsp_handle_formatting 处理 formatting / lsp_handle_formatting handles textDocument/formatting
@@ -529,6 +629,14 @@ fn jint(v) {
     match v {
         json::Json::JInt(n) => n,
         _ => 0,
+    }
+}
+
+// jbool 读布尔 JSON 值，缺省回退 / jbool reads a boolean JSON value with a fallback
+fn jbool(v, fallback) {
+    match v {
+        json::Json::JBool(b) => b,
+        _ => fallback,
     }
 }
 
