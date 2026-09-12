@@ -1,6 +1,6 @@
-// lsp.bur — 语言服务器：stdin/stdout JSON-RPC、文档 overlay、诊断推送与 hover。
+// lsp.bur — 语言服务器：stdin/stdout JSON-RPC、文档 overlay、诊断推送、hover 与 formatting。
 // The language server: JSON-RPC over stdin/stdout, document overlays,
-// diagnostic publishing and hover.
+// diagnostic publishing, hover and formatting.
 
 import json "std/json"
 import "burryn.dev/compiler/lib"
@@ -45,6 +45,8 @@ pub fn lsp_serve() {
                     lsp_handle_hover(id, params)
                 } else if method == "textDocument/definition" {
                     lsp_handle_definition(id, params)
+                } else if method == "textDocument/formatting" {
+                    lsp_handle_formatting(id, params)
                 } else if has_id {
                     lsp_write_message(jobj(["jsonrpc", "id", "error"], [json::Json::JStr("2.0"), id, jobj(["code", "message"], [json::Json::JInt(-32601), json::Json::JStr("Method not found")])]))
                 }
@@ -193,7 +195,7 @@ fn lsp_handle_initialize(id, params) {
             module::lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "documentFormattingProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
 }
 
 // lsp_read_headers 读头直到空行 / lsp_read_headers reads headers up to the blank line
@@ -301,6 +303,71 @@ fn lsp_handle_definition(id, params) {
             lsp_respond(id, json::Json::JNull)
         },
     }
+}
+
+// lsp_handle_formatting 处理 formatting / lsp_handle_formatting handles textDocument/formatting
+fn lsp_handle_formatting(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    match lsp_doc_text(uri) {
+        Some(text) => {
+            lsp_respond(id, lsp_format_edits(text))
+        },
+        None => {
+            lsp_respond(id, json::Json::JNull)
+        },
+    }
+}
+
+// lsp_doc_text 取文档文本：overlay 优先，未打开的从盘读
+// lsp_doc_text fetches document text: overlay first, disk for closed docs
+fn lsp_doc_text(uri) {
+    match module::lsp_doc_get(uri) {
+        Some(t) => Some(t),
+        None => {
+            match module::lsp_overlay_read(lsp_uri_to_path(uri)) {
+                Ok(s) => Some(s),
+                Err(_) => None,
+            }
+        },
+    }
+}
+
+// lsp_format_edits 计算全文格式化编辑 / lsp_format_edits computes the whole-document formatting edits
+// 坏代码返回 null，已格式化返回空数组 / Broken code yields null, already-clean code an empty list
+fn lsp_format_edits(text) {
+    match frontend::lex(text) {
+        lib::LexOut::Lexed(toks, ldiags, comments) => {
+            if len(ldiags) > 0 {
+                return json::Json::JNull
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if len(pdiags) > 0 {
+                        return json::Json::JNull
+                    }
+                    match format_verified(stmts, text, comments) {
+                        Ok(out) => {
+                            if out == text {
+                                return json::Json::JArr([])
+                            }
+                            json::Json::JArr([lsp_full_text_edit(text, out)])
+                        },
+                        Err(_) => json::Json::JNull,
+                    }
+                },
+            }
+        },
+    }
+}
+
+// lsp_full_text_edit 构造全文替换单编辑 / lsp_full_text_edit builds one full-document replace edit
+fn lsp_full_text_edit(old, out) {
+    let starts = lsp_line_starts(old)
+    let last = len(starts) - 1
+    let end_line = last
+    let end_char = str_len(old) - starts[last]
+    jobj(["range", "newText"], [jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(0), json::Json::JInt(0)]), jobj(["line", "character"], [json::Json::JInt(end_line), json::Json::JInt(end_char)])]), json::Json::JStr(out)])
 }
 
 // lsp_read_exact 从 stdin 精确读 n 字节（LSP transport）
