@@ -41,6 +41,20 @@ let mut lsp_bind_offs = []
 let mut lsp_bind_sids = []
 let mut lsp_bind_isfn = []
 
+// LSP signature-help：调用点（含被调绑定）与实参区间记录，及按绑定索引的签名表
+// Signature-help support: recorded call sites (with callee binding) and argument
+// spans, plus a signature table keyed by binding index
+let mut lsp_call_files = []
+let mut lsp_call_starts = []
+let mut lsp_call_ends = []
+let mut lsp_call_binds = []
+let mut lsp_arg_calls = []
+let mut lsp_arg_starts = []
+let mut lsp_arg_ends = []
+let mut lsp_sig_bs = []
+let mut lsp_sig_labels = []
+let mut lsp_sig_pnames = []
+
 // import 定义表：有效别名 → import 语句位置
 // Import definitions: effective alias → import statement location
 let mut imp_keys = []
@@ -116,6 +130,16 @@ pub fn lsp_set_recording(b: bool) {
         lsp_bind_offs = []
         lsp_bind_sids = []
         lsp_bind_isfn = []
+        lsp_call_files = []
+        lsp_call_starts = []
+        lsp_call_ends = []
+        lsp_call_binds = []
+        lsp_arg_calls = []
+        lsp_arg_starts = []
+        lsp_arg_ends = []
+        lsp_sig_bs = []
+        lsp_sig_labels = []
+        lsp_sig_pnames = []
     }
 }
 
@@ -223,6 +247,70 @@ fn lsp_record_global_fn() {
     }
 }
 
+// lsp_join_names 逗号连接名字列表 / lsp_join_names joins a name list with commas
+fn lsp_join_names(names) {
+    let mut out = ""
+    let mut i = 0
+    while i < len(names) {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + names[i]
+        i = i + 1
+    }
+    out
+}
+
+// lsp_tail 去掉列表首项（方法的 receiver 参数）/ lsp_tail drops the first item (a method's receiver parameter)
+fn lsp_tail(xs) {
+    let mut out = []
+    let mut i = 1
+    while i < len(xs) {
+        push(out, xs[i])
+        i = i + 1
+    }
+    out
+}
+
+// lsp_record_fn_sig 记录绑定索引对应的签名标签与参数名 / lsp_record_fn_sig records a signature label and parameter names keyed by binding index
+fn lsp_record_fn_sig(b, label, params) {
+    if lsp_recording {
+        push(lsp_sig_bs, b)
+        push(lsp_sig_labels, label)
+        push(lsp_sig_pnames, params)
+    }
+}
+
+// lsp_record_call 记录一个调用点（含被调绑定）并返回其索引 / lsp_record_call records a call site (with callee binding) and returns its index
+fn lsp_record_call(file, sp, b) {
+    let mut ci = -1
+    if lsp_recording {
+        match sp {
+            Sp(s, e) => {
+                push(lsp_call_files, file)
+                push(lsp_call_starts, s)
+                push(lsp_call_ends, e)
+                push(lsp_call_binds, b)
+                ci = len(lsp_call_files) - 1
+            },
+        }
+    }
+    ci
+}
+
+// lsp_record_arg 记录一个实参区间，归属指定调用 / lsp_record_arg records one argument span attached to its call
+fn lsp_record_arg(ci, sp) {
+    if lsp_recording && ci >= 0 {
+        match sp {
+            Sp(s, e) => {
+                push(lsp_arg_calls, ci)
+                push(lsp_arg_starts, s)
+                push(lsp_arg_ends, e)
+            },
+        }
+    }
+}
+
 // lsp_completions_at 查询 offset 处可见的名字：内层遮蔽外层，顶层全文件有效
 // lsp_completions_at returns the names visible at offset: inner scopes shadow
 // outer ones, top-level bindings apply to the whole file
@@ -266,6 +354,68 @@ pub fn lsp_completions_at(file, offset) {
         bi = bi - 1
     }
     out
+}
+
+// lsp_signature_help_at 查询 offset 所在调用的签名与活动实参下标：内层调用优先
+// lsp_signature_help_at returns the signature and active argument index of the
+// call containing offset, innermost call first
+pub fn lsp_signature_help_at(file, offset) {
+    let mut best = -1
+    let mut ci = 0
+    while ci < len(lsp_call_files) {
+        if lsp_call_files[ci] == file && lsp_call_starts[ci] <= offset && lsp_call_ends[ci] >= offset {
+            if best < 0 || lsp_call_starts[ci] > lsp_call_starts[best] {
+                best = ci
+            }
+        }
+        ci = ci + 1
+    }
+    if best < 0 {
+        return None
+    }
+    // 含 offset 的实参给下标；否则数完全落在光标前的实参（逗号后即下一参数）
+    let mut active = -1
+    let mut seen = 0
+    let mut ai = 0
+    while ai < len(lsp_arg_calls) {
+        if lsp_arg_calls[ai] == best {
+            if lsp_arg_starts[ai] <= offset && lsp_arg_ends[ai] >= offset && active < 0 {
+                active = seen
+            }
+            if lsp_arg_ends[ai] < offset {
+                seen = seen + 1
+            }
+        }
+        ai = ai + 1
+    }
+    if active < 0 {
+        active = seen
+    }
+    let bi = lsp_call_binds[best]
+    let mut si = 0
+    while si < len(lsp_sig_bs) {
+        if lsp_sig_bs[si] == bi {
+            let label = lsp_sig_labels[si]
+            let pnames = lsp_sig_pnames[si]
+            // 参数区间在标签串内定位：起点跟随 "("，后续按名字长 + 2 推进
+            let mut pspans = []
+            let mut off = -1
+            let mut k = 0
+            while off < 0 && k < str_len(label) {
+                if byte_at(label, k) == 40 {
+                    off = k + 1
+                }
+                k = k + 1
+            }
+            for pn in pnames {
+                push(pspans, (off, off + str_len(pn)))
+                off = off + str_len(pn) + 2
+            }
+            return Some((label, pspans, active))
+        }
+        si = si + 1
+    }
+    None
 }
 
 // typecheck_script 是脚本类型检查入口 / typecheck_script is the script typecheck entry
@@ -1792,7 +1942,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     None => -1,
                 }
                 if mft >= 0 {
-                    b_used[lookup(recv_name + "." + mname)] = true
+                    let mb = lookup(recv_name + "." + mname)
+                    b_used[mb] = true
+                    let sci = lsp_record_call(cur_file, csp, mb)
                     match csp {
                         Sp(_, ce) => push(chan_fors, cur_file + ":" + str(ce) + "|" + recv_name + "." + mname),
                     }
@@ -1806,6 +1958,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         }
                         let mut i = 1
                         while i < len(ta[ft_res]) && i - 1 < len(cargs) {
+                            lsp_record_arg(sci, span_of(cargs[i - 1]))
                             let at = infer_expr_ref(cargs[i - 1])
                             let e2 = ty_unify(tk, tn, ta, tr, tl, ta[ft_res][i], at)
                             if e2 != "" {
@@ -1898,9 +2051,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             }
             con1("chan", fresh(""))
         } else {
+            let sci = lsp_record_call(cur_file, csp, callee_b)
             let ct = infer_expr_ref(callee)
             let mut ahs = []
             for a in cargs {
+                lsp_record_arg(sci, span_of(a))
                 push(ahs, infer_expr_ref(a))
             }
             let rf = ty_resolve(tk, tr, ct)
@@ -2759,8 +2914,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 b_isfn[b] = true
                 b_used[b] = true
                 match lit {
-                    FnLit(_, muts, _, _, _, _, _, _, _) => {
+                    FnLit(params, muts, _, _, _, _, _, _, _) => {
                         put(b_muts, b, muts)
+                        lsp_record_fn_sig(b, name + "(" + lsp_join_names(params) + ")", params)
                     },
                     _ => {},
                 }
@@ -2795,8 +2951,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 b_isfn[b] = true
                 b_used[b] = true
                 match lit {
-                    FnLit(_, muts, _, _, _, _, _, _, _) => {
+                    FnLit(params, muts, _, _, _, _, _, _, _) => {
                         put(b_muts, b, muts)
+                        let mps = lsp_tail(params)
+                        lsp_record_fn_sig(b, rt + "." + name + "(" + lsp_join_names(mps) + ")", mps)
                     },
                     _ => {},
                 }
@@ -3208,6 +3366,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         match lit {
                             FnLit(params, _, _, _, _, _, _, _, _) => {
                                 b_params[b] = params
+                                lsp_record_fn_sig(b, name + "(" + lsp_join_names(params) + ")", params)
                             },
                             _ => {},
                         }

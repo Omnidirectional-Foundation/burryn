@@ -49,6 +49,8 @@ pub fn lsp_serve() {
                     lsp_handle_completion(id, params)
                 } else if method == "textDocument/formatting" {
                     lsp_handle_formatting(id, params)
+                } else if method == "textDocument/signatureHelp" {
+                    lsp_handle_signature(id, params)
                 } else if has_id {
                     lsp_write_message(jobj(["jsonrpc", "id", "error"], [json::Json::JStr("2.0"), id, jobj(["code", "message"], [json::Json::JInt(-32601), json::Json::JStr("Method not found")])]))
                 }
@@ -61,7 +63,10 @@ pub fn lsp_serve() {
 }
 
 // lsp_check_document 类型检查单个文档 / lsp_check_document typechecks a document
-fn lsp_check_document(_uri, src) {
+// 文件路径用真实路径传入：录制按路径键，空路径会让脚本查询全空
+// Documents typecheck with their real path: recordings key by path, and an
+// empty path would blank every script-mode query
+fn lsp_check_document(uri, src) {
     let mut all_diags = []
     match frontend::lex(src) {
         lib::LexOut::Lexed(toks, ldiags, _) => {
@@ -72,11 +77,16 @@ fn lsp_check_document(_uri, src) {
                     match frontend::fold_consts(stmts) {
                         frontend::FoldOut::FoldedScript(folded, fdiags) => {
                             all_diags = concat(all_diags, fdiags)
-                            match frontend::typecheck_script(folded) {
+                            // 脚本路径同样开录制，hover/definition/completion/signature-help 才有数据
+                            // The script path records too, so hover, definition,
+                            // completion and signature-help all have data
+                            frontend::lsp_set_recording(true)
+                            match frontend::typecheck_program([[folded]], [[lsp_uri_to_path(uri)]], false, [""], [[[]]]) {
                                 lib::CheckOut::Checked(cdiags, _, _, _, _) => {
                                     all_diags = concat(all_diags, cdiags)
                                 },
                             }
+                            frontend::lsp_set_recording(false)
                         },
                         _ => {},
                     }
@@ -197,7 +207,7 @@ fn lsp_handle_initialize(id, params) {
             module::lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj([], []), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider", "signatureHelpProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj([], []), json::Json::JBool(true), jobj([], [])]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
 }
 
 // lsp_read_headers 读头直到空行 / lsp_read_headers reads headers up to the blank line
@@ -341,6 +351,46 @@ fn lsp_handle_completion(id, params) {
         push(out, jobj(["label", "kind", "detail"], [json::Json::JStr(name), json::Json::JInt(ck), json::Json::JStr(kind)]))
     }
     lsp_respond(id, json::Json::JArr(out))
+}
+
+// lsp_handle_signature 处理签名帮助 / lsp_handle_signature handles textDocument/signatureHelp
+fn lsp_handle_signature(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match lsp_doc_text(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    match frontend::lsp_signature_help_at(path, offset) {
+        Some(sig) => {
+            let (label, pspans, active) = sig
+            // 每个 parameter 用 [start, end] 在标签串内定位 / each parameter locates [start, end] within the label
+            let mut parr = []
+            for pl in pspans {
+                let (ps, pe) = pl
+                push(parr, jobj(["label"], [json::Json::JArr([json::Json::JInt(ps), json::Json::JInt(pe)])]))
+            }
+            let sigobj = jobj(["label", "parameters"], [json::Json::JStr(label), json::Json::JArr(parr)])
+            lsp_respond(id, jobj(["signatures", "activeSignature", "activeParameter"], [json::Json::JArr([sigobj]), json::Json::JInt(0), json::Json::JInt(active)]))
+        },
+        None => {
+            lsp_respond(id, json::Json::JNull)
+        },
+    }
 }
 
 // lsp_handle_formatting 处理 formatting / lsp_handle_formatting handles textDocument/formatting
