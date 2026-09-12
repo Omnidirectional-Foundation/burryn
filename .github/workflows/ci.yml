@@ -1,8 +1,8 @@
 # L0 births gen1 as a tool (C midwife, not the CI product).
 # L0 接生 gen1 当工具（C 只接生，不是 CI 产物）。
-# bur-base is minted once per archive/go-host SHA at CC_OPT=-O1, fingerprinted,
+# bur-base is minted once per seed/go-host SHA at CC_OPT=-O1, fingerprinted,
 # and reused. Cache is a shortcut; identity is go-host SHA + sha256.
-# bur-base 按 archive/go-host SHA、CC_OPT=-O1 接生一次并打指纹后复用。
+# bur-base 按 seed/go-host SHA、CC_OPT=-O1 接生一次并打指纹后复用。
 # cache 是捷径，身份是 go-host SHA + sha256。
 # gen1 is born every push from current compiler/. Verify jobs download gen1.
 # gen1 每个 push 从当前 compiler/ 接生。验证 job 下载 gen1。
@@ -39,7 +39,7 @@ jobs:
       - name: Checkout Go seed
         uses: actions/checkout@v4
         with:
-          ref: archive/go-host
+          ref: seed/go-host
           path: _go-host
 
       - name: go-host SHA
@@ -63,7 +63,7 @@ jobs:
       - name: Checkout Go seed
         uses: actions/checkout@v4
         with:
-          ref: archive/go-host
+          ref: seed/go-host
           path: _go-host
 
       - name: Set up Go
@@ -98,7 +98,7 @@ jobs:
       - name: Checkout Go seed
         uses: actions/checkout@v4
         with:
-          ref: archive/go-host
+          ref: seed/go-host
           path: _go-host
 
       - name: Restore bur-base
@@ -193,7 +193,7 @@ jobs:
       - name: Checkout Go seed runtime
         uses: actions/checkout@v4
         with:
-          ref: archive/go-host
+          ref: seed/go-host
           path: _go-host
 
       - name: Birth gen1
@@ -243,6 +243,24 @@ jobs:
           ./gen1 dev embed-std .
           git diff --exit-code compiler/lib/std_embed.bur
 
+      # ud2 may only be constructed inside guarded_ud2 (pe.bur) and the
+      # dispatch-chain default (dispatch_chain.bur). A bare ud2 anywhere else
+      # is one missing jmp away from a fallthrough-into-trap (rounds 10-16);
+      # new arms must route through the constructor.
+      - name: no bare ud2 emission
+        run: |
+          set -euo pipefail
+          bad=$(grep -rn 'e1(15) + e1(11)' compiler/backends/x86/ \
+            | grep -v '^\s*//' \
+            | grep -v 'jmp_rel32(2) + e1(15) + e1(11)' \
+            | grep -v 'default_case = e1(15) + e1(11)' \
+            || true)
+          if [ -n "$bad" ]; then
+            echo "bare ud2 outside guarded constructors:"
+            echo "$bad"
+            exit 1
+          fi
+
   fixpoint:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -289,7 +307,7 @@ jobs:
           set -euo pipefail
           chmod +x gen1
           mv gen1 bur
-          SKIP_FIXPOINT=1 ./scripts/testdata-verify.sh
+          BUR=./bur SKIP_FIXPOINT=1 ./scripts/testdata-verify.sh
 
   examples:
     needs: gen1
@@ -310,7 +328,7 @@ jobs:
           set -euo pipefail
           chmod +x gen1
           mv gen1 bur
-          ./scripts/examples-verify.sh
+          BUR=./bur ./scripts/examples-verify.sh
 
   std:
     needs: gen1
@@ -334,6 +352,26 @@ jobs:
             ./gen1 test "std/$p"
           done
 
+  lsp:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: lsp-verify
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          BUR=./gen1 ./scripts/lsp-verify.sh
+
   multibackend:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -353,7 +391,39 @@ jobs:
           set -euo pipefail
           chmod +x gen1
           mv gen1 bur
-          ./scripts/multi-backend-verify.sh
+          BUR=./bur ./scripts/multi-backend-verify.sh
+
+  x86-repro:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      # x86 artifact reproducibility, not the C three-generation fixpoint:
+      # there is no x86 self-chain. The same compiler building the same
+      # source twice must emit byte-identical output (no timestamps,
+      # no hash-order leaks in the serializers).
+      - name: Build each target twice and compare
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build --backend x86 examples/basics/hello.bur -o elf-a
+          ./gen1 build --backend x86 examples/basics/hello.bur -o elf-b
+          cmp elf-a elf-b
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-a.exe
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-b.exe
+          cmp pe-a.exe pe-b.exe
+          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o macho-a
+          ./gen1 build --backend x86 --os darwin examples/basics/hello.bur -o macho-b
+          cmp macho-a macho-b
 
   x86-pe-build:
     needs: gen1
@@ -369,17 +439,28 @@ jobs:
         with:
           name: gen1
 
-      - name: Build windows hello
+      # PE corpus: hello + pure slice (fib, float_arith) + yield + timer slice
+      # (clock, sleep), all hard-gated against their goldens.
+      - name: Build windows programs
         run: |
           set -euo pipefail
           chmod +x gen1
-          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o hello.exe
+          mkdir -p pe-out
+          ./gen1 build --backend x86 --os windows examples/basics/hello.bur -o pe-out/hello.exe
+          ./gen1 build --backend x86 --os windows examples/basics/fib.bur -o pe-out/fib.exe
+          ./gen1 build --backend x86 --os windows examples/basics/float_arith.bur -o pe-out/float_arith.exe
+          ./gen1 build --backend x86 --os windows examples/concurrency/yield.bur -o pe-out/yield.exe
+          ./gen1 build --backend x86 --os windows testdata/regression/clock.bur -o pe-out/clock.exe
+          ./gen1 build --backend x86 --os windows examples/io/fs.bur -o pe-out/fs.exe
+          ./gen1 build --backend x86 --os windows examples/io/sleep.bur -o pe-out/sleep.exe
+          ./gen1 build --backend x86 --os windows examples/net/net_loopback.bur -o pe-out/net_loopback.exe
+          ./gen1 build --backend x86 --os windows examples/net/net_nb.bur -o pe-out/net_nb.exe
 
-      - name: Upload hello.exe
+      - name: Upload windows programs
         uses: actions/upload-artifact@v4
         with:
-          name: x86-pe-hello
-          path: hello.exe
+          name: x86-pe-progs
+          path: pe-out
           if-no-files-found: error
           retention-days: 7
 
@@ -392,17 +473,60 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download hello.exe
+      - name: Download windows programs
         uses: actions/download-artifact@v4
         with:
-          name: x86-pe-hello
+          name: x86-pe-progs
+          path: pe-out
 
       - name: Run and compare golden
         shell: pwsh
         run: |
-          cmd /c ".\hello.exe > actual.txt"
+          cmd /c ".\pe-out\hello.exe > actual.txt"
           if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
           git diff --no-index --text examples/basics/hello.golden actual.txt
+          if ((Get-Item actual.txt).Length -eq 0) { Write-Error "empty stdout from actual.txt"; exit 1 }
+
+      - name: Run pure corpus slice
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\fib.exe > actual-fib.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/basics/fib.golden actual-fib.txt
+          if ((Get-Item actual-fib.txt).Length -eq 0) { Write-Error "empty stdout from actual-fib.txt"; exit 1 }
+          cmd /c ".\pe-out\float_arith.exe > actual-float_arith.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/basics/float_arith.golden actual-float_arith.txt
+          if ((Get-Item actual-float_arith.txt).Length -eq 0) { Write-Error "empty stdout from actual-float_arith.txt"; exit 1 }
+
+      - name: Run spawn slice (hard gate)
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\yield.exe > actual-yield.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/concurrency/yield.golden actual-yield.txt
+          if ((Get-Item actual-yield.txt).Length -eq 0) { Write-Error "empty stdout from actual-yield.txt"; exit 1 }
+
+      - name: Run timer slice (hard gate)
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\clock.exe > actual-clock.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text testdata/regression/clock.golden actual-clock.txt
+          if ((Get-Item actual-clock.txt).Length -eq 0) { Write-Error "empty stdout from actual-clock.txt"; exit 1 }
+          cmd /c ".\pe-out\sleep.exe > actual-sleep.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/io/sleep.golden actual-sleep.txt
+          if ((Get-Item actual-sleep.txt).Length -eq 0) { Write-Error "empty stdout from actual-sleep.txt"; exit 1 }
+
+      - name: Run fs slice (hard gate)
+        shell: pwsh
+        run: |
+          cmd /c ".\pe-out\fs.exe > actual-fs.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "exit code $LASTEXITCODE"; exit 1 }
+          git diff --no-index --text examples/io/fs.golden actual-fs.txt
+          if ((Get-Item actual-fs.txt).Length -eq 0) { Write-Error "empty stdout from actual-fs.txt"; exit 1 }
+          if ((Get-Item actual-sleep.txt).Length -eq 0) { Write-Error "empty stdout from actual-sleep.txt"; exit 1 }
 
   x86-macho-build:
     needs: gen1
@@ -427,6 +551,12 @@ jobs:
           ./gen1 build --backend x86 --os darwin testdata/regression/clock.bur -o macho-out/clock-mac
           ./gen1 build --backend x86 --os darwin examples/basics/fib.bur -o macho-out/fib-mac
           ./gen1 build --backend x86 --os darwin examples/basics/float_arith.bur -o macho-out/float_arith-mac
+          ./gen1 build --backend x86 --os darwin examples/concurrency/yield.bur -o macho-out/yield-mac
+          ./gen1 build --backend x86 --os darwin examples/io/sleep.bur -o macho-out/sleep-mac
+          ./gen1 build --backend x86 --os darwin examples/concurrency/pipeline.bur -o macho-out/pipeline-mac
+          ./gen1 build --backend x86 --os darwin examples/io/fs.bur -o macho-out/fs-mac
+          ./gen1 build --backend x86 --os darwin examples/net/net_loopback.bur -o macho-out/net_loopback-mac
+          ./gen1 build --backend x86 --os darwin examples/net/net_nb.bur -o macho-out/net_nb-mac
 
       - name: Upload macho programs
         uses: actions/upload-artifact@v4
@@ -490,6 +620,12 @@ jobs:
           check_one clock-mac testdata/regression/clock.golden
           check_one fib-mac examples/basics/fib.golden
           check_one float_arith-mac examples/basics/float_arith.golden
+          check_one yield-mac examples/concurrency/yield.golden
+          check_one sleep-mac examples/io/sleep.golden
+          check_one pipeline-mac examples/concurrency/pipeline.golden
+          check_one fs-mac examples/io/fs.golden
+          check_one net_loopback-mac examples/net/net_loopback.golden
+          check_one net_nb-mac examples/net/net_nb.golden
 
   runtime:
     needs: []
@@ -531,8 +667,8 @@ jobs:
   gate:
     needs:
       [gohost, seed, bur-base, gen1, check, fixpoint, testdata, examples, std,
-       multibackend, x86-pe-build, x86-pe-run, x86-macho-build, x86-macho-run,
-       runtime]
+       lsp, multibackend, x86-repro, x86-pe-build, x86-pe-run, x86-macho-build,
+        x86-macho-run, runtime]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

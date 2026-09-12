@@ -16,7 +16,7 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 `compiler/` 用 Burryn 自身重实现了整条编译管线——词法、语法、类型检查、字节码编译、C 代码生成、虚拟机、模块加载、工具链与 `bur` CLI。
 `bur` 先把自身编译为 C，`cc` 再将其编译为原生二进制，而这个原生 `bur` 又能把同一份源码编译出逐字节相同的输出。
 一个封闭的自举定点。
-用于启动自举的原始 Go 实现已归档在 `archive/go-host` 分支。
+用于启动自举的原始 Go 实现已归档在 `seed/go-host` 分支。
 
 ## 名字
 
@@ -26,7 +26,7 @@ Burryn 是一门借鉴 Go 与 Rust 的小型编程语言。
 
 ## 环境要求
 
-- 一份原生 `bur` 二进制，或用 **Go 1.26+** 从 `archive/go-host` 自举
+- 一份原生 `bur` 二进制，或用 **Go 1.26+** 从 `seed/go-host` 自举
 - C99 编译器（`gcc` 或 `clang`），用于 `bur build` 以及重建 `bur`
 - 一台 x86-64 主机运行原生后端的产物：Linux（ELF）、Windows（PE）或 macOS（Mach-O）
 
@@ -192,7 +192,7 @@ $ bur build compiler -o bur
 从零自举（归档 Go 宿主）：
 
 ```sh
-$ git worktree add ../go-host archive/go-host
+$ git worktree add ../go-host seed/go-host
 $ (cd ../go-host && go build -o ../bur-seed .)
 $ (cd ../go-host && ../bur-seed build burc -o ../bur-base)
 $ ./bur-base build compiler -o bur

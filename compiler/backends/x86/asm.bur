@@ -81,6 +81,31 @@ pub fn cqo() {
     e1(72) + e1(153)
 }
 
+// cdqe 发射 cdqe（eax 符号扩展进 rax 高 32 位）：调用返回 32 位 int 的 Win64
+// API（bind/listen/connect/setsockopt/getsockopt/recv/send/ioctlsocket 等）
+// 后必须先扩展再测符号——x86-64「写 32 位寄存器零扩展至 64 位」这条硬件规则
+// 在被调用方以 32 位宽度写 eax 时自动生效，失败返回的 -1 落在 eax 里被该规则
+// 零扩展成 0x00000000FFFFFFFF，满宽 test rax,rax 会读成正数（真机实测：非阻塞
+// recv() 无数据时应返回 -1/WSAEWOULDBLOCK 触发 park，未扩展时读成巨大正数
+// "成功"，返回 Ok("")，读端永不让出调度器，server fiber 因此从未被跑到）。
+// SOCKET 返回值（socket/accept）天生 64 位，不需要这条扩展，也不能加。
+// cdqe emits cdqe (sign-extends eax into the high 32 bits of rax): after
+// calling a Win64 API that returns a 32-bit int (bind/listen/connect/
+// setsockopt/getsockopt/recv/send/ioctlsocket, etc.), the sign must be
+// extended before testing it — the "writing a 32-bit register zero-extends to
+// 64 bits" x86-64 rule fires automatically when the callee writes eax at
+// 32-bit width, so a failure's -1 lands in eax and zero-extends under that
+// rule to 0x00000000FFFFFFFF, which a full-width test rax,rax reads as
+// positive (confirmed on real hardware: a non-blocking recv() with no data
+// should return -1/WSAEWOULDBLOCK to trigger a park, but read unextended it
+// looked like a huge positive "success", returning Ok(""), so the reader
+// fiber never yielded and the server fiber never got scheduled). SOCKET
+// return values (socket/accept) are natively 64-bit and must not get this
+// extension.
+pub fn cdqe() {
+    e1(72) + e1(152)
+}
+
 // e8 发射 8 字节小端 / e8 emits eight little-endian bytes
 pub fn e8(v) {
     e4(v % 4294967296) + e4(v / 4294967296)

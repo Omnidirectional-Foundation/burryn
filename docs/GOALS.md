@@ -1,6 +1,6 @@
 # GOALS — Burryn 路线与里程碑
 
-> v0.7 · active · 2026-09-06 ~ 09-07
+> v0.8 · active · 2026-09-07
 > 状态：前瞻规划 · 编号 `S<n>[.<m>]`
 > 相关文档：[`architecture.md`](architecture.md) 实现权威 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
@@ -22,10 +22,10 @@
 | **S2 C 后端与语言完备** | S2.1–S2.7：C 后端、模块、map、`select`/`close`、深 `mut`、`pub`、必要 stdlib | 已实现 |
 | **S3 自举前端** | 编译器前端由 Burryn 写成并编译自己 | 已实现 |
 | **S4 重写 VM** | VM 由 Burryn 重写，经 cc 编成原生 | 已实现 |
-| **S5 删 Go** | CLI 用 Burryn 写；main 清零 Go；`archive/go-host` 留档 | 已实现 |
+| **S5 删 Go** | CLI 用 Burryn 写；main 清零 Go；`seed/go-host` 留档 | 已实现 |
 | **S6 生态工具链** | S6.1–S6.8：依赖、fmt、test、诊断、std/json、runtime IO、checker 债 | 已实现 |
 | **S7 语言特性扩展** | S7.1–S7.8（S7.4 命名参数已否决，编号保留） | 已实现 |
-| **S8 后端与重型类型** | S8.1 Linux ELF 单文件已实现；S8.5 PE 与 Mach-O 序列化层；S8.2 语法冻结、S8.3 row poly、S8.4 封闭 record 按名合一、S8.7 类型别名均已实现 | 部分实现 |
+| **S8 所有后端完工** | S8.1–S8.4 / S8.7 已实现；S8.5 / S8.6 / S8.8–S8.10 未实现（排期见 §3） | 部分实现 |
 | **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 hover / go-to-def / completion / formatting / signature-help；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
 | **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 未实现 |
 
@@ -33,23 +33,38 @@ S1–S5 为自举闭环：`bur` 由本语言写成、经 cc 逐字节重建自�
 stdlib 按「够自举用 + owner 真实脚本需求」生长。
 触及 `ty_unify` / token 编号 / 自举链的改动，改完必验 fixpoint（gen1 == gen2）。
 
-## 3. S8 剩余
+## 3. S8：所有后端完工
 
-S8.1 / S8.2 / S8.3 / S8.4 / S8.7 已实现；S8.5 未实现。
+S8 = 所有后端完工，一条完成线：C 后端 + x86 后端（Linux / Windows / macOS 三目标，且含模块包）+ LLVM + Cranelift + WASM 全部可用；验收闸仍是 `.github/workflows/ci.yml` 的全部 job 持续全绿。子项编号只用来排工作顺序，不得用来缩小 S8 的范围。
+
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| S8.1 | Linux ELF 单文件后端 | 已实现 |
+| S8.2 / S8.3 / S8.4 / S8.7 | 语法冻结、row poly、封闭 record 按名合一、类型别名 | 已实现 |
+| S8.5 | PE 与 Mach-O 序列化层，实心版 | 未实现，死线 2026-09-28 |
+| S8.6 | x86 模块包 | 未实现，死线 2026-10-12 |
+| S8.8 | LLVM 后端 | 未实现，死线 2026-10-26 |
+| S8.9 | Cranelift 后端 | 未实现，死线 2026-11-09 |
+| S8.10 | WASM 后端 | 未实现，死线 2026-11-23 |
+
+S8 全阶段 2026-11-23 收线。内部顺序：先收 S8.1，再 S8.5，再 S8.6，然后 S8.8 → S8.9 → S8.10。
 
 **S8.1 完成线（定案，已实现）**：Linux ELF 单文件程序后端（`bur build --backend x86 <file.bur>`）。
 完成条件 = fiber 感知 IO + `net_nb` 落地 + multi-backend 已知缺陷清零或显式登记为语言级限制。
-**不含**模块包、**不含**用 x86 编 compiler（x86 自举）、**不含** PE 与 Mach-O（归 S8.5）。
 自举判定维持 [`architecture.md`](architecture.md) §3.5：编译器由本语言写成且能编译自己；输出 C 再经 cc 落地，完全算自举。
-模块包与 x86 自举若将来做，必须拆成两项（用户包 ≠ 编 compiler），另开编号，不得并入 S8.1。
 
-**S8.5 完成线（定案）**：PE 与 Mach-O 序列化层，与 S8.1 同一后端的另外两个目标（`bur build --backend x86 --os windows|darwin`）。
-Mach-O 不另开编号，与 PE 同属 S8.5。
+**S8.5 实心版（定案）**：PE 与 Mach-O 序列化层，与 S8.1 同一后端的另外两个目标（`bur build --backend x86 --os windows|darwin`）；Mach-O 不另开编号，与 PE 同属 S8.5。
+完成条件 = 两目标可编 + spawn / sleep / fs / net / exec 语料在 macOS 与 Windows 真机 job 全绿 + 共用验收闸持续全绿；hello 级全绿即收的 hollow 版不算完成。
+**不含**加固填字段（UUID、DllCharacteristics flag 位不阻塞收线）；PIE 与节拆分属序列化层本职，在完成线之内。
+PE 侧分阶段（非常驻小任务，按此顺序）：fd↔HANDLE 映射表（含 write 改查表）
+→ 文件臂 → net 臂（WSAStartup＋SOCKET/HANDLE 类型分流）→ exec 臂；
+Mach-O 侧全程裸 syscall 直通，无需 fd 表。
+**含**崩溃可诊断性（定案）：PE 补 `.pdata` / unwind（异常目录 [3]，现状下 WER 不介入、无 dump、无栈回溯），Mach-O 补对等项（`LC_FUNCTION_STARTS` / `__unwind_info`，现状十条命令里没有）。它是序列化层本职，随 S8.5 落地；不阻塞语料口径（纯计算程序不受影响），但别掉出清单。
 
-**S8.1 与 S8.5 共用验收闸（定案）**：`.github/workflows/ci.yml` 的全部 job 持续全绿。
-两者在此之前都不算完成——后端推进以此为准，不以单次 job 通过为准。
+**S8.6 x86 模块包（定案）**：模块包并入 S8，不另开编号。`compile_to_x86` 的 `is_dir` 拒收去掉，三目标共用这条路径。它涉及跨编译单元的符号解析与寻址模型，推迟等于将来重写，故不推迟。
 
-内部顺序：先收 S8.1，再 S8.5。
+**x86 自举仍不在 S8 内**：用 x86 编 compiler 不是后端完工的必要条件——[`architecture.md`](architecture.md) §3.5 的自举判定已由 C 路径满足。
+
 类型系统扩展的取舍见 §7；行多态与封闭 record 的实现定案见 [`architecture.md`](architecture.md) §2.1。
 
 ## 4. S9 剩余
@@ -68,7 +83,7 @@ Mach-O 不另开编号，与 PE 同属 S8.5。
 
 ## 6. 后端次序
 
-主线：x86 Linux ELF（S8.1）→ PE 与 Mach-O 序列化层（S8.5）→ runtime 平台抽象与工具链探测 → LLVM → Cranelift → WASM。
+主线（编号与排期见 §3）：x86 Linux ELF（S8.1，已完成）→ PE 与 Mach-O 序列化层（S8.5）→ x86 模块包（S8.6）→ runtime 平台抽象与工具链探测 → LLVM（S8.8）→ Cranelift（S8.9）→ WASM（S8.10）。
 后端矩阵、工具链探测与值模型见 [`architecture.md`](architecture.md) §3，不在此复述。
 
 ## 7. 明确排除（不接受重新提案）
