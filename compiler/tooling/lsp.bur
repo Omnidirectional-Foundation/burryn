@@ -45,6 +45,8 @@ pub fn lsp_serve() {
                     lsp_handle_hover(id, params)
                 } else if method == "textDocument/definition" {
                     lsp_handle_definition(id, params)
+                } else if method == "textDocument/completion" {
+                    lsp_handle_completion(id, params)
                 } else if method == "textDocument/formatting" {
                     lsp_handle_formatting(id, params)
                 } else if has_id {
@@ -195,7 +197,7 @@ fn lsp_handle_initialize(id, params) {
             module::lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "documentFormattingProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj([], []), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
 }
 
 // lsp_read_headers 读头直到空行 / lsp_read_headers reads headers up to the blank line
@@ -303,6 +305,42 @@ fn lsp_handle_definition(id, params) {
             lsp_respond(id, json::Json::JNull)
         },
     }
+}
+
+// lsp_handle_completion 处理名字补全 / lsp_handle_completion handles textDocument/completion
+fn lsp_handle_completion(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let line = jint(jobj_field(pos, "line"))
+    let ch = jint(jobj_field(pos, "character"))
+    let path = lsp_uri_to_path(uri)
+    let mut offset = -1
+    match lsp_doc_text(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    if offset < 0 {
+        lsp_respond(id, json::Json::JArr([]))
+        return
+    }
+    let items = frontend::lsp_completions_at(path, offset)
+    let mut out = []
+    for it in items {
+        let (name, kind, isfn) = it
+        let ck = if isfn {
+            3
+        } else {
+            6
+        }
+        push(out, jobj(["label", "kind", "detail"], [json::Json::JStr(name), json::Json::JInt(ck), json::Json::JStr(kind)]))
+    }
+    lsp_respond(id, json::Json::JArr(out))
 }
 
 // lsp_handle_formatting 处理 formatting / lsp_handle_formatting handles textDocument/formatting
