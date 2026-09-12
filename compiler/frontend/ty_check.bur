@@ -40,6 +40,7 @@ let mut lsp_bind_files = []
 let mut lsp_bind_offs = []
 let mut lsp_bind_sids = []
 let mut lsp_bind_isfn = []
+let mut lsp_bind_ends = []
 
 // LSP signature-help：调用点（含被调绑定）与实参区间记录，及按绑定索引的签名表
 // Signature-help support: recorded call sites (with callee binding) and argument
@@ -54,6 +55,16 @@ let mut lsp_arg_ends = []
 let mut lsp_sig_bs = []
 let mut lsp_sig_labels = []
 let mut lsp_sig_pnames = []
+
+// LSP pkg:: 补全：import 别名 → 包路径映射（按文件），及各包 pub 成员表
+// pkg:: completion: import alias to package path mappings (per file), and each
+// package's pub member table
+let mut lsp_imp_aliases = []
+let mut lsp_imp_paths = []
+let mut lsp_imp_files = []
+let mut lsp_pkg_paths = []
+let mut lsp_pkg_names = []
+let mut lsp_pkg_isfn = []
 
 // import 定义表：有效别名 → import 语句位置
 // Import definitions: effective alias → import statement location
@@ -130,6 +141,7 @@ pub fn lsp_set_recording(b: bool) {
         lsp_bind_offs = []
         lsp_bind_sids = []
         lsp_bind_isfn = []
+        lsp_bind_ends = []
         lsp_call_files = []
         lsp_call_starts = []
         lsp_call_ends = []
@@ -140,6 +152,12 @@ pub fn lsp_set_recording(b: bool) {
         lsp_sig_bs = []
         lsp_sig_labels = []
         lsp_sig_pnames = []
+        lsp_imp_aliases = []
+        lsp_imp_paths = []
+        lsp_imp_files = []
+        lsp_pkg_paths = []
+        lsp_pkg_names = []
+        lsp_pkg_isfn = []
     }
 }
 
@@ -225,11 +243,12 @@ fn lsp_record_binding(name, kind, file, sp) {
             }
         }
         match sp {
-            Sp(s, _) => {
+            Sp(s, e) => {
                 push(lsp_bind_names, name)
                 push(lsp_bind_kinds, kind)
                 push(lsp_bind_files, file)
                 push(lsp_bind_offs, s)
+                push(lsp_bind_ends, e)
                 push(lsp_bind_sids, cur_sid)
                 push(lsp_bind_isfn, false)
             },
@@ -311,10 +330,57 @@ fn lsp_record_arg(ci, sp) {
     }
 }
 
-// lsp_completions_at 查询 offset 处可见的名字：内层遮蔽外层，顶层全文件有效
+// lsp_record_import 记录一个文件内 import 别名到包路径的映射 / lsp_record_import records a file's import alias to package path mapping
+fn lsp_record_import(file, alias, path) {
+    if lsp_recording {
+        push(lsp_imp_aliases, alias)
+        push(lsp_imp_paths, path)
+        push(lsp_imp_files, file)
+    }
+}
+
+// lsp_record_pkg_member 记录一个包的 pub 成员 / lsp_record_pkg_member records a package's pub member
+fn lsp_record_pkg_member(path, name, isfn) {
+    if lsp_recording {
+        push(lsp_pkg_paths, path)
+        push(lsp_pkg_names, name)
+        push(lsp_pkg_isfn, isfn)
+    }
+}
+
+// lsp_completions_at 查询 offset 处可见的名字：内层遮蔽外层，顶层全文件有效；
+// pkg 非空时改为补全该包（按文件内 import 别名归一）的 pub 成员
 // lsp_completions_at returns the names visible at offset: inner scopes shadow
-// outer ones, top-level bindings apply to the whole file
-pub fn lsp_completions_at(file, offset) {
+// outer ones, top-level bindings apply to the whole file; a non-empty pkg
+// switches to that package's pub members via the file's import aliases
+pub fn lsp_completions_at(file, offset, pkg) {
+    if pkg != "" {
+        let mut ppath = ""
+        let mut pii = 0
+        while pii < len(lsp_imp_aliases) {
+            if lsp_imp_aliases[pii] == pkg && lsp_imp_files[pii] == file {
+                ppath = lsp_imp_paths[pii]
+            }
+            pii = pii + 1
+        }
+        if ppath == "" {
+            return []
+        }
+        let mut pout = []
+        let mut pmi = 0
+        while pmi < len(lsp_pkg_paths) {
+            if lsp_pkg_paths[pmi] == ppath {
+                let pkind = if lsp_pkg_isfn[pmi] {
+                    "fn"
+                } else {
+                    "val"
+                }
+                push(pout, (lsp_pkg_names[pmi], pkind, lsp_pkg_isfn[pmi]))
+            }
+            pmi = pmi + 1
+        }
+        return pout
+    }
     let mut out = []
     let mut seen = map()
     // 含 offset 的 scope id 集（嵌套 scope 的 span 相互包含，命中集即链）
@@ -418,6 +484,141 @@ pub fn lsp_signature_help_at(file, offset) {
     None
 }
 
+// lsp_references_at 查询声明位置与全部使用位置：光标在声明名或使用处均可归一
+// lsp_references_at returns the declaration site and every use site, normalized
+// from either a declaration name or a use of the name
+pub fn lsp_references_at(file, offset, include_decl) {
+    let mut target_file = ""
+    let mut target_off = -1
+    let mut rbi = 0
+    while rbi < len(lsp_bind_names) {
+        if lsp_bind_files[rbi] == file && lsp_bind_offs[rbi] <= offset && lsp_bind_ends[rbi] >= offset {
+            target_file = file
+            target_off = lsp_bind_offs[rbi]
+        }
+        rbi = rbi + 1
+    }
+    if target_off < 0 {
+        match lsp_def_at(file, offset) {
+            Some(rt) => {
+                let (rtoff, rtfile) = rt
+                target_file = rtfile
+                target_off = rtoff
+            },
+            None => {},
+        }
+    }
+    if target_off < 0 {
+        return []
+    }
+    let mut rend = -1
+    rbi = 0
+    while rbi < len(lsp_bind_names) {
+        if lsp_bind_files[rbi] == target_file && lsp_bind_offs[rbi] == target_off {
+            rend = lsp_bind_ends[rbi]
+        }
+        rbi = rbi + 1
+    }
+    let mut rout = []
+    if include_decl && rend >= 0 {
+        push(rout, (target_file, target_off, rend))
+    }
+    let mut rdi = 0
+    while rdi < len(lsp_def_toffs) {
+        if lsp_def_tfiles[rdi] == target_file && lsp_def_toffs[rdi] == target_off {
+            push(rout, (lsp_def_files[rdi], lsp_def_starts[rdi], lsp_def_ends[rdi]))
+        }
+        rdi = rdi + 1
+    }
+    rout
+}
+
+// lsp_push_symbol 并入符号条目（全区间 + 名区间）/ lsp_push_symbol appends a
+// symbol entry (full span + name span)
+fn lsp_push_symbol(mut dout, name, kind, sstart, send, nstart, nend) {
+    push(dout, (name, kind, sstart, send, nstart, nend))
+    dout
+}
+
+// lsp_document_symbols 列出顶层声明符号：名字、LSP SymbolKind、全区间与名区间
+// lsp_document_symbols lists top-level symbols: name, LSP SymbolKind, full span
+// and name span
+pub fn lsp_document_symbols(stmts) {
+    let mut dout = []
+    for s in stmts {
+        match s {
+            FnDecl(name, nsp, _, _, sp) => {
+                match sp {
+                    Sp(ds, de) => {
+                        match nsp {
+                            Sp(ns, ne) => {
+                                dout = lsp_push_symbol(dout, name, 12, ds, de, ns, ne)
+                            },
+                        }
+                    },
+                }
+            },
+            MethodDecl(_, name, nsp, _, sp) => {
+                match sp {
+                    Sp(ds, de) => {
+                        match nsp {
+                            Sp(ns, ne) => {
+                                dout = lsp_push_symbol(dout, name, 12, ds, de, ns, ne)
+                            },
+                        }
+                    },
+                }
+            },
+            LetStmt(name, nsp, is_mut, _, _, _, sp) => {
+                let dkind = if is_mut {
+                    13
+                } else {
+                    14
+                }
+                match sp {
+                    Sp(ds, de) => {
+                        match nsp {
+                            Sp(ns, ne) => {
+                                dout = lsp_push_symbol(dout, name, dkind, ds, de, ns, ne)
+                            },
+                        }
+                    },
+                }
+            },
+            ConstDecl(name, nsp, _, _, _, sp) => {
+                match sp {
+                    Sp(ds, de) => {
+                        match nsp {
+                            Sp(ns, ne) => {
+                                dout = lsp_push_symbol(dout, name, 14, ds, de, ns, ne)
+                            },
+                        }
+                    },
+                }
+            },
+            // 这两类声明不单独存名字区间，selectionRange 退化为声明起点
+            // These two decls store no separate name span; selectionRange falls
+            // back to the declaration start
+            TypeAliasDecl(name, _, _, sp) => {
+                match sp {
+                    Sp(ds, de) => {
+                        dout = lsp_push_symbol(dout, name, 11, ds, de, ds, ds)
+                    },
+                }
+            },
+            EnumDecl(name, _, _, _, sp) => {
+                match sp {
+                    Sp(ds, de) => {
+                        dout = lsp_push_symbol(dout, name, 10, ds, de, ds, ds)
+                    },
+                }
+            },
+            _ => {},
+        }
+    }
+    dout
+}
+
 // typecheck_script 是脚本类型检查入口 / typecheck_script is the script typecheck entry
 pub fn typecheck_script(stmts) {
     typecheck_program([[stmts]], [[""]], false, [""], [[[]]])
@@ -434,6 +635,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     let mut tl = []
     let mut diags = []
     let mut b_scheme = []
+    let mut b_name = []
     let mut b_mut = []
     let mut b_used = []
     let mut b_isfn = []
@@ -688,8 +890,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         len(b_scheme) - 1
     }
     // declare 声明一个名字（带冲突检查）/ declare declares a name (with conflict check)
-    fn declare(name, sch, is_mut, kind, sp) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref c, ref chan_fors, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
+    fn declare(name, sch, is_mut, kind, sp) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_name, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref c, ref chan_fors, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
         let bh = new_binding(sch, is_mut, kind, sp)
+        push(b_name, name)
         put(scopes[len(scopes) - 1], name, bh)
         lsp_record_binding(name, kind, cur_file, sp)
         bh
@@ -3300,6 +3503,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         push(imp_keys, al)
                         push(imp_offs, sp_start(dsp))
                         push(imp_files, cur_file)
+                        lsp_record_import(cur_file, al, path)
                     },
                     _ => {},
                 }
@@ -3696,6 +3900,55 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         lsp_arena_tn = tn
         lsp_arena_ta = ta
         lsp_arena_tr = tr
+        // native 内建签名：标签取自声明类型的 pretty 形式（特例变参 fn 无实签名，跳过；
+        // native 不走 FnDecl，b_isfn 恒 false，只按 kind 识别）
+        // Native builtin signatures: labels from the declared type's pretty form;
+        // variadic specials have no honest signature and are skipped; natives
+        // never pass through FnDecl so b_isfn stays false — detect by kind only
+        let mut nbi = 0
+        while nbi < len(b_kind) {
+            if b_kind[nbi] == "native" && b_special[nbi] == "" {
+                let nt = ty_resolve(tk, tr, s_t[b_scheme[nbi]])
+                if tk[nt] == 1 {
+                    let mut nps = []
+                    let mut npi = 0
+                    while npi < len(ta[nt]) {
+                        push(nps, ty_pretty1(tk, tn, ta, tr, ta[nt][npi]))
+                        npi = npi + 1
+                    }
+                    let nret = ty_pretty1(tk, tn, ta, tr, tr[nt])
+                    let mut nlabel = b_name[nbi] + "(" + lsp_join_names(nps) + ")"
+                    if nret != "unit" {
+                        nlabel = nlabel + " -> " + nret
+                    }
+                    lsp_record_fn_sig(nbi, nlabel, [])
+                }
+            }
+            nbi = nbi + 1
+        }
+        // 包 pub 成员表：pkg_vals 键 = 包路径.名字，按末位点分（包路径自身可含点）
+        // Package pub member table: pkg_vals keys are path.name, split on the
+        // last dot (package paths themselves may contain dots)
+        for pk in keys(pkg_vals) {
+            match get(pkg_vals, pk) {
+                Some(pbv) => {
+                    if b_pub[pbv] {
+                        let mut pdot = -1
+                        let mut pki = 0
+                        while pki < str_len(pk) {
+                            if byte_at(pk, pki) == 46 {
+                                pdot = pki
+                            }
+                            pki = pki + 1
+                        }
+                        if pdot > 0 {
+                            lsp_record_pkg_member(substr(pk, 0, pdot), substr(pk, pdot + 1, str_len(pk) - pdot - 1), b_isfn[pbv])
+                        }
+                    }
+                },
+                None => {},
+            }
+        }
     }
     lib::CheckOut::Checked(sorted_diags, sorted_files, bind_lines, chan_fors, interface_sources)
 }
