@@ -14,7 +14,10 @@ if [ $# -eq 0 ]; then
     exit 2
 fi
 
-BUR=${BUR:-./bur}
+if [ -z "${BUR:-}" ]; then
+    echo "BUR is not set; invoke as BUR=<compiler> $0 ..." >&2
+    exit 2
+fi
 fails=0
 SKIP_NAMES=${SKIP:-}
 

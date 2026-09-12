@@ -25,6 +25,36 @@ let mut lsp_def_files = []
 let mut lsp_def_toffs = []
 let mut lsp_def_tfiles = []
 
+// LSP completion：作用域区间与绑定名记录，供按文件+偏移查询可见名字
+// Completion support: recorded scope ranges and binding names, queried by
+// file + offset
+let mut lsp_scope_ids = []
+let mut lsp_scope_files = []
+let mut lsp_scope_starts = []
+let mut lsp_scope_ends = []
+let mut lsp_scope_depths = []
+let mut lsp_scope_seq = 0
+let mut lsp_bind_names = []
+let mut lsp_bind_kinds = []
+let mut lsp_bind_files = []
+let mut lsp_bind_offs = []
+let mut lsp_bind_sids = []
+let mut lsp_bind_isfn = []
+
+// LSP signature-help：调用点（含被调绑定）与实参区间记录，及按绑定索引的签名表
+// Signature-help support: recorded call sites (with callee binding) and argument
+// spans, plus a signature table keyed by binding index
+let mut lsp_call_files = []
+let mut lsp_call_starts = []
+let mut lsp_call_ends = []
+let mut lsp_call_binds = []
+let mut lsp_arg_calls = []
+let mut lsp_arg_starts = []
+let mut lsp_arg_ends = []
+let mut lsp_sig_bs = []
+let mut lsp_sig_labels = []
+let mut lsp_sig_pnames = []
+
 // import 定义表：有效别名 → import 语句位置
 // Import definitions: effective alias → import statement location
 let mut imp_keys = []
@@ -74,6 +104,43 @@ pub fn lsp_type_at(file, offset) {
 // lsp_set_recording 开关类型记录 / lsp_set_recording toggles type recording
 pub fn lsp_set_recording(b: bool) {
     lsp_recording = b
+    if b {
+        lsp_ty_starts = []
+        lsp_ty_ends = []
+        lsp_ty_handles = []
+        lsp_ty_files = []
+        lsp_arena_tk = []
+        lsp_arena_tn = []
+        lsp_arena_ta = []
+        lsp_arena_tr = []
+        lsp_def_starts = []
+        lsp_def_ends = []
+        lsp_def_files = []
+        lsp_def_toffs = []
+        lsp_def_tfiles = []
+        lsp_scope_ids = []
+        lsp_scope_files = []
+        lsp_scope_starts = []
+        lsp_scope_ends = []
+        lsp_scope_depths = []
+        lsp_scope_seq = 0
+        lsp_bind_names = []
+        lsp_bind_kinds = []
+        lsp_bind_files = []
+        lsp_bind_offs = []
+        lsp_bind_sids = []
+        lsp_bind_isfn = []
+        lsp_call_files = []
+        lsp_call_starts = []
+        lsp_call_ends = []
+        lsp_call_binds = []
+        lsp_arg_calls = []
+        lsp_arg_starts = []
+        lsp_arg_ends = []
+        lsp_sig_bs = []
+        lsp_sig_labels = []
+        lsp_sig_pnames = []
+    }
 }
 
 // lsp_record_def 记录一个名字使用区间及其定义位置 / lsp_record_def records a use span and its definition location
@@ -106,6 +173,249 @@ pub fn lsp_def_at(file, offset) {
     } else {
         Some((lsp_def_toffs[best], lsp_def_tfiles[best]))
     }
+}
+
+// lsp_record_scope_open 记录作用域开区间 / lsp_record_scope_open records a scope opening
+fn lsp_record_scope_open(file, sp, depth) {
+    if lsp_recording {
+        match sp {
+            Sp(s, _) => {
+                push(lsp_scope_ids, lsp_scope_seq)
+                push(lsp_scope_files, file)
+                push(lsp_scope_starts, s)
+                push(lsp_scope_ends, -1)
+                push(lsp_scope_depths, depth)
+                lsp_scope_seq = lsp_scope_seq + 1
+            },
+        }
+    }
+}
+
+// lsp_record_scope_close 闭合最近未闭合的作用域区间 / lsp_record_scope_close closes the most recent open scope
+fn lsp_record_scope_close(sp) {
+    if lsp_recording {
+        let mut i = len(lsp_scope_ends) - 1
+        while i >= 0 {
+            if lsp_scope_ends[i] == -1 {
+                match sp {
+                    Sp(_, e) => {
+                        lsp_scope_ends[i] = e
+                    },
+                }
+                i = -1
+            } else {
+                i = i - 1
+            }
+        }
+    }
+}
+
+// lsp_record_binding 记录一个绑定名及其声明位置 / lsp_record_binding records a binding name and its declaration site
+fn lsp_record_binding(name, kind, file, sp) {
+    if lsp_recording {
+        // 当前打开的 scope id（栈顶未闭合者），无则 -1 = 顶层
+        let mut cur_sid = -1
+        let mut si = len(lsp_scope_ends) - 1
+        while si >= 0 {
+            if lsp_scope_ends[si] == -1 {
+                cur_sid = lsp_scope_ids[si]
+                si = -1
+            } else {
+                si = si - 1
+            }
+        }
+        match sp {
+            Sp(s, _) => {
+                push(lsp_bind_names, name)
+                push(lsp_bind_kinds, kind)
+                push(lsp_bind_files, file)
+                push(lsp_bind_offs, s)
+                push(lsp_bind_sids, cur_sid)
+                push(lsp_bind_isfn, false)
+            },
+        }
+    }
+}
+
+// lsp_record_global_fn 把最近一次绑定标记为函数 / lsp_record_global_fn marks the most recent binding as a function
+fn lsp_record_global_fn() {
+    if lsp_recording {
+        let i = len(lsp_bind_isfn) - 1
+        if i >= 0 {
+            lsp_bind_isfn[i] = true
+        }
+    }
+}
+
+// lsp_join_names 逗号连接名字列表 / lsp_join_names joins a name list with commas
+fn lsp_join_names(names) {
+    let mut out = ""
+    let mut i = 0
+    while i < len(names) {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + names[i]
+        i = i + 1
+    }
+    out
+}
+
+// lsp_tail 去掉列表首项（方法的 receiver 参数）/ lsp_tail drops the first item (a method's receiver parameter)
+fn lsp_tail(xs) {
+    let mut out = []
+    let mut i = 1
+    while i < len(xs) {
+        push(out, xs[i])
+        i = i + 1
+    }
+    out
+}
+
+// lsp_record_fn_sig 记录绑定索引对应的签名标签与参数名 / lsp_record_fn_sig records a signature label and parameter names keyed by binding index
+fn lsp_record_fn_sig(b, label, params) {
+    if lsp_recording {
+        push(lsp_sig_bs, b)
+        push(lsp_sig_labels, label)
+        push(lsp_sig_pnames, params)
+    }
+}
+
+// lsp_record_call 记录一个调用点（含被调绑定）并返回其索引 / lsp_record_call records a call site (with callee binding) and returns its index
+fn lsp_record_call(file, sp, b) {
+    let mut ci = -1
+    if lsp_recording {
+        match sp {
+            Sp(s, e) => {
+                push(lsp_call_files, file)
+                push(lsp_call_starts, s)
+                push(lsp_call_ends, e)
+                push(lsp_call_binds, b)
+                ci = len(lsp_call_files) - 1
+            },
+        }
+    }
+    ci
+}
+
+// lsp_record_arg 记录一个实参区间，归属指定调用 / lsp_record_arg records one argument span attached to its call
+fn lsp_record_arg(ci, sp) {
+    if lsp_recording && ci >= 0 {
+        match sp {
+            Sp(s, e) => {
+                push(lsp_arg_calls, ci)
+                push(lsp_arg_starts, s)
+                push(lsp_arg_ends, e)
+            },
+        }
+    }
+}
+
+// lsp_completions_at 查询 offset 处可见的名字：内层遮蔽外层，顶层全文件有效
+// lsp_completions_at returns the names visible at offset: inner scopes shadow
+// outer ones, top-level bindings apply to the whole file
+pub fn lsp_completions_at(file, offset) {
+    let mut out = []
+    let mut seen = map()
+    // 含 offset 的 scope id 集（嵌套 scope 的 span 相互包含，命中集即链）
+    let mut active = map()
+    let mut si = 0
+    while si < len(lsp_scope_ids) {
+        if lsp_scope_files[si] == file && lsp_scope_starts[si] <= offset && lsp_scope_ends[si] >= offset {
+            put(active, lsp_scope_ids[si], true)
+        }
+        si = si + 1
+    }
+    // 倒序扫：后声明（内层）先占名字，实现内层遮蔽外层
+    let mut bi = len(lsp_bind_names) - 1
+    while bi >= 0 {
+        if lsp_bind_files[bi] == file && lsp_bind_kinds[bi] != "native" && lsp_bind_offs[bi] <= offset {
+            let mut vis = false
+            if lsp_bind_sids[bi] == -1 {
+                vis = true
+            } else {
+                match get(active, lsp_bind_sids[bi]) {
+                    Some(_) => {
+                        vis = true
+                    },
+                    None => {},
+                }
+            }
+            if vis {
+                match get(seen, lsp_bind_names[bi]) {
+                    None => {
+                        put(seen, lsp_bind_names[bi], true)
+                        push(out, (lsp_bind_names[bi], lsp_bind_kinds[bi], lsp_bind_isfn[bi]))
+                    },
+                    _ => {},
+                }
+            }
+        }
+        bi = bi - 1
+    }
+    out
+}
+
+// lsp_signature_help_at 查询 offset 所在调用的签名与活动实参下标：内层调用优先
+// lsp_signature_help_at returns the signature and active argument index of the
+// call containing offset, innermost call first
+pub fn lsp_signature_help_at(file, offset) {
+    let mut best = -1
+    let mut ci = 0
+    while ci < len(lsp_call_files) {
+        if lsp_call_files[ci] == file && lsp_call_starts[ci] <= offset && lsp_call_ends[ci] >= offset {
+            if best < 0 || lsp_call_starts[ci] > lsp_call_starts[best] {
+                best = ci
+            }
+        }
+        ci = ci + 1
+    }
+    if best < 0 {
+        return None
+    }
+    // 含 offset 的实参给下标；否则数完全落在光标前的实参（逗号后即下一参数）
+    let mut active = -1
+    let mut seen = 0
+    let mut ai = 0
+    while ai < len(lsp_arg_calls) {
+        if lsp_arg_calls[ai] == best {
+            if lsp_arg_starts[ai] <= offset && lsp_arg_ends[ai] >= offset && active < 0 {
+                active = seen
+            }
+            if lsp_arg_ends[ai] < offset {
+                seen = seen + 1
+            }
+        }
+        ai = ai + 1
+    }
+    if active < 0 {
+        active = seen
+    }
+    let bi = lsp_call_binds[best]
+    let mut si = 0
+    while si < len(lsp_sig_bs) {
+        if lsp_sig_bs[si] == bi {
+            let label = lsp_sig_labels[si]
+            let pnames = lsp_sig_pnames[si]
+            // 参数区间在标签串内定位：起点跟随 "("，后续按名字长 + 2 推进
+            let mut pspans = []
+            let mut off = -1
+            let mut k = 0
+            while off < 0 && k < str_len(label) {
+                if byte_at(label, k) == 40 {
+                    off = k + 1
+                }
+                k = k + 1
+            }
+            for pn in pnames {
+                push(pspans, (off, off + str_len(pn)))
+                off = off + str_len(pn) + 2
+            }
+            return Some((label, pspans, active))
+        }
+        si = si + 1
+    }
+    None
 }
 
 // typecheck_script 是脚本类型检查入口 / typecheck_script is the script typecheck entry
@@ -381,6 +691,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     fn declare(name, sch, is_mut, kind, sp) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref c, ref chan_fors, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
         let bh = new_binding(sch, is_mut, kind, sp)
         put(scopes[len(scopes) - 1], name, bh)
+        lsp_record_binding(name, kind, cur_file, sp)
         bh
     }
     // lookup 按名字查 scheme / lookup finds a scheme by name
@@ -1587,8 +1898,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
     // infer_block_expr 推断块表达式 / infer_block_expr infers a block expression
     fn infer_block_expr(blk) capture(ref alias_by_name, ref alias_depth, ref alias_pkg, ref alias_pub, ref alias_qual, ref alias_te, ref b_file, ref bind_by, ref bind_lines, ref bind_names, ref b_isfn, ref b_kind, ref b_mut, ref b_muts, ref b_params, ref b_pub, ref b_ready, ref b_scheme, ref b_span, ref b_special, ref b_used, ref c, ref chan_fors, ref cur_aliases, ref cur_file, ref cur_pkg, ref diag_files, ref diags, ref dm_file, ref dm_fresh, ref dm_help, ref dm_msg, ref dm_sp, ref dm_type, ref enum_by_name, ref e_params, ref e_prefix, ref e_pub, ref e_qual, ref e_variants, ref flat_files, ref has_err, ref infer_expr_ref, ref infer_stmt_ref, ref interface_sources, ref level, ref method_tbl, ref out, ref pi, ref pkg_seen, ref pkg_vals, ref pt_file, ref pt_inner, ref pt_res, ref pt_ret, ref pt_sp, ref ranks, ref ret_tys, ref scopes, ref sorted_diags, ref sorted_files, ref s_t, ref starts, ref s_vars, ref ta, ref taken, ref tk, ref tl, ref tn, ref tr, ref try_level, ref v_fields, ref v_file, ref v_name, ref v_span) {
         push_scope()
+        lsp_record_scope_open(cur_file, span_of(blk), len(scopes) - 1)
         let t = infer_block_noscope(blk)
         pop_scope()
+        lsp_record_scope_close(span_of(blk))
         t
     }
 
@@ -1629,7 +1942,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     None => -1,
                 }
                 if mft >= 0 {
-                    b_used[lookup(recv_name + "." + mname)] = true
+                    let mb = lookup(recv_name + "." + mname)
+                    b_used[mb] = true
+                    let sci = lsp_record_call(cur_file, csp, mb)
                     match csp {
                         Sp(_, ce) => push(chan_fors, cur_file + ":" + str(ce) + "|" + recv_name + "." + mname),
                     }
@@ -1643,6 +1958,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         }
                         let mut i = 1
                         while i < len(ta[ft_res]) && i - 1 < len(cargs) {
+                            lsp_record_arg(sci, span_of(cargs[i - 1]))
                             let at = infer_expr_ref(cargs[i - 1])
                             let e2 = ty_unify(tk, tn, ta, tr, tl, ta[ft_res][i], at)
                             if e2 != "" {
@@ -1735,9 +2051,11 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             }
             con1("chan", fresh(""))
         } else {
+            let sci = lsp_record_call(cur_file, csp, callee_b)
             let ct = infer_expr_ref(callee)
             let mut ahs = []
             for a in cargs {
+                lsp_record_arg(sci, span_of(a))
                 push(ahs, infer_expr_ref(a))
             }
             let rf = ty_resolve(tk, tr, ct)
@@ -1905,11 +2223,12 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
 
         for arm in arms {
             match arm {
-                MatchArm(pat, guard, body, _) => {
+                MatchArm(pat, guard, body, asp) => {
                     // 逐臂：模式绑定入作用域，guard 为 bool，体与整体合一
                     // Per arm: pattern bindings enter scope, guard is bool, the body
                     // unifies with the match type
                     push_scope()
+                    lsp_record_scope_open(cur_file, asp, len(scopes) - 1)
                     let unguarded = match guard {
                         NoNode => true,
                         _ => false,
@@ -2073,6 +2392,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     let bt = infer_expr_ref(body)
                     unify_at(res_t, bt, span_of(body), "between the arms of this `match` (all arms must produce one type)")
                     pop_scope()
+                    lsp_record_scope_close(asp)
                 },
                 _ => {},
             }
@@ -2357,6 +2677,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             // Function literals: parameters enter scope, return type unifies with the body
             FnLit(params, muts, pspans, param_tys, ret_ty, body, _, _, _) => {
                 push_scope()
+                lsp_record_scope_open(cur_file, span_of(e), len(scopes) - 1)
                 let mut annotation_vars = map()
                 for te in param_tys {
                     collect_annotation_vars(te, annotation_vars)
@@ -2399,12 +2720,15 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     },
                 }
                 pop_scope()
+                lsp_record_scope_close(span_of(e))
                 tfn(phs, ret)
             },
             Block(_, _) => {
                 push_scope()
+                lsp_record_scope_open(cur_file, span_of(e), len(scopes) - 1)
                 let t = infer_block_noscope(e)
                 pop_scope()
+                lsp_record_scope_close(span_of(e))
                 t
             },
             // if：条件约束 bool，两分支合一（无 else 时 unit）
@@ -2590,8 +2914,9 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 b_isfn[b] = true
                 b_used[b] = true
                 match lit {
-                    FnLit(_, muts, _, _, _, _, _, _, _) => {
+                    FnLit(params, muts, _, _, _, _, _, _, _) => {
                         put(b_muts, b, muts)
+                        lsp_record_fn_sig(b, name + "(" + lsp_join_names(params) + ")", params)
                     },
                     _ => {},
                 }
@@ -2626,8 +2951,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 b_isfn[b] = true
                 b_used[b] = true
                 match lit {
-                    FnLit(_, muts, _, _, _, _, _, _, _) => {
+                    FnLit(params, muts, _, _, _, _, _, _, _) => {
                         put(b_muts, b, muts)
+                        let mps = lsp_tail(params)
+                        lsp_record_fn_sig(b, rt + "." + name + "(" + lsp_join_names(mps) + ")", mps)
                     },
                     _ => {},
                 }
@@ -2692,8 +3019,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 let ct = infer_expr(cond)
                 unify_at(ct, h_bool, span_of(cond), "in this `while` condition")
                 push_scope()
+                lsp_record_scope_open(cur_file, span_of(body), len(scopes) - 1)
                 infer_block_stmts(body)
                 pop_scope()
+                lsp_record_scope_close(span_of(body))
             },
             LabelStmt(_, inner, _) => infer_stmt(inner),
             ForStmt(v, vsp, idx, isp, iter, _, body, fsp) => {
@@ -2712,12 +3041,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     unify_at(it, con1("list", el), span_of(iter), "in this `for` loop (iterate over a list or channel)")
                 }
                 push_scope()
+                lsp_record_scope_open(cur_file, fsp, len(scopes) - 1)
                 if idx != "" {
                     let _ = declare(idx, mono(h_int), false, "pattern", isp)
                 }
                 let _ = declare(v, mono(el), false, "pattern", vsp)
                 infer_block_stmts(body)
                 pop_scope()
+                lsp_record_scope_close(fsp)
             },
             ReturnStmt(val, ssp) => {
                 let has_val = match val {
@@ -2762,11 +3093,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                                 let _ = infer_expr(body)
                             } else {
                                 push_scope()
+                                lsp_record_scope_open(cur_file, span_of(body), len(scopes) - 1)
                                 if bind != "" && bind != "_" {
                                     let _ = declare(bind, mono(el), false, "pattern", bind_sp)
                                 }
                                 let _ = infer_expr(body)
                                 pop_scope()
+                                lsp_record_scope_close(span_of(body))
                             }
                         },
                         _ => {},
@@ -3027,11 +3360,13 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     FnDecl(name, nsp, is_pub, lit, _) => {
                         let b = declare(name, mono(fresh("")), false, "global", nsp)
                         b_isfn[b] = true
+                        lsp_record_global_fn()
                         b_pub[b] = is_pub
                         b_ready[b] = false
                         match lit {
                             FnLit(params, _, _, _, _, _, _, _, _) => {
                                 b_params[b] = params
+                                lsp_record_fn_sig(b, name + "(" + lsp_join_names(params) + ")", params)
                             },
                             _ => {},
                         }
