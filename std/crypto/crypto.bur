@@ -1,0 +1,185 @@
+// std/crypto — SHA-256 与十六进制摘要（纯 Burryn，零新 native）。
+// SHA-256 and hex digests (pure Burryn, zero new natives).
+// str 是文本不是字节串（chr 对 ≥ 0x80 的码点写 UTF-8 序列），因此摘要与消息
+// 内部全程用 [int] 字节表承载；输入按其 UTF-8 字节序列做哈希。语言表层没有
+// 位运算算子，32 位域用算术模拟：移位走 p2 幂表、AND 逐比特循环，值恒在
+// [0, 2^32) 内保持正数；规格见 FIPS 180-4。
+// A str is text, not bytes (chr writes UTF-8 sequences for codepoints >=
+// 0x80), so both message and digest travel as [int] byte lists; the input is
+// hashed as its UTF-8 byte sequence. The language surface has no bitwise
+// operators, so the 32-bit domain is emulated arithmetically: shifts through
+// the p2 power-of-two table, AND via a per-bit loop, values always kept in
+// [0, 2^32) and positive; see FIPS 180-4.
+
+let h_init = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+
+let k_round = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]
+
+// p2 2 的幂表，p2[i] = 2^i（rotr 与组字共用） / p2 holds powers of two, p2[i] = 2^i (shared by rotr and word packing)
+let p2 = [
+    1, 2, 4, 8, 16, 32, 64, 128,
+    256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+    65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608,
+    16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824, 2147483648,
+]
+
+// band32 逐位与：低位起逐比特提取 / band32 computes bitwise AND by extracting bits from the low end
+fn band32(xa, xb) {
+    let mut a = xa
+    let mut b = xb
+    let mut out = 0
+    let mut bit = 1
+    let mut i = 0
+    while i < 32 {
+        if a % 2 == 1 && b % 2 == 1 {
+            out = out + bit
+        }
+        a = a / 2
+        b = b / 2
+        bit = bit * 2
+        i = i + 1
+    }
+    out
+}
+
+// bxor32 异或恒等式 a + b - 2(a & b) / bxor32 applies the identity a + b - 2(a & b)
+fn bxor32(xa, xb) {
+    (xa + xb) - 2 * band32(xa, xb)
+}
+
+// rotr32 循环右移：拆高低两半在 32 位域内拼回 / rotr32 rotates right: recombine the two halves within 32 bits
+fn rotr32(x, n) {
+    x / p2[n] + (x % p2[n]) * p2[32 - n]
+}
+
+// sha256 计算 32 字节摘要，返回 0-255 的 int 表 / sha256 computes the 32-byte digest as ints in 0-255
+pub fn sha256(data) {
+    let n = str_len(data)
+    let mut bytes = []
+    let mut i = 0
+    while i < n {
+        push(bytes, byte_at(data, i))
+        i = i + 1
+    }
+    // 填充：0x80、零字节补到模 64 余 56、8 字节大端位长 / padding: 0x80, zero bytes to 56 mod 64, the 8-byte big-endian bit length
+    push(bytes, 128)
+    let r = (n + 1) % 64
+    let zeros = if r <= 56 {
+        56 - r
+    } else {
+        120 - r
+    }
+    let mut zi = 0
+    while zi < zeros {
+        push(bytes, 0)
+        zi = zi + 1
+    }
+    let mut v = n * 8
+    let mut lb = []
+    let mut bi = 0
+    while bi < 8 {
+        push(lb, v % 256)
+        v = v / 256
+        bi = bi + 1
+    }
+    let mut li = 7
+    while li >= 0 {
+        push(bytes, lb[li])
+        li = li - 1
+    }
+    let mut hs = []
+    for h0 in h_init {
+        push(hs, h0)
+    }
+    let nblocks = len(bytes) / 64
+    let mut blk = 0
+    while blk < nblocks {
+        // 消息表：前 16 字按大端组字，其余按公式扩展 / schedule: first 16 words packed big-endian, the rest expanded
+        let base = blk * 64
+        let mut w = []
+        let mut t = 0
+        while t < 16 {
+            let off = base + t * 4
+            push(w, bytes[off] * p2[24] + bytes[off + 1] * p2[16] + bytes[off + 2] * p2[8] + bytes[off + 3])
+            t = t + 1
+        }
+        while t < 64 {
+            let s0 = bxor32(bxor32(rotr32(w[t - 15], 7), rotr32(w[t - 15], 18)), w[t - 15] / 8)
+            let s1 = bxor32(bxor32(rotr32(w[t - 2], 17), rotr32(w[t - 2], 19)), w[t - 2] / 1024)
+            push(w, (w[t - 16] + s0 + w[t - 7] + s1) % 4294967296)
+            t = t + 1
+        }
+        let mut a = hs[0]
+        let mut b = hs[1]
+        let mut c = hs[2]
+        let mut d = hs[3]
+        let mut e = hs[4]
+        let mut f = hs[5]
+        let mut g = hs[6]
+        let mut hh = hs[7]
+        let mut rj = 0
+        while rj < 64 {
+            let s1 = bxor32(bxor32(rotr32(e, 6), rotr32(e, 11)), rotr32(e, 25))
+            let ch = bxor32(band32(e, f), band32(4294967295 - e, g))
+            let t1 = (hh + s1 + ch + k_round[rj] + w[rj]) % 4294967296
+            let s0 = bxor32(bxor32(rotr32(a, 2), rotr32(a, 13)), rotr32(a, 22))
+            let maj = bxor32(bxor32(band32(a, b), band32(a, c)), band32(b, c))
+            let t2 = (s0 + maj) % 4294967296
+            hh = g
+            g = f
+            f = e
+            e = (d + t1) % 4294967296
+            d = c
+            c = b
+            b = a
+            a = (t1 + t2) % 4294967296
+            rj = rj + 1
+        }
+        hs[0] = (hs[0] + a) % 4294967296
+        hs[1] = (hs[1] + b) % 4294967296
+        hs[2] = (hs[2] + c) % 4294967296
+        hs[3] = (hs[3] + d) % 4294967296
+        hs[4] = (hs[4] + e) % 4294967296
+        hs[5] = (hs[5] + f) % 4294967296
+        hs[6] = (hs[6] + g) % 4294967296
+        hs[7] = (hs[7] + hh) % 4294967296
+        blk = blk + 1
+    }
+    // 8 个 32 位字串成 32 字节大端 / serialize the 8 words into 32 big-endian bytes
+    let mut out = []
+    for hv in hs {
+        push(out, hv / p2[24] % 256)
+        push(out, hv / p2[16] % 256)
+        push(out, hv / p2[8] % 256)
+        push(out, hv % 256)
+    }
+    out
+}
+
+// sha256_hex 摘要的小写十六进制串 / sha256_hex returns the digest as lowercase hex
+pub fn sha256_hex(data) {
+    let d = sha256(data)
+    let digits = "0123456789abcdef"
+    let mut out = ""
+    for b in d {
+        out = out + substr(digits, b / 16, 1) + substr(digits, b % 16, 1)
+    }
+    out
+}
