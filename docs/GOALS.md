@@ -71,13 +71,13 @@ Mach-O 侧全程裸 syscall 直通，无需 fd 表。
 
 架构定案见 [`architecture.md`](architecture.md) §6（`bur lsp`、full sync、薄客户端）。
 
-已有：S9.1 传输 + 文档同步 + 诊断；S9.3 VSCode 扩展；S9.2 的 hover、go-to-definition、作用域感知 completion（含 `pkg::` 成员）、formatting、signature-help（含 native 内建）、references、documentSymbol。
+已有：S9.1 传输 + 文档同步 + 诊断；S9.3 VSCode 扩展；S9.2 的 hover、go-to-definition、作用域感知 completion（含 `pkg::` 成员）、formatting、signature-help（含 native 内建）、references、documentSymbol、documentHighlight、rename（含 prepareRename）。
 
-未有：rename、document highlight；S9.4 JetBrains 与其他编辑器配置片段。
+未有：S9.4 JetBrains 与其他编辑器配置片段。
 
-**单文档索引是当前精度上限**：`lsp_check_document` 把每份文档单独送进 `typecheck_program`，而 `lsp_set_recording(true)` 每次都清空录制数组，因此 references 与 go-to-definition 只在当前文档内成立；跨文件要先换成多文档录制。
+**单文档索引是当前精度上限**：`lsp_check_document` 把每份文档单独送进 `typecheck_program`，而 `lsp_set_recording(true)` 每次都清空录制数组，因此 references/documentHighlight/rename 与 go-to-definition 只在当前文档内成立；跨文件要先换成多文档录制。
 
-顺序：先收 rename 与 document highlight，再 S9.4。S9 整体在 S8.1 完成线之后推进。
+顺序：S9.2 语言特性已收齐，下一步 S9.4。S9 整体在 S8.1 完成线之后推进。
 
 ## 5. S10
 
