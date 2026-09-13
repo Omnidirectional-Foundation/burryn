@@ -15,15 +15,131 @@ pub let MACHO_DATA_VA_OFF = 16777216
 // page after the command block)
 pub let MACHO_TEXT_OFF = 4096
 
-// macho_hdr_size 是命令块总长：32B mach_header_64 之后接九条命令
-// （PAGEZERO/TEXT+节/DATA/LINKEDIT 四段 368B、UUID 24、MAIN 24、
-// BUILD_VERSION 24、DYLINKER 28、LOAD_DYLIB 56）
+// macho_hdr_size 是命令块总长：32B mach_header_64 之后接十一条命令
+// （PAGEZERO/TEXT+两节(__text、__unwind_info)/DATA/LINKEDIT 四段 448B、UUID 24、
+// MAIN 24、BUILD_VERSION 24、DYLINKER 28、LOAD_DYLIB 56、CHAINED_FIXUPS 16、
+// FUNCTION_STARTS 16）
 // macho_hdr_size is the command-block length: a 32-byte mach_header_64
-// followed by nine commands (four segments PAGEZERO/TEXT+section/DATA/
-// LINKEDIT at 368B total, UUID 24, MAIN 24, BUILD_VERSION 24, DYLINKER 28,
-// LOAD_DYLIB 56)
+// followed by eleven commands (four segments PAGEZERO/TEXT+two sections
+// (__text, __unwind_info)/DATA/LINKEDIT at 448B total, UUID 24, MAIN 24,
+// BUILD_VERSION 24, DYLINKER 28, LOAD_DYLIB 56, CHAINED_FIXUPS 16,
+// FUNCTION_STARTS 16)
 pub fn macho_hdr_size() {
-    572
+    668
+}
+
+// uleb128 生成小端 ULEB128 变长编码（LC_FUNCTION_STARTS 载荷的编码单位）；调用方
+// 保证 n 非负——文件内偏移天然非负，用不上负数分支
+// uleb128 emits little-endian ULEB128 (the encoding unit for LC_FUNCTION_STARTS'
+// payload); callers guarantee n is non-negative — file offsets are inherently
+// so, no negative branch is needed
+fn uleb128(n) {
+    let mut out = ""
+    let mut v = n
+    let mut going = true
+    while going {
+        let mut b = v % 128
+        v = v / 128
+        if v != 0 {
+            b = b + 128
+        } else {
+            going = false
+        }
+        out = out + byte_chr(b)
+    }
+    out
+}
+
+// macho_function_starts_payload 生成 LC_FUNCTION_STARTS 载荷：升序偏移表压成
+// ULEB128 差分序列（首项相对 __TEXT vmaddr，其余相对上一项），tool 无需符号表
+// 即可按函数边界符号化。offs 是 funcs_bytes 内偏移（发射顺序 = 地址升序，与 PE
+// .pdata 复用同一份 pdata_offsets），code_base 是 funcs_bytes 在文件内的起点
+// （MACHO_TEXT_OFF + funcs_bytes 在 text_content 内的偏移）。
+// macho_function_starts_payload builds LC_FUNCTION_STARTS' payload: the
+// ascending offset table packed into a ULEB128 delta sequence (the first entry
+// is relative to __TEXT's vmaddr, the rest to the previous entry), letting tools
+// symbolicate by function boundary without a symbol table. offs are offsets
+// within funcs_bytes (emission order = ascending address, reusing the same
+// pdata_offsets as PE's .pdata); code_base is funcs_bytes' file-relative start
+// (MACHO_TEXT_OFF + funcs_bytes' offset within text_content).
+fn macho_function_starts_payload(offs, code_base) {
+    let mut payload = ""
+    let mut prev = 0
+    let mut i = 0
+    while i < len(offs) {
+        let abs_off = code_base + offs[i]
+        payload = payload + uleb128(abs_off - prev)
+        prev = abs_off
+        i = i + 1
+    }
+    payload
+}
+
+// macho_function_starts_cmd 生成 LC_FUNCTION_STARTS（linkedit_data_command，
+// 与 macho_chained_fixups 同构：cmd + cmdsize(16) + dataoff + datasize）
+// macho_function_starts_cmd builds LC_FUNCTION_STARTS (a linkedit_data_command,
+// the same shape as macho_chained_fixups: cmd + cmdsize(16) + dataoff + datasize)
+fn macho_function_starts_cmd(dataoff, datasize) {
+    u32(38) + u32(16) + u32(dataoff) + u32(datasize)
+}
+
+// macho_unwind_encoding 生成全程序共享的 x86_64 compact unwind 编码：唯一序言
+// 形态（push rbp + sub rsp,8，共 16 字节栈占用、1 个保存寄存器）落在
+// UNWIND_X86_64_MODE_STACK_IMMD——frameless（rbp 不当帧指针）、栈立即数、按
+// LLVM `compact_unwind_encoding.h` 逐字核对的排列码：
+// mode(0x02000000) | stack_size=16/8=2 左移 16 位 | reg_count=1 左移 10 位 |
+// permutation。排列码按官方 permute_encode 算法手算：仅存 RBP（寄存器号 6，
+// UNWIND_X86_64_REG_RBP），registerCount=1 时 renumregs[5] =
+// registers[5] - countless - 1 = 6 - 0 - 1 = 5，故 permutation = 5。
+// 未接真机验证（S8.5 R1/R2 之外的项，写的时候不需要真机）——比特级来源是权威文档
+// 逐字抄的算法，不是凭记忆猜的，但没有拿真实二进制或 lldb 反查过，如实记此状态。
+// macho_unwind_encoding builds the whole-program shared x86_64 compact unwind
+// encoding: the sole prologue shape (push rbp + sub rsp,8, 16 bytes of stack use,
+// 1 saved register) lands on UNWIND_X86_64_MODE_STACK_IMMD — frameless (rbp is
+// not a frame pointer), stack-immediate, permutation checked byte-for-byte
+// against LLVM's compact_unwind_encoding.h: mode(0x02000000) |
+// stack_size=16/8=2 shifted left 16 | reg_count=1 shifted left 10 | permutation.
+// The permutation is hand-computed via the documented permute_encode algorithm:
+// only RBP is saved (register number 6, UNWIND_X86_64_REG_RBP), and with
+// registerCount=1, renumregs[5] = registers[5] - countless - 1 = 6 - 0 - 1 = 5,
+// so permutation = 5.
+// Not verified against real hardware (an item outside S8.5's R1/R2, which don't
+// need real hardware to write) — the bit-level source is copied verbatim from
+// authoritative documentation, not guessed from memory, but it has not been
+// cross-checked against a real binary or lldb; stating that plainly rather than
+// implying more confidence than earned.
+fn macho_unwind_encoding() {
+    33686533
+}
+
+// macho_unwind_info 生成 __TEXT,__unwind_info 节内容：不用 compressed 二级页
+// （不需要共享编码索引表那层间接——所有函数编码本就相同，regular 页直接存编码值
+// 更简单）；单个 regular 二级页装全部函数，一级索引两项（真实页 + 终结哨兵，
+// 终结项 secondLevelPagesSectionOffset=0、functionOffset=末函数结尾，dyld 靠它
+// 界定覆盖范围末端）；personality/LSDA 数组留空（无异常处理器）。
+// macho_unwind_info builds the __TEXT,__unwind_info section content: no
+// compressed second-level pages (no need for that layer of indirection through a
+// shared-encoding table — every function's encoding is already identical, so a
+// regular page storing the encoding value directly is simpler); a single regular
+// second-level page holds every function, and the first-level index has two
+// entries (the real page plus a terminating sentinel — the sentinel has
+// secondLevelPagesSectionOffset=0 and functionOffset=the last function's end,
+// which is how dyld bounds the covered range); the personality/LSDA arrays stay
+// empty (no exception handler).
+fn macho_unwind_info(offs, lens, code_base) {
+    let n = len(offs)
+    let index_off = 28
+    let page_off = index_off + 2 * 12
+    let last = code_base + offs[n - 1] + lens[n - 1]
+    let hdr = u32(1) + u32(index_off) + u32(0) + u32(index_off) + u32(0) + u32(index_off) + u32(2)
+    let index = u32(code_base + offs[0]) + u32(page_off) + u32(page_off) + u32(last) + u32(0) + u32(page_off)
+    let mut page = u32(2) + u16(8) + u16(n)
+    let mut i = 0
+    while i < n {
+        page = page + u32(code_base + offs[i]) + u32(macho_unwind_encoding())
+        i = i + 1
+    }
+    hdr + index + page
 }
 
 // macho_chained_fixups 生成 LC_DYLD_CHAINED_FIXUPS 指向 __LINKEDIT 内的元数据
@@ -55,19 +171,40 @@ fn macho_dylib() {
     u32(12) + u32(24 + str_len(name)) + u32(24) + u32(0) + u32(0) + u32(0) + name
 }
 
-// emit_macho 装配 Mach-O：命令块(548B) + 垫零至 0x1000 + __TEXT 内容 +
-// 垫零至页界 + __DATA 内容 + 垫零至页界后的空 __LINKEDIT；入口在 __TEXT 内容内
-// entry_in_text 处
-// emit_macho assembles the Mach-O: command block (548B) + zero padding to
-// 0x1000 + __TEXT content + padding to the page boundary + __DATA content +
-// an empty __LINKEDIT after padding to the next page boundary; the entry sits
-// at entry_in_text within the __TEXT content
-pub fn emit_macho(text_content, entry_in_text, data_content) {
-    let text_end = MACHO_TEXT_OFF + str_len(text_content)
+// emit_macho 装配 Mach-O：命令块 + 垫零至 0x1000 + __TEXT 内容（含 __unwind_info）
+// + 垫零至页界 + __DATA 内容 + 垫零至页界后的 __LINKEDIT（链式修复元数据 +
+// LC_FUNCTION_STARTS 载荷）；入口在 __TEXT 内容内 entry_in_text 处。pdata_offsets/
+// pdata_lens 是 funcs_bytes 内每个变体的 (偏移, 长度)，与 PE .pdata 共用同一份
+// （x86.bur 的发射顺序 = 地址升序，见 pe_build_pdata 的同一注释）；code_base 是
+// funcs_bytes 在文件内的起点。
+// emit_macho assembles the Mach-O: command block + zero padding to 0x1000 +
+// __TEXT content (including __unwind_info) + padding to the page boundary +
+// __DATA content + __LINKEDIT after padding to the next page boundary
+// (chained-fixups metadata plus the LC_FUNCTION_STARTS payload); the entry sits
+// at entry_in_text within the __TEXT content. pdata_offsets/pdata_lens are each
+// variant's (offset, length) within funcs_bytes, shared with PE's .pdata
+// (x86.bur's emission order is ascending address, see pe_build_pdata's matching
+// comment); code_base is funcs_bytes' file-relative start.
+pub fn emit_macho(text_content, entry_in_text, data_content, pdata_offsets, pdata_lens, code_base) {
+    let unwind_content = macho_unwind_info(pdata_offsets, pdata_lens, code_base)
+    let unwind_len = str_len(unwind_content)
+    // 不对 ULEB128 载荷做尾部零字节补齐——补齐用的 0x00 本身就是「值为 0」的合法
+    // ULEB128 编码，会被解码器当成多出的一个函数起点，把最后一个真实条目复制一遍
+    // （已用真机构建实测复现）；datasize 精确等于载荷长度，链接编辑区里它已是最后
+    //一块内容，没有后续结构需要对齐它的结尾。
+    // no trailing zero-byte padding on the ULEB128 payload — a 0x00 pad byte is
+    // itself a valid ULEB128 encoding of 0, so a decoder reads it as one more
+    // function start and ends up duplicating the last real entry (reproduced via
+    // an actual build). datasize is exactly the payload length; it's already the
+    // last thing in __LINKEDIT, so nothing downstream needs its end aligned.
+    let fstarts_payload = macho_function_starts_payload(pdata_offsets, code_base)
+    let text_end = MACHO_TEXT_OFF + str_len(text_content) + unwind_len
     let data_fileoff = pe_align(text_end, 4096)
     let linkedit_off = pe_align(data_fileoff + str_len(data_content), 4096)
-    let payload = macho_linkedit_payload()
-    let hdrs = macho_header(10, 524 + 16) + macho_pagezero() + macho_text_segment(str_len(text_content)) + macho_data_segment(data_fileoff, str_len(data_content)) + macho_linkedit_segment(linkedit_off, str_len(payload)) + macho_uuid() + macho_main(MACHO_TEXT_OFF + entry_in_text) + macho_build_version() + macho_dylinker() + macho_dylib() + macho_chained_fixups(linkedit_off, str_len(payload))
+    let chained_payload = macho_linkedit_payload()
+    let fstarts_dataoff = linkedit_off + str_len(chained_payload)
+    let full_linkedit_payload = chained_payload + fstarts_payload
+    let hdrs = macho_header(11, 524 + 16 + 96) + macho_pagezero() + macho_text_segment(str_len(text_content), unwind_len) + macho_data_segment(data_fileoff, str_len(data_content)) + macho_linkedit_segment(linkedit_off, str_len(full_linkedit_payload)) + macho_uuid() + macho_main(MACHO_TEXT_OFF + entry_in_text) + macho_build_version() + macho_dylinker() + macho_dylib() + macho_chained_fixups(linkedit_off, str_len(chained_payload)) + macho_function_starts_cmd(fstarts_dataoff, str_len(fstarts_payload))
     let mut head_pad = ""
     let mut pi = macho_hdr_size()
     while pi < MACHO_TEXT_OFF {
@@ -75,7 +212,7 @@ pub fn emit_macho(text_content, entry_in_text, data_content) {
         pi = pi + 1
     }
     let mut mid_pad = ""
-    pi = MACHO_TEXT_OFF + str_len(text_content)
+    pi = MACHO_TEXT_OFF + str_len(text_content) + unwind_len
     while pi < data_fileoff {
         mid_pad = mid_pad + byte_chr(0)
         pi = pi + 1
@@ -86,7 +223,7 @@ pub fn emit_macho(text_content, entry_in_text, data_content) {
         tail = tail + byte_chr(0)
         ti = ti + 1
     }
-    hdrs + head_pad + text_content + mid_pad + data_content + tail + payload
+    hdrs + head_pad + text_content + unwind_content + mid_pad + data_content + tail + full_linkedit_payload
 }
 
 // macho_build_dispatcher 生成 darwin syscall 兼容分派器。
@@ -329,12 +466,18 @@ fn macho_pagezero() {
 }
 
 // macho_text_segment 生成 __TEXT：fileoff 0 从头区盖起，maxprot/initprot R-X，
-// 内含一个 __text 纯指令节
+// 内含两节——纯指令 __text 与紧随其后的 __unwind_info（S8.5 崩溃可诊断性，
+// LC_FUNCTION_STARTS 的对等项；见 macho_unwind_info）
 // macho_text_segment builds __TEXT: fileoff 0 covering the headers onward,
-// maxprot/initprot R-X, carrying a single __text pure-instructions section
-fn macho_text_segment(text_len) {
-    let sect = macho_seg_name("__text") + macho_seg_name("__TEXT") + u64(macho_base + MACHO_TEXT_OFF) + u64(text_len) + u32(MACHO_TEXT_OFF) + u32(6) + u32(0) + u32(0) + u32(2147483648) + u32(0) + u32(0) + u32(0)
-    u32(25) + u32(152) + macho_seg_name("__TEXT") + u64(macho_base) + u64(pe_align(MACHO_TEXT_OFF + text_len, 4096)) + u64(0) + u64(MACHO_TEXT_OFF + text_len) + u32(5) + u32(5) + u32(1) + u32(0) + sect
+// maxprot/initprot R-X, carrying two sections — the pure-instructions __text
+// and __unwind_info right after it (S8.5 crash diagnostics, LC_FUNCTION_STARTS'
+// counterpart; see macho_unwind_info)
+fn macho_text_segment(text_len, unwind_len) {
+    let unwind_off = MACHO_TEXT_OFF + text_len
+    let text_sect = macho_seg_name("__text") + macho_seg_name("__TEXT") + u64(macho_base + MACHO_TEXT_OFF) + u64(text_len) + u32(MACHO_TEXT_OFF) + u32(6) + u32(0) + u32(0) + u32(2147483648) + u32(0) + u32(0) + u32(0)
+    let unwind_sect = macho_seg_name("__unwind_info") + macho_seg_name("__TEXT") + u64(macho_base + unwind_off) + u64(unwind_len) + u32(unwind_off) + u32(2) + u32(0) + u32(0) + u32(0) + u32(0) + u32(0) + u32(0)
+    let total_len = unwind_off + unwind_len
+    u32(25) + u32(232) + macho_seg_name("__TEXT") + u64(macho_base) + u64(pe_align(total_len, 4096)) + u64(0) + u64(total_len) + u32(5) + u32(5) + u32(2) + u32(0) + text_sect + unwind_sect
 }
 
 // macho_uuid 生成 LC_UUID（占位全零即可被接受）

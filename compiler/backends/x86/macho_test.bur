@@ -1,0 +1,36 @@
+// macho_test.bur — macho.bur 的 bur test 套件：LC_FUNCTION_STARTS / __unwind_info 编码
+// bur test suite for macho.bur: LC_FUNCTION_STARTS / __unwind_info encoding
+
+fn test_macho_unwind_encoding_value() {
+    // 0x02000000 (MODE_STACK_IMMD) | 2<<16 (stack_size=16B/8) | 1<<10 (reg_count=1)
+    // | 5 (permutation for saving only RBP, register 6) = 0x02020405
+    assert(macho_unwind_encoding() == 33686533, "compact unwind encoding matches the hand-derived 0x02020405")
+}
+
+fn test_uleb128_small_and_multibyte() {
+    assert(uleb128(0) == byte_chr(0), "0 encodes as a single zero byte")
+    assert(uleb128(127) == byte_chr(127), "127 fits in one byte (no continuation bit)")
+    assert(uleb128(128) == byte_chr(128) + byte_chr(1), "128 needs a continuation byte then 1")
+    assert(uleb128(300) == byte_chr(172) + byte_chr(2), "300 = 0b100101100 -> 0xAC 0x02")
+}
+
+fn test_macho_function_starts_payload_deltas() {
+    let payload = macho_function_starts_payload([0, 100, 250], 4096)
+    let want = uleb128(4096) + uleb128(100) + uleb128(150)
+    assert(payload == want, "first entry relative to code_base, rest are deltas from the previous absolute offset")
+}
+
+fn test_macho_unwind_info_structure() {
+    let offs = [0, 50, 120]
+    let lens = [50, 70, 30]
+    let code_base = 4096
+    let info = macho_unwind_info(offs, lens, code_base)
+    // header: version=1, commonEncOff=commonEncCount=persOff=persCount=0 folded
+    // into 28, indexOff=28, indexCount=2
+    let want_hdr = u32(1) + u32(28) + u32(0) + u32(28) + u32(0) + u32(28) + u32(2)
+    let page_off = 28 + 2 * 12
+    let last = code_base + 120 + 30
+    let want_index = u32(code_base + 0) + u32(page_off) + u32(page_off) + u32(last) + u32(0) + u32(page_off)
+    let want_page = u32(2) + u16(8) + u16(3) + u32(code_base + 0) + u32(macho_unwind_encoding()) + u32(code_base + 50) + u32(macho_unwind_encoding()) + u32(code_base + 120) + u32(macho_unwind_encoding())
+    assert(info == want_hdr + want_index + want_page, "header + two-entry index (real page + sentinel) + one regular page with 3 entries sharing one encoding")
+}
