@@ -1,6 +1,6 @@
 # GOALS — Burryn 路线与里程碑
 
-> v0.8 · active · 2026-09-07
+> v0.8 · active · 2026-09-07 ~ 09-13
 > 状态：前瞻规划 · 编号 `S<n>[.<m>]`
 > 相关文档：[`architecture.md`](architecture.md) 实现权威 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
@@ -26,8 +26,8 @@
 | **S6 生态工具链** | S6.1–S6.8：依赖、fmt、test、诊断、std/json、runtime IO、checker 债 | 已实现 |
 | **S7 语言特性扩展** | S7.1–S7.8（S7.4 命名参数已否决，编号保留） | 已实现 |
 | **S8 所有后端完工** | S8.1–S8.4 / S8.7 已实现；S8.5 / S8.6 / S8.8–S8.10 未实现（排期见 §3） | 部分实现 |
-| **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 hover / go-to-def / completion / formatting / signature-help；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
-| **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`。待扩展：`log`/`datetime`/`regex`/`crypto`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 未实现 |
+| **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 语言特性（清单见 §4）；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
+| **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`/`log`/`crypto`。待扩展：`datetime`/`regex`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 部分实现 |
 
 S1–S5 为自举闭环：`bur` 由本语言写成、经 cc 逐字节重建自身。
 stdlib 按「够自举用 + owner 真实脚本需求」生长。
@@ -71,11 +71,13 @@ Mach-O 侧全程裸 syscall 直通，无需 fd 表。
 
 架构定案见 [`architecture.md`](architecture.md) §6（`bur lsp`、full sync、薄客户端）。
 
-已有：S9.1 传输 + 文档同步 + 诊断；S9.2 的 hover 与 go-to-definition；S9.3 VSCode 扩展。
+已有：S9.1 传输 + 文档同步 + 诊断；S9.3 VSCode 扩展；S9.2 的 hover、go-to-definition、作用域感知 completion（含 `pkg::` 成员）、formatting、signature-help（含 native 内建）、references、documentSymbol。
 
-未有：completion、formatting、signature-help；S9.4 JetBrains 与其他编辑器配置片段。
+未有：rename、document highlight；S9.4 JetBrains 与其他编辑器配置片段。
 
-顺序：先收齐 S9.2 剩余三项，再 S9.4。S9 整体在 S8.1 完成线之后推进。
+**单文档索引是当前精度上限**：`lsp_check_document` 把每份文档单独送进 `typecheck_program`，而 `lsp_set_recording(true)` 每次都清空录制数组，因此 references 与 go-to-definition 只在当前文档内成立；跨文件要先换成多文档录制。
+
+顺序：先收 rename 与 document highlight，再 S9.4。S9 整体在 S8.1 完成线之后推进。
 
 ## 5. S10
 
