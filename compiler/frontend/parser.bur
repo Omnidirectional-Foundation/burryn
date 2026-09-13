@@ -427,6 +427,26 @@ fn p_method_decl(toks, mut pos) {
     Ok(MethodDecl(rty_name(rty), tok_lex(name), sp_of_tok(name), lit, span_of(lit)))
 }
 
+// p_impl_decl 解析 impl 块：类型名 + 花括号内的一串方法声明
+// p_impl_decl parses an impl block: a type name plus a brace-delimited run of method declarations
+fn p_impl_decl(toks, mut pos) {
+    let tok = p_advance(toks, pos)
+    let name = p_expect(toks, pos, t_ident, "type name after impl")?
+    p_expect(toks, pos, t_lbrace, "'" + chr(123) + "' after impl type name")?
+    p_skip_semis(toks, pos)
+    let mut methods = []
+    while !p_check(toks, pos, t_rbrace) {
+        if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_lparen && tok_type(toks[pos[0] + 2]) == t_ident && tok_type(toks[pos[0] + 3]) == t_colon {
+            push(methods, p_method_decl(toks, pos)?)
+        } else {
+            return perr("E1121", "impl blocks contain only receiver methods, e.g. `fn (recv: Type) name() " + chr(123) + " ... }`", "expected a method declaration inside `impl`", sp_of_tok(p_peek(toks, pos)))
+        }
+        p_skip_semis(toks, pos)
+    }
+    let close = p_expect(toks, pos, t_rbrace, "'}' to close impl block")?
+    Ok(ImplDecl(tok_lex(name), methods, sp_union(sp_of_tok(tok), sp_of_tok(close))))
+}
+
 // p_interpolated 解析插值字符串：把片段与表达式拼成 + 链
 // p_interpolated parses interpolated strings: segments and expressions become a + chain
 fn p_interpolated(toks, mut pos) {
@@ -1204,8 +1224,10 @@ fn p_statement(toks, mut pos) {
         p_const_stmt(toks, pos)
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_ident {
         p_fn_decl(toks, pos)
+    } else if p_check(toks, pos, t_impl) {
+        p_impl_decl(toks, pos)
     } else if p_check(toks, pos, t_fn) && tok_type(toks[pos[0] + 1]) == t_lparen && tok_type(toks[pos[0] + 2]) == t_ident && tok_type(toks[pos[0] + 3]) == t_colon {
-        p_method_decl(toks, pos)
+        perr("E1121", "methods must be declared inside an `impl` block, e.g. `impl Type " + chr(123) + " fn (recv: Type) name() " + chr(123) + " ... } }`", "expected a declaration, found a bare method", sp_of_tok(p_peek(toks, pos)))
     } else if p_check(toks, pos, t_enum) {
         p_enum_decl(toks, pos)
     } else if p_check(toks, pos, t_type) {

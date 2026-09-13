@@ -1306,6 +1306,31 @@ fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
             frontend::Node::TypeAliasDecl(name, te, is_pub, sp) => {
                 push(out, frontend::Node::TypeAliasDecl(name, resolve_te(te, aliases, mod_path, disp, diags, dfiles), is_pub, sp))
             },
+            frontend::Node::ImplDecl(rt, methods, isp) => {
+                let mut rmethods = []
+                for m in methods {
+                    match m {
+                        frontend::Node::MethodDecl(mrt, mname, mnsp, lit, msp) => {
+                            match lit {
+                                frontend::Node::FnLit(params, muts, pspans, param_tys, ret_ty, body, fname, crefs, lsp) => {
+                                    let mut rparam_tys = []
+                                    for te in param_tys {
+                                        push(rparam_tys, resolve_te(te, aliases, mod_path, disp, diags, dfiles))
+                                    }
+                                    let rret_ty = match ret_ty {
+                                        frontend::Node::NoNode => frontend::Node::NoNode,
+                                        te => resolve_te(te, aliases, mod_path, disp, diags, dfiles),
+                                    }
+                                    push(rmethods, frontend::Node::MethodDecl(mrt, mname, mnsp, frontend::Node::FnLit(params, muts, pspans, rparam_tys, rret_ty, body, fname, crefs, lsp), msp))
+                                },
+                                _ => push(rmethods, m),
+                            }
+                        },
+                        _ => push(rmethods, m),
+                    }
+                }
+                push(out, frontend::Node::ImplDecl(rt, rmethods, isp))
+            },
             _ => push(out, s),
         }
     }
@@ -1313,6 +1338,47 @@ fn resolve_file_tes(stmts, aliases, mod_path, disp, mut diags, mut dfiles) {
 }
 
 // check_pkg_shape 包形状检查：pub 导出与 import 匹配
+// check_pkg_name 登记一个包级声明名，撞名则报 E0428
+// check_pkg_name registers one package-level declared name, reporting E0428 on a collision
+fn check_pkg_name(name, name_sp, disp, pkg_path, mut declared, mut declared_s, mut declared_e, mut diags, mut dfiles) {
+    match get(declared, name) {
+        Some(prev) => {
+            let where_part = if prev != disp {
+                " (first declared in " + prev + ")"
+            } else {
+                ""
+            }
+            let ps = match get(declared_s, name) {
+                Some(x) => x,
+                None => 0,
+            }
+            let pe = match get(declared_e, name) {
+                Some(x) => x,
+                None => 0,
+            }
+            match name_sp {
+                frontend::SpanT::Sp(ns0, ne0) => {
+                    if prev == disp {
+                        push(diags, lib::DiagT::DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [lib::LabelT::Lab(ps, pe, "first declared here")], []))
+                    } else {
+                        push(diags, lib::DiagT::Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
+                    }
+                    push(dfiles, disp)
+                },
+            }
+        },
+        None => {
+            put(declared, name, disp)
+            match name_sp {
+                frontend::SpanT::Sp(ns0, ne0) => {
+                    put(declared_s, name, ns0)
+                    put(declared_e, name, ne0)
+                },
+            }
+        },
+    }
+}
+
 // check_pkg_shape checks the package shape: pub exports match imports
 // check_pkg_shape 校验包形状：pub 导出与 import 使用一致
 // check_pkg_shape verifies the package shape: pub exports match imports
@@ -1366,6 +1432,16 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
                         }
                     }
                 },
+                frontend::Node::ImplDecl(_rt, methods, _) => {
+                    for m in methods {
+                        match m {
+                            frontend::Node::MethodDecl(mrt, mname, mnsp, _, _) => {
+                                check_pkg_name(mrt + "." + mname, mnsp, disp, pkg_path, declared, declared_s, declared_e, diags, dfiles)
+                            },
+                            _ => {},
+                        }
+                    }
+                },
                 _ => {
                     match frontend::span_of(s) {
                         frontend::SpanT::Sp(ss0, se0) => {
@@ -1376,42 +1452,7 @@ fn check_pkg_shape(pkg_path, files_stmts, file_paths, mut diags, mut dfiles) {
                 },
             }
             if name != "" {
-                match get(declared, name) {
-                    Some(prev) => {
-                        let where_part = if prev != disp {
-                            " (first declared in " + prev + ")"
-                        } else {
-                            ""
-                        }
-                        let ps = match get(declared_s, name) {
-                            Some(x) => x,
-                            None => 0,
-                        }
-                        let pe = match get(declared_e, name) {
-                            Some(x) => x,
-                            None => 0,
-                        }
-                        match name_sp {
-                            frontend::SpanT::Sp(ns0, ne0) => {
-                                if prev == disp {
-                                    push(diags, lib::DiagT::DiagX(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0, [lib::LabelT::Lab(ps, pe, "first declared here")], []))
-                                } else {
-                                    push(diags, lib::DiagT::Diag(true, "E0428", "`" + name + "` is declared more than once in package \"" + pkg_path + "\"" + where_part, "", ns0, ne0))
-                                }
-                                push(dfiles, disp)
-                            },
-                        }
-                    },
-                    None => {
-                        put(declared, name, disp)
-                        match name_sp {
-                            frontend::SpanT::Sp(ns0, ne0) => {
-                                put(declared_s, name, ns0)
-                                put(declared_e, name, ne0)
-                            },
-                        }
-                    },
-                }
+                check_pkg_name(name, name_sp, disp, pkg_path, declared, declared_s, declared_e, diags, dfiles)
             }
         }
         fi = fi + 1

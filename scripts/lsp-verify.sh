@@ -273,15 +273,17 @@ ren_native = req("textDocument/rename", {"textDocument": {"uri": muri},
                                          "newName": "whatever"})
 check("rename on a native builtin is null", ren_native["result"] is None)
 
-# 方法签名（receiver 剔除）：方法仅脚本模式可用，用单文件脚本 fixture；
+# 方法签名（receiver 剔除）：方法要 impl 块包裹，脚本模式单文件 fixture 一样适用；
 # 每次检查只保留最后一份文档的录制，故脚本用例必须放最后
 suri = "file:///tmp/burryn-lsp-verify-sig.bur"
 ssrc = (
     "enum Point { Point(float, float) }\n"
     "\n"
-    "fn (p: Point) dist() {\n"
-    "    match p {\n"
-    "        Point(x, y) => x * x + y * y,\n"
+    "impl Point {\n"
+    "    fn (p: Point) dist() {\n"
+    "        match p {\n"
+    "            Point(x, y) => x * x + y * y,\n"
+    "        }\n"
     "    }\n"
     "}\n"
     "\n"
