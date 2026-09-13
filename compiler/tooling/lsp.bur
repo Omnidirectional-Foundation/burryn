@@ -55,6 +55,12 @@ pub fn lsp_serve() {
                     lsp_handle_references(id, params)
                 } else if method == "textDocument/documentSymbol" {
                     lsp_handle_document_symbol(id, params)
+                } else if method == "textDocument/documentHighlight" {
+                    lsp_handle_document_highlight(id, params)
+                } else if method == "textDocument/prepareRename" {
+                    lsp_handle_prepare_rename(id, params)
+                } else if method == "textDocument/rename" {
+                    lsp_handle_rename(id, params)
                 } else if has_id {
                     lsp_write_message(jobj(["jsonrpc", "id", "error"], [json::Json::JStr("2.0"), id, jobj(["code", "message"], [json::Json::JInt(-32601), json::Json::JStr("Method not found")])]))
                 }
@@ -211,7 +217,7 @@ fn lsp_handle_initialize(id, params) {
             module::lsp_set_root_path(lsp_normalize_root(root_path))
         }
     }
-    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider", "signatureHelpProvider", "referencesProvider", "documentSymbolProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj(["triggerCharacters"], [json::Json::JArr([json::Json::JStr(":")])]), json::Json::JBool(true), jobj([], []), json::Json::JBool(true), json::Json::JBool(true)]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
+    lsp_respond(id, jobj(["capabilities", "serverInfo"], [jobj(["textDocumentSync", "positionEncoding", "hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider", "signatureHelpProvider", "referencesProvider", "documentSymbolProvider", "documentHighlightProvider", "renameProvider"], [json::Json::JInt(1), json::Json::JStr("utf-8"), json::Json::JBool(true), json::Json::JBool(true), jobj(["triggerCharacters"], [json::Json::JArr([json::Json::JStr(":")])]), json::Json::JBool(true), jobj([], []), json::Json::JBool(true), json::Json::JBool(true), json::Json::JBool(true), jobj(["prepareProvider"], [json::Json::JBool(true)])]), jobj(["name", "version"], [json::Json::JStr("bur-lsp"), json::Json::JStr("0.6.0")])]))
 }
 
 // lsp_read_headers 读头直到空行 / lsp_read_headers reads headers up to the blank line
@@ -429,36 +435,21 @@ fn lsp_handle_references(id, params) {
     let td = jobj_field(params, "textDocument")
     let uri = jstr_field(td, "uri")
     let pos = jobj_field(params, "position")
-    let line = jint(jobj_field(pos, "line"))
-    let ch = jint(jobj_field(pos, "character"))
     let ctx = jobj_field(params, "context")
     let include = match jobj_get(ctx, "includeDeclaration") {
         Some(bv) => jbool(bv, true),
         None => true,
     }
     let path = lsp_uri_to_path(uri)
-    let mut offset = -1
-    match lsp_doc_text(uri) {
-        Some(text) => {
-            let starts = lsp_line_starts(text)
-            if line >= 0 && line < len(starts) {
-                offset = starts[line] + ch
-            }
-        },
-        None => {},
-    }
+    let offset = lsp_offset_at(uri, jint(jobj_field(pos, "line")), jint(jobj_field(pos, "character")))
     if offset < 0 {
         lsp_respond(id, json::Json::JArr([]))
         return
     }
-    let refs = frontend::lsp_references_at(path, offset, include)
     let mut out = []
-    for rf in refs {
+    for rf in frontend::lsp_references_at(path, offset, include) {
         let (rf_file, rstart, rend) = rf
-        let rstarts = lsp_line_starts_for(rf_file, [], [])
-        let rs = lsp_offset_to_pos(rstarts, rstart)
-        let rpe = lsp_offset_to_pos(rstarts, rend)
-        push(out, jobj(["uri", "range"], [json::Json::JStr(lsp_path_to_uri(rf_file)), jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(rs[0]), json::Json::JInt(rs[1])]), jobj(["line", "character"], [json::Json::JInt(rpe[0]), json::Json::JInt(rpe[1])])])]))
+        push(out, jobj(["uri", "range"], [json::Json::JStr(lsp_path_to_uri(rf_file)), lsp_range_at(rf_file, rstart, rend)]))
     }
     lsp_respond(id, json::Json::JArr(out))
 }
@@ -491,6 +482,107 @@ fn lsp_handle_document_symbol(id, params) {
         None => {},
     }
     lsp_respond(id, json::Json::JArr(syms))
+}
+
+// lsp_offset_at 把 position 转成文档内偏移，取不到给 -1
+// lsp_offset_at converts a position to a document offset, -1 when unavailable
+fn lsp_offset_at(uri, line, ch) {
+    let mut offset = -1
+    match lsp_doc_text(uri) {
+        Some(text) => {
+            let starts = lsp_line_starts(text)
+            if line >= 0 && line < len(starts) {
+                offset = starts[line] + ch
+            }
+        },
+        None => {},
+    }
+    offset
+}
+
+// lsp_range_at 把偏移区间转成 LSP Range（同文件内，起止分别转行列）
+// lsp_range_at converts an offset span into an LSP Range (same file, each end
+// converted to line/character separately)
+fn lsp_range_at(rf_file, rstart, rend) {
+    let rstarts = lsp_line_starts_for(rf_file, [], [])
+    let rs = lsp_offset_to_pos(rstarts, rstart)
+    let rpe = lsp_offset_to_pos(rstarts, rend)
+    jobj(["start", "end"], [jobj(["line", "character"], [json::Json::JInt(rs[0]), json::Json::JInt(rs[1])]), jobj(["line", "character"], [json::Json::JInt(rpe[0]), json::Json::JInt(rpe[1])])])
+}
+
+// lsp_handle_document_highlight 处理同文档内高亮 / lsp_handle_document_highlight handles textDocument/documentHighlight
+fn lsp_handle_document_highlight(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let path = lsp_uri_to_path(uri)
+    let offset = lsp_offset_at(uri, jint(jobj_field(pos, "line")), jint(jobj_field(pos, "character")))
+    if offset < 0 {
+        lsp_respond(id, json::Json::JArr([]))
+        return
+    }
+    let mut out = []
+    for rf in frontend::lsp_references_at(path, offset, true) {
+        let (rf_file, rstart, rend) = rf
+        push(out, jobj(["range", "kind"], [lsp_range_at(rf_file, rstart, rend), json::Json::JInt(1)]))
+    }
+    lsp_respond(id, json::Json::JArr(out))
+}
+
+// lsp_handle_prepare_rename 校验光标处可改名，回传待改名区间
+// lsp_handle_prepare_rename validates the cursor names a renameable symbol
+// and returns the range to be renamed
+fn lsp_handle_prepare_rename(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let path = lsp_uri_to_path(uri)
+    let offset = lsp_offset_at(uri, jint(jobj_field(pos, "line")), jint(jobj_field(pos, "character")))
+    if offset < 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    for rf in frontend::lsp_references_at(path, offset, true) {
+        let (rf_file, rstart, rend) = rf
+        if rf_file == path && rstart <= offset && offset <= rend {
+            lsp_respond(id, lsp_range_at(rf_file, rstart, rend))
+            return
+        }
+    }
+    lsp_respond(id, json::Json::JNull)
+}
+
+// lsp_handle_rename 处理改名：把全部使用位置转成同一份 WorkspaceEdit
+// lsp_handle_rename handles rename by turning every use site into one
+// WorkspaceEdit
+fn lsp_handle_rename(id, params) {
+    let td = jobj_field(params, "textDocument")
+    let uri = jstr_field(td, "uri")
+    let pos = jobj_field(params, "position")
+    let new_name = jstr_field(params, "newName")
+    let path = lsp_uri_to_path(uri)
+    let offset = lsp_offset_at(uri, jint(jobj_field(pos, "line")), jint(jobj_field(pos, "character")))
+    if offset < 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    let refs = frontend::lsp_references_at(path, offset, true)
+    if len(refs) == 0 {
+        lsp_respond(id, json::Json::JNull)
+        return
+    }
+    // 单文档录制下每个条目都落在同一份文件里（见 architecture.md §6「单文档索引」），
+    // 故按 uri 分组直接是单元素分组，不需要通用的多文件归并
+    // Under single-document recording every entry lands in the same file (see
+    // architecture.md §6 "single-document ceiling"), so grouping by uri is a
+    // single-element group and needs no general multi-file merge
+    let mut edits = []
+    for rf in refs {
+        let (rf_file, rstart, rend) = rf
+        push(edits, jobj(["range", "newText"], [lsp_range_at(rf_file, rstart, rend), json::Json::JStr(new_name)]))
+    }
+    let (edit_file, _, _) = refs[0]
+    lsp_respond(id, jobj(["changes"], [jobj([lsp_path_to_uri(edit_file)], [json::Json::JArr(edits)])]))
 }
 
 // lsp_handle_formatting 处理 formatting / lsp_handle_formatting handles textDocument/formatting
