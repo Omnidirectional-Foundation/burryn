@@ -232,10 +232,99 @@ fn compile_module_to_c(dir) {
 // compile_to_x86 编译为 x86 ELF / compile_to_x86 compiles to an x86 ELF
 fn compile_to_x86(input) {
     if is_dir(input) {
-        eprintln("error: x86 backend does not support modules yet")
-        exit(exit_static)
+        compile_module_to_x86(lib::strip_trailing_slash(input))
     } else {
         compile_file_to_x86(input)
+    }
+}
+
+// compile_module_to_x86 模块转 x86 二进制：与 compile_module_to_c 同构，多一步把
+// float_rt 当作入口包（`pkgs_stmts` 的最后一项——见 module.bur 的 load_module_test
+// 同一前例）的额外一个文件并入，而不是当可 import 的包（float_rt.bur 顶部注释：
+// 它只能引用自身声明，找不到名字就是编译期报错）。用 concat 建全新的外层数组而非
+// 原地 push 改写 load_module 返回的数组，绕开深 mut 对「入参是否新鲜堆值」的要求。
+// compile_module_to_x86 compiles a module to an x86 binary: the same shape as
+// compile_module_to_c, with one extra step merging float_rt in as an additional
+// file in the entry package (the last entry of `pkgs_stmts` — same precedent as
+// module.bur's load_module_test), rather than as an importable package
+// (float_rt.bur's header comment: it may only reference its own declarations,
+// and an unresolved name there is a compile error). Builds fresh outer arrays via
+// concat rather than push-mutating load_module's returned arrays in place, which
+// sidesteps deep-mut's requirement that an in-place-mutated value be freshly
+// heap-sourced.
+fn compile_module_to_x86(dir) {
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let frt_path = "compiler/lib/float_rt.bur"
+            let frt_src = match read_file(frt_path) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln("error: " + msg)
+                    exit(exit_no_input)
+                },
+            }
+            let frt_stmts = match frontend::lex(frt_src) {
+                lib::LexOut::Lexed(toks, ldiags2, _) => {
+                    if emit_errors(ldiags2, frt_path, false) {
+                        exit(exit_static)
+                    }
+                    match frontend::parse(toks) {
+                        frontend::ParseOut::Parsed(stmts, pdiags2) => {
+                            if emit_errors(pdiags2, frt_path, false) {
+                                exit(exit_static)
+                            }
+                            stmts
+                        },
+                    }
+                },
+            }
+            let ei = len(pkgs_stmts) - 1
+            let mut pkgs_stmts2 = []
+            let mut pkgs_fpaths2 = []
+            let mut pkgs_imports2 = []
+            let mut pkgs_lstarts2 = []
+            let mut pi = 0
+            while pi < len(pkgs_stmts) {
+                if pi == ei {
+                    push(pkgs_stmts2, concat(pkgs_stmts[pi], [frt_stmts]))
+                    push(pkgs_fpaths2, concat(pkgs_fpaths[pi], [frt_path]))
+                    push(pkgs_imports2, concat(pkgs_imports[pi], [[]]))
+                    push(pkgs_lstarts2, concat(pkgs_lstarts[pi], [lib::line_starts(frt_src)]))
+                } else {
+                    push(pkgs_stmts2, pkgs_stmts[pi])
+                    push(pkgs_fpaths2, pkgs_fpaths[pi])
+                    push(pkgs_imports2, pkgs_imports[pi])
+                    push(pkgs_lstarts2, pkgs_lstarts[pi])
+                }
+                pi = pi + 1
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts2, pkgs_fpaths2, pkg_paths, pkgs_imports2)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths2, pkg_paths, pkgs_imports2, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths2, true, pkg_paths, pkgs_imports2, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
+                            exit(exit_static)
+                        },
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => x86::x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea),
+                    }
+                },
+            }
+        },
     }
 }
 

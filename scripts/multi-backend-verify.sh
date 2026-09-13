@@ -5,8 +5,6 @@
 # 判定规则（构建失败保留真实退出码，无哨兵）：
 #   PASS = 三方 stdout + exit code 一致，含三方一致拒绝（构建期拒绝也在内）
 #   SKIP = 任一后端 SIGTRAP(133)，未实现 opcode
-#   GAP  = x86 明确拒收模块（"x86 backend does not support modules"），且另两方一致；
-#          实际 gap 集合必须等于 EXPECTED_GAPS，多一个少一个换一个都非零退出
 #   FAIL = 其余任一后端行为差异；FAIL > 0 非零退出
 # Usage: ./scripts/multi-backend-verify.sh
 set -u
@@ -23,37 +21,22 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0
 FAIL=0
 SKIP=0
-GAP=0
 SEQ=0
 FAILURES=""
-GAPS=""
-# GAP 基线：x86 能跑但明确拒收模块的三处。判据是集合相等——多一个、
-# 少一个、换一个都非零退出；gap 变 PASS 也红（清单该更新，不该无声）。
-# 注意另 9 个 testdata/pkg/*（annotations/cached/constcycle/consts/deepmut/
-# extimport/extmissing/pipeline/stdjson）是三方一致拒绝的模块负样例
-# （未用 import、坏依赖、常量环等），走 PASS，不进此桶。
-# GAP baseline: the three runnable programs x86 rejects for modules. Compared
-# as a set — any addition, removal or swap fails; a gap turning PASS fails too
-# (the list must be updated, not silently shrunk). The other nine
-# testdata/pkg/* are unanimously-rejected module fixtures, hence PASS.
-EXPECTED_GAPS="testdata/pkg/deferred/ testdata/pkg/greeter/ testdata/pkg/modules/"
 
 # run_trio <file> <label> — VM/C/x86 三方跑同一程序并比较
-# 构建失败保留真实退出码（无哨兵）：三方一致拒绝（含构建期拒绝）走 PASS；
-# GAP 旁路只留 x86 那条模块拒收（共享前端的 E0449/E0432 不进豁免桶）。
+# 构建失败保留真实退出码（无哨兵）：三方一致拒绝（含构建期拒绝）走 PASS。
 run_trio() {
     local file="$1" label="$2"
     local vm_rc=0 c_rc=0 x_rc=0 vm_out="" c_out="" x_out=""
-    local x_mod_reject=0
     SEQ=$((SEQ + 1))
 
     vm_out=$(timeout 20 "$BUR" run "$file" 2>/dev/null)
     vm_rc=$?
 
     local cbin="$TMP/c_$SEQ"
-    local cerr=""
     local c_brc=0
-    cerr=$("$BUR" build --backend c "$file" -o "$cbin" 2>&1)
+    "$BUR" build --backend c "$file" -o "$cbin" >/dev/null 2>&1
     c_brc=$?
     if [ -x "$cbin" ]; then
         c_out=$(timeout 20 "$cbin" 2>/dev/null)
@@ -64,9 +47,8 @@ run_trio() {
     fi
 
     local xbin="$TMP/x_$SEQ"
-    local xerr=""
     local x_brc=0
-    xerr=$("$BUR" build --backend x86 "$file" -o "$xbin" 2>&1)
+    "$BUR" build --backend x86 "$file" -o "$xbin" >/dev/null 2>&1
     x_brc=$?
     if [ -x "$xbin" ]; then
         x_out=$(timeout 20 "$xbin" 2>/dev/null)
@@ -74,9 +56,6 @@ run_trio() {
     else
         x_out=""
         x_rc=$x_brc
-        if echo "$xerr" | grep -q "x86 backend does not support modules"; then
-            x_mod_reject=1
-        fi
     fi
 
     if [ "$vm_rc" -eq 133 ] || [ "$c_rc" -eq 133 ] || [ "$x_rc" -eq 133 ]; then
@@ -88,13 +67,6 @@ run_trio() {
     if [ "$vm_rc" = "$c_rc" ] && [ "$c_rc" = "$x_rc" ] && [ "$vm_out" = "$c_out" ] && [ "$c_out" = "$x_out" ]; then
         echo "  PASS $label"
         PASS=$((PASS + 1))
-        return
-    fi
-
-    if [ "$x_mod_reject" -eq 1 ] && [ "$vm_rc" = "$c_rc" ] && [ "$vm_out" = "$c_out" ]; then
-        echo "  GAP  $label (x86 backend rejects modules)"
-        GAP=$((GAP + 1))
-        GAPS="$GAPS $label"
         return
     fi
 
@@ -145,21 +117,9 @@ for t in std/*/*_test.bur; do
 done
 
 echo
-echo "=== Summary: $PASS pass, $FAIL fail, $SKIP skip, $GAP known-gap ==="
+echo "=== Summary: $PASS pass, $FAIL fail, $SKIP skip ==="
 if [ -n "$FAILURES" ]; then
     echo "FAILED:$FAILURES"
-fi
-if [ -n "$GAPS" ]; then
-    echo "KNOWN-GAP (backend rejects):$GAPS"
-fi
-norm_gaps() {
-    echo "$1" | tr ' ' '\n' | grep -v '^$' | sort | tr '\n' ' '
-}
-if [ "$(norm_gaps "$GAPS")" != "$(norm_gaps "$EXPECTED_GAPS")" ]; then
-    echo "GAP set mismatch:" >&2
-    echo "  expected:$EXPECTED_GAPS" >&2
-    echo "  actual:$GAPS" >&2
-    exit 1
 fi
 if [ "$FAIL" -gt 0 ]; then
     exit 1
