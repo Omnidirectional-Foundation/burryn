@@ -1,6 +1,6 @@
 # Architecture — Burryn 实现架构
 
-> v0.6 · active · 2026-08-29
+> v0.7 · active · 2026-09-13
 > 状态：实现权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
 > 相关文档：[`GOALS.md`](GOALS.md) 路线与完成线 · [`grammar.md`](grammar.md) 表层语法 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`../README.md`](../README.md)
 
@@ -396,7 +396,9 @@ check 管线须支持从内存源码运行（LSP 核心工程改造点）。
 - go-to-definition：从名字使用处跳到绑定处（需 AST span → 定义 span 映射，跨文件走 module loader）
 - completion：作用域感知名字补全（局部变量、函数名、包成员 `pkg::`）
 - formatting：调 `bur fmt -`（stdin→stdout）
-- signature-help：函数调用时显示参数信息
+- signature-help：函数调用时显示参数信息，native 内建走同一张签名表
+- references：光标落在声明名或使用处都归一到同一绑定，再列出全部使用位置
+- documentSymbol：按文档列出顶层声明的全区间与名区间
 
 **编辑器客户端**：
 
