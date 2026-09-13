@@ -579,6 +579,24 @@ pub fn lsp_document_symbols(stmts) {
                     },
                 }
             },
+            ImplDecl(rt, methods, _) => {
+                for m in methods {
+                    match m {
+                        MethodDecl(_, mname, mnsp, _, msp) => {
+                            match msp {
+                                Sp(ds, de) => {
+                                    match mnsp {
+                                        Sp(ns, ne) => {
+                                            dout = lsp_push_symbol(dout, rt + "." + mname, 12, ds, de, ns, ne)
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+            },
             LetStmt(name, nsp, is_mut, _, _, _, sp) => {
                 let dkind = if is_mut {
                     13
@@ -627,6 +645,17 @@ pub fn lsp_document_symbols(stmts) {
         }
     }
     dout
+}
+
+// fd_lit 取一个顶层「函数状」声明（FnDecl / MethodDecl）的函数字面量，其余给 NoNode
+// fd_lit extracts the fn literal from a top-level "function-shaped" decl
+// (FnDecl / MethodDecl); anything else yields NoNode
+fn fd_lit(s) {
+    match s {
+        FnDecl(_, _, _, l, _) => l,
+        MethodDecl(_, _, _, l, _) => l,
+        _ => NoNode,
+    }
 }
 
 // typecheck_script 是脚本类型检查入口 / typecheck_script is the script typecheck entry
@@ -1905,7 +1934,29 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 scan_free(r, sc, seen, out)
             },
             Call(callee, cargs, _) => {
-                scan_free(callee, sc, seen, out)
+                // 方法调用 obj.mname() 的接收者类型要等推断完才知道，这里够不到；
+                // 用前缀 "." 的名字标出对「全部同名方法」的保守依赖，由调用点的
+                // 邻接图构建统一展开（scan_bound 不适用：方法名不进变量作用域）
+                // A method call's receiver type isn't known until inference, out
+                // of reach here; a "."-prefixed name marks the conservative
+                // dependency on every same-named method, expanded uniformly where
+                // the adjacency graph is built (scan_bound doesn't apply: method
+                // names never enter the variable scope)
+                match callee {
+                    FieldAccess(obj, mname, _) => {
+                        scan_free(obj, sc, seen, out)
+                        let mkey = "." + mname
+                        let dup = match get(seen, mkey) {
+                            Some(_) => true,
+                            None => false,
+                        }
+                        if !dup {
+                            put(seen, mkey, true)
+                            push(out, mkey)
+                        }
+                    },
+                    _ => scan_free(callee, sc, seen, out),
+                }
                 for a in cargs {
                     scan_free(a, sc, seen, out)
                 }
@@ -2155,13 +2206,21 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     None => -1,
                 }
                 if mft >= 0 {
-                    let mb = lookup(recv_name + "." + mname)
+                    // mft 本身就是绑定句柄（见预声明 put(method_tbl, key, b)）——method
+                    // 所在包的作用域在跨包调用时早已 pop_scope() 弹出，按名字重新
+                    // lookup 只在本包内调用才凑巧命中，句柄本身不受作用域生命周期影响
+                    // mft is itself the binding handle (see the pre-declare
+                    // put(method_tbl, key, b)) — the declaring package's scope is
+                    // already popped by the time a cross-package call runs, so a
+                    // fresh name-based lookup only happens to work for same-package
+                    // calls; the handle itself outlives scope popping
+                    let mb = mft
                     b_used[mb] = true
                     let sci = lsp_record_call(cur_file, csp, mb)
                     match csp {
                         Sp(_, ce) => push(chan_fors, cur_file + ":" + str(ce) + "|" + recv_name + "." + mname),
                     }
-                    let ft = instantiate(b_scheme[lookup(recv_name + "." + mname)])
+                    let ft = instantiate(b_scheme[mft])
                     let ft_res = ty_resolve(tk, tr, ft)
                     if tk[ft_res] == 1 && len(ta[ft_res]) > 0 {
                         let first = ta[ft_res][0]
@@ -3155,29 +3214,6 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                     cerr(span_of(init), "E0609", "only tuples destructure with `let (a, b) = ...`", "cannot destructure a non-tuple value")
                 }
             },
-            MethodDecl(rt, name, nsp, lit, ssp) => {
-                if rt == "" {
-                    cerr(ssp, "E0609", "receiver must be a named enum or type alias, e.g. `fn (s: Point) ...`", "cannot resolve receiver type of method `" + name + "`")
-                }
-                let tv = fresh("")
-                let b = declare(rt + "." + name, mono(tv), false, "local", nsp)
-                b_isfn[b] = true
-                b_used[b] = true
-                match lit {
-                    FnLit(params, muts, _, _, _, _, _, _, _) => {
-                        put(b_muts, b, muts)
-                        let mps = lsp_tail(params)
-                        lsp_record_fn_sig(b, rt + "." + name + "(" + lsp_join_names(mps) + ")", mps)
-                    },
-                    _ => {},
-                }
-                level = level + 1
-                let ft = infer_expr(lit)
-                level = level - 1
-                b_scheme[b] = generalize(ft)
-                unify_at(tv, ft, nsp, "in this method")
-                put(method_tbl, rt + "." + name, ft)
-            },
             EnumDecl(_, _, _, _, ssp) => {
                 cerr(ssp, "E0637", "", "enum declarations are only allowed at top level")
             },
@@ -3563,6 +3599,14 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         let mut pre = map()
         let mut fnames = []
         let mut fname_idx = map()
+        // 方法名（不带接收者类型）到 fname_idx 下标列表：SCC 建图时 `.mname()`
+        // 无法静态确定接收者类型，保守地把它当成依赖全部同名方法（见 scan_free
+        // 的 Call 分支与下方邻接边构建）
+        // method bare name to a list of fname_idx indices: `.mname()` can't
+        // statically pin its receiver type when building the SCC graph, so it
+        // conservatively depends on every method sharing that name (see
+        // scan_free's Call case and the adjacency edges built below)
+        let mut method_name_idx = map()
         let mut fd_name = []
         let mut fd_stmt = []
         let mut fd_file = []
@@ -3602,6 +3646,73 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         let b = declare(name, mono(tv), is_mut, "global", nsp)
                         b_pub[b] = is_pub
                     },
+                    ImplDecl(rt, methods, _) => {
+                        // 接收者的内部类型名走 qual_name 加包前缀（register_enum 对
+                        // enum 值类型同样处理，ty_new_con 用 e_qual[eh]）——调用点
+                        // infer_call 拿到的 recv_name 就是这个加了前缀的名字，registration
+                        // key 不跟着加前缀就永远查不到，跨包方法会全部假死成 E0609
+                        // The receiver's internal type name gets the package prefix via
+                        // qual_name (register_enum does the same for enum value types,
+                        // ty_new_con uses e_qual[eh]) — infer_call's recv_name at the call
+                        // site is this prefixed name, and a registration key without the
+                        // same prefix can never be found, silently breaking every
+                        // cross-package method as E0609
+                        let qrt = qual_name(rt)
+                        for m in methods {
+                            match m {
+                                MethodDecl(mrt, mname, mnsp, mlit, mssp) => {
+                                    if mrt == "" {
+                                        cerr(mnsp, "E0609", "receiver must be a named enum or type alias, e.g. `fn (s: Point) ...`", "cannot resolve receiver type of method `" + mname + "`")
+                                    } else if mrt != rt {
+                                        cerr(mnsp, "E0610", "", "method receiver type `" + mrt + "` does not match `impl " + rt + "`")
+                                    }
+                                    // 校验后一律按 impl 声明的类型注册（挂在类型上是本设计的权威，
+                                    // 不一致已经报过 E0610）；同一个改写节点塞回 fd_stmt，SCC 组
+                                    // 推断阶段才能用同一个 key 查到这个绑定
+                                    // Registered under the impl's declared type after validation
+                                    // (attaching to the type is this design's authority; a mismatch
+                                    // already got E0610); the rewritten node goes back into fd_stmt
+                                    // so the SCC-group inference phase looks it up under the same key
+                                    let cm = MethodDecl(qrt, mname, mnsp, mlit, mssp)
+                                    let key = qrt + "." + mname
+                                    let b = declare(key, mono(fresh("")), false, "global", mnsp)
+                                    b_isfn[b] = true
+                                    b_used[b] = true
+                                    b_ready[b] = false
+                                    lsp_record_global_fn()
+                                    match mlit {
+                                        FnLit(params, _, _, _, _, _, _, _, _) => {
+                                            let mps = lsp_tail(params)
+                                            b_params[b] = params
+                                            lsp_record_fn_sig(b, key + "(" + lsp_join_names(mps) + ")", mps)
+                                        },
+                                        _ => {},
+                                    }
+                                    put(method_tbl, key, b)
+                                    let ni = match get(fname_idx, key) {
+                                        Some(x) => x,
+                                        None => {
+                                            put(fname_idx, key, len(fnames))
+                                            push(fnames, key)
+                                            len(fnames) - 1
+                                        },
+                                    }
+                                    let mut midx = match get(method_name_idx, mname) {
+                                        Some(lst) => lst,
+                                        None => [],
+                                    }
+                                    if !contains(midx, ni) {
+                                        push(midx, ni)
+                                    }
+                                    put(method_name_idx, mname, midx)
+                                    push(fd_name, ni)
+                                    push(fd_stmt, cm)
+                                    push(fd_file, fi)
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
                     _ => {},
                 }
             }
@@ -3618,24 +3729,38 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
         while di < len(fd_stmt) {
             cur_file = file_paths[fd_file[di]]
             cur_aliases = aliases_of(file_imports[fd_file[di]])
-            match fd_stmt[di] {
-                FnDecl(_, _, _, lit, _) => {
+            match fd_lit(fd_stmt[di]) {
+                NoNode => {},
+                lit => {
                     let mut sc = [map()]
                     let mut seen = map()
                     let mut free = []
                     scan_free(lit, sc, seen, free)
                     for fname in free {
-                        match get(fname_idx, fname) {
-                            Some(ti) => {
-                                if !contains(adj[fd_name[di]], ti) {
-                                    push(adj[fd_name[di]], ti)
-                                }
-                            },
-                            None => {},
+                        if str_len(fname) > 0 && char_at(fname, 0) == "." {
+                            let mname = substr(fname, 1, str_len(fname) - 1)
+                            match get(method_name_idx, mname) {
+                                Some(idxs) => {
+                                    for ti in idxs {
+                                        if !contains(adj[fd_name[di]], ti) {
+                                            push(adj[fd_name[di]], ti)
+                                        }
+                                    }
+                                },
+                                None => {},
+                            }
+                        } else {
+                            match get(fname_idx, fname) {
+                                Some(ti) => {
+                                    if !contains(adj[fd_name[di]], ti) {
+                                        push(adj[fd_name[di]], ti)
+                                    }
+                                },
+                                None => {},
+                            }
                         }
                     }
                 },
-                _ => {},
             }
             di = di + 1
         }
@@ -3697,6 +3822,21 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         }
                         push(gft, ft)
                     },
+                    MethodDecl(mrt, mname, mnsp, lit, _) => {
+                        let key = mrt + "." + mname
+                        match lit {
+                            FnLit(_, muts, _, _, _, _, _, _, _) => {
+                                put(b_muts, lookup(key), muts)
+                            },
+                            _ => {},
+                        }
+                        let ft = infer_expr(lit)
+                        match get(gtv, key) {
+                            Some(tv) => unify_at(tv, ft, mnsp, "in this method"),
+                            None => {},
+                        }
+                        push(gft, ft)
+                    },
                     _ => push(gft, fresh("")),
                 }
             }
@@ -3708,6 +3848,10 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                 match fd_stmt[gdecls[gi][mi]] {
                     FnDecl(name, _, _, _, _) => {
                         let b = lookup(name)
+                        b_scheme[b] = generalize(gft[mi])
+                    },
+                    MethodDecl(mrt, mname, _, _, _) => {
+                        let b = lookup(mrt + "." + mname)
                         b_scheme[b] = generalize(gft[mi])
                     },
                     _ => {},
@@ -3725,6 +3869,7 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
             for s in files_stmts[fi] {
                 match s {
                     FnDecl(_, _, _, _, _) => {},
+                    ImplDecl(_, _, _) => {},
                     LetStmt(name, nsp, _, is_pub, ty, init, _) => {
                         if is_pub && !is_pkg {
                             err_pub_script(span_of(s))

@@ -27,12 +27,12 @@ shebang       ::= '#!' 仅当位于源文件字节偏移 0
 ident        ::= [a-zA-Z_][a-zA-Z0-9_]*
 ```text
 
-**关键字（24 个，保留字，不可作标识符）：**
+**关键字（25 个，保留字，不可作标识符）：**
 
 ```text
 let  mut  const  fn  if  else  while  for  in  return
 true  false  enum  match  spawn  break  continue  pub
-import  select  record  type  defer  capture
+import  select  record  type  defer  capture  impl
 ```text
 
 **两个"像关键字但不是关键字"的标识符（词法层特判，语法层语义由上下文决定）：**
@@ -107,7 +107,7 @@ escape       ::= '\n' | '\t' | '\"' | '\\' | '\r'      // 唯一的五个转义
 
 ```text
 program      ::= { top_level_decl }
-top_level_decl ::= import | fn_decl | method_decl | enum_decl | let_decl | const_decl
+top_level_decl ::= import | fn_decl | impl_decl | enum_decl | let_decl | const_decl
                  | type_decl | pub_decl
 ```text
 
@@ -118,6 +118,7 @@ top_level_decl ::= import | fn_decl | method_decl | enum_decl | let_decl | const
 
 ```text
 fn_decl      ::= 'fn' ident '(' params ')' ['->' type_expr] ['capture' '(' captures ')'] block
+impl_decl    ::= 'impl' ident '{' { method_decl } '}'
 method_decl  ::= 'fn' '(' ident ':' type_expr ')' ident '(' params ')' ['->' type_expr] block
 captures     ::= { 'ref'? ident } ,       // ref 前缀 = 引用捕获；无前缀 = 值捕获（默认，与省略同义）
 params       ::= { ['mut'] ident [':' type_expr] },
