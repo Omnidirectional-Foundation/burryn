@@ -27,7 +27,7 @@
 | **S7 语言特性扩展** | S7.1–S7.8（S7.4 命名参数已否决，编号保留） | 已实现 |
 | **S8 所有后端完工** | S8.1–S8.4 / S8.7 已实现；S8.5 / S8.6 / S8.8–S8.10 未实现（排期见 §3） | 部分实现 |
 | **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 语言特性（清单见 §4）；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
-| **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`/`log`/`crypto`。待扩展：`datetime`/`regex`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 部分实现 |
+| **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`/`log`/`crypto`/`regex`。待扩展：`datetime`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 部分实现 |
 
 S1–S5 为自举闭环：`bur` 由本语言写成、经 cc 逐字节重建自身。
 stdlib 按「够自举用 + owner 真实脚本需求」生长。

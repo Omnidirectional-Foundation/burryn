@@ -1,0 +1,866 @@
+// std/regex — 正则表达式：递归下降解析直接编译成 Thompson NFA 程序，Pike VM 模拟执行。
+// Regular expressions: a recursive-descent parser compiles straight to a Thompson
+// NFA program, executed by simulation (Pike's VM).
+//
+// 选这条路线（而非回溯）是为了给一条硬保证：任何模式在任何输入上都是
+// O(len(prog) * len(input))，不会有回溯引擎那种病态模式的指数级卡死。代价是不支持
+// 反向引用（`\1`）与环视（lookaround）——二者都需要比有限自动机更强的表达力，
+// 这条边界与 RE2 / Go `regexp` 一致，不是本实现的疏漏。
+// This route (over backtracking) is chosen for a hard guarantee: any pattern on any
+// input runs in O(len(prog) * len(input)), never the exponential blowup a
+// backtracking engine can hit on pathological patterns. The cost is no
+// backreferences (`\1`) and no lookaround — both need more power than a finite
+// automaton offers; this boundary matches RE2 / Go's `regexp`, it isn't an
+// oversight here.
+//
+// 语法范围：字面量、`.`、字符类 `[...]`/`[^...]`（含范围与 `\d\w\s` 简写及其取反）、
+// 锚点 `^`/`$`（整串边界，非多行模式）、量词 `* + ? {n} {n,} {n,m}`（均贪婪，暂不支持
+// 惰性量词——加法式扩展，不破坏现有编码）、分组 `(...)` 捕获 / `(?:...)` 非捕获、
+// 交替 `|`、常见转义（元字符转义 + `\n \t \r`）。不支持单词边界 `\b`（需要检视前一
+// 字节，留作未来扩展）。
+// Syntax scope: literals, `.`, character classes `[...]`/`[^...]` (ranges plus
+// `\d\w\s` shorthands and their negations), anchors `^`/`$` (whole-string
+// boundaries, no multiline mode), quantifiers `* + ? {n} {n,} {n,m}` (all greedy;
+// lazy quantifiers are not yet supported — an additive extension that would not
+// disturb the existing encoding), groups `(...)` capturing / `(?:...)`
+// non-capturing, alternation `|`, common escapes (metacharacter escapes plus
+// `\n \t \r`). No word boundary `\b` (needs inspecting the previous byte; left as a
+// future extension).
+//
+// 匹配语义：最左优先（leftmost-first），同 Perl/PCRE/Python `re` 默认行为，不是 POSIX
+// 的最左最长。`find` 逐起点扫描，每个起点跑一次 Pike VM——O(n) 起点 × 单趟 O(m)，
+// 简单正确，牺牲了"整串一趟扫完"那个技巧版本的常数因子。
+// Match semantics: leftmost-first, matching Perl/PCRE/Python `re`'s default
+// behavior, not POSIX leftmost-longest. `find` scans start positions one at a
+// time, running one Pike VM pass per start — O(n) starts times one O(m) pass each;
+// simple and correct, at the cost of the constant factor a single
+// whole-string-in-one-pass trick would save.
+
+// ===== 字节常量（ASCII，模式串按字节而非码点处理，与全语言的字符串索引口径一致）=====
+// ===== byte constants (ASCII; patterns are processed byte-wise, matching the
+// language's string indexing convention throughout) =====
+let b_pipe = 124
+let b_lparen = 40
+let b_rparen = 41
+let b_lbrack = 91
+let b_rbrack = 93
+let b_lbrace = 123
+let b_rbrace = 125
+let b_star = 42
+let b_plus = 43
+let b_ques = 63
+let b_dot = 46
+let b_caret = 94
+let b_dollar = 36
+let b_bslash = 92
+let b_dash = 45
+let b_colon = 58
+let b_comma = 44
+let b_q = 63
+
+// MAX_REPEAT：单个 {n,m} 允许的最大界，防止病态模式把程序数组撑到失控体积
+// MAX_REPEAT: the largest bound a single {n,m} may request, so a pathological
+// pattern cannot blow the compiled program array up without limit
+let max_repeat = 1000
+
+// ===== Thompson 程序：一条条指令，Split/Jmp 的跳转目标是相对偏移（相对下一条指令的
+// 位置，同 x86 后端 jmp_rel32 的编码习惯）——这样每条子表达式可以独立编译、直接
+// concat 拼接，不需要回填 =====
+// ===== the Thompson program: instructions where Split/Jmp targets are relative
+// offsets (relative to the position right after the jump itself, the same
+// convention the x86 backend's jmp_rel32 uses) — so each subexpression compiles
+// independently and subprograms concat straight together, no backpatching needed =====
+pub enum Inst {
+    IChar(int),
+    IAny,
+    IClass(bool, [int], [int]),
+    ISplit(int, int),
+    IJmp(int),
+    ISave(int),
+    IMatch,
+    IAssertStart,
+    IAssertEnd,
+}
+
+// 编译好的正则：程序 + 捕获槽位数（含隐式的组 0 = 整段匹配，故 nslots = 2*(ngroups+1)）。
+// 用 enum 包一个字段元组而非 record——impl 方法目前只按枚举接收者派发（同
+// testdata/types/methods.bur 的 Point 先例），record 类型别名当接收者会稳定假死成
+// E0609（已探明并记在 reports/ROADMAP.md，留给 impl 块本身的后续修）
+// a compiled regex: the program plus the capture slot count (including the
+// implicit group 0 = the whole match, so nslots = 2*(ngroups+1)). Wrapped as an
+// enum around a field tuple rather than a record — method dispatch currently
+// only works for an enum receiver (matching testdata/types/methods.bur's Point
+// precedent); a record type-alias receiver reliably comes back E0609 (found and
+// noted in reports/ROADMAP.md, left for a follow-up fix to impl blocks
+// themselves)
+enum Regex {
+    Regex([Inst], int),
+}
+
+// 一次匹配：起止字节偏移 + 各分组的起止（未匹配的分组 = -1）。Match 从不当方法接收者，
+// 只作数据返回给调用方读字段，留作 record（`.field` 访问只对 record 生效，不像
+// Regex 那样受上面枚举/record 接收者那条限制拖累）
+// one match: the start/end byte offsets plus each group's start/end (an
+// unmatched group is -1). Match is never used as a method receiver — it's only
+// data handed back for callers to read fields from — so it stays a record
+// (`.field` access only works on records, and Match never runs into the
+// enum/record receiver limitation noted above for Regex)
+type Match = record { start: int, end: int, text: str, group_starts: [int], group_ends: [int] }
+
+// ===== 字符类：负责判定字节是否落在（或不落在，取决于 negate）一组区间内 =====
+// ===== character classes: decide whether a byte falls inside (or outside, per
+// negate) a set of ranges =====
+fn class_matches(negate, los, his, b) {
+    let mut hit = false
+    let mut i = 0
+    while i < len(los) {
+        if b >= los[i] && b <= his[i] {
+            hit = true
+        }
+        i = i + 1
+    }
+    if negate {
+        !hit
+    } else {
+        hit
+    }
+}
+
+// digit_ranges/word_ranges/space_ranges：`\d \w \s` 的底层区间表
+// digit_ranges/word_ranges/space_ranges: the underlying range tables for `\d \w \s`
+fn digit_ranges() {
+    ([48], [57])
+}
+
+fn word_ranges() {
+    ([65, 97, 48, 95], [90, 122, 57, 95])
+}
+
+fn space_ranges() {
+    ([9, 10, 11, 12, 13, 32], [9, 10, 11, 12, 13, 32])
+}
+
+// ===== 解析器：递归下降，pos/ngroup 用单元素可变数组线程穿全部子规则（同编译器自身
+// parser.bur 的 pos 传法），直接编译到指令表，不建中间 AST =====
+// ===== parser: recursive descent, pos/ngroup threaded through every subrule as
+// single-element mutable arrays (the same pos-passing idiom the compiler's own
+// parser.bur uses), compiling straight to the instruction table with no
+// intermediate AST =====
+
+fn rx_peek(pat, pos) {
+    if pos[0] < str_len(pat) {
+        byte_at(pat, pos[0])
+    } else {
+        -1
+    }
+}
+
+// parse 是正则编译入口：pattern → Regex，失败给出可定位到字节偏移的错误
+// parse is the regex compile entry: pattern to Regex, failing with an
+// error message pinpointing the byte offset
+pub fn parse(pattern) {
+    let mut pos = [0]
+    let mut ngroup = [0]
+    let body = parse_alt(pattern, pos, ngroup)?
+    if pos[0] != str_len(pattern) {
+        return Err("regex: unexpected '" + substr(pattern, pos[0], 1) + "' at byte " + str(pos[0]))
+    }
+    let prog = concat(concat([ISave(0)], body), [ISave(1), IMatch])
+    Ok(Regex::Regex(prog, 2 * (ngroup[0] + 1)))
+}
+
+// parse_alt：concat ('|' concat)*，左结合折叠成一串二元 Split/Jmp
+// parse_alt: concat ('|' concat)*, left-folded into a chain of binary Split/Jmp
+fn parse_alt(pat, mut pos, ngroup) {
+    let mut leftbox = [parse_concat(pat, pos, ngroup)?]
+    while rx_peek(pat, pos) == b_pipe {
+        pos[0] = pos[0] + 1
+        let right = parse_concat(pat, pos, ngroup)?
+        leftbox[0] = concat(concat([ISplit(0, len(leftbox[0]) + 1)], leftbox[0]), concat([IJmp(len(right))], right))
+    }
+    Ok(leftbox[0])
+}
+
+// parse_concat：repeat*，遇 '|' ')' 或串尾停止（空 concat 合法，匹配空串）
+// parse_concat: repeat*, stopping at '|', ')' or end of pattern (an empty concat
+// is legal, matching the empty string)
+fn parse_concat(pat, pos, ngroup) {
+    let mut acc = []
+    while true {
+        let b = rx_peek(pat, pos)
+        if b == -1 || b == b_pipe || b == b_rparen {
+            return Ok(acc)
+        }
+        let piece = parse_repeat(pat, pos, ngroup)?
+        acc = concat(acc, piece)
+    }
+    Ok(acc)
+}
+
+// parse_repeat：atom 后缀跟 * + ? 或 {n,m}，均贪婪
+// parse_repeat: an atom followed by a * + ? or {n,m} suffix, all greedy
+fn parse_repeat(pat, mut pos, ngroup) {
+    let atom = parse_atom(pat, pos, ngroup)?
+    let b = rx_peek(pat, pos)
+    if b == b_star {
+        pos[0] = pos[0] + 1
+        return Ok(concat([ISplit(0, len(atom) + 1)], concat(atom, [IJmp(0 - (len(atom) + 2))])))
+    }
+    if b == b_plus {
+        pos[0] = pos[0] + 1
+        return Ok(concat(atom, [ISplit(0 - (len(atom) + 1), 0)]))
+    }
+    if b == b_ques {
+        pos[0] = pos[0] + 1
+        return Ok(concat([ISplit(0, len(atom))], atom))
+    }
+    if b == b_lbrace {
+        return parse_bound(pat, pos, atom)
+    }
+    Ok(atom)
+}
+
+// parse_bound 解析 {n} / {n,} / {n,m} 并按重复次数展开成拼接的 atom 副本
+// （标准去糖：{n,m} = atom{n} 接 (atom?){m-n}；{n,} = atom{n} 接 atom*）。
+// 不构成合法界（数字缺失、m<n 等）一律报错，不回退成字面量 '{'。
+// parse_bound parses {n} / {n,} / {n,m} and expands it into concatenated atom
+// copies (standard desugaring: {n,m} = atom{n} followed by (atom?){m-n};
+// {n,} = atom{n} followed by atom*). Anything that isn't a well-formed bound
+// (missing digits, m<n, ...) is an error, never falls back to a literal '{'.
+fn parse_bound(pat, mut pos, atom) {
+    pos[0] = pos[0] + 1
+    let min = parse_digits(pat, pos)?
+    let mut max = min
+    let mut unbounded = false
+    if rx_peek(pat, pos) == b_comma {
+        pos[0] = pos[0] + 1
+        if rx_peek(pat, pos) == b_rbrace {
+            unbounded = true
+        } else {
+            max = parse_digits(pat, pos)?
+        }
+    }
+    if rx_peek(pat, pos) != b_rbrace {
+        return Err("regex: expected '}' at byte " + str(pos[0]))
+    }
+    pos[0] = pos[0] + 1
+    if min > max_repeat || max > max_repeat {
+        return Err("regex: repeat count exceeds " + str(max_repeat))
+    }
+    if !unbounded && max < min {
+        return Err("regex: repeat max below min")
+    }
+    let mut out = []
+    let mut i = 0
+    while i < min {
+        out = concat(out, atom)
+        i = i + 1
+    }
+    if unbounded {
+        out = concat(out, concat([ISplit(0, len(atom) + 1)], concat(atom, [IJmp(0 - (len(atom) + 2))])))
+    } else {
+        let mut j = min
+        while j < max {
+            out = concat(out, concat([ISplit(0, len(atom))], atom))
+            j = j + 1
+        }
+    }
+    Ok(out)
+}
+
+fn parse_digits(pat, mut pos) {
+    let start = pos[0]
+    let mut n = 0
+    while rx_peek(pat, pos) >= 48 && rx_peek(pat, pos) <= 57 {
+        n = n * 10 + (rx_peek(pat, pos) - 48)
+        pos[0] = pos[0] + 1
+    }
+    if pos[0] == start {
+        return Err("regex: expected digits at byte " + str(pos[0]))
+    }
+    Ok(n)
+}
+
+// parse_atom：字面量 / '.' / 字符类 / 分组 / 锚点 / 转义
+// parse_atom: a literal / '.' / character class / group / anchor / escape
+fn parse_atom(pat, mut pos, ngroup) {
+    let b = rx_peek(pat, pos)
+    if b == -1 {
+        return Err("regex: unexpected end of pattern")
+    }
+    if b == b_dot {
+        pos[0] = pos[0] + 1
+        return Ok([IAny])
+    }
+    if b == b_caret {
+        pos[0] = pos[0] + 1
+        return Ok([IAssertStart])
+    }
+    if b == b_dollar {
+        pos[0] = pos[0] + 1
+        return Ok([IAssertEnd])
+    }
+    if b == b_lbrack {
+        return parse_class(pat, pos)
+    }
+    if b == b_lparen {
+        return parse_group(pat, pos, ngroup)
+    }
+    if b == b_star || b == b_plus || b == b_ques {
+        return Err("regex: quantifier with nothing to repeat at byte " + str(pos[0]))
+    }
+    if b == b_bslash {
+        return parse_escape_atom(pat, pos)
+    }
+    pos[0] = pos[0] + 1
+    Ok([IChar(b)])
+}
+
+// parse_group：'(' 后看 '?:' 判非捕获，否则捕获并领取下一个组号
+// parse_group: after '(', peek for '?:' to detect non-capturing; otherwise it
+// captures and claims the next group number
+fn parse_group(pat, mut pos, mut ngroup) {
+    pos[0] = pos[0] + 1
+    let mut capturing = true
+    if rx_peek(pat, pos) == b_q {
+        let save = pos[0]
+        pos[0] = pos[0] + 1
+        if rx_peek(pat, pos) == b_colon {
+            pos[0] = pos[0] + 1
+            capturing = false
+        } else {
+            pos[0] = save
+        }
+    }
+    let idx = ngroup[0] + 1
+    if capturing {
+        ngroup[0] = idx
+    }
+    let body = parse_alt(pat, pos, ngroup)?
+    if rx_peek(pat, pos) != b_rparen {
+        return Err("regex: unterminated group at byte " + str(pos[0]))
+    }
+    pos[0] = pos[0] + 1
+    if capturing {
+        Ok(concat(concat([ISave(2 * idx)], body), [ISave(2 * idx + 1)]))
+    } else {
+        Ok(body)
+    }
+}
+
+// parse_escape_atom：atom 位置上的转义——元字符转义 = 字面量，`\d\w\s` 及其取反 = 类，
+// 控制字符转义 = 对应字节
+// parse_escape_atom: an escape at atom position — metacharacter escapes are
+// literals, `\d\w\s` and their negations are classes, control-character escapes
+// are their byte
+fn parse_escape_atom(pat, mut pos) {
+    pos[0] = pos[0] + 1
+    let c = rx_peek(pat, pos)
+    if c == -1 {
+        return Err("regex: trailing backslash")
+    }
+    pos[0] = pos[0] + 1
+    if c == 100 {
+        let (los, his) = digit_ranges()
+        return Ok([IClass(false, los, his)])
+    }
+    if c == 68 {
+        let (los, his) = digit_ranges()
+        return Ok([IClass(true, los, his)])
+    }
+    if c == 119 {
+        let (los, his) = word_ranges()
+        return Ok([IClass(false, los, his)])
+    }
+    if c == 87 {
+        let (los, his) = word_ranges()
+        return Ok([IClass(true, los, his)])
+    }
+    if c == 115 {
+        let (los, his) = space_ranges()
+        return Ok([IClass(false, los, his)])
+    }
+    if c == 83 {
+        let (los, his) = space_ranges()
+        return Ok([IClass(true, los, his)])
+    }
+    Ok([IChar(escape_literal_byte(c))])
+}
+
+// escape_literal_byte：其余转义一律取「原样字节」（元字符转义）或已知控制字符
+// escape_literal_byte: every other escape is either the byte itself
+// (metacharacter escapes) or a recognized control character
+fn escape_literal_byte(c) {
+    if c == 110 {
+        10
+    } else if c == 116 {
+        9
+    } else if c == 114 {
+        13
+    } else {
+        c
+    }
+}
+
+// parse_class：'[' ... ']'，首字节 '^' 取反；'-' 在首尾或紧跟另一个 '-' 时按字面量，
+// 否则与前一项构成范围；类内 `\d\w\s` 展开进同一张区间表，其余转义按单字节处理
+// parse_class: '[' ... ']', a leading '^' negates; '-' is literal at the edges or
+// right after another '-', otherwise it forms a range with the previous item;
+// `\d\w\s` inside a class expand into the same range table, other escapes are
+// single bytes
+fn parse_class(pat, mut pos) {
+    pos[0] = pos[0] + 1
+    let mut negate = false
+    if rx_peek(pat, pos) == b_caret {
+        negate = true
+        pos[0] = pos[0] + 1
+    }
+    let mut los = []
+    let mut his = []
+    while rx_peek(pat, pos) != b_rbrack {
+        if rx_peek(pat, pos) == -1 {
+            return Err("regex: unterminated character class")
+        }
+        let lo = parse_class_item(pat, pos, los, his)?
+        match lo {
+            None => {},
+            Some(lo_byte) => {
+                let mut hi_byte = lo_byte
+                if rx_peek(pat, pos) == b_dash {
+                    let save = pos[0]
+                    pos[0] = pos[0] + 1
+                    if rx_peek(pat, pos) == b_rbrack || rx_peek(pat, pos) == -1 {
+                        pos[0] = save
+                    } else {
+                        hi_byte = parse_class_char(pat, pos)?
+                    }
+                }
+                push(los, lo_byte)
+                push(his, hi_byte)
+            },
+        }
+    }
+    pos[0] = pos[0] + 1
+    Ok([IClass(negate, los, his)])
+}
+
+// parse_class_item：类内一项——`\d\w\s`（及取反）直接把区间并进 los/his 并回 None，
+// 普通字符 / 单字节转义回 Some(byte) 交上层去判断是否续接范围
+// parse_class_item: one class item — `\d\w\s` (and negations) merge their ranges
+// straight into los/his and return None; an ordinary char or single-byte escape
+// returns Some(byte) for the caller to decide whether a range follows
+fn parse_class_item(pat, mut pos, mut los, mut his) {
+    let b = rx_peek(pat, pos)
+    if b == b_bslash {
+        pos[0] = pos[0] + 1
+        let c = rx_peek(pat, pos)
+        if c == -1 {
+            return Err("regex: trailing backslash in class")
+        }
+        pos[0] = pos[0] + 1
+        if c == 100 {
+            let (dlos, dhis) = digit_ranges()
+            merge_ranges(los, his, dlos, dhis)
+            return Ok(None)
+        }
+        if c == 119 {
+            let (wlos, whis) = word_ranges()
+            merge_ranges(los, his, wlos, whis)
+            return Ok(None)
+        }
+        if c == 115 {
+            let (slos, shis) = space_ranges()
+            merge_ranges(los, his, slos, shis)
+            return Ok(None)
+        }
+        return Ok(Some(escape_literal_byte(c)))
+    }
+    pos[0] = pos[0] + 1
+    Ok(Some(b))
+}
+
+// merge_ranges 接收已在调用侧拆好的 plos/phis（而非一个元组参数）——元组解构对
+// "直接调用结果" 之外的表达式（比如函数参数）目前推不出元组类型，绕开即可
+// merge_ranges takes plos/phis already destructured at the call site (rather
+// than one tuple parameter) — tuple destructuring currently can't infer a tuple
+// type for anything other than a direct call result (e.g. a function parameter),
+// so this just routes around it
+fn merge_ranges(mut los, mut his, plos, phis) {
+    let mut i = 0
+    while i < len(plos) {
+        push(los, plos[i])
+        push(his, phis[i])
+        i = i + 1
+    }
+}
+
+// parse_class_char：范围右端单字节（不接受在此处再展开 `\d` 这类简写）
+// parse_class_char: a range's right edge as a single byte (a `\d`-style
+// shorthand cannot appear here)
+fn parse_class_char(pat, mut pos) {
+    let b = rx_peek(pat, pos)
+    if b == b_bslash {
+        pos[0] = pos[0] + 1
+        let c = rx_peek(pat, pos)
+        if c == -1 {
+            return Err("regex: trailing backslash in class")
+        }
+        pos[0] = pos[0] + 1
+        return Ok(escape_literal_byte(c))
+    }
+    pos[0] = pos[0] + 1
+    Ok(b)
+}
+
+// ===== Pike VM：把 Split/Jmp/Save/断言全在 build_closure 的 ε-闭包里展开，
+// (list_pcs, list_caps) 这对并行数组只留「消耗字节」或「匹配成功」两类指令；同位置
+// visited 去重防止环视量词无限展开。用显式栈迭代（而非递归）：栈是 LIFO，Split 的
+// 两条分支要按 d1 整支先于 d2 的深度优先顺序展开，故入栈顺序反过来——先压 d2、后压
+// d1，d1 才会先弹出、其派生的后续帧全部压在 d2 之上，直到那一支耗尽才轮到 d2，正是
+// 深度优先要的顺序。线程表一律用 (pcs, capss) 并行数组表示，不用「一个装 (int,
+// [int]) 元组的数组」——后者在本仓其它地方从未出现过，元组包着堆内容、又被塞进数组
+// 长期存活到跨越好几轮分配之后，会撞见 GC 处理这类嵌套值的一个边界（现象：数组
+// 长度在没有任何写入路径的情况下变化，见 reports/ROADMAP.md 的记录）；并行数组是
+// 整个编译器自身早就在用、久经验证的写法，绕开即可。
+// ===== Pike's VM: Split/Jmp/Save/assertions are all expanded inside
+// build_closure's epsilon closure; the (list_pcs, list_caps) parallel arrays
+// only ever hold "consumes a byte" or "matched" instructions; a per-position
+// visited set dedupes to stop repetition-around-repetition patterns from
+// expanding forever. Uses an explicit stack (iterative, not recursive): a stack
+// is LIFO, and Split's two branches must unfold in depth-first order — d1's
+// whole subtree before d2 — so the push order is reversed: push d2 first, then
+// d1, so d1 pops first and everything it derives stacks on top of d2 until that
+// branch is exhausted, which is exactly the depth-first order required. Thread
+// lists are represented as (pcs, capss) parallel arrays throughout, never as
+// "an array holding (int, [int]) tuples" — the latter shape appears nowhere
+// else in this repo, and a tuple wrapping heap content that then lives inside
+// an array across several allocation rounds runs into an edge the GC has with
+// nested values like that (symptom: an array's length changing with no write
+// path that could have done it — see the note in reports/ROADMAP.md). Parallel
+// arrays are the compiler's own long-proven idiom, so this just routes around it.
+
+fn build_closure(prog, start_pc, start_caps, at_pos, input, mut list_pcs, mut list_caps, mut visited) {
+    let mut stack_pc = [start_pc]
+    let mut stack_caps = [start_caps]
+    while len(stack_pc) > 0 {
+        let pc = pop(stack_pc)
+        let caps = pop(stack_caps)
+        if !visited[pc] {
+            visited[pc] = true
+            match prog[pc] {
+                Inst::IJmp(d) => {
+                    push(stack_pc, pc + 1 + d)
+                    push(stack_caps, caps)
+                },
+                Inst::ISplit(d1, d2) => {
+                    push(stack_pc, pc + 1 + d2)
+                    push(stack_caps, caps)
+                    push(stack_pc, pc + 1 + d1)
+                    push(stack_caps, caps)
+                },
+                Inst::ISave(slot) => {
+                    let mut caps2 = slice(caps, 0, len(caps))
+                    caps2[slot] = at_pos
+                    push(stack_pc, pc + 1)
+                    push(stack_caps, caps2)
+                },
+                Inst::IAssertStart => {
+                    if at_pos == 0 {
+                        push(stack_pc, pc + 1)
+                        push(stack_caps, caps)
+                    }
+                },
+                Inst::IAssertEnd => {
+                    if at_pos == str_len(input) {
+                        push(stack_pc, pc + 1)
+                        push(stack_caps, caps)
+                    }
+                },
+                _ => {
+                    push(list_pcs, pc)
+                    push(list_caps, caps)
+                },
+            }
+        }
+    }
+}
+
+// run_at 跑 Pike VM，从 start 处尝试锚定匹配（不做起点扫描，那是 find 的职责）
+// run_at runs the Pike VM, attempting an anchored match starting exactly at
+// start (it does not scan start positions — that's find's job)
+fn run_at(r, input, start) {
+    match r {
+        Regex::Regex(prog, nslots) => run_prog_at(prog, nslots, input, start),
+    }
+}
+
+fn run_prog_at(prog, nslots, input, start) {
+    let n = len(prog)
+    let mut pos = start
+    let mut clist_pcs = []
+    let mut clist_caps = []
+    let mut v0 = make_bools(n)
+    build_closure(prog, 0, make_ints(nslots), pos, input, clist_pcs, clist_caps, v0)
+    let mut matched = None
+    while true {
+        let mut nlist_pcs = []
+        let mut nlist_caps = []
+        let mut v1 = make_bools(n)
+        let mut i = 0
+        let mut stop = false
+        while i < len(clist_pcs) && !stop {
+            let pc = clist_pcs[i]
+            let caps = clist_caps[i]
+            match prog[pc] {
+                Inst::IChar(c) => {
+                    if pos < str_len(input) && byte_at(input, pos) == c {
+                        build_closure(prog, pc + 1, caps, pos + 1, input, nlist_pcs, nlist_caps, v1)
+                    }
+                },
+                Inst::IAny => {
+                    if pos < str_len(input) && byte_at(input, pos) != 10 {
+                        build_closure(prog, pc + 1, caps, pos + 1, input, nlist_pcs, nlist_caps, v1)
+                    }
+                },
+                Inst::IClass(negate, los, his) => {
+                    if pos < str_len(input) && class_matches(negate, los, his, byte_at(input, pos)) {
+                        build_closure(prog, pc + 1, caps, pos + 1, input, nlist_pcs, nlist_caps, v1)
+                    }
+                },
+                Inst::IMatch => {
+                    matched = Some(caps)
+                    stop = true
+                },
+                _ => {},
+            }
+            i = i + 1
+        }
+        clist_pcs = nlist_pcs
+        clist_caps = nlist_caps
+        if pos >= str_len(input) || len(clist_pcs) == 0 {
+            return matched
+        }
+        pos = pos + 1
+    }
+    matched
+}
+
+fn make_bools(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        push(out, false)
+        i = i + 1
+    }
+    out
+}
+
+fn make_ints(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        push(out, -1)
+        i = i + 1
+    }
+    out
+}
+
+// slots_to_match 把原始捕获槽位数组包成 Match（槽 0/1 = 整段匹配，2k/2k+1 = 第 k 组）
+// slots_to_match wraps a raw capture-slot array into a Match (slots 0/1 are the
+// whole match, 2k/2k+1 are group k)
+fn slots_to_match(input, slots) {
+    let ngroups = len(slots) / 2 - 1
+    let mut gs = []
+    let mut ge = []
+    let mut i = 1
+    while i <= ngroups {
+        push(gs, slots[2 * i])
+        push(ge, slots[2 * i + 1])
+        i = i + 1
+    }
+    record { start: slots[0], end: slots[1], text: substr(input, slots[0], slots[1] - slots[0]), group_starts: gs, group_ends: ge }
+}
+
+// ===== 公开 API：编译一次、Regex 上挂方法反复匹配 =====
+// ===== public API: compile once, match repeatedly through methods on Regex =====
+
+impl Regex {
+    // is_match 判断 s 中是否存在任意位置的匹配
+    // is_match tells whether s contains a match anywhere
+    fn (r: Regex) is_match(s) {
+        match r.find(s) {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    // find 找 s 中最左的匹配（逐起点扫描，见文件头「匹配语义」）
+    // find locates the leftmost match in s (scanning start positions, see the
+    // file header's "match semantics")
+    fn (r: Regex) find(s) {
+        r.find_at(s, 0)
+    }
+
+    // find_at 找 s 中从 from 开始向右的最左匹配
+    // find_at locates the leftmost match in s starting the scan at from
+    fn (r: Regex) find_at(s, from) {
+        let mut i = from
+        let mut result = None
+        let mut going = true
+        while i <= str_len(s) && going {
+            match run_at(r, s, i) {
+                Some(slots) => {
+                    result = Some(slots_to_match(s, slots))
+                    going = false
+                },
+                None => {},
+            }
+            i = i + 1
+        }
+        result
+    }
+
+    // find_all 找 s 中全部不重叠匹配（空匹配后强制前进 1 字节，防止死循环）
+    // find_all locates every non-overlapping match in s (an empty match forces a
+    // 1-byte advance, so it cannot loop forever)
+    fn (r: Regex) find_all(s) {
+        let mut out = []
+        let mut i = 0
+        let mut going = true
+        while i <= str_len(s) && going {
+            match r.find_at(s, i) {
+                Some(m) => {
+                    push(out, m)
+                    if m.end > m.start {
+                        i = m.end
+                    } else {
+                        i = m.end + 1
+                    }
+                },
+                None => {
+                    going = false
+                },
+            }
+        }
+        out
+    }
+
+    // replace 把 s 中第一个匹配换成 repl（`$N`/`$$` 见 expand_replacement）
+    // replace substitutes s's first match with repl (`$N`/`$$`, see
+    // expand_replacement)
+    fn (r: Regex) replace(s, repl) {
+        match r.find(s) {
+            Some(m) => substr(s, 0, m.start) + expand_replacement(repl, s, m) + substr(s, m.end, str_len(s) - m.end),
+            None => s,
+        }
+    }
+
+    // replace_all 把 s 中全部不重叠匹配依次替换
+    // replace_all substitutes every non-overlapping match in s in turn
+    fn (r: Regex) replace_all(s, repl) {
+        let mut out = ""
+        let mut i = 0
+        let mut going = true
+        while i <= str_len(s) && going {
+            match r.find_at(s, i) {
+                Some(m) => {
+                    out = out + substr(s, i, m.start - i) + expand_replacement(repl, s, m)
+                    if m.end > m.start {
+                        i = m.end
+                    } else {
+                        if m.end < str_len(s) {
+                            out = out + substr(s, m.end, 1)
+                        }
+                        i = m.end + 1
+                    }
+                },
+                None => {
+                    out = out + substr(s, i, str_len(s) - i)
+                    going = false
+                },
+            }
+        }
+        out
+    }
+
+    // split 按全部不重叠匹配切分 s，分隔符本身不进结果
+    // split cuts s at every non-overlapping match; the separators themselves are
+    // dropped from the result
+    fn (r: Regex) split(s) {
+        let mut out = []
+        let mut i = 0
+        let mut last = 0
+        let mut going = true
+        while i <= str_len(s) && going {
+            match r.find_at(s, i) {
+                Some(m) => {
+                    push(out, substr(s, last, m.start - last))
+                    last = m.end
+                    if m.end > m.start {
+                        i = m.end
+                    } else {
+                        i = m.end + 1
+                    }
+                },
+                None => {
+                    going = false
+                },
+            }
+        }
+        push(out, substr(s, last, str_len(s) - last))
+        out
+    }
+}
+
+// expand_replacement 展开替换模板：`$0` 整段匹配、`$1..` 分组（未匹配的组展开为
+// 空串）、`$$` 字面 `$`；其余 `$` 后随非数字非 `$` 字符按字面量原样保留
+// expand_replacement expands a replacement template: `$0` is the whole match,
+// `$1..` are groups (an unmatched group expands to empty), `$$` is a literal
+// `$`; any other character right after `$` is kept as-is
+fn expand_replacement(repl, s, m: Match) {
+    let mut out = ""
+    let mut i = 0
+    while i < str_len(repl) {
+        let c = byte_at(repl, i)
+        if c == 36 && i + 1 < str_len(repl) {
+            let d = byte_at(repl, i + 1)
+            if d == 36 {
+                out = out + "$"
+                i = i + 2
+            } else if d >= 48 && d <= 57 {
+                let mut j = i + 1
+                let mut n = 0
+                while j < str_len(repl) && byte_at(repl, j) >= 48 && byte_at(repl, j) <= 57 {
+                    n = n * 10 + (byte_at(repl, j) - 48)
+                    j = j + 1
+                }
+                out = out + group_text(s, m, n)
+                i = j
+            } else {
+                out = out + substr(repl, i, 1)
+                i = i + 1
+            }
+        } else {
+            out = out + substr(repl, i, 1)
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn group_text(s, m: Match, n) {
+    if n == 0 {
+        return m.text
+    }
+    let idx = n - 1
+    if idx < 0 || idx >= len(m.group_starts) {
+        return ""
+    }
+    let gs = m.group_starts[idx]
+    let ge = m.group_ends[idx]
+    if gs < 0 || ge < 0 {
+        ""
+    } else {
+        substr(s, gs, ge - gs)
+    }
+}

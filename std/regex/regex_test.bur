@@ -1,0 +1,194 @@
+// regex_test.bur — std/regex 的 bur test 套件
+// bur test suite for std/regex
+
+fn ok_regex(pattern) {
+    match parse(pattern) {
+        Ok(r) => r,
+        Err(msg) => {
+            assert(false, "pattern should compile: " + pattern + " (" + msg + ")")
+            Regex::Regex([IMatch], 2)
+        },
+    }
+}
+
+fn test_literal_match() {
+    let r = ok_regex("abc")
+    assert(r.is_match("xxabcyy"), "literal found mid-string")
+    assert(!r.is_match("abd"), "literal absent")
+}
+
+fn test_compile_error_unbalanced() {
+    match parse("(abc") {
+        Ok(_) => assert(false, "unterminated group must not compile"),
+        Err(_) => {},
+    }
+    match parse("abc)") {
+        Ok(_) => assert(false, "stray ) must not compile"),
+        Err(_) => {},
+    }
+    match parse("*abc") {
+        Ok(_) => assert(false, "leading quantifier must not compile"),
+        Err(_) => {},
+    }
+}
+
+fn test_dot_and_anchors() {
+    let r = ok_regex("^a.c$")
+    assert(r.is_match("abc"), "dot matches any byte")
+    assert(!r.is_match("a\nc"), "dot excludes newline")
+    assert(!r.is_match("xabc"), "^ anchors to string start")
+    assert(!r.is_match("abcx"), "$ anchors to string end")
+}
+
+fn test_star_plus_ques() {
+    let star = ok_regex("ab*c")
+    assert(star.is_match("ac"), "* allows zero")
+    assert(star.is_match("abbbc"), "* allows many")
+    let plus = ok_regex("ab+c")
+    assert(!plus.is_match("ac"), "+ requires at least one")
+    assert(plus.is_match("abc"), "+ allows one")
+    let ques = ok_regex("ab?c")
+    assert(ques.is_match("ac"), "? allows zero")
+    assert(ques.is_match("abc"), "? allows one")
+    assert(!ques.is_match("abbc"), "? forbids two")
+}
+
+fn test_greedy_find_picks_longest_star() {
+    let r = ok_regex("a*")
+    match r.find("aaab") {
+        Some(m) => assert(m.text == "aaa", "greedy * takes the longest run"),
+        None => assert(false, "a* always matches (possibly empty)"),
+    }
+}
+
+fn test_bounded_repeat() {
+    let exact = ok_regex("a{{3}")
+    assert(exact.is_match("aaa"), "{{3} matches exactly 3")
+    assert(!exact.is_match("aa"), "{{3} rejects 2")
+    let range = ok_regex("^a{{2,4}$")
+    assert(!range.is_match("a"), "{{2,4} rejects 1")
+    assert(range.is_match("aa"), "{{2,4} accepts 2")
+    assert(range.is_match("aaaa"), "{{2,4} accepts 4")
+    assert(!range.is_match("aaaaa"), "{{2,4} rejects 5")
+    let unbounded = ok_regex("^a{{2,}$")
+    assert(!unbounded.is_match("a"), "{{2,} rejects 1")
+    assert(unbounded.is_match("aaaaaa"), "{{2,} accepts many")
+    match parse("a{{5,2}") {
+        Ok(_) => assert(false, "max below min must not compile"),
+        Err(_) => {},
+    }
+}
+
+fn test_char_class() {
+    let r = ok_regex("[a-c]+")
+    assert(r.is_match("bbc"), "range class matches inside")
+    assert(!r.is_match("xyz"), "range class rejects outside")
+    let neg = ok_regex("^[^0-9]+$")
+    assert(neg.is_match("abc"), "negated class accepts non-digits")
+    assert(!neg.is_match("ab1"), "negated class rejects a digit")
+    let dash_edge = ok_regex("[a-]")
+    assert(dash_edge.is_match("-"), "trailing '-' in a class is literal")
+}
+
+fn test_shorthand_classes() {
+    let d = ok_regex("^\\d+$")
+    assert(d.is_match("12345"), "\\d matches digits")
+    assert(!d.is_match("12a45"), "\\d rejects a letter")
+    let w = ok_regex("^\\w+$")
+    assert(w.is_match("abc_123"), "\\w matches word chars")
+    assert(!w.is_match("abc-123"), "\\w rejects a dash")
+    let s = ok_regex("a\\sb")
+    assert(s.is_match("a b"), "\\s matches a space")
+    assert(s.is_match("a\tb"), "\\s matches a tab")
+    let notd = ok_regex("^\\D+$")
+    assert(notd.is_match("abc"), "\\D matches non-digits")
+    assert(!notd.is_match("a1c"), "\\D rejects a digit")
+    let mixed = ok_regex("^[\\da-f]+$")
+    assert(mixed.is_match("0a1b2c"), "shorthand inside a class merges ranges")
+}
+
+fn test_alternation_and_groups() {
+    let alt = ok_regex("cat|dog")
+    assert(alt.is_match("I have a dog"), "alternation matches second branch")
+    assert(alt.is_match("cats"), "alternation matches first branch")
+    assert(!alt.is_match("fish"), "alternation rejects neither")
+    let grp = ok_regex("(ab)+")
+    match grp.find("ababab") {
+        Some(m) => assert(m.text == "ababab", "group repetition covers the whole run"),
+        None => assert(false, "(ab)+ must match"),
+    }
+    let noncap = ok_regex("(?:ab)+c")
+    assert(noncap.is_match("ababc"), "non-capturing group still repeats")
+}
+
+fn test_capture_groups() {
+    let r = ok_regex("(\\d+)-(\\d+)")
+    match r.find("phone: 555-1234") {
+        Some(m) => {
+            assert(len(m.group_starts) == 2, "two capture groups recorded")
+            let g1 = substr("phone: 555-1234", m.group_starts[0], m.group_ends[0] - m.group_starts[0])
+            let g2 = substr("phone: 555-1234", m.group_starts[1], m.group_ends[1] - m.group_starts[1])
+            assert(g1 == "555", "first group captured")
+            assert(g2 == "1234", "second group captured")
+        },
+        None => assert(false, "phone pattern must match"),
+    }
+}
+
+fn test_optional_group_unmatched_is_negative_one() {
+    let r = ok_regex("a(b)?c")
+    match r.find("ac") {
+        Some(m) => assert(m.group_starts[0] == -1 && m.group_ends[0] == -1, "unmatched optional group reports -1"),
+        None => assert(false, "a(b)?c must match ac"),
+    }
+}
+
+fn test_escapes() {
+    let r = ok_regex("a\\.b\\*c")
+    assert(r.is_match("a.b*c"), "escaped metacharacters match literally")
+    assert(!r.is_match("axbyc"), "unescaped stand-ins do not match")
+}
+
+fn test_find_all() {
+    let r = ok_regex("\\d+")
+    let ms = r.find_all("a12 b345 c6")
+    assert(len(ms) == 3, "three numeric runs found")
+    assert(ms[0].text == "12", "first run")
+    assert(ms[1].text == "345", "second run")
+    assert(ms[2].text == "6", "third run")
+}
+
+fn test_find_all_empty_matches_terminate() {
+    let r = ok_regex("a*")
+    let ms = r.find_all("baab")
+    assert(len(ms) > 0, "find_all on a* over baab terminates with results")
+}
+
+fn test_replace_and_replace_all() {
+    let r = ok_regex("\\d+")
+    assert(r.replace("a12b34", "#") == "a#b34", "replace only touches the first match")
+    assert(r.replace_all("a12b34", "#") == "a#b#", "replace_all touches every match")
+}
+
+fn test_replace_backreferences() {
+    let r = ok_regex("(\\w+)@(\\w+)")
+    assert(r.replace("user@host", "$2:$1") == "host:user", "$N substitutes capture groups")
+    assert(r.replace("user@host", "$$$1") == "$user", "$$ is a literal dollar sign")
+}
+
+fn test_split() {
+    let r = ok_regex(",\\s*")
+    let parts = r.split("a, b,c ,  d")
+    assert(len(parts) == 4, "split on comma-plus-spaces gives four fields")
+    assert(parts[0] == "a", "first field")
+    assert(parts[1] == "b", "second field")
+    assert(parts[2] == "c ", "third field keeps its own trailing space")
+    assert(parts[3] == "d", "fourth field")
+}
+
+fn test_max_repeat_guard() {
+    match parse("a{{100000}") {
+        Ok(_) => assert(false, "an absurd repeat count must be rejected"),
+        Err(_) => {},
+    }
+}
