@@ -399,6 +399,10 @@ check 管线须支持从内存源码运行（LSP 核心工程改造点）。
 - signature-help：函数调用时显示参数信息，native 内建走同一张签名表
 - references：光标落在声明名或使用处都归一到同一绑定，再列出全部使用位置
 - documentSymbol：按文档列出顶层声明的全区间与名区间
+- documentHighlight：与 references 同一归一集合，落回当前文档并标 kind
+- rename / prepareRename：复用 references 的归一集合把每个位置转成一条
+  `TextEdit`；native 内建（`declare(..., Sp(0, 0))`，`cur_file` 为空串）在这三个
+  特性上一律判定为不可定位，返回空结果而不是把毫不相关的同名 native 揉进一组
 
 **编辑器客户端**：
 

@@ -4,12 +4,20 @@
 # 断言：能力位、formatting 全文编辑与 fmt 引擎一致、已格式化空编辑、坏代码 null、
 # completion 作用域感知（内层可见外层、块出即遮蔽、global fn 标 Function）、
 # signature-help（activeParameter 按实参区间、参数在标签内定位、方法剔 receiver、
-# 调用外 null）。
+# 调用外 null）、documentHighlight（与 references 同一归一集合）、
+# prepareRename/rename（光标落声明或使用处等价、WorkspaceEdit 覆盖全部位置）、
+# native 内建在 references/rename/documentHighlight 上一律空结果（回归：native
+# 全体共用 declare(..., Sp(0, 0))，未加判据会把毫不相关的 native 揉进同一组）。
 # Asserts: capability bits, formatting full-document edit parity with the fmt
 # engine, empty edits on already-clean input, null on broken code, scope-aware
 # completion (inner sees outer, shadowing on block exit, global functions
-# tagged Function), and signature-help (activeParameter from argument spans,
-# parameter labels within the label, method receiver excluded, null off-call).
+# tagged Function), signature-help (activeParameter from argument spans,
+# parameter labels within the label, method receiver excluded, null off-call),
+# documentHighlight (same normalized set as references), prepareRename/rename
+# (cursor on declaration or use is equivalent, WorkspaceEdit covers every
+# site), and native builtins yielding empty results on references/rename/
+# documentHighlight (regression: every native shares declare(..., Sp(0, 0)),
+# and without a guard that lumps unrelated natives into one group).
 # Usage: BUR=<compiler> ./scripts/lsp-verify.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -69,6 +77,8 @@ check("capabilities", caps.get("documentFormattingProvider") is True
       and caps.get("signatureHelpProvider") is not None
       and caps.get("referencesProvider") is True
       and caps.get("documentSymbolProvider") is True
+      and caps.get("documentHighlightProvider") is True
+      and caps.get("renameProvider", {}).get("prepareProvider") is True
       and caps.get("completionProvider", {}).get("triggerCharacters") == [":"])
 send("initialized", {})
 
@@ -213,6 +223,55 @@ check("documentSymbol lists top-level decls",
       dmap.get("helper") == 12 and dmap.get("add3") == 12
       and dmap.get("main") == 12 and dmap.get("topv") == 14
       and len(dsl) == 4)
+
+# documentHighlight：与 references 同一归一集合（决定用其中一个正确，
+# 两者内容也该一致），一律带 kind
+hl = req("textDocument/documentHighlight", {"textDocument": {"uri": muri},
+                                            "position": {"line": ln_top, "character": 4}})
+hll = hl["result"] or []
+check("documentHighlight matches references count and carries kind",
+      len(hll) == 3 and all(h["kind"] == 1 for h in hll)
+      and {(h["range"]["start"]["line"], h["range"]["start"]["character"]) for h in hll}
+      == {(r["range"]["start"]["line"], r["range"]["start"]["character"]) for r in r_all})
+
+# prepareRename：光标落声明或使用处都给出同一枚符号的区间
+def prep(ln, chv):
+    r = req("textDocument/prepareRename", {"textDocument": {"uri": muri},
+                                           "position": {"line": ln, "character": chv}})
+    return r["result"]
+
+prep_decl = prep(ln_top, 4)
+check("prepareRename on declaration returns the `topv` span",
+      prep_decl is not None and prep_decl["start"] == {"line": ln_top, "character": 4}
+      and prep_decl["end"]["character"] - prep_decl["start"]["character"] == len("topv"))
+prep_use = prep(ln_use1, mlines[ln_use1].index("topv"))
+check("prepareRename on a use returns the same span shape",
+      prep_use is not None
+      and prep_use["end"]["character"] - prep_use["start"]["character"] == len("topv"))
+
+# rename：WorkspaceEdit 覆盖声明与全部使用位置，newText 一致
+ren = req("textDocument/rename", {"textDocument": {"uri": muri},
+                                  "position": {"line": ln_use1, "character": mlines[ln_use1].index("topv")},
+                                  "newName": "topv2"})
+changes = (ren["result"] or {}).get("changes", {})
+check("rename returns a WorkspaceEdit covering declaration and every use",
+      list(changes.keys()) == [muri] and len(changes[muri]) == 3
+      and all(e["newText"] == "topv2" for e in changes[muri]))
+
+# native 内建：references/documentHighlight/prepareRename/rename 一律空结果
+# （回归：native 全体共用 declare(..., Sp(0, 0))，未加判据会互相牵连）
+ln_native = ln_pl
+ch_native = mlines[ln_native].index("println") + 2
+check("references on a native builtin is empty",
+      refs(ln_native, ch_native, True) == [])
+hl_native = req("textDocument/documentHighlight", {"textDocument": {"uri": muri},
+                                                    "position": {"line": ln_native, "character": ch_native}})
+check("documentHighlight on a native builtin is empty", hl_native["result"] == [])
+check("prepareRename on a native builtin is null", prep(ln_native, ch_native) is None)
+ren_native = req("textDocument/rename", {"textDocument": {"uri": muri},
+                                         "position": {"line": ln_native, "character": ch_native},
+                                         "newName": "whatever"})
+check("rename on a native builtin is null", ren_native["result"] is None)
 
 # 方法签名（receiver 剔除）：方法仅脚本模式可用，用单文件脚本 fixture；
 # 每次检查只保留最后一份文档的录制，故脚本用例必须放最后
