@@ -471,6 +471,17 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + sched_bytes + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + waitset_add_bytes + timer_add_bytes
     let mut func_offsets = []
     let mut variant_offsets = []
+    // pdata_offsets/pdata_lens：每个变体的 (funcs_bytes 内偏移, 字节长度)，按发射顺序
+    // 记录——与 func_offsets/variant_offsets 按 vi==0 分流不同，这两个不分流，直接
+    // 保留发射顺序，即地址升序，供 PE .pdata 的 RUNTIME_FUNCTION 数组（要求按
+    // BeginAddress 升序）使用
+    // pdata_offsets/pdata_lens: each variant's (offset within funcs_bytes, byte
+    // length), recorded in emission order — unlike func_offsets/variant_offsets
+    // which split on vi==0, these two don't split; emission order is address
+    // order, which is what PE .pdata's RUNTIME_FUNCTION array needs (it must be
+    // sorted ascending by BeginAddress)
+    let mut pdata_offsets = []
+    let mut pdata_lens = []
     let mut fh = 0
     while fh < nfn {
         let vsigs = fn_variants[fh]
@@ -482,7 +493,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             } else {
                 push(variant_offsets, str_len(funcs_bytes))
             }
+            push(pdata_offsets, str_len(funcs_bytes))
             let fbytes = emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, en_vnames, nfn, f2s_h, p_depth_maps, pt_target_shadow, pd_sink, globals_map, n_globals, global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, record_field_types, enum_field_types, enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr)
+            push(pdata_lens, str_len(fbytes))
             funcs_bytes = funcs_bytes + fbytes
             vi = vi + 1
         }
@@ -583,7 +596,32 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         let runtime_with_fd = runtime_with_thunk + fd_fill + wsa_fill
         let imports = pe_build_imports(import_dlls, import_counts, import_names, idata_off)
-        emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports, start_off, idata_off, str_len(imports))
+        // .pdata：紧接导入表，4B 对齐（RUNTIME_FUNCTION 三个字段皆 DWORD）；数组在前、
+        // 共享 UNWIND_INFO 在后。用户函数序言形态唯一（natives.bur 的
+        // x86gen_prologue：push rbp + sub rsp,8），故全程序共享一份 UNWIND_INFO；
+        // GC/调度器等内部子程序不建标准帧或做原生纤程切栈，本轮不纳入 .pdata 覆盖
+        // （未覆盖地址落回 Windows 默认的叶函数假设，不劣于改动前的现状）。
+        // .pdata: right after the import table, 4B-aligned (all three
+        // RUNTIME_FUNCTION fields are DWORDs); the array first, the shared
+        // UNWIND_INFO after. User functions share one prologue shape
+        // (natives.bur's x86gen_prologue: push rbp + sub rsp,8), so one shared
+        // UNWIND_INFO covers all of them. The GC/scheduler internals don't build
+        // a standard frame or do raw fiber stack-switching, so they're left out
+        // of .pdata coverage this round (an uncovered address falls back to
+        // Windows' default leaf-function assumption, no worse than before this
+        // change).
+        let code_base_off = str_len(runtime_with_fd) + str_len(const_data)
+        let idata_end = idata_off + str_len(imports)
+        let pdata_off = pe_align(idata_end, 4)
+        let mut pdata_pad = ""
+        let mut ppi = idata_end
+        while ppi < pdata_off {
+            pdata_pad = pdata_pad + byte_chr(0)
+            ppi = ppi + 1
+        }
+        let unwind_off = pdata_off + 12 * len(pdata_offsets)
+        let pdata_bytes = pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
+        emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports + pdata_pad + pdata_bytes + pe_unwind_info(), start_off, idata_off, str_len(imports), pdata_off, str_len(pdata_bytes))
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
         // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），

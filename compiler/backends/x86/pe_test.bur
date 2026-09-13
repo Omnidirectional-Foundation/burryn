@@ -1,0 +1,31 @@
+// pe_test.bur — pe.bur 的 bur test 套件：.pdata / UNWIND_INFO 编码
+// bur test suite for pe.bur: .pdata / UNWIND_INFO encoding
+
+fn test_pe_unwind_info() {
+    let uw = pe_unwind_info()
+    let want = byte_chr(1) + byte_chr(5) + byte_chr(2) + byte_chr(0) + byte_chr(5) + byte_chr(2) + byte_chr(1) + byte_chr(80)
+    assert(uw == want, "header(ver1/flags0,prolog5,codes2,frame0) + ALLOC_SMALL(sub rsp,8 @5) + PUSH_NONVOL(rbp=5 @1)")
+}
+
+fn test_pe_build_pdata_single() {
+    let pdata = pe_build_pdata([0], [100], 4096, 5000)
+    let want = e4(pe_content_rva(4096)) + e4(pe_content_rva(4196)) + e4(pe_content_rva(5000))
+    assert(pdata == want, "single RUNTIME_FUNCTION: begin/end/unwind RVAs")
+}
+
+// 前提：offs/lens 已按调用方发射顺序（=地址升序）传入，本函数只逐项映射，不排序
+// precondition: offs/lens arrive in the caller's emission order (= ascending
+// address); this function only maps entries across, it does not sort
+fn test_pe_build_pdata_multi_shares_one_unwind() {
+    let code_base = 4096
+    let unwind_off = 9999
+    let offs = [0, 100, 250]
+    let lens = [50, 100, 30]
+    let pdata = pe_build_pdata(offs, lens, code_base, unwind_off)
+    let want = e4(pe_content_rva(code_base + 0)) + e4(pe_content_rva(code_base + 50)) + e4(pe_content_rva(unwind_off)) + e4(pe_content_rva(code_base + 100)) + e4(pe_content_rva(code_base + 200)) + e4(pe_content_rva(unwind_off)) + e4(pe_content_rva(code_base + 250)) + e4(pe_content_rva(code_base + 280)) + e4(pe_content_rva(unwind_off))
+    assert(pdata == want, "3 entries: begin=base+off, end=begin+len, all sharing one UnwindInfoAddress")
+}
+
+fn test_pe_build_pdata_empty() {
+    assert(pe_build_pdata([], [], 4096, 5000) == "", "no functions means an empty RUNTIME_FUNCTION array")
+}

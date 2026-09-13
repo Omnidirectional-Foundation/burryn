@@ -5,7 +5,7 @@
 // emit_pe 装配 PE32+：头区(512B) + 内容(补齐 512)；入口在内容内 entry_off 处
 // emit_pe assembles the PE32+: 512-byte header area + content (padded to 512);
 // the entry point sits at entry_off within the content
-pub fn emit_pe(content, entry_off, idata_off, idata_len) {
+pub fn emit_pe(content, entry_off, idata_off, idata_len, pdata_off, pdata_len) {
     let mut padded = content
     let n = str_len(content) % 512
     if n != 0 {
@@ -17,7 +17,7 @@ pub fn emit_pe(content, entry_off, idata_off, idata_len) {
         }
         padded = padded + pz
     }
-    pe_emit_headers(entry_off, str_len(content), idata_off, idata_len) + padded
+    pe_emit_headers(entry_off, str_len(content), idata_off, idata_len, pdata_off, pdata_len) + padded
 }
 
 // pe_build_imports 生成导入 blob；dll_names 与 fn_counts 等长（每 DLL 的函数数），
@@ -574,7 +574,7 @@ pub fn pe_build_dispatcher(iat) {
 // pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 单节表
 // pe_emit_headers lays out DOS + COFF + PE32+ optional header (240B with 16 data
 // directories) + the single section table
-pub fn pe_emit_headers(entry_off, content_len, idata_off, idata_len) {
+pub fn pe_emit_headers(entry_off, content_len, idata_off, idata_len, pdata_off, pdata_len) {
     // DOS：MZ 魔数 + e_lfanew=64，其余补零
     // DOS: MZ magic + e_lfanew=64, zero padding elsewhere
     let mut dos = "MZ"
@@ -589,12 +589,15 @@ pub fn pe_emit_headers(entry_off, content_len, idata_off, idata_len) {
     let coff = "PE" + byte_chr(0) + byte_chr(0) + e2(34404) + e2(1) + e4(0) + e4(0) + e4(0) + e2(240) + e2(34)
     let image_size = 4096 + pe_align(content_len, 4096)
     let opt = e2(523) + e1(0) + e1(0) + e4(content_len) + e4(0) + e4(0) + e4(pe_content_rva(entry_off)) + e4(4096) + e8(4194304) + e4(4096) + e4(512) + e2(6) + e2(0) + e2(0) + e2(0) + e2(6) + e2(0) + e4(0) + e4(image_size) + e4(512) + e4(0) + e2(3) + e2(0) + e8(8388608) + e8(1048576) + e8(1048576) + e8(4096) + e4(0) + e4(16)
-    // 16 个数据目录，仅 [1]=导入表非零 / sixteen data directories, only [1]=imports set
+    // 16 个数据目录：[1]=导入表、[3]=异常目录（.pdata），其余零
+    // sixteen data directories: [1]=imports, [3]=exception table (.pdata), rest zero
     let mut dirs = ""
     let mut k = 0
     while k < 16 {
         if k == 1 {
             dirs = dirs + e4(pe_content_rva(idata_off)) + e4(idata_len)
+        } else if k == 3 {
+            dirs = dirs + e4(pe_content_rva(pdata_off)) + e4(pdata_len)
         } else {
             dirs = dirs + e4(0) + e4(0)
         }
@@ -628,6 +631,50 @@ pub fn pe_align(n, a) {
     } else {
         n + a - m
     }
+}
+
+// pe_unwind_info 生成全程序共享的 UNWIND_INFO：用户函数唯一的序言形态（push rbp +
+// sub rsp,8，共 5 字节，见 natives.bur 的 x86gen_prologue）编两条 UNWIND_CODE；
+// 数组按撤销顺序（后发生的先撤销）排列：先 sub rsp,8（UWOP_ALLOC_SMALL，
+// OpInfo=(8/8)-1=0，CodeOffset=5，两条指令末尾），再 push rbp（UWOP_PUSH_NONVOL，
+// OpInfo=5=rbp 的寄存器号，CodeOffset=1）。FrameRegister=0：rbp 存的是调用者 r14
+// 而非栈相对帧基，unwind 按纯 RSP 相对计算。Flags=0（UNW_FLAG_NHANDLER）：不挂异常
+// 处理器，这份 UNWIND_INFO 只服务栈回溯 / 崩溃诊断，不介入实际异常派遣。
+// pe_unwind_info emits the whole-program shared UNWIND_INFO: the sole user-function
+// prologue shape (push rbp + sub rsp,8, 5 bytes total, see natives.bur's
+// x86gen_prologue) encodes as two UNWIND_CODEs, listed in undo order (last
+// executed first): sub rsp,8 (UWOP_ALLOC_SMALL, OpInfo=(8/8)-1=0, CodeOffset=5,
+// the end of both instructions), then push rbp (UWOP_PUSH_NONVOL, OpInfo=5=rbp's
+// register number, CodeOffset=1). FrameRegister=0: rbp holds the caller's r14, not
+// a stack-relative frame base, so unwinding is pure RSP-relative. Flags=0
+// (UNW_FLAG_NHANDLER): no exception handler chained — this UNWIND_INFO only
+// serves stack walking / crash diagnostics, not actual exception dispatch.
+pub fn pe_unwind_info() {
+    let hdr = byte_chr(1) + byte_chr(5) + byte_chr(2) + byte_chr(0)
+    let alloc_small = byte_chr(5) + byte_chr(2)
+    let push_rbp = byte_chr(1) + byte_chr(5 * 16)
+    hdr + alloc_small + push_rbp
+}
+
+// pe_build_pdata 生成 RUNTIME_FUNCTION 数组（每项 12B：BeginAddress/EndAddress/
+// UnwindInfoAddress 三个 RVA）。RtlLookupFunctionEntry 对该表做二分查找，要求按
+// BeginAddress 升序——offs/lens 已按发射顺序（=地址升序）记录，逐项直接映射，
+// 全部指向同一份共享 UNWIND_INFO（unwind_off，内容内偏移）。
+// pe_build_pdata builds the RUNTIME_FUNCTION array (12B/entry: BeginAddress,
+// EndAddress, UnwindInfoAddress RVAs). RtlLookupFunctionEntry binary-searches this
+// table, so it must be sorted ascending by BeginAddress — offs/lens are already in
+// emission order (= ascending address), mapping straight across, every entry
+// pointing at the one shared UNWIND_INFO (unwind_off, a content offset).
+pub fn pe_build_pdata(offs, lens, code_base, unwind_off) {
+    let n = len(offs)
+    let mut blob = ""
+    let mut i = 0
+    while i < n {
+        let begin = code_base + offs[i]
+        blob = blob + e4(pe_content_rva(begin)) + e4(pe_content_rva(begin + lens[i])) + e4(pe_content_rva(unwind_off))
+        i = i + 1
+    }
+    blob
 }
 
 // pe_hints_size 累计 hint/name 段尺寸（每项 2B hint + 名字 + NUL，补偶）
