@@ -707,12 +707,25 @@ fn x86gen_parse_ip_at(off) {
     head
 }
 
-// x86gen_sockaddr_at 构建 sockaddr_in（AF_INET）到 [rsp+16..31]：r9 = port、[rsp+0..3] = IP 四字节
-// x86gen_sockaddr_at builds an AF_INET sockaddr_in at [rsp+16..31]: r9 = port, [rsp+0..3] = four
-// IP bytes
+// x86gen_sockaddr_at 构建 sockaddr_in（AF_INET）到 [rsp+16..31]：r9 = port（主机字节序）、
+// [rsp+0..3] = IP 四字节。f2 做 htons：sin_port 必须是网络字节序，与主机字节序在 x86（小端）
+// 上正好相反；此前 f2 把移位对象错放在 rdx（本该移位的是 rax，即端口低字节），结果是把端口
+// 原样写回、并没有真的交换字节序——所有自建 socket 因此绑定/连接到了字节交换后的错误端口
+// （例如请求 39777 实际落在 24987），只是因为 burryn 自己的 tcp_listen/tcp_dial 两端用的是
+// 同一份（同样错误）编码，彼此还能连上，这个 bug 才一直没被发现，直到 Windows 真机上用外部
+// 校验过字节序的探针去连才暴露出来（见 reports/s8-5-pe-net-arm.md 第十一轮）。
+// x86gen_sockaddr_at builds an AF_INET sockaddr_in at [rsp+16..31]: r9 = port (host byte order),
+// [rsp+0..3] = four IP bytes. f2 performs htons: sin_port must be network byte order, the reverse
+// of host order on x86 (little-endian); f2 used to shift the wrong operand (rdx instead of rax,
+// the port's low byte) and ended up writing the port back unchanged rather than actually
+// swapping it -- every self-made socket was silently bound/connected to the byte-swapped wrong
+// port (e.g. requesting 39777 actually landed on 24987). This went unnoticed because burryn's own
+// tcp_listen/tcp_dial share this same (equally wrong) encoding on both ends, so they still found
+// each other; it only surfaced once a byte-order-correct external probe tried to connect on
+// real Windows hardware (see reports/s8-5-pe-net-arm.md round 11).
 fn x86gen_sockaddr_at() {
     let f1 = mov_ri64(rax, 2) + mov_mr(rsp, 16, rax)
-    let f2 = mov_rr(rax, r9) + mov_ri64(rcx, 8) + mov_rr(rdx, rax) + shr_rcl(rdx) + mov_ri64(rcx, 255) + and_rr(rdx, rcx) + and_rr(rax, rcx) + mov_ri64(rcx, 8) + shl_rcl(rdx) + or_rr(rax, rdx) + mov_mr(rsp, 18, rax)
+    let f2 = mov_rr(rax, r9) + mov_ri64(rcx, 8) + mov_rr(rdx, rax) + shr_rcl(rdx) + mov_ri64(rcx, 255) + and_rr(rdx, rcx) + and_rr(rax, rcx) + mov_ri64(rcx, 8) + shl_rcl(rax) + or_rr(rax, rdx) + mov_mr(rsp, 18, rax)
     let f3 = mov_rm(rax, rsp, 0) + mov_mr(rsp, 20, rax)
     let f4 = xor_rr(rax, rax) + mov_mr(rsp, 24, rax)
     f1 + f2 + f3 + f4
