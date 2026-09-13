@@ -386,7 +386,20 @@ fn x86gen_prologue(arity, _locals, yield_addr, lifted) {
         }
         pslot = pslot + 1
     }
-    push_r(rbp) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1)) + sub_ri32(rsp, 8) + xor_rr(rax, rax) + mov_mr(rsp, 0, rax) + budget + lift_code
+    // 两条真正改 rsp 的指令（push rbp、sub rsp,8）紧挨着排在最前：mov_rr/lea 都不碰
+    // rsp，谁先谁后对它们的正确性没有影响，但对 PE .pdata 的 UNWIND_CODE 有影响——
+    // lea 的位移随 arity 变，disp8/disp32 两种编码长度不同，夹在两条栈操作中间会让
+    // "sub rsp,8 结束于第几字节" 因函数而异；挪到最前，这个字节数就是全程序统一的
+    // 常量（1 字节 push + 4 字节 sub = 5），见 pe.bur 的 pe_unwind_info
+    // The two real rsp-affecting instructions (push rbp, sub rsp,8) sit first:
+    // mov_rr/lea never touch rsp, so their relative order doesn't affect
+    // correctness — but it does affect PE .pdata's UNWIND_CODE. lea's
+    // displacement varies with arity, and its disp8-vs-disp32 encoding differs
+    // in length; sandwiched between the two stack ops, that would make "byte
+    // offset where sub rsp,8 ends" vary per function. Moved to the front, that
+    // offset is a program-wide constant (1-byte push + 4-byte sub = 5), see
+    // pe.bur's pe_unwind_info
+    push_r(rbp) + sub_ri32(rsp, 8) + mov_rr(rbp, r14) + lea(r14, r15, 0 - 8 * (arity + 1)) + xor_rr(rax, rax) + mov_mr(rsp, 0, rax) + budget + lift_code
 }
 
 // x86gen_epilogue 生成函数尾声：返回值落栈并恢复帧
