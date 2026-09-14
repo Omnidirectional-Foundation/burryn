@@ -1,0 +1,45 @@
+// elf_test.bur — elf.bur 的 bur test 套件：.eh_frame CIE/FDE 编码
+// bur test suite for elf.bur: .eh_frame CIE/FDE encoding
+
+fn test_eh_cie_encoding() {
+    let cie = eh_cie()
+    let want = u32(20) + u32(0) + byte_chr(1) + byte_chr(0) + byte_chr(1) + byte_chr(120) + byte_chr(16) + byte_chr(12) + byte_chr(7) + byte_chr(8) + byte_chr(144) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0)
+    assert(cie == want, "length=20, CIE_id=0, version=1, empty augmentation, code_align=1, data_align=-8 (SLEB128 0x78), RA col=16 (rip), def_cfa(rsp,8), offset(rip,cfa-8), 6-byte nop pad to 8-byte alignment")
+}
+
+fn test_elf_eh_frame_single_function() {
+    let eh = elf_eh_frame([0], [20], 4194304)
+    let cie = eh_cie()
+    let fde_content = u32(str_len(cie) + 4) + u64(4194304) + u64(20) + byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(134) + byte_chr(2) + byte_chr(68) + byte_chr(14) + byte_chr(24)
+    let want = cie + u32(str_len(fde_content)) + fde_content
+    assert(eh == want, "one CIE + one FDE: CIE_pointer back to the shared CIE, absolute initial_location/address_range, fixed advance_loc/def_cfa_offset/offset instruction stream")
+}
+
+fn test_elf_eh_frame_multi_functions_share_one_cie() {
+    let eh = elf_eh_frame([0, 100, 250], [50, 100, 30], 4194304)
+    let cie = eh_cie()
+    let instrs = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(134) + byte_chr(2) + byte_chr(68) + byte_chr(14) + byte_chr(24)
+    let fde0_content = u32(str_len(cie) + 4) + u64(4194304 + 0) + u64(50) + instrs
+    let fde0 = u32(str_len(fde0_content)) + fde0_content
+    let fde1_content = u32(str_len(cie) + str_len(fde0) + 4) + u64(4194304 + 100) + u64(100) + instrs
+    let fde1 = u32(str_len(fde1_content)) + fde1_content
+    let fde2_content = u32(str_len(cie) + str_len(fde0) + str_len(fde1) + 4) + u64(4194304 + 250) + u64(30) + instrs
+    let fde2 = u32(str_len(fde2_content)) + fde2_content
+    let want = cie + fde0 + fde1 + fde2
+    assert(eh == want, "3 functions share one CIE; each FDE's CIE_pointer counts back from its own position to the shared CIE's start")
+}
+
+fn test_elf_eh_frame_empty() {
+    assert(elf_eh_frame([], [], 4194304) == eh_cie(), "no functions means the CIE alone, no FDEs")
+}
+
+fn test_elf_shstrtab_layout() {
+    let want = byte_chr(0) + ".eh_frame" + byte_chr(0) + ".shstrtab" + byte_chr(0)
+    assert(elf_shstrtab() == want, "leading NUL, then .eh_frame\\0 at offset 1, then .shstrtab\\0 at offset 11")
+}
+
+fn test_elf_section_header_encoding() {
+    let sh = elf_section_header(1, 1, 4194304, 128, 56)
+    let want = u32(1) + u32(1) + u64(0) + u64(4194304) + u64(128) + u64(56) + u32(0) + u32(0) + u64(1) + u64(0)
+    assert(sh == want, "Elf64_Shdr: name/type/flags/addr/offset/size/link/info/addralign/entsize, 64 bytes total")
+}

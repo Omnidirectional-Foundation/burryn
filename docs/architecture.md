@@ -449,6 +449,45 @@ s8-1-multibackend.md`），归类为「三方一致拒绝」，未按 [`GOALS.md
 （清零：不存在缺陷）满足。`scripts/multi-backend-verify.sh` 的 pass 计数不因此改变
 （改前改后九例都各自贡献一条 PASS，只是四例从"巧合通过的拒绝"变成"真正的成功"）。
 
+### 5.19 ELF `.eh_frame`（DWARF CFI，定案，2026-09-14）
+
+Linux 目标崩溃可诊断性此前是三个格式里唯一没起步的一个（PE `.pdata`/UNWIND_INFO
+与 Mach-O `__unwind_info` 已交付）。本节把 ELF 补齐到同等范围：只覆盖用户函数
+（`natives.bur` 的 `x86gen_prologue`），GC/调度器内部子程序与纤程切换点不覆盖，
+与已交付的 PE/Mach-O 边界一致——不是新缺口，是本轮特意保持的对称。
+
+**格式选择：`.eh_frame` + 最小节头表，不做 `.eh_frame_hdr`/`PT_GNU_EH_FRAME`。**
+这一步不是凭经验假设，是实测定的：在这台机器上分别构造了 (a) 只有
+`PT_GNU_EH_FRAME` 程序头、节头表清零的 ELF，(b) 只有三条节头（NULL/.eh_frame/
+.shstrtab）、没有 `PT_GNU_EH_FRAME` 的 ELF，两者都嵌入同一段真实的多帧调用链
+（crash → b → a）。gdb 13.1 对 (a) 给出的回溯是垃圾（把栈上无关数据当返回地址），
+对 (b) 给出的回溯逐帧精确匹配源级调用链。结论：gdb 的事后调试走节头表按名字定位
+`.eh_frame` 这条路，`PT_GNU_EH_FRAME`/`.eh_frame_hdr` 只服务运行中进程的 libgcc
+展开（`_Unwind_Find_FDE`）——本运行时不装任何信号处理器、不调用 `backtrace()`
+（`runtime/*.c` 与 x86 后端代码全文搜不到 `sigaction`/`SIGSEGV`/`backtrace`），
+崩溃诊断的唯一消费方是外部工具（gdb/coredump 分析），因此只做节头表这条路径，
+省掉 `.eh_frame_hdr` 二分查找表与 `PT_GNU_EH_FRAME` 程序头，实现量减半。
+
+**CIE/FDE 编码**：单份全程序共享 CIE（初始规则 CFA=rsp+8、返回地址列 rip 在
+cfa-8）+ 每函数一条 FDE（advance_loc 1→def_cfa_offset 16→rbp 存于 cfa-16；
+advance_loc 4→def_cfa_offset 24——对应序言的 `push rbp`/`sub rsp,8` 两步）。空
+augmentation 字符串，地址字段用原生 8 字节绝对值，不带 PC 相对重定位——与本程序
+固定基址、非 PIE 的现状一致，也避免了 LEB128 变长指针编码。手写字节先与真实
+工具链（GNU `as`）对同一段序言生成的 CIE/FDE 逐字节比对过（`readelf
+--debug-dump=frames`），再用编译器实际产出的 ELF 在 gdb 下跑深度非尾递归到真实
+栈溢出崩溃，回溯逐帧正确（重复调用点、相同返回地址，形态与源码调用链完全吻合）。
+
+**节头表最小化**：只有 NULL/.eh_frame/.shstrtab 三条，不含 `.text`/符号表——
+崩溃可诊断性只要求返回地址能正确回溯，不要求源码级符号名（与 PE/Mach-O 已交付
+的范围一致，gdb 在没有符号表时显示 `?? ()` 但地址精确）。节头表本身与
+`.shstrtab` 落在 PT_LOAD 覆盖范围之外，是纯尾部调试数据，`execve` 从不读取。
+
+代码：`compiler/backends/x86/elf.bur`（`eh_cie`/`elf_eh_frame`/`elf_shstrtab`/
+`elf_section_header`/`elf_header_with_sh`，单测 `elf_test.bur`），调用点
+`x86.bur` 的 ELF 分支复用已有的 `pdata_offsets`/`pdata_lens`（PE/Mach-O 同一份
+数据）。`scripts/multi-backend-verify.sh` 覆盖的全部 examples/testdata/
+testdata/pkg 用例三方（VM/C/x86）复核过，无回归。
+
 ## 6. LSP 与编辑器生态
 
 **架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0（LSP 3.17 规范）。
