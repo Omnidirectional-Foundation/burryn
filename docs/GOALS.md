@@ -25,7 +25,7 @@
 | **S5 删 Go** | CLI 用 Burryn 写；main 清零 Go；`seed/go-host` 留档 | 已实现 |
 | **S6 生态工具链** | S6.1–S6.8：依赖、fmt、test、诊断、std/json、runtime IO、checker 债 | 已实现 |
 | **S7 语言特性扩展** | S7.1–S7.8（S7.4 命名参数已否决，编号保留） | 已实现 |
-| **S8 所有后端完工** | S8.1–S8.4 / S8.6 / S8.7 已实现；S8.5 / S8.8–S8.10 未实现（排期见 §3） | 部分实现 |
+| **S8 所有后端完工** | S8.2–S8.4 / S8.6 / S8.7 已实现；S8.1 / S8.5 因「x86 完成线收紧」标为部分实现（PIE / 节拆分 / 全 unwind 覆盖 / ELF unwind 待补，详见 §3）；S8.8–S8.10 未实现 | 部分实现 |
 | **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 语言特性（清单见 §4）；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
 | **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`/`log`/`crypto`/`regex`。待扩展：`datetime`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 部分实现 |
 
@@ -41,27 +41,23 @@ S8 = 所有后端完工，一条完成线：C 后端 + x86 后端（Linux / Wind
 |---|---|---|
 | S8.1 | Linux ELF 单文件后端 | 已实现 |
 | S8.2 / S8.3 / S8.4 / S8.7 | 语法冻结、row poly、封闭 record 按名合一、类型别名 | 已实现 |
-| S8.5 | PE 与 Mach-O 序列化层，实心版 | 未实现，死线 2026-09-28 |
+| S8.5 | PE 与 Mach-O 序列化层，实心版 | 部分实现（见下方「x86 完成线收紧」） |
 | S8.6 | x86 模块包 | 已实现 |
-| S8.8 | LLVM 后端 | 未实现，死线 2026-10-26 |
-| S8.9 | Cranelift 后端 | 未实现，死线 2026-11-09 |
-| S8.10 | WASM 后端 | 未实现，死线 2026-11-23 |
+| S8.8 | LLVM 后端 | 未实现 |
+| S8.9 | Cranelift 后端 | 未实现 |
+| S8.10 | WASM 后端 | 未实现 |
 
-S8 全阶段 2026-11-23 收线。内部顺序：先收 S8.1，再 S8.5，再 S8.6，然后 S8.8 → S8.9 → S8.10。
+内部顺序（2026-09-14 作者拍板，取代旧序）：**x86 后端彻底完工**（下方「x86 完成线收紧」全部条目清零）→ 多后端 S8.8 → S8.9 → S8.10 → **LSP（S9）彻底完工** → 基础生态。S10 新增包（`datetime`/`http` 等）暂缓，等前面几项收完再议。
+> 本节曾有的 S8.5/S8.8/S8.9/S8.10 具体日期（09-28、10-12、10-26、11-09、11-23）是此前会话自排期，作者从未拍板，已删——这类工作节奏排期属 `reports/ROADMAP.md`（gitignored 本地文档）范畴，不该写进本文件冒充定案。
 
-**S8.1 完成线（定案，已实现）**：Linux ELF 单文件程序后端（`bur build --backend x86 <file.bur>`）。
-完成条件 = fiber 感知 IO + `net_nb` 落地 + multi-backend 已知缺陷清零或显式登记为语言级限制。
-自举判定维持 [`architecture.md`](architecture.md) §3.5：编译器由本语言写成且能编译自己；输出 C 再经 cc 落地，完全算自举。
+**x86 完成线收紧（2026-09-14 作者拍板）**：x86 后端（不分 S8.1/S8.5/S8.6 子项，统一一条线）须与 C 后端全面对齐，不留任何已知功能缺口，具体逐项：
 
-**S8.5 实心版（定案）**：PE 与 Mach-O 序列化层，与 S8.1 同一后端的另外两个目标（`bur build --backend x86 --os windows|darwin`）；Mach-O 不另开编号，与 PE 同属 S8.5。
-完成条件 = 两目标可编 + spawn / sleep / fs / net / exec 语料在 macOS 与 Windows 真机 job 全绿 + 共用验收闸持续全绿；hello 级全绿即收的 hollow 版不算完成。
-**不含**加固填字段（UUID、DllCharacteristics flag 位不阻塞收线）；PIE 与节拆分属序列化层本职，在完成线之内。
-PE 侧分阶段（非常驻小任务，按此顺序）：fd↔HANDLE 映射表（含 write 改查表）
-→ 文件臂 → net 臂（WSAStartup＋SOCKET/HANDLE 类型分流）→ exec 臂；
-Mach-O 侧全程裸 syscall 直通，无需 fd 表。
-**含**崩溃可诊断性（定案）：PE 补 `.pdata` / unwind（异常目录 [3]，现状下 WER 不介入、无 dump、无栈回溯），Mach-O 补对等项（`LC_FUNCTION_STARTS` / `__unwind_info`，现状十条命令里没有）。它是序列化层本职，随 S8.5 落地；不阻塞语料口径（纯计算程序不受影响），但别掉出清单。
-
-**S8.6 x86 模块包（定案）**：模块包并入 S8，不另开编号。`compile_to_x86` 的 `is_dir` 拒收去掉，三目标共用这条路径。它涉及跨编译单元的符号解析与寻址模型，推迟等于将来重写，故不推迟。
+- **`scripts/multi-backend-verify.sh` 全 PASS**：SKIP 恒为 0（不接受"跳过不算"），当前 91 pass / 0 fail / 0 skip 已达标，往后每次改动都不能倒退。
+- **PIE**（三目标）：现状 ELF 固定基址静态执行、PE 无 ASLR 标记、Mach-O 显式 `MH_PIE` 未置位——三个都是位置相关。根因：后端约 488 处用 `mov_ri64` 内嵌按固定 `img_base()`/`macho_base` 算出的绝对地址，仅 8 处用 `lea_rip_rel32` 相对寻址；`architecture.md` 目前没有任何 PIE 机制设计。落地前需要先定设计（大改现有绝对寻址成 RIP 相对，或保留绝对寻址但按平台各自的重定位表格式在装载时打补丁——ELF `.rela.dyn`/`R_X86_64_RELATIVE`、PE `.reloc` 基址重定位目录、Mach-O chained fixups 的 rebase 项，三种格式互不相通）。范围与风险目前最大的一项，值得单独开一轮设计讨论，不建议直接开工。
+- **节/段拆分（R-X 代码与 R-W 数据分开）**（三目标）：现状三个后端都是单一 RWX 段/节（ELF `phdr_load` 注释明写"RWX: GC runtime 槽需写"，PE `.bub`、Mach-O `__TEXT` 同构），因为运行时/GC 状态与代码挤在同一块里。要拆开需要先把这些可写状态搬进独立的可写段，是与 PIE 强相关但可能可以先行的一步（先拆分、仍固定基址，PIE 单独后续跟上）。
+- **崩溃可诊断性对齐 C 的覆盖面**（三目标）：C 运行时的纤程切换走 `ucontext`/Win32 Fiber API（`runtime/burrt_impl.c` 的 `getcontext`/`bur_switch_to_sched`），这类系统级协程切换本身对栈回溯就是不透明的——所以 PE/Mach-O 已落地的"只覆盖用户函数，纤程切换点（yield/调度器恢复）不覆盖"这条边界，其实已经对齐 C 的真实能力，不是缺口。**真正的缺口**是：(a) GC/调度器里*不做*纤程切换、只是普通 `call`/`ret` 的内部子程序（`gc_record` 9-push、`mark_addr` 7-push、`chan_schedule`/`wake_waiters`/`push_queue`/`remove_waiter`/`waitset_add`/`timer_add`）目前一条都没纳入 unwind 覆盖，而 C 编译同等函数会自动拿到完整栈回溯信息——这些是普通序言，补齐是已交付机制（`pe_unwind_info`/`macho_unwind_info`）的直接扩展，每种序言形态多算一份编码，不是新架构；(b) **ELF 完全没有 unwind 机制**（无 `.eh_frame`，无 CFI），PE/Mach-O 已经做了各自的机制，Linux 目标这块是从零开始，且是第三种、又不同的格式（DWARF CFI）。
+- **`net_nb` / fiber 感知 IO 真机验收**：Windows 侧仍卡 R1/R2（`net_loopback` 双修复复验、`WSAPoll` vs `select` P/Invoke 对照），等工作站真机回写，非代码缺口，状态不变，见 `reports/ROADMAP.md`。
+- **multi-backend 已知缺陷显式登记**：`testdata/pkg/{annotations,cached,constcycle,consts,deepmut,extimport,extmissing,pipeline,stdjson}` 九例三方一致拒绝，此前只记在一份过期的 gitignored 报告里，未按 S8.1 完成线原文"显式登记为语言级限制"的要求写进 `architecture.md`；且该报告本身已发现有过时内容（其记录的元组解构丢类型 bug 其实已修，报告未随之更新），这九例本身也需要重新逐条核实，不能直接采信旧报告的归类。
 
 **x86 自举仍不在 S8 内**：用 x86 编 compiler 不是后端完工的必要条件——[`architecture.md`](architecture.md) §3.5 的自举判定已由 C 路径满足。
 
@@ -77,15 +73,17 @@ Mach-O 侧全程裸 syscall 直通，无需 fd 表。
 
 **单文档索引是当前精度上限**：`lsp_check_document` 把每份文档单独送进 `typecheck_program`，而 `lsp_set_recording(true)` 每次都清空录制数组，因此 references/documentHighlight/rename 与 go-to-definition 只在当前文档内成立；跨文件要先换成多文档录制。
 
-顺序：S9.2 语言特性已收齐，下一步 S9.4。S9 整体在 S8.1 完成线之后推进。
+顺序（2026-09-14 作者拍板，取代旧序）：S9.2 语言特性已收齐，下一步 S9.4——但 S9 整体排在 x86 完成线收紧与 S8.8–S8.10 之后，见 §3「内部顺序」。
 
 ## 5. S10
 
 原则：能纯 Burryn 就不加 native；每包 `bur.mod` + `*_test.bur`，随 std_embed 分发。
 
+**新增包暂缓（2026-09-14 作者拍板）**：`datetime`/`http` 等新包排在 x86 完成线收紧、S8.8–S8.10、S9 之后，见 §3「内部顺序」；已有 std 包的维护不受影响。
+
 ## 6. 后端次序
 
-主线（编号与排期见 §3）：x86 Linux ELF（S8.1，已完成）→ PE 与 Mach-O 序列化层（S8.5）→ x86 模块包（S8.6）→ runtime 平台抽象与工具链探测 → LLVM（S8.8）→ Cranelift（S8.9）→ WASM（S8.10）。
+主线（细节见 §3）：x86 Linux ELF（S8.1，已完成）→ x86 模块包（S8.6，已完成）→ PE 与 Mach-O 序列化层（S8.5，部分实现）→ **x86 完成线收紧**（PIE / 节拆分 / unwind 覆盖对齐 C / multi-backend 零缺口，§3 详列）→ runtime 平台抽象与工具链探测 → LLVM（S8.8）→ Cranelift（S8.9）→ WASM（S8.10）→ LSP（S9）彻底完工 → 基础生态（S10 新增包）。
 后端矩阵、工具链探测与值模型见 [`architecture.md`](architecture.md) §3，不在此复述。
 
 ## 7. 明确排除（不接受重新提案）
