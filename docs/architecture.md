@@ -405,6 +405,50 @@ x86 后端无 libc、无 ucontext——fiber 调度、park/wake、上下文切�
 - per-fiber defer 栈（数组存 closure 指针）+ 帧进入记 watermark（照 C runtime `bur_run_defers` 的 dbase 语义）
 - op_defer 压入；函数 epilogue 前按 watermark LIFO 执行，返回值先 peek 保留在栈上再执行 defer（防 defer 内分配回收）
 
+### 5.18 multi-backend 九例复核（2026-09-14 逐条重新核实，取代旧报告）
+
+`testdata/pkg/{annotations,cached,constcycle,consts,deepmut,extimport,extmissing,
+pipeline,stdjson}` 九例此前只记在一份过期的 gitignored 报告里（`reports/
+s8-1-multibackend.md`），归类为「三方一致拒绝」，未按 [`GOALS.md`](GOALS.md) §3
+的要求写进本文件；该报告本身有过时内容未同步（记录的元组解构丢类型 bug 已修，报告未
+更新），逐条重新核实后发现**原归类本身是错的**：九例里没有一例是 x86 后端缺陷或
+语言级限制，具体：
+
+- **`annotations`/`consts`/`pipeline`/`stdjson`（4 例）**：不是拒绝用例，是测试
+  夹具本身的语法错误——用 `.`（record 字段访问）而非 `::`（路径限定）做跨包成员
+  访问，[`grammar.md`](grammar.md) 明文规定 `::` "永远是路径"、`.` "不得用于路径
+  限定"。用 `.` 写会在类型检查阶段被拒绝，四例因此被误记成"三方一致拒绝的语言限制"；
+  实际上把 `.` 改成 `::` 后四例都是三方（VM/C/x86）一致的正常成功用例，输出与退出码
+  完全一致，不存在任何缺陷。已直接修正四份 fixture 源码。
+- **`deepmut`（1 例）**：修正同样的 `.`/`::` 笔误后，三方一致拒绝**依然成立**，但
+  这不是缺陷或限制——这是 deep-mut 检查按设计正确工作：跨包 `mut` 绑定要求显式契约，
+  这里没有，因此正确报 `E0597`。是诊断功能的预期行为，不是需要"登记"的短板。
+  （若未来出现"跨包 `mut` 显式契约"语法，行为会随之改变，不属于本条锁定范围。）
+- **`constcycle`（1 例）**：同文件内 `const` 相互引用成环，三方一致在构建期报
+  `E0391`（cycle detected）。这条与包/模块/`.`-`::` 完全无关，纯粹是 const 求值器
+  的环检测，同样是诊断功能的预期行为。
+- **`extmissing`（1 例）**：`bur.mod` 没有 `require` 该模块的声明，三方一致报
+  `E0432`（cannot resolve import）。这个结果与本地 `~/.burryn/pkg` 缓存状态无关——
+  即使缓存里真的有该模块，缺 `require` 声明本身就会被拒绝；已验证清空缓存/填充
+  假缓存两种状态下判据不变。是模块系统按设计工作，不是 x86 或语言限制。
+- **`cached`/`extimport`（2 例）**：`bur.mod` 有 `require`，但引用的 `example.com/
+  acme/*` 是文档占位域名，从不会在任何真实环境里被 `bur mod download` 解析到——
+  在干净缓存（本地默认状态、CI runner 默认状态）下，三方一致报 `E0432`
+  （module not in cache）。这是环境状态（缺依赖），不是编译器缺陷。用手工构造的
+  假缓存条目（同样路径/版本，导出所需符号）验证过"若依赖可用会发生什么"：两例的
+  真实结果（三方一致，输出正确、退出码一致）与干净缓存下的三方一致拒绝一样，都不
+  暴露任何 x86 特有差异——即缓存状态翻转，判据（三方一致）不翻。这两例源码里也有
+  同样的 `.`/`::` 笔误，已一并修正（当前失败路径走不到那段代码，但修正后源码本身
+  合语法，为将来的状态留了正确的基线）。
+
+**结论**：九例里 6 例是三方一致成功（4 例改完 fixture 后立即成立，`cached`/
+`extimport` 在依赖可用时也成立）、3 例是三方一致的正确诊断拒绝（`deepmut`/
+`constcycle`/`extmissing`，覆盖 deep-mut 安全检查、const 环检测、缺失 `require`
+三种独立机制）。**没有发现任何 x86 后端缺陷，也没有需要登记为"语言级限制"的条目**——
+`docs/GOALS.md` §3 原始要求的"已知缺陷清零或显式登记为语言级限制"，此处以前者
+（清零：不存在缺陷）满足。`scripts/multi-backend-verify.sh` 的 pass 计数不因此改变
+（改前改后九例都各自贡献一条 PASS，只是四例从"巧合通过的拒绝"变成"真正的成功"）。
+
 ## 6. LSP 与编辑器生态
 
 **架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0（LSP 3.17 规范）。
