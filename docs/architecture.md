@@ -247,10 +247,13 @@ Raw int64，8 字节/槽，**无 tag**。
 ### 5.3 内存布局
 
 ```text
-ELF header (64B) | phdr (56B) | str_data | funcs | jump_table | _start
-                                 ^base_addr+120
+代码域（R-X）: headers | consts | funcs | jump_table | _start | .eh_frame
+                ^img_base = ELF base+176 / PE base+4096 / Mach-O base+0x1000
+数据域（R-W）: runtime slots [+ windows: thunk 槽 | fd 表 | WSA 区]
+                ^data_origin = 镜像基址 + DATA_VA_OFF (16MB)
 ```
 
+- 可写 runtime 区独立成 R-W 段，与代码域之间留未映射 VA 空洞，定案见 §5.21
 - 堆：16MB via mmap(MAP_ANONYMOUS)，零填充，bump-allocated via r12
 - 值栈：1MB below rsp，向上增长
 - 全局变量：堆首 N*8 字节（rbx = base）
@@ -553,6 +556,33 @@ PE/Mach-O 初版时同一验证力度，如实记录，不假装有更高确信�
 单测覆盖 `elf_test.bur`/`pe_test.bur`/`macho_test.bur`。
 `scripts/multi-backend-verify.sh` 覆盖的全部 examples/testdata/testdata/pkg
 用例三方（VM/C/x86）复核过，无回归。
+
+### 5.21 节/段拆分：R-X 代码与 R-W 数据（定案，2026-09-23）
+
+完成线「节/段拆分（R-X 代码与 R-W 数据分开）」的落地定案：三目标一致把可写
+runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WSA 区）从代码域
+迁出，代码域收成 R-X。仍保持固定基址——PIE 是独立后续项，不绑在本改动里。
+
+- **布局**：可写区落在镜像基址 + 16MB 的固定高 VA（`DATA_VA_OFF`，`layout.bur`
+  单一定义，取代原 Mach-O 专属的 `MACHO_DATA_VA_OFF`），与代码域之间留未映射
+  VA 空洞，使 `rt_slot` 等地址公式在代码长度确定前即可求值。可写段按目标分别
+  是：ELF 第二条 PT_LOAD（`p_flags=R|W`，文件内页对齐紧跟 `.eh_frame`）；PE
+  `.data`（两节表使头区 496B→536B，`SizeOfHeaders` 随 FileAlignment 抬到
+  1024B，`SizeOfImage` 覆盖固定数据 RVA）；Mach-O `__DATA`（先行落地）。代码域
+  R-X：ELF 首条 PT_LOAD（两条 phdr 使 `img_base` 从 base+120 移到 base+176）、
+  PE `.text`（`CODE|EXECUTE|READ`）、Mach-O `__TEXT`。
+- **寻址收口不改**：`rt_slot`/`fd_base`/`wsa_base`/`thunk_slot_abs` 全部经
+  `data_origin()` 取址，代码域经 `img_base()`/`code_origin()`——runtime 槽地址
+  整体平移到高 VA、代码内绝对地址随 `img_base` 平移，无逐处改写；
+  `rt_region_size()` 随之失去调用方，删除。
+- **验证**：ELF 真机端到端——16 个 examples（GC 压力、并发五件套、io、net
+  loopback/net_nb/net_errors）构建运行对 golden 一致（PE 轮改动不触碰 Linux
+  发射路径，ELF 字节与该轮验证时一致）；`readelf -l` 核对两条 PT_LOAD 权限
+  （R E / RW）与 VA；`readelf --debug-dump=frames` 核对 76 条 FDE 全部落在新
+  代码域内且升序。PE 用 Python 结构校验头区/节表/SizeOfHeaders/SizeOfImage 与
+  数据段内三个 GC 子程序地址槽（须指向代码域）——该校验当场揪出初版把 `.text`
+  的 Characteristics 误算成 `0x60000040`（INITIALIZED_DATA 而非 CODE）的错常数。
+  Mach-O 字节不变（常量等值改名，既有单测锁定）。
 
 ## 6. LSP 与编辑器生态
 
