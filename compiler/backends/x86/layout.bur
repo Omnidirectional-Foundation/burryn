@@ -14,8 +14,9 @@ pub fn thunk_slot_abs() {
     data_origin() + RUNTIME_SIZE
 }
 
-// GC runtime 槽（const_data 前的固定区，base_addr+120 起，每槽 8B）
-// GC runtime slots: fixed region before const_data (base_addr+120), 8 bytes each
+// GC runtime 槽（可写数据段内的固定区，data_origin() 起，每槽 8B）
+// GC runtime slots: the fixed region inside the writable data segment (from
+// data_origin()), 8 bytes each
 pub let rt_gc_cnt = 0
 pub let rt_gc_threshold = 8
 pub let rt_gc_cycles = 16
@@ -110,29 +111,33 @@ pub fn rt_slot(off) {
     data_origin() + off
 }
 
-// code_origin 返回代码/常量内容的绝对起点：darwin 的 runtime 区已迁出 __TEXT，
-// 常量紧跟头区；其余目标的常量仍在 runtime 区之后。
-// code_origin returns the absolute start of code/constants content: on darwin
-// the runtime area has moved out of __TEXT so constants follow the headers
-// directly; other targets keep them after the runtime area.
+// DATA_VA_OFF 是三目标统一的可写数据段固定偏移：与代码尺寸解耦，使 rt_slot 等
+// 地址公式在代码长度确定前即可求值；代码段与数据段之间留未映射 VA 空洞。
+// DATA_VA_OFF is the three targets' shared writable-data segment's fixed offset
+// from the image base, decoupled from the code size so address formulas like
+// rt_slot resolve before the code length is known; an unmapped VA hole sits
+// between the code and data segments.
+pub let DATA_VA_OFF = 16777216
+
+// code_origin 返回代码/常量内容的绝对起点：三目标的 runtime 区都已迁出代码域，
+// 常量紧跟各自的头区。
+// code_origin returns the absolute start of code/constants content: all three
+// targets keep the runtime area out of the code domain, so constants follow
+// the headers directly.
 pub fn code_origin() {
-    if target_os == "darwin" {
-        img_base()
-    } else {
-        img_base() + rt_region_size()
-    }
+    img_base()
 }
 
-// data_origin 返回可写 runtime 区的绝对基址：darwin 独立落在固定高 VA 的
-// __DATA 段（与 __TEXT 尺寸解耦），其余目标与代码同域。
-// data_origin returns the writable runtime area's absolute base: on darwin it
-// lives in a fixed-high-VA __DATA segment (decoupled from the __TEXT size);
-// other targets share the code domain.
+// data_origin 返回可写 runtime 区的绝对基址：三目标一致落在镜像基址加
+// DATA_VA_OFF 的独立可写段（ELF 第二条 PT_LOAD、PE .data、Mach-O __DATA）。
+// data_origin returns the writable runtime area's absolute base: all three
+// targets place it in the standalone writable segment at the image base plus
+// DATA_VA_OFF (ELF's second PT_LOAD, PE's .data, Mach-O's __DATA).
 pub fn data_origin() {
     if target_os == "darwin" {
-        macho_base + MACHO_DATA_VA_OFF
+        macho_base + DATA_VA_OFF
     } else {
-        img_base()
+        base_addr + DATA_VA_OFF
     }
 }
 
@@ -140,20 +145,20 @@ pub fn set_target_os(os) {
     target_os = os
 }
 
-// img_base 返回代码/常量域的绝对基址：ELF 在 base+120（头 64+56B）；
-// PE 头区占满首个 RVA 页，内容从 base+4096 起；Mach-O 的 __TEXT 内容
-// 从 base+0x1000 起。所有绝对地址编码经此收口。
+// img_base 返回代码/常量域的绝对基址：ELF 在 base+176（64B 头 + 两条 phdr，即
+// ELF_CODE_OFF）；PE 头区占满首个 RVA 页，内容从 base+4096 起；Mach-O 的
+// __TEXT 内容从 base+0x1000 起。所有绝对地址编码经此收口。
 // img_base returns the absolute base of the code/constants domain: ELF sits at
-// base+120 (64+56 bytes of headers); PE headers fill the first RVA page, so
-// content starts at base+4096; Mach-O __TEXT content starts at base+0x1000.
-// Every absolute encoding funnels through here.
+// base+176 (64-byte header plus two program headers, ELF_CODE_OFF); PE headers
+// fill the first RVA page, so content starts at base+4096; Mach-O __TEXT
+// content starts at base+0x1000. Every absolute encoding funnels through here.
 pub fn img_base() {
     if target_os == "windows" {
         base_addr + 4096
     } else if target_os == "darwin" {
         macho_base + MACHO_TEXT_OFF
     } else {
-        base_addr + 120
+        base_addr + ELF_CODE_OFF
     }
 }
 
