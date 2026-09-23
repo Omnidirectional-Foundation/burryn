@@ -559,23 +559,23 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
     let start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr)
     if target_os == "windows" {
-        let pe_start_off = rt_region_size() + start_off
-        // PE 装配：runtime 区尾的 8B 槽填分派器绝对地址；分派器与 kernel32 +
-        // ws2_32 导入表依次接在 _start 后。分派器长度与值无关，先以零地址测长，
-        // 再按真实 IAT 绝对址重发；槽值据此可算，无需回补。
-        // PE assembly: the 8-byte slot at the end of the runtime area holds
-        // the dispatcher's absolute address; the dispatcher and the kernel32 +
-        // ws2_32 import tables follow _start. The dispatcher length is
-        // value-independent, so it is measured once with zero addresses and
-        // rebuilt with real IAT addresses; the slot value follows without
-        // backpatching.
+        // PE 装配：可写 runtime 区（含分派器地址槽、fd 表、WSA 区）独立进
+        // 固定高 RVA 的 .data；分派器与 kernel32 + ws2_32 导入表依次接在 _start
+        // 后。分派器长度与值无关，先以零地址测长，再按真实 IAT 绝对址重发；
+        // 槽值据此可算，无需回补。
+        // PE assembly: the writable runtime area (the dispatcher-address slot,
+        // fd table and WSA area included) moves into a fixed-high-RVA .data;
+        // the dispatcher and the kernel32 + ws2_32 import tables follow _start.
+        // The dispatcher length is value-independent, so it is measured once
+        // with zero addresses and rebuilt with real IAT addresses; the slot
+        // value follows without backpatching.
         let import_dlls = ["kernel32.dll", "ws2_32.dll"]
         let import_counts = [16, 14]
         let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError"]
         // 分派器接在 _start 之后；槽与导入表 RVA 都从真实内容偏移算起
         // The dispatcher follows _start; the slot and import RVAs derive from
         // the true content offsets.
-        let disp_off = pe_start_off + str_len(start_bytes)
+        let disp_off = start_off + str_len(start_bytes)
         let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         let idata_off = disp_off + str_len(disp_probe)
         let iat_abs0 = img_base() + idata_off + pe_import_desc_size(len(import_dlls)) + pe_ilt_size(len(import_names), len(import_dlls))
@@ -632,7 +632,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         // of .pdata coverage this round (an uncovered address falls back to
         // Windows' default leaf-function assumption, no worse than before this
         // change).
-        let code_base_off = str_len(runtime_with_fd) + str_len(const_data)
+        let code_base_off = const_data_len
         let idata_end = idata_off + str_len(imports)
         let pdata_off = pe_align(idata_end, 4)
         let mut pdata_pad = ""
@@ -662,7 +662,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let internal_pdata = pe_build_pdata_multi(rt_unwind_offsets, rt_unwind_lens, code_base_off, internal_unwind_offs)
         let pdata_bytes = internal_pdata + pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
         let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0]) + pe_unwind_info_pushes(rt_unwind_pushes[2])
-        emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports + pdata_pad + pdata_bytes + unwind_blobs, pe_start_off, idata_off, str_len(imports), pdata_off, str_len(pdata_bytes))
+        emit_pe(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports + pdata_pad + pdata_bytes + unwind_blobs, start_off, idata_off, str_len(imports), pdata_off, str_len(pdata_bytes), runtime_with_fd)
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
         // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），

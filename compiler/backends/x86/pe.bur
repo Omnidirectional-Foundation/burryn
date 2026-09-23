@@ -2,12 +2,14 @@
 // PE output: headers, section table and the import tables (ILT/IAT/hint),
 // plus the Windows dispatch arms.
 
-// emit_pe 装配 PE32+：头区(512B) + 内容(补齐 512)；入口在内容内 entry_off 处
-// emit_pe assembles the PE32+: 512-byte header area + content (padded to 512);
-// the entry point sits at entry_off within the content
-pub fn emit_pe(content, entry_off, idata_off, idata_len, pdata_off, pdata_len) {
-    let mut padded = content
-    let n = str_len(content) % 512
+// emit_pe 装配 PE32+：头区(1024B) + 代码内容（补齐 512）+ 可写数据内容（补齐 512）；
+// 入口在代码内容内 entry_off 处
+// emit_pe assembles the PE32+: 1024-byte header area + code content (padded to
+// 512) + the writable data content (padded to 512); the entry point sits at
+// entry_off within the code content
+pub fn emit_pe(code, entry_off, idata_off, idata_len, pdata_off, pdata_len, data_content) {
+    let mut padded = code
+    let n = str_len(code) % 512
     if n != 0 {
         let mut pz = ""
         let mut zi = 0
@@ -17,7 +19,30 @@ pub fn emit_pe(content, entry_off, idata_off, idata_len, pdata_off, pdata_len) {
         }
         padded = padded + pz
     }
-    pe_emit_headers(entry_off, str_len(content), idata_off, idata_len, pdata_off, pdata_len) + padded
+    let mut padded_data = data_content
+    let dn = str_len(data_content) % 512
+    if dn != 0 {
+        let mut dz = ""
+        let mut di = 0
+        while di < 512 - dn {
+            dz = dz + byte_chr(0)
+            di = di + 1
+        }
+        padded_data = padded_data + dz
+    }
+    pe_emit_headers(entry_off, str_len(code), idata_off, idata_len, pdata_off, pdata_len, str_len(data_content)) + padded + padded_data
+}
+
+// pe_build_section_entry 生成一条 40B 节表项：名字补零到 8B，字段按
+// IMAGE_SECTION_HEADER 顺序。
+// pe_build_section_entry builds one 40-byte section table entry: the name is
+// zero-padded to 8 bytes, fields in IMAGE_SECTION_HEADER order.
+fn pe_build_section_entry(name, vsize, vaddr, rawsize, rawptr, chars) {
+    let mut nm = name
+    while str_len(nm) < 8 {
+        nm = nm + byte_chr(0)
+    }
+    nm + e4(vsize) + e4(vaddr) + e4(rawsize) + e4(rawptr) + e4(0) + e4(0) + e2(0) + e2(0) + e4(chars)
 }
 
 // pe_build_imports 生成导入 blob；dll_names 与 fn_counts 等长（每 DLL 的函数数），
@@ -571,10 +596,17 @@ pub fn pe_build_dispatcher(iat) {
     sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 41, 49, 50, 42, 43, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
 }
 
-// pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 单节表
+// pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 两节表
+// （.text R-X 承载代码域，.data R-W 在固定高 RVA 承载可写 runtime 区）。头区总量
+// 64+24+240+128+80=536B，按 FileAlignment 抬到 1024B，SizeOfHeaders 与节 raw 指针
+// 一致用这个值。
 // pe_emit_headers lays out DOS + COFF + PE32+ optional header (240B with 16 data
-// directories) + the single section table
-pub fn pe_emit_headers(entry_off, content_len, idata_off, idata_len, pdata_off, pdata_len) {
+// directories) + the two-entry section table (.text R-X carrying the code
+// domain, .data R-W holding the writable runtime area at the fixed high RVA).
+// The header block totals 64+24+240+128+80=536B, rounded up to 1024B by
+// FileAlignment; SizeOfHeaders and the section raw pointers use that value.
+pub fn pe_emit_headers(entry_off, code_len, idata_off, idata_len, pdata_off, pdata_len, data_len) {
+    let hdr_area = 1024
     // DOS：MZ 魔数 + e_lfanew=64，其余补零
     // DOS: MZ magic + e_lfanew=64, zero padding elsewhere
     let mut dos = "MZ"
@@ -584,11 +616,11 @@ pub fn pe_emit_headers(entry_off, content_len, idata_off, idata_len, pdata_off, 
         di = di + 1
     }
     dos = dos + e4(64)
-    // COFF：AMD64、单节、可执行镜像 + 大地址感知
-    // COFF: AMD64, one section, executable image + large-address-aware
-    let coff = "PE" + byte_chr(0) + byte_chr(0) + e2(34404) + e2(1) + e4(0) + e4(0) + e4(0) + e2(240) + e2(34)
-    let image_size = 4096 + pe_align(content_len, 4096)
-    let opt = e2(523) + e1(0) + e1(0) + e4(content_len) + e4(0) + e4(0) + e4(pe_content_rva(entry_off)) + e4(4096) + e8(4194304) + e4(4096) + e4(512) + e2(6) + e2(0) + e2(0) + e2(0) + e2(6) + e2(0) + e4(0) + e4(image_size) + e4(512) + e4(0) + e2(3) + e2(0) + e8(8388608) + e8(1048576) + e8(1048576) + e8(4096) + e4(0) + e4(16)
+    // COFF：AMD64、两节、可执行镜像 + 大地址感知
+    // COFF: AMD64, two sections, executable image + large-address-aware
+    let coff = "PE" + byte_chr(0) + byte_chr(0) + e2(34404) + e2(2) + e4(0) + e4(0) + e4(0) + e2(240) + e2(34)
+    let image_size = DATA_VA_OFF + pe_align(data_len, 4096)
+    let opt = e2(523) + e1(0) + e1(0) + e4(code_len) + e4(0) + e4(0) + e4(pe_content_rva(entry_off)) + e4(4096) + e8(4194304) + e4(4096) + e4(512) + e2(6) + e2(0) + e2(0) + e2(0) + e2(6) + e2(0) + e4(0) + e4(image_size) + e4(hdr_area) + e4(0) + e2(3) + e2(0) + e8(8388608) + e8(1048576) + e8(1048576) + e8(4096) + e4(0) + e4(16)
     // 16 个数据目录：[1]=导入表、[3]=异常目录（.pdata），其余零
     // sixteen data directories: [1]=imports, [3]=exception table (.pdata), rest zero
     let mut dirs = ""
@@ -603,13 +635,17 @@ pub fn pe_emit_headers(entry_off, content_len, idata_off, idata_len, pdata_off, 
         }
         k = k + 1
     }
-    // 节表：.bub，CODE|EXECUTE|READ|WRITE
-    // Section table: .bub with CODE|EXECUTE|READ|WRITE
-    let sect = ".bub" + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + e4(content_len) + e4(4096) + e4(pe_align(content_len, 512)) + e4(512) + e4(0) + e4(0) + e2(0) + e2(0) + e4(3758154784)
-    let hdr = dos + coff + opt + dirs + sect
+    // 节表：.text（CODE|EXECUTE|READ）承载代码域；.data（INITIALIZED_DATA|READ|WRITE）
+    // 在固定高 RVA 承载可写 runtime 区，raw 数据紧跟 .text 之后
+    // Section table: .text (CODE|EXECUTE|READ) carries the code domain; .data
+    // (INITIALIZED_DATA|READ|WRITE) holds the writable runtime area at the
+    // fixed high RVA, its raw data right after .text's
+    let sect_text = pe_build_section_entry(".text", code_len, 4096, pe_align(code_len, 512), hdr_area, 1610612768)
+    let sect_data = pe_build_section_entry(".data", data_len, DATA_VA_OFF, pe_align(data_len, 512), hdr_area + pe_align(code_len, 512), 3221225536)
+    let hdr = dos + coff + opt + dirs + sect_text + sect_data
     let mut pad = ""
     let mut pi = str_len(hdr)
-    while pi < 512 {
+    while pi < hdr_area {
         pad = pad + byte_chr(0)
         pi = pi + 1
     }
