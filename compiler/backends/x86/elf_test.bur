@@ -43,3 +43,41 @@ fn test_elf_section_header_encoding() {
     let want = u32(1) + u32(1) + u64(0) + u64(4194304) + u64(128) + u64(56) + u32(0) + u32(0) + u64(1) + u64(0)
     assert(sh == want, "Elf64_Shdr: name/type/flags/addr/offset/size/link/info/addralign/entsize, 64 bytes total")
 }
+
+fn test_eh_push_instrs_empty_is_zero_prologue() {
+    assert(eh_push_instrs([]) == "", "no pushes at entry means no CFI instructions at all — the CIE's initial rule holds throughout")
+}
+
+fn test_eh_push_instrs_low_registers_one_byte_each() {
+    // rdx(2)/rdi(7)/rsi(6)/rax(0)/rcx(1): all <8, each push_r is 1 byte, so each
+    // advance_loc step is 1
+    let instrs = eh_push_instrs([rdx, rdi, rsi, rax, rcx])
+    let want = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(65) + byte_chr(14) + byte_chr(24) + byte_chr(65) + byte_chr(14) + byte_chr(32) + byte_chr(65) + byte_chr(14) + byte_chr(40) + byte_chr(65) + byte_chr(14) + byte_chr(48)
+    assert(instrs == want, "5 low-register pushes: advance_loc(1) + def_cfa_offset(+8 each) per step, CFA ending at rsp+48")
+}
+
+fn test_eh_push_instrs_high_registers_two_bytes_each() {
+    // r8(8)/r9(9)/r10(10)/r11(11): all >=8, REX prefix makes each push_r 2 bytes
+    let instrs = eh_push_instrs([r8, r9, r10, r11])
+    let want = byte_chr(66) + byte_chr(14) + byte_chr(16) + byte_chr(66) + byte_chr(14) + byte_chr(24) + byte_chr(66) + byte_chr(14) + byte_chr(32) + byte_chr(66) + byte_chr(14) + byte_chr(40)
+    assert(instrs == want, "4 REX-prefixed pushes: advance_loc(2) + def_cfa_offset(+8 each) per step, CFA ending at rsp+40")
+}
+
+fn test_eh_push_instrs_gc_record_shape() {
+    // x86gen_gc_record's push3 order: rdx,rdi,rsi,rax,rcx (1B each), r8,r9,r10,r11 (2B each)
+    let instrs = eh_push_instrs([rdx, rdi, rsi, rax, rcx, r8, r9, r10, r11])
+    let want = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(65) + byte_chr(14) + byte_chr(24) + byte_chr(65) + byte_chr(14) + byte_chr(32) + byte_chr(65) + byte_chr(14) + byte_chr(40) + byte_chr(65) + byte_chr(14) + byte_chr(48) + byte_chr(66) + byte_chr(14) + byte_chr(56) + byte_chr(66) + byte_chr(14) + byte_chr(64) + byte_chr(66) + byte_chr(14) + byte_chr(72) + byte_chr(66) + byte_chr(14) + byte_chr(80)
+    assert(instrs == want, "gc_record's real 9-push prologue: CFA ends at rsp+80 (8 initial + 9*8)")
+}
+
+fn test_elf_eh_frame_internal_zero_and_push_shapes() {
+    let cie = eh_cie()
+    let user_eh = elf_eh_frame([0], [20], 4194304)
+    let internal = elf_eh_frame_internal([100, 150], [30, 40], 4194304, [[], [rax, rcx]], str_len(user_eh))
+    let zero_content = u32(str_len(user_eh) + 4) + u64(4194304 + 100) + u64(30) + ""
+    let zero_fde = u32(str_len(zero_content)) + zero_content
+    let push_instrs = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(65) + byte_chr(14) + byte_chr(24)
+    let push_content = u32(str_len(user_eh) + str_len(zero_fde) + 4) + u64(4194304 + 150) + u64(40) + push_instrs
+    let push_fde = u32(str_len(push_content)) + push_content
+    assert(internal == zero_fde + push_fde, "a zero-prologue entry (empty instruction stream) and a 2-push entry, both counting cie_pointer back across the user FDEs that precede them")
+}

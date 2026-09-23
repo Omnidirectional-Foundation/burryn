@@ -24,7 +24,8 @@ fn test_macho_unwind_info_structure() {
     let offs = [0, 50, 120]
     let lens = [50, 70, 30]
     let code_base = 4096
-    let info = macho_unwind_info(offs, lens, code_base)
+    let encs = [macho_unwind_encoding(), macho_unwind_encoding(), macho_unwind_encoding()]
+    let info = macho_unwind_info(offs, lens, code_base, encs)
     // header: version=1, commonEncOff=commonEncCount=persOff=persCount=0 folded
     // into 28, indexOff=28, indexCount=2
     let want_hdr = u32(1) + u32(28) + u32(0) + u32(28) + u32(0) + u32(28) + u32(2)
@@ -33,4 +34,34 @@ fn test_macho_unwind_info_structure() {
     let want_index = u32(code_base + 0) + u32(page_off) + u32(page_off) + u32(last) + u32(0) + u32(page_off)
     let want_page = u32(2) + u16(8) + u16(3) + u32(code_base + 0) + u32(macho_unwind_encoding()) + u32(code_base + 50) + u32(macho_unwind_encoding()) + u32(code_base + 120) + u32(macho_unwind_encoding())
     assert(info == want_hdr + want_index + want_page, "header + two-entry index (real page + sentinel) + one regular page with 3 entries sharing one encoding")
+}
+
+fn test_macho_unwind_info_heterogeneous_encodings() {
+    // regular 页原生按项存编码，异质编码（零序言 + push7 + 用户形态）直接逐项传入
+    let offs = [0, 20, 90]
+    let lens = [20, 70, 40]
+    let code_base = 8192
+    let encs = [macho_unwind_encoding_pushes([]), macho_unwind_encoding_pushes([rax, rcx, rdx, rdi, r8, r9, r10]), macho_unwind_encoding()]
+    let info = macho_unwind_info(offs, lens, code_base, encs)
+    let page_off = 28 + 2 * 12
+    let last = code_base + 90 + 40
+    let want_hdr = u32(1) + u32(28) + u32(0) + u32(28) + u32(0) + u32(28) + u32(2)
+    let want_index = u32(code_base + 0) + u32(page_off) + u32(page_off) + u32(last) + u32(0) + u32(page_off)
+    let want_page = u32(2) + u16(8) + u16(3) + u32(code_base + 0) + u32(macho_unwind_encoding_pushes([])) + u32(code_base + 20) + u32(macho_unwind_encoding_pushes([rax, rcx, rdx, rdi, r8, r9, r10])) + u32(code_base + 90) + u32(macho_unwind_encoding())
+    assert(info == want_hdr + want_index + want_page, "one regular page mixing zero-prologue, 7-push, and user-shape encodings in address order")
+}
+
+fn test_macho_unwind_encoding_pushes_zero_is_bare_stack_immd() {
+    assert(macho_unwind_encoding_pushes([]) == 33554432, "MODE_STACK_IMMD with stack_size=0, reg_count=0, permutation=0 (0x02000000)")
+}
+
+fn test_macho_unwind_encoding_pushes_gc_record_shape() {
+    // 9 次 push = stack_size 字段 9（每条 push 定长 8 字节，与指令编码字节数无关）
+    let enc = macho_unwind_encoding_pushes([rdx, rdi, rsi, rax, rcx, r8, r9, r10, r11])
+    assert(enc == 33554432 + 9 * 65536, "MODE_STACK_IMMD, stack_size=9 (9 pushes * 8B), reg_count=0")
+}
+
+fn test_macho_unwind_encoding_pushes_mark_addr_shape() {
+    let enc = macho_unwind_encoding_pushes([rax, rcx, rdx, rdi, r8, r9, r10])
+    assert(enc == 33554432 + 7 * 65536, "MODE_STACK_IMMD, stack_size=7 (7 pushes * 8B), reg_count=0")
 }

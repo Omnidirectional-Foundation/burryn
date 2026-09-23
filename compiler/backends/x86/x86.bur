@@ -469,6 +469,25 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let timer_add_bytes = x86gen_timer_add_block()
     let timer_add_addr = waitset_add_addr + str_len(waitset_add_bytes)
     let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + sched_bytes + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + waitset_add_bytes + timer_add_bytes
+    // 内部子程序 unwind 覆盖：gc_record（9-push）、mark_addr（7-push）与其余六个纯
+    // call/ret、零序言的子程序（gc_collect、chan 系四个、waitset_add、timer_add）——
+    // 序言形态逐个核对自 runtime.bur 源码（push_r 出现次数与顺序）。调度器三块
+    // （sched/yield/done）是纤程切换机制本身，边界与 PE/Mach-O 一致不覆盖（见
+    // architecture.md §5.19/GOALS.md）。rt_unwind_* 三个并行数组供三个后端的
+    // unwind-info 构建复用，push_regs 为空数组表示零序言。
+    // Internal-subroutine unwind coverage: gc_record (9-push), mark_addr
+    // (7-push), and six purely call/ret, zero-prologue subroutines
+    // (gc_collect, the four chan_* ones, waitset_add, timer_add) — prologue
+    // shapes were checked one by one against runtime.bur's source (push_r
+    // call count and order). The three scheduler blocks (sched/yield/done)
+    // are the fiber-switch mechanism itself, left uncovered to match the
+    // PE/Mach-O boundary (see architecture.md §5.19 / GOALS.md). The three
+    // rt_unwind_* parallel arrays feed all three backends' unwind-info
+    // builders; an empty push_regs array means a zero prologue.
+    let internal_base = code_origin() + const_data_len
+    let rt_unwind_offsets = [0, str_len(gc_rec_bytes), str_len(gc_rec_bytes) + str_len(gc_col), chan_sched_addr - internal_base, chan_wake_addr - internal_base, chan_push_sendq_addr - internal_base, chan_push_recvq_addr - internal_base, chan_push_waiters_addr - internal_base, chan_remove_waiter_addr - internal_base, waitset_add_addr - internal_base, timer_add_addr - internal_base]
+    let rt_unwind_lens = [str_len(gc_rec_bytes), str_len(gc_col), str_len(gc_mark), str_len(chan_sched_bytes), str_len(chan_wake_bytes), str_len(chan_push_sendq_bytes), str_len(chan_push_recvq_bytes), str_len(chan_push_waiters_bytes), str_len(chan_remove_waiter_bytes), str_len(waitset_add_bytes), str_len(timer_add_bytes)]
+    let rt_unwind_pushes = [[rdx, rdi, rsi, rax, rcx, r8, r9, r10, r11], [], [rax, rcx, rdx, rdi, r8, r9, r10], [], [], [], [], [], [], [], []]
     let mut func_offsets = []
     let mut variant_offsets = []
     // pdata_offsets/pdata_lens：每个变体的 (funcs_bytes 内偏移, 字节长度)，按发射顺序
@@ -619,9 +638,28 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             pdata_pad = pdata_pad + byte_chr(0)
             ppi = ppi + 1
         }
-        let unwind_off = pdata_off + 12 * len(pdata_offsets)
-        let pdata_bytes = pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
-        emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports + pdata_pad + pdata_bytes + pe_unwind_info(), start_off, idata_off, str_len(imports), pdata_off, str_len(pdata_bytes))
+        // 内部子程序 unwind 覆盖：三份 UNWIND_INFO（零序言、gc_record 的 9-push、
+        // mark_addr 的 7-push）跟在用户函数共享的那份后面；.pdata 数组把内部子程序
+        // 的 11 项放在用户函数前面（内部子程序地址恒低于全部用户函数，符合
+        // RtlLookupFunctionEntry 要求的 BeginAddress 升序）。索引 0/2 对应
+        // rt_unwind_pushes 里 gc_record/mark_addr 的真实寄存器列表，其余 9 项零序言。
+        // Internal-subroutine unwind coverage: three UNWIND_INFO blobs (zero
+        // prologue, gc_record's 9-push, mark_addr's 7-push) follow the one
+        // shared by user functions; the .pdata array places the internal
+        // subroutines' 11 entries before the user functions (internal
+        // subroutines always sit at lower addresses than every user function,
+        // satisfying RtlLookupFunctionEntry's ascending-BeginAddress
+        // requirement). Indices 0/2 use rt_unwind_pushes' real register lists
+        // for gc_record/mark_addr; the other 9 entries are zero-prologue.
+        let unwind_off = pdata_off + 12 * (len(pdata_offsets) + len(rt_unwind_offsets))
+        let zero_unwind_off = unwind_off + str_len(pe_unwind_info())
+        let push9_unwind_off = zero_unwind_off + str_len(pe_unwind_info_zero())
+        let push7_unwind_off = push9_unwind_off + str_len(pe_unwind_info_pushes(rt_unwind_pushes[0]))
+        let internal_unwind_offs = [push9_unwind_off, zero_unwind_off, push7_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off]
+        let internal_pdata = pe_build_pdata_multi(rt_unwind_offsets, rt_unwind_lens, code_base_off, internal_unwind_offs)
+        let pdata_bytes = internal_pdata + pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
+        let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0]) + pe_unwind_info_pushes(rt_unwind_pushes[2])
+        emit_pe(runtime_with_fd + const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports + pdata_pad + pdata_bytes + unwind_blobs, start_off, idata_off, str_len(imports), pdata_off, str_len(pdata_bytes))
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
         // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），
@@ -634,8 +672,8 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let dispatcher = macho_build_dispatcher()
         let dispatcher_va = img_base() + entry_in_text + str_len(start_bytes)
         let runtime_with_thunk = runtime_bytes + e8(dispatcher_va)
-        emit_macho(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher, entry_in_text, runtime_with_thunk, pdata_offsets, pdata_lens, MACHO_TEXT_OFF + const_data_len)
+        emit_macho(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher, entry_in_text, runtime_with_thunk, pdata_offsets, pdata_lens, MACHO_TEXT_OFF + const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     } else {
-        emit_elf(runtime_bytes + const_data + funcs_bytes + jt_bytes + start_bytes, start_off, pdata_offsets, pdata_lens, str_len(runtime_bytes) + str_len(const_data))
+        emit_elf(runtime_bytes + const_data + funcs_bytes + jt_bytes + start_bytes, start_off, pdata_offsets, pdata_lens, str_len(runtime_bytes) + str_len(const_data), rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     }
 }

@@ -677,6 +677,81 @@ pub fn pe_build_pdata(offs, lens, code_base, unwind_off) {
     blob
 }
 
+// pe_unwind_info_zero 是零序言子程序的 UNWIND_INFO：SizeOfProlog=0、
+// CountOfUnwindCodes=0——GC/调度器里纯 call/ret、不建帧的内部子程序（gc_collect、
+// chan 系四个、waitset_add、timer_add）共享这一份，不需要任何 UNWIND_CODE。
+// pe_unwind_info_zero is the UNWIND_INFO for a zero-prologue subroutine:
+// SizeOfProlog=0, CountOfUnwindCodes=0 — the internal subroutines that are
+// plain call/ret and build no frame (gc_collect, the four chan_* ones,
+// waitset_add, timer_add) share this one, needing no UNWIND_CODE at all.
+pub fn pe_unwind_info_zero() {
+    byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0)
+}
+
+// pe_unwind_info_pushes 生成"入口连续 push、不带 sub rsp"这一类序言的
+// UNWIND_INFO（`gc_record`/`mark_addr`）：每条 push 的编码字节数（寄存器号 <8
+// 一字节，r8-r15 因 REX 前缀两字节）决定 CodeOffset 累计，UNWIND_CODE 数组按
+// Windows 的撤销顺序（执行逆序）排列，奇数个码补一个零 slot 到 DWORD 对齐——
+// 与 ELF 侧 `eh_push_instrs`/Mach-O 侧同一份 push_regs 数据源，三个格式各自的
+// 编码规则不同，但都从同一份寄存器列表算出。
+// pe_unwind_info_pushes builds the UNWIND_INFO for the "consecutive pushes at
+// entry, no sub rsp" prologue shape (gc_record/mark_addr): each push's own
+// encoding length (1 byte for registers <8, 2 bytes for r8-r15 due to the REX
+// prefix) accumulates the CodeOffset; the UNWIND_CODE array is listed in
+// Windows' undo order (reverse of execution), padded with one zero slot to
+// DWORD alignment when the count is odd — the same push_regs data source
+// feeds ELF's eh_push_instrs and Mach-O's equivalent; each format has its own
+// encoding rules but all three derive from the same register list.
+pub fn pe_unwind_info_pushes(push_regs) {
+    let n = len(push_regs)
+    let mut offs = []
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let reg = push_regs[i]
+        let ilen = if reg >= 8 {
+            2
+        } else {
+            1
+        }
+        acc = acc + ilen
+        push(offs, acc)
+        i = i + 1
+    }
+    let mut codes = ""
+    let mut j = n - 1
+    while j >= 0 {
+        codes = codes + byte_chr(offs[j]) + byte_chr(push_regs[j] * 16)
+        j = j - 1
+    }
+    if n % 2 == 1 {
+        codes = codes + byte_chr(0) + byte_chr(0)
+    }
+    byte_chr(1) + byte_chr(acc) + byte_chr(n) + byte_chr(0) + codes
+}
+
+// pe_build_pdata_multi 与 pe_build_pdata 同构，只是 unwind_offs 是与 offs/lens
+// 平行的逐项数组（而非全体共享一个 unwind_off）——内部子程序有三种不同序言
+// 形态（零/push7/push9），但在地址上与彼此、与用户函数交错，无法像用户函数那样
+// 按"一种形态"整体共享，需要逐项指定各自的 UNWIND_INFO 偏移。
+// pe_build_pdata_multi mirrors pe_build_pdata, except unwind_offs runs
+// parallel to offs/lens (instead of one shared unwind_off) — the internal
+// subroutines have three different prologue shapes (zero/push7/push9)
+// interleaved in address order with each other and with user functions, so
+// they can't share one UNWIND_INFO the way user functions do; each entry
+// needs its own UNWIND_INFO offset.
+pub fn pe_build_pdata_multi(offs, lens, code_base, unwind_offs) {
+    let n = len(offs)
+    let mut blob = ""
+    let mut i = 0
+    while i < n {
+        let begin = code_base + offs[i]
+        blob = blob + e4(pe_content_rva(begin)) + e4(pe_content_rva(begin + lens[i])) + e4(pe_content_rva(unwind_offs[i]))
+        i = i + 1
+    }
+    blob
+}
+
 // pe_hints_size 累计 hint/name 段尺寸（每项 2B hint + 名字 + NUL，补偶）
 // pe_hints_size totals the hint/name segment (per entry 2B hint + name + NUL, even-padded)
 pub fn pe_hints_size(fns) {

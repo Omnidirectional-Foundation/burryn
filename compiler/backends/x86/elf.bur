@@ -84,6 +84,69 @@ pub fn elf_eh_frame(offs, lens, code_va_base) {
     cie + fdes
 }
 
+// eh_push_instrs 由入口连续 push 的寄存器列表生成 FDE 指令流：每条 push 各自的
+// 编码字节数（寄存器号 <8 一字节，r8-r15 因 REX 前缀两字节）决定 advance_loc 步长，
+// CFA 偏移每条 push 固定 +8。内部子程序（`runtime.bur` 的 gc_record/mark_addr）
+// 序言只做连续 push、不像用户函数序言那样再接 `sub rsp`，故不需要区分两种指令；
+// 空数组（零序言：GC/调度器里纯 call/ret、不建帧的子程序）返回空指令流——CIE 的
+// 初始规则（CFA=rsp+8）原样贯穿整个函数体，不需要任何 CFI 指令。delta/累计偏移
+// 均远小于 64/128（内部子程序序言最多 9 个寄存器），单字节 ULEB128/advance_loc
+// 足够，不需要通用变长编码。
+// eh_push_instrs builds the FDE instruction stream from the list of registers
+// pushed at function entry: each push's own encoding length (1 byte for
+// registers <8, 2 bytes for r8-r15 due to the REX prefix) sets the
+// advance_loc step, while the CFA offset always grows by 8 per push.
+// Internal subroutines (runtime.bur's gc_record/mark_addr) only do
+// consecutive pushes at entry, unlike user functions which follow with a
+// `sub rsp` — so there's no need to distinguish two instruction shapes here.
+// An empty array (zero prologue: GC/scheduler subroutines that are plain
+// call/ret and build no frame) returns an empty instruction stream — the
+// CIE's initial rule (CFA=rsp+8) holds unchanged for the whole function body,
+// needing no CFI instructions at all. Every delta/running offset stays well
+// under 64/128 (at most 9 registers), so single-byte advance_loc/ULEB128 is
+// enough — no general variable-length encoder needed.
+fn eh_push_instrs(push_regs) {
+    let mut instrs = ""
+    let mut cfa_off = 8
+    let mut i = 0
+    while i < len(push_regs) {
+        let reg = push_regs[i]
+        let ilen = if reg >= 8 {
+            2
+        } else {
+            1
+        }
+        cfa_off = cfa_off + 8
+        instrs = instrs + byte_chr(64 + ilen) + byte_chr(14) + byte_chr(cfa_off)
+        i = i + 1
+    }
+    instrs
+}
+
+// elf_eh_frame_internal 追加内部子程序的 FDE，跟在 elf_eh_frame 已生成的一批 FDE
+// 后面，复用同一份共享 CIE——prior_len 是前面已有内容（CIE + 已发射 FDE）的总字节
+// 数，供 cie_pointer 往回数。push_regs_list 与 offs/lens 平行，每项是该函数入口
+// 连续 push 的寄存器列表（空数组＝零序言）。
+// elf_eh_frame_internal appends internal-subroutine FDEs after the batch
+// elf_eh_frame already produced, reusing the same shared CIE — prior_len is
+// the total byte length of what precedes this call (CIE plus FDEs already
+// emitted), which cie_pointer counts back across. push_regs_list runs
+// parallel to offs/lens: each entry is the list of registers pushed at that
+// function's entry (an empty array means a zero prologue).
+pub fn elf_eh_frame_internal(offs, lens, code_va_base, push_regs_list, prior_len) {
+    let n = len(offs)
+    let mut fdes = ""
+    let mut i = 0
+    while i < n {
+        let instrs = eh_push_instrs(push_regs_list[i])
+        let cie_pointer = prior_len + str_len(fdes) + 4
+        let content = u32(cie_pointer) + u64(code_va_base + offs[i]) + u64(lens[i]) + instrs
+        fdes = fdes + u32(str_len(content)) + content
+        i = i + 1
+    }
+    fdes
+}
+
 // elf_shstrtab 是节名字符串表：唯一有名字的节是 .eh_frame，供 gdb/readelf 的 CFI
 // 读取路径按名字定位——不需要完整符号表（崩溃可诊断性只要求返回地址能正确回溯，
 // 不要求源码级符号名，与 PE/Mach-O 已交付的范围一致）
@@ -109,7 +172,9 @@ fn elf_section_header(name, typ, addr, off, size) {
 // 已用手工构造的最小 ELF 在 gdb 下实测验证——见 architecture.md §5.19）。
 // pdata_offsets/pdata_lens 是 x86.bur codegen 循环已经无条件收集的每函数偏移/
 // 长度（PE/Mach-O 复用同一份数据），code_base 是 funcs_bytes 在 code 里的起始
-// 偏移，换算 elf_eh_frame 需要的绝对 VA 基址。
+// 偏移，换算 elf_eh_frame 需要的绝对 VA 基址。rt_unwind_* 三个并行数组是内部
+// 子程序（gc_record/mark_addr/…）的偏移/长度/入口 push 寄存器列表，追加在用户
+// 函数 FDE 后面，同一份共享 CIE。
 // emit_elf is the ELF assembly entry. .eh_frame and its section header table
 // follow code; the section header table itself and .shstrtab sit outside the
 // PT_LOAD's coverage (pure trailing debug data — execve never reads them,
@@ -117,13 +182,19 @@ fn elf_section_header(name, typ, addr, off, size) {
 // architecture.md §5.19). pdata_offsets/pdata_lens are the per-function
 // offset/length pairs x86.bur's codegen loop already collects unconditionally
 // (shared with PE/Mach-O); code_base is funcs_bytes' starting offset within
-// code, converted to the absolute VA base elf_eh_frame needs.
-pub fn emit_elf(code, entry_off, pdata_offsets, pdata_lens, code_base) {
+// code, converted to the absolute VA base elf_eh_frame needs. The three
+// rt_unwind_* parallel arrays are the internal subroutines' (gc_record/
+// mark_addr/…) offsets/lengths/entry push-register lists, appended after the
+// user-function FDEs, sharing the same CIE.
+pub fn emit_elf(code, entry_off, pdata_offsets, pdata_lens, code_base, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes) {
     let hdr_size = 64
     let ph_size = 56
     let code_offset = hdr_size + ph_size
     let entry = base_addr + code_offset + entry_off
-    let eh_frame = elf_eh_frame(pdata_offsets, pdata_lens, base_addr + code_offset + code_base)
+    let va_base = base_addr + code_offset + code_base
+    let user_eh = elf_eh_frame(pdata_offsets, pdata_lens, va_base)
+    let internal_eh = elf_eh_frame_internal(rt_unwind_offsets, rt_unwind_lens, va_base, rt_unwind_pushes, str_len(user_eh))
+    let eh_frame = user_eh + internal_eh
     let eh_frame_off = code_offset + str_len(code)
     let load_total = eh_frame_off + str_len(eh_frame)
     let shstrtab = elf_shstrtab()

@@ -112,21 +112,66 @@ fn macho_unwind_encoding() {
     33686533
 }
 
+// macho_unwind_encoding_pushes 生成"入口连续 push、不带 sub rsp"这一类序言
+// （`gc_record`/`mark_addr`，空数组即零序言）的 compact unwind 编码：仍是
+// UNWIND_X86_64_MODE_STACK_IMMD（frameless、栈立即数），stack_size 字段直接
+// 等于 push 条数（每条 push 定长搬 8 字节，不像 PE/ELF 的按字节偏移那样需要
+// 区分 REX 前缀长度——compact unwind 的 stack_size 单位本就是 8 字节，不是
+// 指令字节数），reg_count 与 permutation 都置 0——不为这些寄存器（多数不是
+// callee-saved，是这些子程序特意保护的调用者寄存器）走 permutation 编码：
+// compact unwind 的 permutation 字段设计上只描述标准 callee-saved 寄存器
+// （rbx/r12-r15/rbp）的保存位置，供异常传播时真正"恢复"用；本项目不做
+// personality/LSDA 异常展开（见 macho_unwind_info 的空异常处理器留白），
+// 只要 stack_size correct 就能正确算出 CFA/返回地址、继续回溯——reg_count=0
+// 等价于"不描述任何寄存器恢复位置"，对纯回溯无影响。
+// macho_unwind_encoding_pushes builds the compact unwind encoding for the
+// "consecutive pushes at entry, no sub rsp" prologue shape (gc_record/
+// mark_addr; an empty array is the zero prologue): still
+// UNWIND_X86_64_MODE_STACK_IMMD (frameless, stack-immediate). The stack_size
+// field is simply the push count (each push moves a fixed 8 bytes — unlike
+// PE/ELF's byte-offset tracking, compact unwind's stack_size unit is already
+// 8 bytes, not instruction bytes, so there's no need to distinguish
+// REX-prefixed push lengths here). reg_count and permutation stay 0 — these
+// pushes mostly aren't callee-saved registers (they're caller-saved
+// registers these subroutines deliberately protect), and compact unwind's
+// permutation field is designed to describe only the standard callee-saved
+// set (rbx/r12-r15/rbp) for actually restoring them during exception
+// propagation; this project does no personality/LSDA-based exception
+// unwinding (see macho_unwind_info's empty exception-handler fields), so a
+// correct stack_size alone is enough to compute CFA/the return address and
+// keep walking the backtrace — reg_count=0 means "no register-restore
+// locations described," which doesn't matter for pure backtracing.
+fn macho_unwind_encoding_pushes(push_regs) {
+    33554432 + len(push_regs) * 65536
+}
+
 // macho_unwind_info 生成 __TEXT,__unwind_info 节内容：不用 compressed 二级页
-// （不需要共享编码索引表那层间接——所有函数编码本就相同，regular 页直接存编码值
-// 更简单）；单个 regular 二级页装全部函数，一级索引两项（真实页 + 终结哨兵，
-// 终结项 secondLevelPagesSectionOffset=0、functionOffset=末函数结尾，dyld 靠它
-// 界定覆盖范围末端）；personality/LSDA 数组留空（无异常处理器）。
+// （不需要共享编码索引表那层间接——regular 页本就逐项直存编码值，异质编码
+// 天然支持，不必额外绕一层压缩索引）；单个 regular 二级页装全部函数（用户
+// 函数与内部子程序混在同一页，按地址升序排列），一级索引两项（真实页 + 终结
+// 哨兵，终结项 secondLevelPagesSectionOffset=0、functionOffset=末函数结尾，
+// dyld 靠它界定覆盖范围末端）；personality/LSDA 数组留空（无异常处理器）。
+// encodings 与 offs/lens 平行，逐项指定各自的 compact unwind 编码——内部子
+// 程序（gc_record 的 9-push、mark_addr 的 7-push、其余零序言）与用户函数三种
+// 编码交错出现，regular 页格式天然按项存储，不需要为异质编码单独设计结构。
 // macho_unwind_info builds the __TEXT,__unwind_info section content: no
-// compressed second-level pages (no need for that layer of indirection through a
-// shared-encoding table — every function's encoding is already identical, so a
-// regular page storing the encoding value directly is simpler); a single regular
-// second-level page holds every function, and the first-level index has two
-// entries (the real page plus a terminating sentinel — the sentinel has
-// secondLevelPagesSectionOffset=0 and functionOffset=the last function's end,
-// which is how dyld bounds the covered range); the personality/LSDA arrays stay
-// empty (no exception handler).
-fn macho_unwind_info(offs, lens, code_base) {
+// compressed second-level pages (no need for that layer of indirection
+// through a shared-encoding table — a regular page already stores the
+// encoding value per entry, so heterogeneous encodings are natively
+// supported without an extra compression layer); a single regular
+// second-level page holds every function (user functions and internal
+// subroutines interleaved in the same page, in ascending address order), and
+// the first-level index has two entries (the real page plus a terminating
+// sentinel — the sentinel has secondLevelPagesSectionOffset=0 and
+// functionOffset=the last function's end, which is how dyld bounds the
+// covered range); the personality/LSDA arrays stay empty (no exception
+// handler). encodings runs parallel to offs/lens, giving each entry its own
+// compact unwind encoding — the internal subroutines' three shapes
+// (gc_record's 9-push, mark_addr's 7-push, the rest zero-prologue)
+// interleave with the user-function shape, and the regular page format
+// stores per-entry values natively, needing no extra structure for
+// heterogeneous encodings.
+fn macho_unwind_info(offs, lens, code_base, encodings) {
     let n = len(offs)
     let index_off = 28
     let page_off = index_off + 2 * 12
@@ -136,7 +181,7 @@ fn macho_unwind_info(offs, lens, code_base) {
     let mut page = u32(2) + u16(8) + u16(n)
     let mut i = 0
     while i < n {
-        page = page + u32(code_base + offs[i]) + u32(macho_unwind_encoding())
+        page = page + u32(code_base + offs[i]) + u32(encodings[i])
         i = i + 1
     }
     hdr + index + page
@@ -184,9 +229,31 @@ fn macho_dylib() {
 // at entry_in_text within the __TEXT content. pdata_offsets/pdata_lens are each
 // variant's (offset, length) within funcs_bytes, shared with PE's .pdata
 // (x86.bur's emission order is ascending address, see pe_build_pdata's matching
-// comment); code_base is funcs_bytes' file-relative start.
-pub fn emit_macho(text_content, entry_in_text, data_content, pdata_offsets, pdata_lens, code_base) {
-    let unwind_content = macho_unwind_info(pdata_offsets, pdata_lens, code_base)
+// comment); code_base is funcs_bytes' file-relative start. rt_unwind_offsets/
+// rt_unwind_lens/rt_unwind_pushes are the internal subroutines' (gc_record/
+// mark_addr/…) offsets/lengths/entry push-register lists, sharing the same
+// __unwind_info regular page as the user functions — internal subroutines
+// always sit at lower addresses, so they're prepended before building the
+// combined, address-ascending offs/lens/encodings arrays.
+pub fn emit_macho(text_content, entry_in_text, data_content, pdata_offsets, pdata_lens, code_base, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes) {
+    let mut all_offs = []
+    let mut all_lens = []
+    let mut all_encs = []
+    let mut ri = 0
+    while ri < len(rt_unwind_offsets) {
+        push(all_offs, rt_unwind_offsets[ri])
+        push(all_lens, rt_unwind_lens[ri])
+        push(all_encs, macho_unwind_encoding_pushes(rt_unwind_pushes[ri]))
+        ri = ri + 1
+    }
+    let mut ui = 0
+    while ui < len(pdata_offsets) {
+        push(all_offs, pdata_offsets[ui])
+        push(all_lens, pdata_lens[ui])
+        push(all_encs, macho_unwind_encoding())
+        ui = ui + 1
+    }
+    let unwind_content = macho_unwind_info(all_offs, all_lens, code_base, all_encs)
     let unwind_len = str_len(unwind_content)
     // 不对 ULEB128 载荷做尾部零字节补齐——补齐用的 0x00 本身就是「值为 0」的合法
     // ULEB128 编码，会被解码器当成多出的一个函数起点，把最后一个真实条目复制一遍

@@ -29,3 +29,32 @@ fn test_pe_build_pdata_multi_shares_one_unwind() {
 fn test_pe_build_pdata_empty() {
     assert(pe_build_pdata([], [], 4096, 5000) == "", "no functions means an empty RUNTIME_FUNCTION array")
 }
+
+fn test_pe_unwind_info_zero() {
+    let uw = pe_unwind_info_zero()
+    let want = byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0)
+    assert(uw == want, "header(ver1/flags0, prolog0, codes0, frame0), no UNWIND_CODE entries")
+}
+
+fn test_pe_unwind_info_pushes_low_registers_odd_count_padded() {
+    // rdx(2)/rdi(7)/rsi(6): 3 low registers, 1 byte each -> CodeOffset 1,2,3;
+    // codes listed in undo order (rsi,rdi,rdx), padded with one zero slot for
+    // the odd count
+    let uw = pe_unwind_info_pushes([rdx, rdi, rsi])
+    let want = byte_chr(1) + byte_chr(3) + byte_chr(3) + byte_chr(0) + byte_chr(3) + byte_chr(6 * 16) + byte_chr(2) + byte_chr(7 * 16) + byte_chr(1) + byte_chr(2 * 16) + byte_chr(0) + byte_chr(0)
+    assert(uw == want, "3 low-register pushes: SizeOfProlog=3, 3 codes in undo order, padded to 4 slots (DWORD alignment)")
+}
+
+fn test_pe_unwind_info_pushes_gc_record_shape() {
+    // x86gen_gc_record's push3 order: rdx,rdi,rsi,rax,rcx (1B each), r8,r9,r10,r11 (2B each)
+    let uw = pe_unwind_info_pushes([rdx, rdi, rsi, rax, rcx, r8, r9, r10, r11])
+    let hdr = byte_chr(1) + byte_chr(13) + byte_chr(9) + byte_chr(0)
+    let codes = byte_chr(13) + byte_chr(r11 * 16) + byte_chr(11) + byte_chr(r10 * 16) + byte_chr(9) + byte_chr(r9 * 16) + byte_chr(7) + byte_chr(r8 * 16) + byte_chr(5) + byte_chr(rcx * 16) + byte_chr(4) + byte_chr(rax * 16) + byte_chr(3) + byte_chr(rsi * 16) + byte_chr(2) + byte_chr(rdi * 16) + byte_chr(1) + byte_chr(rdx * 16) + byte_chr(0) + byte_chr(0)
+    assert(uw == hdr + codes, "gc_record's real 9-push prologue: SizeOfProlog=13 (5x1B+4x2B), 9 codes in undo order padded to 10 slots")
+}
+
+fn test_pe_build_pdata_multi_per_entry_unwind() {
+    let pdata = pe_build_pdata_multi([0, 50], [30, 40], 4096, [5000, 6000])
+    let want = e4(pe_content_rva(4096)) + e4(pe_content_rva(4126)) + e4(pe_content_rva(5000)) + e4(pe_content_rva(4146)) + e4(pe_content_rva(4186)) + e4(pe_content_rva(6000))
+    assert(pdata == want, "each entry gets its own UnwindInfoAddress instead of one shared value")
+}

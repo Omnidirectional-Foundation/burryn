@@ -488,6 +488,72 @@ augmentation 字符串，地址字段用原生 8 字节绝对值，不带 PC 相
 数据）。`scripts/multi-backend-verify.sh` 覆盖的全部 examples/testdata/
 testdata/pkg 用例三方（VM/C/x86）复核过，无回归。
 
+### 5.20 内部子程序 unwind 覆盖扩展（定案，2026-09-14）
+
+在 §5.19 交付的 ELF 之上，把三个格式的 unwind 覆盖从"仅用户函数"扩展到
+`runtime.bur` 的内部子程序：`gc_record`、`gc_collect`、`mark_addr`、
+`chan_schedule`、`chan_wake_waiters`、`chan_push_queue`（sendq/recvq/waiters
+三个实例）、`chan_remove_waiter`、`waitset_add`、`timer_add`，共 11 个代码实例。
+调度器三块（`sched`/`yield`/`fiber_done`）是纤程切换机制本身，边界不变，仍不
+覆盖（见 §5.19）。
+
+**序言形态逐个核对 `runtime.bur` 源码（`push_r` 出现次数与顺序）得出三类**：
+
+- **零序言**（9 例：`gc_collect`、四个 `chan_*`、`waitset_add`、`timer_add`）：
+  入口不碰 `rsp`，函数体全程是 CIE 的初始规则（CFA=rsp+8）——不需要任何
+  CFI/UNWIND_CODE/compact-unwind 指令，三个格式都退化成"只登记 PC 范围，
+  规则沿用入口态"。
+- **9-push**（`gc_record`）：入口连续 `push rdx/rdi/rsi/rax/rcx/r8/r9/r10/r11`
+  （无 `sub rsp`），CFA 最终到 rsp+80。
+- **7-push**（`mark_addr`）：入口连续 `push rax/rcx/rdx/rdi/r8/r9/r10`，CFA
+  最终到 rsp+64。
+
+**三个格式各自的编码差异，同一份 push 寄存器列表喂给三套不同规则**：
+
+- **ELF**（`eh_push_instrs`）：DWARF CFI 需要按字节精确的 `advance_loc`，每条
+  `push` 的指令长度（寄存器号 <8 一字节，r8-r15 因 REX 前缀两字节）决定步长；
+  `elf_eh_frame_internal` 把内部子程序的 FDE 追加在用户函数 FDE 后面，共享
+  同一份 CIE。
+- **PE**（`pe_unwind_info_pushes`/`pe_unwind_info_zero`/
+  `pe_build_pdata_multi`）：Windows UNWIND_CODE 的 CodeOffset 同样按字节精确，
+  与 ELF 同一套"1/2 字节"判断；三种序言各自一份共享 UNWIND_INFO（用户形态不变、
+  新增零序言与两份 push 形态），.pdata 数组内部子程序 11 项排在用户函数前面
+  （地址恒更低，满足 `RtlLookupFunctionEntry` 要求的 BeginAddress 升序）。
+- **Mach-O**（`macho_unwind_encoding_pushes`）：compact unwind 的 stack_size
+  字段单位本就是 8 字节而非指令字节，不需要区分 REX 前缀长度，比 ELF/PE 更简单
+  ——直接是 push 条数。`reg_count`/`permutation` 统一置 0：这些寄存器多数不是
+  callee-saved（是子程序特意保护的调用者寄存器），compact unwind 的
+  permutation 字段设计上只服务真正"恢复寄存器"的异常传播场景，本项目不做
+  personality/LSDA 展开，只要 stack_size 正确即可回溯，`reg_count=0` 无影响。
+  `macho_unwind_info` 的 regular 二级页本就逐项存编码，异质编码天然支持，
+  不需要引入 compressed 页那层间接；内部子程序与用户函数混在同一页，按地址
+  升序排列。
+
+**验证方式对齐 §5.19 的力度，三个格式各自能做到的最大程度**：ELF 有本机 gdb，
+做了两层验证：(a) 手写字节先与真实 `gdb`/`readelf` 解出的每一条
+`DW_CFA_advance_loc`/`DW_CFA_def_cfa_offset` 逐项核对；(b) 用编译器实际产出的
+ELF 跑 `gc_stress.bur`（真实触发 GC），在 `gc_record` 入口断点，`bt` 显示
+frame 0→1 的过渡正确落到真实调用点（地址落在某个用户函数的 FDE 覆盖范围内）——
+frame 1→2 再往上偶尔失真，定位到的原因是用户函数里内联的 `gc_rec()` 括号
+（临时 push/pop 三个寄存器再 `call`）会让该用户函数在那个精确调用点的真实
+CFA 与"序言结束后维持不变"的既有假设有 24 字节的偏差；这是 §5.19 就已经
+接受的、与本轮无关的既有局限（不建模函数体中段的临时 push/pop），不是本轮
+引入的新问题——单独复核过深递归崩溃（跨用户函数、不涉及内部子程序）的
+回溯依旧逐帧精确、零回归。PE/Mach-O 没有本机 Windows/macOS 调试器，验证止于
+静态字节级核对：分别手工解析真实构建产物的 `.pdata`/`__unwind_info`
+二进制内容，逐字节比对 11 个内部子程序条目的 PC 范围、编码偏移与三种序言各自
+的 UNWIND_CODE/compact-unwind 数值，与设计推导完全吻合；这与 §5.19 交付
+PE/Mach-O 初版时同一验证力度，如实记录，不假装有更高确信度。
+
+代码：`elf.bur` 的 `eh_push_instrs`/`elf_eh_frame_internal`，`pe.bur` 的
+`pe_unwind_info_zero`/`pe_unwind_info_pushes`/`pe_build_pdata_multi`，
+`macho.bur` 的 `macho_unwind_encoding_pushes`（`macho_unwind_info` 签名
+扩展为接收逐项 `encodings` 数组），`x86.bur` 里新增的 `rt_unwind_offsets`/
+`rt_unwind_lens`/`rt_unwind_pushes` 三个并行数组（三个后端共用同一份数据源）。
+单测覆盖 `elf_test.bur`/`pe_test.bur`/`macho_test.bur`。
+`scripts/multi-backend-verify.sh` 覆盖的全部 examples/testdata/testdata/pkg
+用例三方（VM/C/x86）复核过，无回归。
+
 ## 6. LSP 与编辑器生态
 
 **架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0（LSP 3.17 规范）。
