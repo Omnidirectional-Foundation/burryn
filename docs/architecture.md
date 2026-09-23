@@ -1,6 +1,6 @@
 # Architecture — Burryn 实现架构
 
-> v0.7 · active · 2026-09-13
+> v0.7 · active · 2026-09-23
 > 状态：实现权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
 > 相关文档：[`GOALS.md`](GOALS.md) 路线与完成线 · [`grammar.md`](grammar.md) 表层语法 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`../README.md`](../README.md)
 

@@ -1,6 +1,6 @@
 # GOALS — Burryn 路线与里程碑
 
-> v0.8 · active · 2026-09-07 ~ 09-13
+> v0.8 · active · 2026-09-07 ~ 09-23
 > 状态：前瞻规划 · 编号 `S<n>[.<m>]`
 > 相关文档：[`architecture.md`](architecture.md) 实现权威 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
