@@ -573,7 +573,9 @@ void bur_quote(Buf *b, const char *s, int64_t n) {
         case '\t': buf_str(b, "\\t"); break;
         case '\r': buf_str(b, "\\r"); break;
         default:
-            if (c >= 0x20 && c < 0x7f) {
+            // Go-style like the VM's go_quote: only control bytes and DEL are
+            // escaped; bytes >= 0x80 pass through so UTF-8 text stays readable
+            if (c >= 0x20 && c != 0x7f) {
                 buf_char(b, (char)c);
             } else {
                 char hex[5];
