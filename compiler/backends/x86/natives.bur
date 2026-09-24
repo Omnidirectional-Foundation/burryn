@@ -203,7 +203,7 @@ fn x86gen_proc_register() {
 // x86gen_exec_native 内联 exec：spawn + 同步排空循环
 // x86gen_exec_native inlines exec: spawn plus a synchronous drain loop
 // exec inline: spawn, drain to completion, build the Result
-fn x86gen_exec_native() {
+fn x86gen_exec_native(sched_addr, timer_add_addr) {
     let spawn_seq = x86gen_exec_spawn_native()
     let pump = x86gen_proc_pump()
     let result = x86gen_proc_result_inst()
@@ -211,13 +211,18 @@ fn x86gen_exec_native() {
     let store = mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let err_tail = err + store
     let done_seq = result + jmp_rel32(str_len(err))
-    // 1ms 休眠（近似 poll 阻塞等待子进程）/ 1ms sleep (approximating a blocking poll on the child)
-    let ns = sub_ri32(rsp, 16) + mov_ri64(rdx, 0) + mov_mr(rsp, 0, rdx) + mov_ri64(rdx, 1000000) + mov_mr(rsp, 8, rdx) + mov_rr(rdi, rsp) + xor_rr(rsi, rsi) + sys_mov_rax(35) + syscall() + add_ri32(rsp, 16)
-    let loop_head = mov_rm(rax, r9, proc_complete) + test_rr(rax, rax) + jne_rel32(str_len(pump) + str_len(ns) + 5)
+    // 未完成就以 1ms timer 让出（C 在此 park 当前 fiber、其余 fiber 照常运行）；proc
+    // 指针跨 park 存在值栈槽里
+    // not complete yet: yield on a 1ms timer (C parks the fiber here while the
+    // others keep running); the proc pointer lives in a value-stack slot across
+    // the park
+    let ns = mov_ri64(r9, 1) + x86gen_timer_park(sched_addr, timer_add_addr)
+    let loop_head = mov_rm(r9, r15, 0 - 8) + mov_rm(rax, r9, proc_complete) + test_rr(rax, rax) + jne_rel32(str_len(pump) + str_len(ns) + 5)
     let loop_back = jmp_rel32(0 - (str_len(loop_head) + str_len(pump) + str_len(ns) + 5))
     let reg = x86gen_proc_register()
-    let fail_test = test_rr(rax, rax) + jl_rel32(str_len(reg) + str_len(mov_rr(r9, rax)) + str_len(loop_head) + str_len(pump) + str_len(ns) + 5 + str_len(done_seq))
-    spawn_seq + fail_test + reg + mov_rr(r9, rax) + loop_head + pump + ns + loop_back + done_seq + err_tail
+    let loop_exit = mov_rm(r9, r15, 0 - 8) + vs_pop_n(1)
+    let fail_test = test_rr(rax, rax) + jl_rel32(str_len(reg) + str_len(vs_push(rax)) + str_len(loop_head) + str_len(pump) + str_len(ns) + 5 + str_len(loop_exit) + str_len(done_seq))
+    spawn_seq + fail_test + reg + vs_push(rax) + loop_head + pump + ns + loop_back + loop_exit + done_seq + err_tail
 }
 
 // x86gen_exec_start_native 内联 exec_start：spawn → Ok(handle) / x86gen_exec_start_native inlines
@@ -1194,7 +1199,7 @@ fn x86gen_read_dir_native() {
     if target_os == "windows" {
         main_done_closeadd = win_closeadd
     }
-    let main_done = main_done_closeadd + mov_rm(r10, r15, 0 - 32) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + test_rr(r10, r10) + je_rel32(str_len(list_alloc) + str_len(build_loop) + str_len(build_tail)) + outer_loop + list_alloc + build_loop + build_tail
+    let main_done = main_done_closeadd + mov_rm(r10, r15, 0 - 32) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + test_rr(r10, r10) + je_rel32(str_len(outer_loop) + str_len(list_alloc) + str_len(build_loop) + str_len(build_tail)) + outer_loop + list_alloc + build_loop + build_tail
     let names_alloc = mov_rr(r9, r12) + mov_mr(r15, 0 - 24, r9) + add_ri32(r12, 16384) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
     let main_tail = sub_ri32(rsp, 8192) + names_alloc + collect_loop + main_done + empty_ok
     let open_fail = test_rr(rax, rax) + jl_rel32(str_len(main_tail))
@@ -1317,8 +1322,12 @@ fn x86gen_record_eq(ftypes) {
 // x86gen_sleep_native inlines sleep: the nanosleep syscall, millisecond precision
 // sleep inline: timer-table park with a deadline; sleep(0) is a plain yield (matching
 // the C runtime's bur_schedule + bur_switch_to_sched)
-fn x86gen_sleep_native(sched_addr, timer_add_addr) {
-    let unit_ret = xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+// x86gen_timer_park 让当前 fiber 睡 r9 毫秒：登记 timer、置 BLOCKED_TIMER、回调度器，
+// 到期后从紧随其后的指令继续（除 rsp/rbp/r14/r15 外寄存器不保留）
+// x86gen_timer_park parks the current fiber for r9 milliseconds: register a
+// timer, mark BLOCKED_TIMER, re-enter the scheduler; it resumes at the next
+// instruction when due (registers other than rsp/rbp/r14/r15 are not preserved)
+fn x86gen_timer_park(sched_addr, timer_add_addr) {
     let park_save = mov_mr(rdi, FB_RSP, rsp) + mov_mr(rdi, FB_RBP, rbp) + mov_mr(rdi, FB_R14, r14) + mov_mr(rdi, FB_R15, r15)
     let park_tail = mov_ri64(r8, sched_addr) + jmp_r(r8)
     let park_push = lea_rip_rel32(r8, str_len(push_r(r8)) + str_len(park_save) + str_len(park_tail)) + push_r(r8)
@@ -1326,7 +1335,12 @@ fn x86gen_sleep_native(sched_addr, timer_add_addr) {
     let timer_add_call = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_ri64(r8, timer_add_addr) + call_r(r8)
     let timer_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rcx, rsp, 0) + mov_ri64(r8, 1000000000) + imul_rr(rcx, r8) + mov_rm(r8, rsp, 8) + add_rr(rcx, r8) + add_rr(rdx, rcx) + mov_rr(rax, rdx) + add_ri32(rsp, 16)
     let timer_deadline = mov_rr(rax, r9) + mov_ri64(rcx, 1000000) + imul_rr(rax, rcx) + mov_rr(rdx, rax)
-    let timer_path = timer_deadline + timer_now + timer_add_call + set_status + park_push + park_save + park_tail
+    timer_deadline + timer_now + timer_add_call + set_status + park_push + park_save + park_tail
+}
+
+fn x86gen_sleep_native(sched_addr, timer_add_addr) {
+    let unit_ret = xor_rr(rax, rax) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+    let timer_path = x86gen_timer_park(sched_addr, timer_add_addr)
     let y_join = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_mr(rcx, 0, rax)
     let y_first = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
     let y_to_join = jmp_rel32(str_len(y_join))
