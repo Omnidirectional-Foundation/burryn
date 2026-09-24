@@ -190,7 +190,10 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_rva_base) {
 // 50 listen、42 connect、43 accept（返槽号，kind=1）、54 setsockopt、
 // 55 getsockopt、72 fcntl（1/3 查表验证，4 走 ioctlsocket）、1000/1001/1002
 // FindFirstFileA/FindNextFileA/FindClose（合成号，无 Linux 对应物，供 read_dir
-// 直调）、1003 启动向量（合成号，供 _start）；其余 ud2 立即崩溃暴露缺口。
+// 直调）、1003 启动向量（合成号，供 _start）、35 nanosleep→Sleep、
+// 61 wait4→WaitForSingleObject + GetExitCodeProcess、1004 spawn→CreatePipe×2 +
+// CreateProcessA（合成号，供 exec native）；kind==2 槽（子进程管道）的 read 先
+// PeekNamedPipe，从不阻塞；其余 ud2 立即崩溃暴露缺口。
 // Supported: 1 write→WriteFile (via the fd table; kind==1 takes recv), 60
 // exit→ExitProcess, 9 mmap→VirtualAlloc, 228 clock_gettime→QPC/QPF synthesizing
 // timespec, 7 poll→Sleep (nfds==0 timer waits only) or WSAPoll for nfds>0 (with
@@ -203,8 +206,11 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_rva_base) {
 // 54 setsockopt, 55 getsockopt, 72 fcntl (1/3 validate through the table,
 // 4 takes ioctlsocket); 1000/1001/1002 FindFirstFileA/FindNextFileA/FindClose
 // (synthetic numbers with no Linux counterpart, called by read_dir directly,
-// see natives), 1003 the startup vector (synthetic, called by _start);
-// anything else hits ud2.
+// see natives), 1003 the startup vector (synthetic, called by _start),
+// 35 nanosleep→Sleep, 61 wait4→WaitForSingleObject + GetExitCodeProcess,
+// 1004 spawn→CreatePipe x2 + CreateProcessA (synthetic, called by the exec
+// natives); read on a kind==2 slot (a child's pipe) peeks first so it never
+// blocks; anything else hits ud2.
 // iat 为全部 IAT 槽的绝对地址，与 pe_import_names 平行，经 pe_iat 按名取用。
 // iat holds every IAT slot's absolute address, parallel to pe_import_names and
 // resolved by name through pe_iat.
@@ -222,11 +228,11 @@ pub fn pe_import_dlls() {
 }
 
 pub fn pe_import_counts() {
-    [18, 14, 1]
+    [24, 14, 1]
 }
 
 pub fn pe_import_names() {
-    ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "GetCommandLineW", "WideCharToMultiByte", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError", "CommandLineToArgvW"]
+    ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "GetCommandLineW", "WideCharToMultiByte", "CreatePipe", "SetHandleInformation", "CreateProcessA", "WaitForSingleObject", "GetExitCodeProcess", "PeekNamedPipe", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError", "CommandLineToArgvW"]
 }
 
 // pe_iat 按函数名取 IAT 槽绝对地址（iat 与 pe_import_names 平行）
@@ -306,6 +312,121 @@ fn pe_fd_lookup(iat, skip_after) {
     let slot = mov_rr(r11, rdi) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10)
     let bound = mov_ri64(r10, 64) + cmp_rr(rdi, r10) + jae_rel32(str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(hop))
     test_rr(rdi, rdi) + jl_rel32(str_len(bound) + str_len(slot) + str_len(kind_chk) + str_len(free_chk) + str_len(lazy) + str_len(hop)) + bound + slot + kind_chk + free_chk + lazy + hop + miss
+}
+
+// pe_call 经 IAT 槽调用 name（mov r10, 槽; call [r10]）
+// pe_call calls name through its IAT slot (mov r10, slot; call [r10])
+fn pe_call(iat, name) {
+    mov_ri64(r10, pe_iat(iat, name)) + e1(65) + e1(255) + e1(18)
+}
+
+// pe_spawn_case 生成 1004 spawn 臂：rdi = argv（NUL 结尾 C 串的 NULL 结尾数组），
+// rsi = 出参区（写 [+0] stdout 读端、[+8] stderr 读端两个 HANDLE），返回进程
+// HANDLE，失败 -1。与 C runtime 的 Windows bur_proc_spawn 同构：argv 按
+// CommandLineToArgvW 规则拼成命令行（含空白/引号/空串的参数加引号，引号前的
+// 反斜杠翻倍，内嵌引号转义为 \"），两条可继承管道的父端去继承标志，
+// STARTF_USESTDHANDLES 接 stdin 继承、stdout/stderr 入管道，CreateProcessA
+// 带 CREATE_NO_WINDOW；子进程启动后关写端与线程句柄。r12 之上的空闲堆作暂存
+// （不前移 r12，调用返回即弃）：+0 SECURITY_ATTRIBUTES、+32 STARTUPINFOA、
+// +144 PROCESS_INFORMATION、+176 命令行。局部：+80/+88 stdout 读/写端、
+// +96/+104 stderr 读/写端、+112 argv 后作 CreateProcessA 结果、+120 出参区。
+// pe_spawn_case emits the 1004 spawn arm: rdi = argv (a NULL-terminated array
+// of NUL-terminated C strings), rsi = the out area ([+0] stdout read end, [+8]
+// stderr read end, both HANDLEs); returns the process HANDLE, -1 on failure.
+// It mirrors the C runtime's Windows bur_proc_spawn: argv joins into a command
+// line under the CommandLineToArgvW rules (arguments holding whitespace, a
+// quote or nothing get quoted, backslashes before a quote double, embedded
+// quotes escape as \"), both inheritable pipes drop the inherit flag on the
+// parent ends, STARTF_USESTDHANDLES keeps stdin inherited and routes
+// stdout/stderr into the pipes, CreateProcessA runs with CREATE_NO_WINDOW, and
+// the write ends plus the thread handle close once the child starts. Free
+// heap above r12 serves as scratch (r12 does not move; the scratch dies on
+// return): +0 SECURITY_ATTRIBUTES, +32 STARTUPINFOA, +144
+// PROCESS_INFORMATION, +176 the command line. Locals: +80/+88 stdout
+// read/write ends, +96/+104 stderr read/write ends, +112 argv then the
+// CreateProcessA result, +120 the out area.
+fn pe_spawn_case(iat) {
+    let close_at = fn(off) {
+        mov_rm(rcx, rsp, off) + pe_call(iat, "CloseHandle")
+    }
+    // 单字节原语：mov al, imm8 / stosb / movsb / rep stosb / mov al, [rsi] /
+    // mov al, [rdx] / test al, al / cmp al, imm8
+    // byte primitives: mov al, imm8 / stosb / movsb / rep stosb / mov al, [rsi]
+    // / mov al, [rdx] / test al, al / cmp al, imm8
+    let put = fn(b) {
+        e1(176) + e1(b) + e1(170)
+    }
+    let movsb = e1(164)
+    let rep_stosb = e1(243) + e1(170)
+    let al_rsi = e1(138) + e1(6)
+    let al_rdx = e1(138) + e1(2)
+    let test_al = e1(132) + e1(192)
+    let cmp_al = fn(b) {
+        e1(60) + e1(b)
+    }
+    let sa = mov_ri64(rax, 24) + mov_mr(r12, 0, rax) + xor_rr(rax, rax) + mov_mr(r12, 8, rax) + mov_ri64(rax, 1) + mov_mr(r12, 16, rax)
+    let pipe_at = fn(off) {
+        lea(rcx, rsp, off) + lea(rdx, rsp, off + 8) + mov_rr(r8, r12) + xor_rr(r9, r9) + pe_call(iat, "CreatePipe")
+    }
+    let no_inherit = fn(off) {
+        mov_rm(rcx, rsp, off) + mov_ri64(rdx, 1) + xor_rr(r8, r8) + pe_call(iat, "SetHandleInformation")
+    }
+    // STARTUPINFOA：清零 104B，cb=104，dwFlags(+60)=STARTF_USESTDHANDLES，
+    // hStdInput(+80)/hStdOutput(+88)/hStdError(+96)
+    // STARTUPINFOA: zero 104B, cb=104, dwFlags (+60) = STARTF_USESTDHANDLES,
+    // hStdInput (+80) / hStdOutput (+88) / hStdError (+96)
+    let si = lea(rdi, r12, 32) + xor_rr(rax, rax) + mov_ri32(rcx, 104) + rep_stosb + mov_ri64(rax, 104) + mov_mr32(r12, 32, rax) + mov_ri64(rax, 256) + mov_mr32(r12, 92, rax) + mov_ri64(rcx, 0 - 10) + pe_call(iat, "GetStdHandle") + mov_mr(r12, 112, rax) + mov_rm(rax, rsp, 88) + mov_mr(r12, 120, rax) + mov_rm(rax, rsp, 104) + mov_mr(r12, 128, rax)
+    // 命令行拼接：r8 = argv 游标，rsi = 源串，rdi = 目标游标，r9 = 非首参，
+    // r11 = 本参加引号，rcx = 反斜杠连续数，rdx = 扫描指针
+    // command-line join: r8 = argv cursor, rsi = source string, rdi = the
+    // destination cursor, r9 = not the first argument, r11 = quote this
+    // argument, rcx = the backslash run length, rdx = the scan pointer
+    // 引号判定：空串直接置位；否则逐字节扫，NUL 经 q_exit 越过 q_set，
+    // 空格/制表/引号落到 q_set
+    // quote decision: an empty string sets it at once; otherwise scan byte by
+    // byte, NUL leaving through q_exit over q_set, space/tab/quote landing on q_set
+    let q_set = mov_ri64(r11, 1)
+    let q_exit = jmp_rel32(str_len(q_set))
+    let q_adv = add_ri32(rdx, 1)
+    let q_tail = str_len(q_adv) + 5
+    let q_d = cmp_al(34) + je_rel32(q_tail + str_len(q_exit))
+    let q_c = cmp_al(9) + je_rel32(str_len(q_d) + q_tail + str_len(q_exit))
+    let q_b = cmp_al(32) + je_rel32(str_len(q_c) + str_len(q_d) + q_tail + str_len(q_exit))
+    let q_a = al_rdx + test_al + je_rel32(str_len(q_b) + str_len(q_c) + str_len(q_d) + q_tail)
+    let q_body = q_a + q_b + q_c + q_d + q_adv
+    let q_loop = q_body + jmp_rel32(0 - (str_len(q_body) + 5))
+    let q_empty = xor_rr(r11, r11) + mov_rr(rdx, rsi) + al_rdx + test_al + jne_rel32(str_len(q_set) + 5) + q_set + jmp_rel32(str_len(q_loop) + str_len(q_exit) + str_len(q_set))
+    let q_scan = q_empty + q_loop + q_exit + q_set
+    let open_q = test_rr(r11, r11) + je_rel32(3) + put(34)
+    let bs_inc = add_ri32(rcx, 1) + add_ri32(rsi, 1)
+    let bs_body = al_rsi + cmp_al(92) + jne_rel32(str_len(bs_inc) + 5) + bs_inc
+    let bs_loop = xor_rr(rcx, rcx) + bs_body + jmp_rel32(0 - (str_len(bs_body) + 5))
+    let ch_normal = e1(176) + e1(92) + rep_stosb + movsb
+    let end_dbl = add_rr(rcx, rcx)
+    let ch_end = test_rr(r11, r11) + je_rel32(str_len(end_dbl)) + end_dbl + e1(176) + e1(92) + rep_stosb
+    let ch_quote = add_rr(rcx, rcx) + add_ri32(rcx, 1) + e1(176) + e1(92) + rep_stosb + put(34) + add_ri32(rsi, 1)
+    // 每字符：数反斜杠 → 引号/NUL/普通三分支；引号与普通回到 ch_top，NUL 出环
+    // per character: count backslashes, then branch on quote / NUL / other;
+    // quote and other loop back to ch_top, NUL leaves the loop
+    let ch_iter = bs_loop + cmp_al(34) + jne_rel32(str_len(ch_quote) + 5) + ch_quote
+    let ch_iter_len = str_len(ch_iter) + 5 + 2 + 6 + str_len(ch_end) + 5 + str_len(ch_normal) + 5
+    let ch_loop = ch_iter + jmp_rel32(0 - (str_len(ch_iter) + 5)) + test_al + jne_rel32(str_len(ch_end) + 5) + ch_end + jmp_rel32(str_len(ch_normal) + 5) + ch_normal + jmp_rel32(0 - ch_iter_len)
+    let close_q = test_rr(r11, r11) + je_rel32(3) + put(34)
+    let sep = test_rr(r9, r9) + je_rel32(3) + put(32)
+    let arg_body = sep + mov_ri64(r9, 1) + q_scan + open_q + ch_loop + close_q + add_ri32(r8, 8)
+    let arg_head = mov_rm(rsi, r8, 0) + test_rr(rsi, rsi) + je_rel32(str_len(arg_body) + 5)
+    let cmdline = mov_rm(r8, rsp, 112) + lea(rdi, r12, 176) + xor_rr(r9, r9) + arg_head + arg_body + jmp_rel32(0 - (str_len(arg_head) + str_len(arg_body) + 5)) + put(0)
+    // CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)
+    let create = xor_rr(rcx, rcx) + lea(rdx, r12, 176) + xor_rr(r8, r8) + xor_rr(r9, r9) + mov_ri64(rax, 1) + mov_mr(rsp, 32, rax) + mov_ri64(rax, 134217728) + mov_mr(rsp, 40, rax) + xor_rr(rax, rax) + mov_mr(rsp, 48, rax) + mov_mr(rsp, 56, rax) + lea(rax, r12, 32) + mov_mr(rsp, 64, rax) + lea(rax, r12, 144) + mov_mr(rsp, 72, rax) + pe_call(iat, "CreateProcessA") + mov_mr(rsp, 112, rax) + close_at(88) + close_at(104)
+    let fail = mov_ri64(rax, 0 - 1)
+    let p2_fail = close_at(80) + close_at(88)
+    let cp_fail = close_at(80) + close_at(96) + jmp_rel32(str_len(p2_fail))
+    let ok = mov_rm(rcx, r12, 152) + pe_call(iat, "CloseHandle") + mov_rm(rcx, rsp, 120) + mov_rm(rax, rsp, 80) + mov_mr(rcx, 0, rax) + mov_rm(rax, rsp, 96) + mov_mr(rcx, 8, rax) + mov_rm(rax, r12, 144) + jmp_rel32(str_len(cp_fail) + str_len(p2_fail) + str_len(fail))
+    let cp_chk = mov_rm32(rax, rsp, 112) + test_rr(rax, rax) + je_rel32(str_len(ok))
+    let after_p2 = no_inherit(80) + no_inherit(96) + si + cmdline + create + cp_chk + ok + cp_fail
+    let p2 = pipe_at(96) + e1(133) + e1(192) + je_rel32(str_len(after_p2))
+    let p1 = pipe_at(80) + e1(133) + e1(192) + je_rel32(str_len(p2) + str_len(after_p2) + str_len(p2_fail))
+    mov_mr(rsp, 112, rdi) + mov_mr(rsp, 120, rsi) + sa + p1 + p2 + after_p2 + p2_fail + fail
 }
 
 pub fn pe_build_dispatcher(iat) {
@@ -398,7 +519,27 @@ pub fn pe_build_dispatcher(iat) {
     let read_body = mov_mr(rsp, 56, rdx) + read_tail
     let read_file = read_body + jmp_rel32(str_len(read_ws))
     let read_split = mov_rm(r10, r11, 8) + mov_ri64(rcx, 1) + cmp_rr(r10, rcx) + je_rel32(str_len(read_file))
-    let read_case = pe_fd_lookup(iat, str_len(read_split) + str_len(read_file) + str_len(read_ws)) + read_split + read_file + read_ws
+    // kind==2（子进程管道）：PeekNamedPipe 取可读量，失败即写端已关返 0（EOF），
+    // 无数据返 -EAGAIN，有数据则 ReadFile 至多 min(len, 可读量) 字节——匿名管道
+    // 没有非阻塞模式，先窥再读才不会卡住 pump（同 C runtime 的 bur_proc_pump）。
+    // 局部：+48 可读量/读到字节数（DWORD，先清整 8B），+56 len，+64 槽地址。
+    // kind==2 (a child's pipe): PeekNamedPipe reports the readable amount; its
+    // failure means the write end closed, returning 0 (EOF); nothing pending
+    // returns -EAGAIN; otherwise ReadFile reads at most min(len, available).
+    // Anonymous pipes have no non-blocking mode, so peeking first keeps the pump
+    // from stalling (as the C runtime's bur_proc_pump does). Locals: +48 the
+    // available/read count (a DWORD, whole 8B cleared first), +56 len, +64 the
+    // slot address.
+    let rp_peek = mov_mr(rsp, 56, rdx) + mov_mr(rsp, 64, r11) + xor_rr(rax, rax) + mov_mr(rsp, 48, rax) + mov_mr(rsp, 40, rax) + lea(rax, rsp, 48) + mov_mr(rsp, 32, rax) + mov_rm(rcx, r11, 0) + xor_rr(rdx, rdx) + xor_rr(r8, r8) + xor_rr(r9, r9) + pe_call(iat, "PeekNamedPipe")
+    let rp_eof = xor_rr(rax, rax)
+    let rp_got = mov_rm32(rax, rsp, 48) + jmp_rel32(str_len(rp_eof))
+    let rp_clamp = mov_rr(r8, rax)
+    let rp_read = mov_rm(r8, rsp, 56) + cmp_rr(rax, r8) + jae_rel32(str_len(rp_clamp)) + rp_clamp + mov_rm(r11, rsp, 64) + mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + lea(r9, rsp, 48) + xor_rr(rax, rax) + mov_mr(rsp, 32, rax) + pe_call(iat, "ReadFile") + e1(133) + e1(192) + je_rel32(str_len(rp_got)) + rp_got + rp_eof
+    let rp_again = mov_ri64(rax, 0 - 11) + jmp_rel32(str_len(rp_read))
+    let rp_avail = mov_rm32(rax, rsp, 48) + test_rr(rax, rax) + jne_rel32(str_len(rp_again)) + rp_again
+    let read_pipe = rp_peek + e1(133) + e1(192) + je_rel32(str_len(rp_avail) + str_len(rp_read) - str_len(rp_eof)) + rp_avail + rp_read + jmp_rel32(str_len(read_split) + str_len(read_file) + str_len(read_ws))
+    let read_kind2 = mov_rm(r10, r11, 8) + mov_ri64(rcx, 2) + cmp_rr(r10, rcx) + jne_rel32(str_len(read_pipe))
+    let read_case = pe_fd_lookup(iat, str_len(read_kind2) + str_len(read_pipe) + str_len(read_split) + str_len(read_file) + str_len(read_ws)) + read_kind2 + read_pipe + read_split + read_file + read_ws
 
     // mmap(addr=0, len=rsi, prot, flags, ...)：固定 RW 私有页，prot/flags 忽略
     // mmap(addr=0, len=rsi, prot, flags, ...): fixed RW private pages, prot/flags ignored
@@ -689,7 +830,23 @@ pub fn pe_build_dispatcher(iat) {
     let sv_cond = mov_rm(rcx, rsp, 96) + mov_rm32(rdx, rsp, 64) + cmp_rr(rcx, rdx) + jge_rel32(str_len(sv_body) + 5)
     let sv_back = jmp_rel32(0 - (str_len(sv_cond) + str_len(sv_body) + 5))
     let argv_case = sv_get + sv_alloc + sv_init + sv_cond + sv_body + sv_back + mov_rm(rax, rsp, 80)
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 1003, 41, 49, 50, 42, 43, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, argv_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
+    // nanosleep(req=rdi)：Sleep(tv_sec*1000 + tv_nsec/1000000)，返 0
+    // nanosleep(req=rdi): Sleep(tv_sec*1000 + tv_nsec/1000000), returning 0
+    let nanosleep_case = mov_rm(rax, rdi, 8) + xor_rr(rdx, rdx) + mov_ri64(rcx, 1000000) + div_r(rcx) + mov_rr(r8, rax) + mov_rm(rax, rdi, 0) + mov_ri64(rcx, 1000) + imul_rr(rax, rcx) + add_rr(rax, r8) + mov_rr(rcx, rax) + pe_call(iat, "Sleep") + xor_rr(rax, rax)
+    // wait4(pid=rdi 进程 HANDLE, status=rsi)：等进程结束，取退出码后关句柄；
+    // status 写 8B 的「退出码 << 8」（低 7 位为 0 即 Linux 的正常退出形状，
+    // 调用方在 windows 上把 >>8 的 32 位值符号扩展，与 C runtime 的 (int)code
+    // 一致），返回 pid。局部 +48 为 DWORD 退出码（先清整 8B）。
+    // wait4(pid=rdi the process HANDLE, status=rsi): wait for the process to
+    // end, read its exit code, then close the handle; status gets 8 bytes of
+    // "exit code << 8" (zero low 7 bits, Linux's normal-exit shape; on windows
+    // the caller sign-extends the 32-bit value after >>8, matching the C
+    // runtime's (int)code), and pid returns. Local +48 holds the DWORD exit
+    // code (whole 8B cleared first).
+    let wait_store = mov_mr(rsi, 0, rax)
+    let wait4_case = mov_rr(rcx, rdi) + mov_ri32(rdx, 4294967295) + pe_call(iat, "WaitForSingleObject") + xor_rr(rax, rax) + mov_mr(rsp, 48, rax) + mov_rr(rcx, rdi) + lea(rdx, rsp, 48) + pe_call(iat, "GetExitCodeProcess") + mov_rr(rcx, rdi) + pe_call(iat, "CloseHandle") + mov_rm(rax, rsp, 48) + mov_ri32(rcx, 8) + shl_rcl(rax) + test_rr(rsi, rsi) + je_rel32(str_len(wait_store)) + wait_store + mov_rr(rax, rdi)
+    let spawn_case = pe_spawn_case(iat)
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 1003, 41, 49, 50, 42, 43, 54, 55, 72, 35, 61, 1004], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, argv_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case, nanosleep_case, wait4_case, spawn_case], epilogue)
 }
 
 // pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 三节表

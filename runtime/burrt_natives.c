@@ -591,7 +591,7 @@ int64_t bur_proc_spawn(Value cmdv, Value argsv, const char **errmsg) {
             while (q[bs] == '\\') bs++;
             q += bs;
             if (*q == '"') {
-                for (int k = 0; k < bs * 2; k++) cmdline[off++] = '\\';
+                for (int k = 0; k < bs * 2 + 1; k++) cmdline[off++] = '\\';
                 cmdline[off++] = '"';
             } else if (*q == '\0' && quote) {
                 for (int k = 0; k < bs * 2; k++) cmdline[off++] = '\\';

@@ -268,7 +268,16 @@ fn x86gen_fdtable_alloc() {
 // untouched by alloc) skips the mark; emitted on windows only, using r10/r11
 // as scratch
 fn x86gen_fdtable_mark_socket() {
-    let mark = mov_rr(r11, rax) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10) + mov_ri64(r10, 1) + mov_mr(r11, 8, r10)
+    x86gen_fdtable_mark_kind(1)
+}
+
+// x86gen_fdtable_mark_kind 把 rax 里槽号对应表项的 kind 置为 kind（1 socket、
+// 2 子进程管道读端）；rax 为负时跳过，r10/r11 作暂存
+// x86gen_fdtable_mark_kind sets the kind of the table entry for the slot in
+// rax (1 socket, 2 a child's pipe read end); a negative rax skips the mark,
+// with r10/r11 as scratch
+fn x86gen_fdtable_mark_kind(kind) {
+    let mark = mov_rr(r11, rax) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10) + mov_ri64(r10, kind) + mov_mr(r11, 8, r10)
     test_rr(rax, rax) + jl_rel32(str_len(mark)) + mark
 }
 
@@ -997,7 +1006,13 @@ fn x86gen_proc_pump() {
     // wait4 状态换算：正常退出 code = (st>>8)&0xff，信号退出 code = 128 + termsig
     // wait4 status: normal exit code = (st>>8)&0xff, signaled code = 128 + termsig
     let store = mov_mr(r9, proc_code, rax) + mov_ri64(rax, 1) + mov_mr(r9, proc_complete, rax)
-    let exited = mov_rr(rax, rcx) + mov_ri32(rcx, 8) + shr_rcl(rax) + mov_ri64(r8, 255) + and_rr(rax, r8)
+    let mut exited = mov_rr(rax, rcx) + mov_ri32(rcx, 8) + shr_rcl(rax) + mov_ri64(r8, 255) + and_rr(rax, r8)
+    if target_os == "windows" {
+        // windows 的 wait4 臂写「32 位退出码 << 8」：右移后按 int 符号扩展
+        // windows' wait4 arm writes "32-bit exit code << 8": shift back, then
+        // sign-extend as an int
+        exited = mov_rr(rax, rcx) + mov_ri32(rcx, 8) + shr_rcl(rax) + cdqe()
+    }
     let signaled = mov_rr(rax, rdx) + add_ri32(rax, 128)
     let code_seq = test_rr(rdx, rdx) + je_rel32(str_len(signaled) + 5) + signaled + jmp_rel32(str_len(exited)) + exited + store
     let hav = mov_ri64(rax, 1) + mov_mr(r9, proc_have_err, rax)
@@ -1452,7 +1467,8 @@ fn x86gen_exec_spawn_native() {
     // read ends)
     let init_out = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_out_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_out_cap, rax)
     let init_err = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_err_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_err_cap, rax)
-    let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
+    let proc_rest = init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
+    let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + proc_rest
     let fork_fail = c1(0) + c1(8) + c1(16) + mov_ri64(rax, 0 - 1)
     let parent_seq = mov_mr(rsp, 24, rax) + c1(4) + c1(12) + c1(20) + test_rr(rax, rax) + jl_rel32(str_len(parent_ok) + 5) + parent_ok + jmp_rel32(str_len(fork_fail)) + fork_fail
     let done_seq = add_ri32(rsp, 80)
@@ -1470,6 +1486,25 @@ fn x86gen_exec_spawn_native() {
     let p2_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(close_p2))
     let p1_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5 + str_len(close_p2) + str_len(close_p1))
     let pipes = pipe1 + p1_fail + pipe2 + p2_fail + pipe3 + p3_fail + skip_fail + close_p2 + close_p1 + fail_tail
+    if target_os == "windows" {
+        // windows：无 fork，分派器 1004 号一步 CreatePipe×2 + CreateProcessA，
+        // [rsp+0]/[rsp+8] 回两个读端 HANDLE，rax 回进程 HANDLE（pid 槽存它，
+        // wait4 臂据此等待）；读端登记进 fd 表并标 kind=2（read 先窥后读，不
+        // 阻塞）。CreateProcess 失败即同步报错，failfd 恒为 -1（同 C runtime）
+        // windows: no fork; dispatcher number 1004 runs CreatePipe x2 plus
+        // CreateProcessA in one step, returning both read-end HANDLEs at
+        // [rsp+0]/[rsp+8] and the process HANDLE in rax (kept in the pid slot
+        // for the wait4 arm); the read ends register in the fd table as kind 2
+        // (read peeks before reading, never blocking). A CreateProcess failure
+        // reports synchronously, so failfd stays -1 (as in the C runtime)
+        let reg = fn(off) {
+            mov_rm(rax, rsp, off) + x86gen_fdtable_alloc() + x86gen_fdtable_mark_kind(2) + mov_mr(rsp, off, rax)
+        }
+        let win_ok = mov_mr(rsp, 24, rax) + reg(0) + reg(8) + mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_ri64(rax, 0 - 1) + mov_mr(r9, proc_failfd, rax) + proc_rest
+        let win_fail = mov_ri64(rax, 0 - 1)
+        let win_spawn = mov_rm(rdi, rsp, 32) + mov_rr(rsi, rsp) + sys_mov_rax(1004) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(win_ok) + 5) + win_ok + jmp_rel32(str_len(win_fail)) + win_fail
+        return sub_ri32(rsp, 80) + defb + argv_alloc + cmd_copy + argv_loop + null_tail + win_spawn + done_seq
+    }
     sub_ri32(rsp, 80) + defb + argv_alloc + cmd_copy + argv_loop + null_tail + pipes + fork_seq
 }
 
