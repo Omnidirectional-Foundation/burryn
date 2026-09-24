@@ -568,7 +568,10 @@ runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WS
   VA 空洞，使 `rt_slot` 等地址公式在代码长度确定前即可求值。可写段按目标分别
   是：ELF 第二条 PT_LOAD（`p_flags=R|W`，文件内页对齐紧跟 `.eh_frame`）；PE
   `.data`（两节表使头区 496B→536B，`SizeOfHeaders` 随 FileAlignment 抬到
-  1024B，`SizeOfImage` 覆盖固定数据 RVA）；Mach-O `__DATA`（先行落地）。代码域
+  1024B，`SizeOfImage` 覆盖固定数据 RVA；kernel32 + ws2_32 导入 blob 跟在
+  runtime 区之后同落 `.data`——加载器解析导入要原地写 IAT，只读节收不下，
+  描述符与 IAT 预填写 RVA（基底 `DATA_VA_OFF`），代码引用 IAT 槽用绝对 VA（经
+  `data_origin()`））；Mach-O `__DATA`（先行落地）。代码域
   R-X：ELF 首条 PT_LOAD（两条 phdr 使 `img_base` 从 base+120 移到 base+176）、
   PE `.text`（`CODE|EXECUTE|READ`）、Mach-O `__TEXT`。
 - **寻址收口不改**：`rt_slot`/`fd_base`/`wsa_base`/`thunk_slot_abs` 全部经

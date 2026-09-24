@@ -560,44 +560,19 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr)
     if target_os == "windows" {
         // PE 装配：可写 runtime 区（含分派器地址槽、fd 表、WSA 区）独立进
-        // 固定高 RVA 的 .data；分派器与 kernel32 + ws2_32 导入表依次接在 _start
-        // 后。分派器长度与值无关，先以零地址测长，再按真实 IAT 绝对址重发；
-        // 槽值据此可算，无需回补。
+        // 固定高 RVA 的 .data；kernel32 + ws2_32 导入 blob 跟在 runtime 区之后同
+        // 落 .data——加载器解析导入时要原地写 IAT，只读的 .text 收不下。分派器
+        // 接在 _start 后，槽值与长度无关，单次构建即可。
         // PE assembly: the writable runtime area (the dispatcher-address slot,
         // fd table and WSA area included) moves into a fixed-high-RVA .data;
-        // the dispatcher and the kernel32 + ws2_32 import tables follow _start.
-        // The dispatcher length is value-independent, so it is measured once
-        // with zero addresses and rebuilt with real IAT addresses; the slot
-        // value follows without backpatching.
+        // the kernel32 + ws2_32 import blob follows the runtime area in the
+        // same .data — the loader writes the IAT in place while resolving
+        // imports, which a read-only .text cannot host. The dispatcher follows
+        // _start; its length is value-independent, so a single build suffices.
         let import_dlls = ["kernel32.dll", "ws2_32.dll"]
         let import_counts = [16, 14]
         let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError"]
-        // 分派器接在 _start 之后；槽与导入表 RVA 都从真实内容偏移算起
-        // The dispatcher follows _start; the slot and import RVAs derive from
-        // the true content offsets.
         let disp_off = start_off + str_len(start_bytes)
-        let disp_probe = pe_build_dispatcher([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        let idata_off = disp_off + str_len(disp_probe)
-        let iat_abs0 = img_base() + idata_off + pe_import_desc_size(len(import_dlls)) + pe_ilt_size(len(import_names), len(import_dlls))
-        // IAT 逐 DLL 独立以零项收尾（同 pe_build_imports 的间隙说明），故各 DLL
-        // 的绝对地址列表要跳过每组之间的空槽，不能按扁平 n*8 连续算
-        // The IAT is zero-terminated per DLL (same gap as pe_build_imports), so
-        // each DLL's absolute-address run must skip the null slot between
-        // groups instead of assuming a flat, contiguous n*8 stride
-        let mut iat_addrs = []
-        let mut iat_doff = 0
-        let mut iat_di = 0
-        while iat_di < len(import_dlls) {
-            let mut iat_ci = 0
-            while iat_ci < import_counts[iat_di] {
-                push(iat_addrs, iat_abs0 + 8 * iat_doff)
-                iat_doff = iat_doff + 1
-                iat_ci = iat_ci + 1
-            }
-            iat_doff = iat_doff + 1
-            iat_di = iat_di + 1
-        }
-        let dispatcher = pe_build_dispatcher(iat_addrs)
         let runtime_with_thunk = runtime_bytes + e8(img_base() + disp_off)
         // fd 表：全 0xFF 填充（kind=-1 空闲），Windows 独有尾区；其后 WSA 区全零
         // （WSAStartup 未调标记 + 写区 + poll 暂存，见 layout.bur wsa_base）
@@ -617,13 +592,42 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
             wfi = wfi + 1
         }
         let runtime_with_fd = runtime_with_thunk + fd_fill + wsa_fill
-        let imports = pe_build_imports(import_dlls, import_counts, import_names, idata_off)
-        // .pdata：紧接导入表，4B 对齐（RUNTIME_FUNCTION 三个字段皆 DWORD）；数组在前、
+        // 导入 blob 落在 .data 内 runtime 区之后；描述符与 IAT 预填里写的是
+        // RVA（基底 DATA_VA_OFF），代码侧引用 IAT 槽用的是绝对 VA（经
+        // data_origin 收口），两套量纲不能混。
+        // The import blob sits in .data after the runtime area; descriptors
+        // and the IAT prefill carry RVAs (based at DATA_VA_OFF) while code
+        // references to the IAT slots use absolute VAs (funneled through
+        // data_origin) — the two scales must not be mixed.
+        let idata_data_off = str_len(runtime_with_fd)
+        let idata_rva = DATA_VA_OFF + idata_data_off
+        let iat_abs0 = data_origin() + idata_data_off + pe_import_desc_size(len(import_dlls)) + pe_ilt_size(len(import_names), len(import_dlls))
+        // IAT 逐 DLL 独立以零项收尾（同 pe_build_imports 的间隙说明），故各 DLL
+        // 的绝对地址列表要跳过每组之间的空槽，不能按扁平 n*8 连续算
+        // The IAT is zero-terminated per DLL (same gap as pe_build_imports), so
+        // each DLL's absolute-address run must skip the null slot between
+        // groups instead of assuming a flat, contiguous n*8 stride
+        let mut iat_addrs = []
+        let mut iat_doff = 0
+        let mut iat_di = 0
+        while iat_di < len(import_dlls) {
+            let mut iat_ci = 0
+            while iat_ci < import_counts[iat_di] {
+                push(iat_addrs, iat_abs0 + 8 * iat_doff)
+                iat_doff = iat_doff + 1
+                iat_ci = iat_ci + 1
+            }
+            iat_doff = iat_doff + 1
+            iat_di = iat_di + 1
+        }
+        let dispatcher = pe_build_dispatcher(iat_addrs)
+        let imports = pe_build_imports(import_dlls, import_counts, import_names, idata_rva)
+        // .pdata：紧接分派器，4B 对齐（RUNTIME_FUNCTION 三个字段皆 DWORD）；数组在前、
         // 共享 UNWIND_INFO 在后。用户函数序言形态唯一（natives.bur 的
         // x86gen_prologue：push rbp + sub rsp,8），故全程序共享一份 UNWIND_INFO；
         // GC/调度器等内部子程序不建标准帧或做原生纤程切栈，本轮不纳入 .pdata 覆盖
         // （未覆盖地址落回 Windows 默认的叶函数假设，不劣于改动前的现状）。
-        // .pdata: right after the import table, 4B-aligned (all three
+        // .pdata: right after the dispatcher, 4B-aligned (all three
         // RUNTIME_FUNCTION fields are DWORDs); the array first, the shared
         // UNWIND_INFO after. User functions share one prologue shape
         // (natives.bur's x86gen_prologue: push rbp + sub rsp,8), so one shared
@@ -633,10 +637,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         // Windows' default leaf-function assumption, no worse than before this
         // change).
         let code_base_off = const_data_len
-        let idata_end = idata_off + str_len(imports)
-        let pdata_off = pe_align(idata_end, 4)
+        let disp_end = disp_off + str_len(dispatcher)
+        let pdata_off = pe_align(disp_end, 4)
         let mut pdata_pad = ""
-        let mut ppi = idata_end
+        let mut ppi = disp_end
         while ppi < pdata_off {
             pdata_pad = pdata_pad + byte_chr(0)
             ppi = ppi + 1
@@ -662,7 +666,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let internal_pdata = pe_build_pdata_multi(rt_unwind_offsets, rt_unwind_lens, code_base_off, internal_unwind_offs)
         let pdata_bytes = internal_pdata + pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
         let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0]) + pe_unwind_info_pushes(rt_unwind_pushes[2])
-        emit_pe(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + imports + pdata_pad + pdata_bytes + unwind_blobs, start_off, idata_off, str_len(imports), pdata_off, str_len(pdata_bytes), runtime_with_fd)
+        emit_pe(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + pdata_pad + pdata_bytes + unwind_blobs, start_off, idata_rva, str_len(imports), pdata_off, str_len(pdata_bytes), runtime_with_fd + imports)
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
         // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），

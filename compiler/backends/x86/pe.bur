@@ -3,11 +3,12 @@
 // plus the Windows dispatch arms.
 
 // emit_pe 装配 PE32+：头区(1024B) + 代码内容（补齐 512）+ 可写数据内容（补齐 512）；
-// 入口在代码内容内 entry_off 处
+// 入口在代码内容内 entry_off 处；idata_rva 是导入 blob 的起始 RVA（落在 .data）
 // emit_pe assembles the PE32+: 1024-byte header area + code content (padded to
 // 512) + the writable data content (padded to 512); the entry point sits at
-// entry_off within the code content
-pub fn emit_pe(code, entry_off, idata_off, idata_len, pdata_off, pdata_len, data_content) {
+// entry_off within the code content; idata_rva is the import blob's starting
+// RVA (inside .data)
+pub fn emit_pe(code, entry_off, idata_rva, idata_len, pdata_off, pdata_len, data_content) {
     let mut padded = code
     let n = str_len(code) % 512
     if n != 0 {
@@ -30,7 +31,7 @@ pub fn emit_pe(code, entry_off, idata_off, idata_len, pdata_off, pdata_len, data
         }
         padded_data = padded_data + dz
     }
-    pe_emit_headers(entry_off, str_len(code), idata_off, idata_len, pdata_off, pdata_len, str_len(data_content)) + padded + padded_data
+    pe_emit_headers(entry_off, str_len(code), idata_rva, idata_len, pdata_off, pdata_len, str_len(data_content)) + padded + padded_data
 }
 
 // pe_build_section_entry 生成一条 40B 节表项：名字补零到 8B，字段按
@@ -46,13 +47,17 @@ fn pe_build_section_entry(name, vsize, vaddr, rawsize, rawptr, chars) {
 }
 
 // pe_build_imports 生成导入 blob；dll_names 与 fn_counts 等长（每 DLL 的函数数），
-// fns 为按 DLL 顺序拍平的函数名表；idata_off 是 blob 在内容内的起点。
+// fns 为按 DLL 顺序拍平的函数名表；idata_rva_base 是 blob 的起始 RVA。整个 blob
+// 须落在可写节（.data）：加载器解析导入时要原地写 IAT，只读节上写不进去。
 // ILT/IAT 为整表共享数组，各 DLL 的 DESC 切片指向其中自家区间；DLL 名依次附后。
 // pe_build_imports builds the import blob; dll_names parallels fn_counts (each
 // DLL's function count) while fns is the flattened name table in DLL order;
-// idata_off is the blob's content offset. ILT/IAT are shared whole-table arrays
-// with per-DLL descriptors slicing their own ranges; DLL names append in order
-pub fn pe_build_imports(dll_names, fn_counts, fns, idata_off) {
+// idata_rva_base is the blob's starting RVA. The whole blob must live in a
+// writable section (.data): the loader writes the IAT in place while resolving
+// imports and cannot write into a read-only section. ILT/IAT are shared
+// whole-table arrays with per-DLL descriptors slicing their own ranges; DLL
+// names append in order
+pub fn pe_build_imports(dll_names, fn_counts, fns, idata_rva_base) {
     let n_dlls = len(dll_names)
     let n = len(fns)
     let desc_sz = pe_import_desc_size(n_dlls)
@@ -61,7 +66,7 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_off) {
     let hints_off = iat_off + pe_iat_size(n, n_dlls)
     let dll_off = hints_off + pe_hints_size(fns)
     let r = fn(off) {
-        e4(pe_content_rva(idata_off + off))
+        e4(idata_rva_base + off)
     }
     // hint/name 各项的 blob 内偏移 / per-entry hint/name offsets inside the blob
     let mut hn = []
@@ -106,7 +111,7 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_off) {
     while dk < n_dlls {
         let mut ci = 0
         while ci < fn_counts[dk] {
-            blob = blob + e8(pe_content_rva(idata_off + hn[ii]))
+            blob = blob + e8(idata_rva_base + hn[ii])
             ii = ii + 1
             ci = ci + 1
         }
@@ -118,7 +123,7 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_off) {
     while dl < n_dlls {
         let mut ci2 = 0
         while ci2 < fn_counts[dl] {
-            blob = blob + e8(pe_content_rva(idata_off + hn[ai]))
+            blob = blob + e8(idata_rva_base + hn[ai])
             ai = ai + 1
             ci2 = ci2 + 1
         }
@@ -605,7 +610,7 @@ pub fn pe_build_dispatcher(iat) {
 // domain, .data R-W holding the writable runtime area at the fixed high RVA).
 // The header block totals 64+24+240+128+80=536B, rounded up to 1024B by
 // FileAlignment; SizeOfHeaders and the section raw pointers use that value.
-pub fn pe_emit_headers(entry_off, code_len, idata_off, idata_len, pdata_off, pdata_len, data_len) {
+pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pdata_len, data_len) {
     let hdr_area = 1024
     // DOS：MZ 魔数 + e_lfanew=64，其余补零
     // DOS: MZ magic + e_lfanew=64, zero padding elsewhere
@@ -627,7 +632,7 @@ pub fn pe_emit_headers(entry_off, code_len, idata_off, idata_len, pdata_off, pda
     let mut k = 0
     while k < 16 {
         if k == 1 {
-            dirs = dirs + e4(pe_content_rva(idata_off)) + e4(idata_len)
+            dirs = dirs + e4(idata_rva) + e4(idata_len)
         } else if k == 3 {
             dirs = dirs + e4(pe_content_rva(pdata_off)) + e4(pdata_len)
         } else {
