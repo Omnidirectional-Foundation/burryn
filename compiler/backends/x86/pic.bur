@@ -1,0 +1,144 @@
+// pic.bur — 位置无关改写：比对真实基址与探针基址两遍装配，把 mov imm64 绝对地址改成 RIP 相对 lea。
+// Position-independent rewrite: diff the real-base and probe-base assemblies and turn
+// mov imm64 absolute addresses into RIP-relative lea.
+
+// PIC_PROBE_SHIFT 是探针遍的基址平移量：高 32 位与低 32 位都非零，嵌在 imm32 里的地址
+// 同样会随之变化，从而被识别为无法改写的站点；页对齐，不改变任何对齐推导
+// PIC_PROBE_SHIFT is the probe pass's base shift: both its high and low 32 bits
+// are nonzero, so an address hidden in an imm32 changes too and is caught as an
+// unrewritable site; page-aligned, so no alignment derivation shifts
+pub let PIC_PROBE_SHIFT = 4296015872
+let PIC_SHIFT_LO = 1048576
+let PIC_SHIFT_HI = 1
+
+// addr_shift 叠加到 img_base/data_origin；探针遍为 PIC_PROBE_SHIFT，真实遍为 0
+// addr_shift is added to img_base/data_origin: PIC_PROBE_SHIFT in the probe
+// pass, zero in the real pass
+pub let mut addr_shift = 0
+let mut pic_probe = false
+let mut pic_ref_text = ""
+let mut pic_ref_data = ""
+
+// set_pic_pass 切换探针遍与真实遍 / set_pic_pass switches between the probe and real passes
+pub fn set_pic_pass(probe) {
+    pic_probe = probe
+    if probe {
+        addr_shift = PIC_PROBE_SHIFT
+    } else {
+        addr_shift = 0
+    }
+}
+
+// pic_text 在探针遍记下代码字节原样返回；真实遍据探针字节改写地址站点（代码起点
+// 的绝对地址为 text_va）
+// pic_text records the code bytes and returns them unchanged in the probe pass;
+// in the real pass it rewrites the address sites against the probe bytes (the
+// code starts at absolute address text_va)
+pub fn pic_text(text: str, text_va) {
+    if pic_probe {
+        pic_ref_text = text
+        text
+    } else {
+        pic_rewrite(text, pic_ref_text, text_va)
+    }
+}
+
+// pic_data 在探针遍记下可写数据段初值；真实遍要求两遍逐字节相同——数据段不存绝对
+// 地址，镜像无需装载期重定位
+// pic_data records the writable data segment's initial bytes in the probe pass;
+// the real pass requires both passes to match byte for byte — the data segment
+// holds no absolute address, so the image needs no load-time relocation
+pub fn pic_data(data: str) {
+    if pic_probe {
+        pic_ref_data = data
+    } else if data != pic_ref_data {
+        pic_fail("data segment differs between the probe and real passes")
+    }
+    data
+}
+
+fn pic_fail(msg) {
+    eprintln("internal error: x86 PIC rewrite: " + msg)
+    exit(1)
+}
+
+fn rd4(s, at) {
+    byte_at(s, at) + byte_at(s, at + 1) * 256 + byte_at(s, at + 2) * 65536 + byte_at(s, at + 3) * 16777216
+}
+
+// pic_site_ok 判定 s 处是否为 mov r64, imm64（REX.W[.B] B8+r）的立即数起点，且两遍的
+// 立即数恰差 PIC_PROBE_SHIFT（按 32 位两半带借位比较，避开 64 位溢出）
+// pic_site_ok tells whether s starts the immediate of a mov r64, imm64
+// (REX.W[.B] B8+r) whose two-pass values differ by exactly PIC_PROBE_SHIFT
+// (compared as borrow-linked 32-bit halves to avoid 64-bit overflow)
+fn pic_site_ok(real, probe, s) {
+    if s < 2 || s + 8 > str_len(real) {
+        return false
+    }
+    let rex = byte_at(real, s - 2)
+    let op = byte_at(real, s - 1)
+    if rex != 72 && rex != 73 || op < 184 || op > 191 {
+        return false
+    }
+    if byte_at(probe, s - 2) != rex || byte_at(probe, s - 1) != op {
+        return false
+    }
+    let mut dlo = rd4(probe, s) - rd4(real, s)
+    let mut dhi = rd4(probe, s + 4) - rd4(real, s + 4)
+    if dlo < 0 {
+        dlo = dlo + 4294967296
+        dhi = dhi - 1
+    }
+    dlo == PIC_SHIFT_LO && dhi == PIC_SHIFT_HI
+}
+
+// pic_rewrite 逐字节比对两遍代码：每处差异必须落在某条 mov r64, imm64 的立即数内，
+// 该 10 字节指令改写成 lea r64, [rip+disp32]（7 字节）+ 3 字节 nop，长度不变，
+// 其余跳转偏移随之保持有效；任何其他差异都是未收口的绝对地址，报内部错误
+// pic_rewrite diffs the two passes' code byte by byte: every difference must
+// lie inside the immediate of a mov r64, imm64, whose 10 bytes become
+// lea r64, [rip+disp32] (7 bytes) plus a 3-byte nop — same length, so every
+// other jump offset stays valid; any other difference is an absolute address
+// that escaped the funnel and raises an internal error
+pub fn pic_rewrite(real, probe, text_va) {
+    let n = str_len(real)
+    if str_len(probe) != n {
+        pic_fail("code length differs between the probe and real passes")
+    }
+    let mut parts = []
+    let mut copied = 0
+    let mut i = 0
+    while i < n {
+        if byte_at(real, i) == byte_at(probe, i) {
+            i = i + 1
+        } else {
+            let mut s = i - 7
+            if s < copied + 2 {
+                s = copied + 2
+            }
+            let mut found = 0 - 1
+            while found < 0 && s <= i {
+                if pic_site_ok(real, probe, s) {
+                    found = s
+                }
+                s = s + 1
+            }
+            if found < 0 {
+                pic_fail("absolute address outside a mov imm64 at code offset " + str(i))
+            }
+            let rex = byte_at(real, found - 2)
+            let reg = byte_at(real, found - 1) - 184 + (rex - 72) * 8
+            let target = rd4(real, found) + rd4(real, found + 4) * 4294967296
+            let disp = target - (text_va + found - 2 + 7)
+            if disp < 0 - 2147483648 || disp > 2147483647 {
+                pic_fail("RIP-relative displacement out of range at code offset " + str(found))
+            }
+            push(parts, substr(real, copied, found - 2 - copied))
+            push(parts, lea_rip_rel32(reg, disp) + e1(15) + e1(31) + e1(0))
+            copied = found + 8
+            i = copied
+        }
+    }
+    push(parts, substr(real, copied, n - copied))
+    join(parts, "")
+}

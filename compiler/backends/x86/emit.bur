@@ -1481,7 +1481,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // call parse_float_bits; the result list is on the value stack top [r15-8]: ok
                 // = elements[0], bits = elements[1]
                 let pf_res = mov_rm(rcx, r15, 0 - 8) + mov_rm(r11, rcx, 16) + mov_rm(rax, r11, 0) + mov_rm(rdx, r11, 8) + test_rr(rax, rax) + je_rel32(str_len(pf_box) + str_len(pf_some)) + pf_box + pf_some + pf_none
-                w(mov_rm(rax, r13, 8 * pf_h) + call_r(rax) + pf_res)
+                w(jt_load(rax, 8 * pf_h) + call_r(rax) + pf_res)
                 ret_type = enum_payload_enc_ctx(ctx, "Option", [["float"]])
             } else if callee == "clock" {
                 w(x86gen_clock_native(n_globals))
@@ -1531,9 +1531,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 }
                 let vidx = variant_index(ctx, handle, call_at)
                 if vidx > 0 {
-                    w(mov_rm(rax, r13, 8 * (nfn + fn_extra_base[handle] + vidx - 1)) + call_r(rax))
+                    w(jt_load(rax, 8 * (nfn + fn_extra_base[handle] + vidx - 1)) + call_r(rax))
                 } else {
-                    w(mov_rm(rax, r13, 8 * handle) + call_r(rax))
+                    w(jt_load(rax, 8 * handle) + call_r(rax))
                 }
                 if handle < len(fn_ret_type) {
                     // 多态函数：per-signature 返回类型优先，未命中回退 fn_ret_param/fn_ret_type
@@ -1620,9 +1620,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                 }
                 let closure_path = if clos_h >= 0 && clos_vidx > 0 && clos_h < len(fn_extra_base) {
-                    mov_rm(rax, r13, 8 * (nfn + fn_extra_base[clos_h] + clos_vidx - 1)) + call_r(rax)
+                    jt_load(rax, 8 * (nfn + fn_extra_base[clos_h] + clos_vidx - 1)) + call_r(rax)
                 } else {
-                    mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax)
+                    mov_rr(rax, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + add_rr(rax, r13) + call_r(rax)
                 }
                 w(mov_rm(rax, r15, 0 - 8 * (n + 1)) + mov_rm(rcx, rax, 0) + xor_rr(rdx, rdx) + sub_ri32(rdx, 1) + cmp_rr(rcx, rdx) + jne_rel32(str_len(ctor_path) + 5) + ctor_path + jmp_rel32(str_len(closure_path)) + closure_path)
                 if len(type_shadow) >= n + 1 {
@@ -1994,7 +1994,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // 6. fb struct 字段（假 frame 在栈顶：FB_RSP 指向 entry 槽）
             let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + mov_ri64(rax, FB_READY) + mov_mr(r11, FB_STATUS, rax) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + mov_rm(rax, r15, 0 - 8) + add_ri32(rax, 4096) + mov_mr(r11, FB_STACK_LO, rax) + add_ri32(rax, FIBER_STACK_SIZE - 4096 - 16) + mov_mr(r11, FB_RSP, rax) + mov_rr(rax, rdi) + mov_mr(r11, FB_R15, rax) + mov_mr(r11, FB_R14, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
             // 5. fake frame：栈顶 [stack_top-16]=entry、[stack_top-8]=done（stack_top = mmap 基址 + FIBER_STACK_SIZE）
-            let fake_frame = mov_rm(rax, r15, 0 - 8 * (n + 2)) + mov_rm(rax, rax, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + mov_rm(rcx, r15, 0 - 8) + add_ri32(rcx, FIBER_STACK_SIZE) + mov_mr(rcx, 0 - 16, rax) + mov_ri64(rax, done_addr) + mov_mr(rcx, 0 - 8, rax)
+            let fake_frame = mov_rm(rax, r15, 0 - 8 * (n + 2)) + mov_rm(rax, rax, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + add_rr(rax, r13) + mov_rm(rcx, r15, 0 - 8) + add_ri32(rcx, FIBER_STACK_SIZE) + mov_mr(rcx, 0 - 16, rax) + mov_ri64(rax, done_addr) + mov_mr(rcx, 0 - 8, rax)
             // 3+4. 拷贝 [callee][args] 到新栈 + fake frame；mmap 基址占值栈顶，callee 在 8*(n+2) 之下
             let copy_args = mov_rm(rdi, r15, 0 - 8) + add_ri32(rdi, 4096) + lea(rsi, r15, 0 - 8 * (n + 2)) + mov_ri64(rcx, argc_bytes) + rep_movsb()
             let guard = mov_rm(rdi, r15, 0 - 8) + mov_ri64(rsi, 4096) + xor_rr(rdx, rdx) + xor_rr(r10, r10) + sys_mov_rax(10) + syscall()
@@ -2869,7 +2869,7 @@ fn x86gen_enum_format_at(ctx: X86Ctx, off, eh, vts) {
                 // float 字段长度 = 调用注入的 format_float(bits) 所得 str 的长度；保存 r10/r11/rcx 现场
                 // float field length comes from the injected format_float(bits) result;
                 // preserve r10/r11/rcx
-                lb = lb + push_r(r10) + push_r(r11) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r10) + add_rr(rcx, rsi)
+                lb = lb + push_r(r10) + push_r(r11) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r10) + add_rr(rcx, rsi)
             } else {
                 let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
                 let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
@@ -2923,7 +2923,7 @@ fn x86gen_enum_format_at(ctx: X86Ctx, off, eh, vts) {
                 // float 字段：调用 format_float(bits) 得 str，拷入输出缓冲；保存 r10/r11/rdi 现场
                 // float field: call format_float(bits), copy the str into the output buffer;
                 // preserve r10/r11/rdi
-                wb = wb + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + rep_movsb()
+                wb = wb + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + rep_movsb()
             } else {
                 wb = wb + mov_rm(rdx, r10, 0) + int_write
             }
@@ -3142,7 +3142,7 @@ fn find_field_in_enc(enc, fname) {
 // write it back to [r15+off] and restore r15
 fn x86gen_float_to_str_at(ctx: X86Ctx, off) {
     let ff_h = find_fn_by_name(ctx.f_name, "frt_format_float")
-    let f2s_call = mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax)
+    let f2s_call = mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax)
     let f2s_fin = mov_rm(rax, r15, 0 - 8) + mov_mr(r15, off - 8, rax) + sub_ri32(r15, 8)
     f2s_call + f2s_fin
 }
@@ -3634,7 +3634,7 @@ fn x86gen_tuple_format_at(ctx: X86Ctx, off, types, ff_h) {
         if t == "str" {
             l1 = l1 + mov_rm(rax, r10, 8 + 8 * i) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
         } else if t == "float" {
-            l1 = l1 + push_r(r10) + push_r(rcx) + mov_rm(rax, r10, 8 + 8 * i) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r10) + add_rr(rcx, rsi)
+            l1 = l1 + push_r(r10) + push_r(rcx) + mov_rm(rax, r10, 8 + 8 * i) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r10) + add_rr(rcx, rsi)
         } else if str_len(inner_codes[i]) > 0 {
             l1 = l1 + push_r(rcx) + push_r(r10) + mov_rm(rax, r10, 8 + 8 * i) + vs_push(rax) + inner_codes[i] + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(r10) + pop_r(rcx) + add_rr(rcx, rsi)
         } else {
@@ -3658,7 +3658,7 @@ fn x86gen_tuple_format_at(ctx: X86Ctx, off, types, ff_h) {
         if t2 == "str" {
             l2 = l2 + mov_rm(rax, r10, 8 + 8 * j) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
         } else if t2 == "float" {
-            l2 = l2 + push_r(r9) + push_r(r10) + push_r(rdi) + mov_rm(rax, r10, 8 + 8 * j) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r10) + pop_r(r9) + rep_movsb()
+            l2 = l2 + push_r(r9) + push_r(r10) + push_r(rdi) + mov_rm(rax, r10, 8 + 8 * j) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r10) + pop_r(r9) + rep_movsb()
         } else if str_len(inner_codes[j]) > 0 {
             l2 = l2 + push_r(r9) + push_r(rdi) + push_r(r10) + mov_rm(rax, r10, 8 + 8 * j) + vs_push(rax) + inner_codes[j] + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(r10) + pop_r(rdi) + pop_r(r9) + rep_movsb()
         } else {

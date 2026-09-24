@@ -161,7 +161,7 @@ fn x86gen_str_convert_at(off) {
 // x86gen_defer_loop emits the defer-chain execution at function return (LIFO, zero-arg closure
 // calls, head at [rsp])
 fn x86gen_defer_loop() {
-    let body = mov_rm(r8, rax, 0) + mov_rm(r9, rax, 8) + mov_mr(rsp, 0, r8) + mov_mr(r15, 0, r9) + add_ri32(r15, 8) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rcx, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + call_r(rax) + sub_ri32(r15, 8)
+    let body = mov_rm(r8, rax, 0) + mov_rm(r9, rax, 8) + mov_mr(rsp, 0, r8) + mov_mr(r15, 0, r9) + add_ri32(r15, 8) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rax, rcx, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + add_rr(rax, r13) + call_r(rax) + sub_ri32(r15, 8)
     let loop_head = mov_rm(rax, rsp, 0) + test_rr(rax, rax) + je_rel32(str_len(body) + 5)
     let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + 5))
     loop_head + body + back
@@ -430,7 +430,7 @@ fn x86gen_list_format_at(off, elem_type, elem_code, ff_h) {
     let next1_wo = add_ri32(r11, 1)
     let int1_neg = add_ri32(rcx, 1) + neg_r(rax)
     let int1_head = test_rr(rax, rax) + jge_rel32(str_len(int1_neg))
-    let float1 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rcx) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + add_rr(rcx, rsi)
+    let float1 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rcx) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + add_rr(rcx, rsi)
     // 非 str/int/float 元素：拷入值栈临时槽，调元素 formatter，读 box 长度
     // non-str/int/float elements: copy into a value-stack temp slot, call the element formatter,
     // read the box length
@@ -456,7 +456,7 @@ fn x86gen_list_format_at(off, elem_type, elem_code, ff_h) {
     let int2_head = test_rr(rax, rax) + jge_rel32(str_len(int2_neg))
     let int2 = mov_rr(rax, rdx) + xor_rr(rcx, rcx) + int2_head + int2_neg + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_loop_jne + write2
     let str2 = mb(34) + add_ri32(rdi, 1) + mov_rr(rsi, rdx) + add_ri32(rsi, 8) + mov_rm(rcx, rdx, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
-    let float2 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rdi) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + rep_movsb()
+    let float2 = push_r(r10) + push_r(r9) + push_r(r8) + push_r(r11) + push_r(rdi) + mov_rm(rax, rdx, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r8) + pop_r(r9) + pop_r(r10) + rep_movsb()
     // pass 2 非 str/int/float 元素：写元素 formatter 结果字节
     // pass 2 non-str/int/float elements: write the element formatter result bytes
     let wrap2 = push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rdi) + vs_push(rdx) + elem_code + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + rep_movsb()
@@ -546,7 +546,7 @@ fn x86gen_map_format_at(off, key_is_str, val_is_str, val_is_float, ff_h) {
     }
     let colon1 = add_ri32(rcx, 2)
     let val_len = if val_is_float {
-        push_r(r8) + push_r(r10) + push_r(r9) + push_r(rcx) + mov_rm(rax, r9, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r9) + pop_r(r10) + pop_r(r8) + add_rr(rcx, rsi)
+        push_r(r8) + push_r(r10) + push_r(r9) + push_r(rcx) + mov_rm(rax, r9, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r9) + pop_r(r10) + pop_r(r8) + add_rr(rcx, rsi)
     } else if val_is_str {
         mov_rm(rax, r9, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
     } else {
@@ -575,7 +575,7 @@ fn x86gen_map_format_at(off, key_is_str, val_is_str, val_is_float, ff_h) {
     let colon2 = mb(58) + add_ri32(rdi, 1) + mb(32) + add_ri32(rdi, 1)
     let val_write = if val_is_float {
         let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rax, rdx, 0)
-        vaddr + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + rep_movsb()
+        vaddr + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(rdi) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + rep_movsb()
     } else if val_is_str {
         let vaddr = mov_rr(rdx, r11) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rm(rcx, r15, off) + mov_rm(rcx, rcx, 24) + add_rr(rdx, rcx) + mov_rm(rax, rdx, 0)
         vaddr + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
@@ -1201,7 +1201,7 @@ fn x86gen_record_format_at(off, names, ftypes, ff_h) {
         if ftypes[pi] == "str" {
             p1f = p1f + mov_rm(rax, r10, 0) + mov_rm(rsi, rax, 0) + add_rr(rcx, rsi) + add_ri32(rcx, 2)
         } else if ftypes[pi] == "float" {
-            p1f = p1f + push_r(r10) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r10) + add_rr(rcx, rsi)
+            p1f = p1f + push_r(r10) + push_r(rcx) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + mov_rm(rsi, rax, 0) + sub_ri32(r15, 8) + pop_r(rcx) + pop_r(r10) + add_rr(rcx, rsi)
         } else {
             let dl = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
             let dl_jne = jne_rel32(0 - (str_len(dl) + 6))
@@ -1234,7 +1234,7 @@ fn x86gen_record_format_at(off, names, ftypes, ff_h) {
         if ftypes[qi] == "str" {
             p2f = p2f + mov_rm(rax, r10, 0) + mb(34) + add_ri32(rdi, 1) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + rep_movsb() + mb(34) + add_ri32(rdi, 1)
         } else if ftypes[qi] == "float" {
-            p2f = p2f + push_r(r9) + push_r(r10) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + mov_rm(rax, r13, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r10) + pop_r(r9) + rep_movsb()
+            p2f = p2f + push_r(r9) + push_r(r10) + push_r(rdi) + mov_rm(rax, r10, 0) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax) + mov_rm(rax, r15, 0 - 8) + lea(rsi, rax, 8) + mov_rm(rcx, rax, 0) + sub_ri32(r15, 8) + pop_r(rdi) + pop_r(r10) + pop_r(r9) + rep_movsb()
         } else {
             p2f = p2f + mov_rm(rdx, r10, 0) + int_write
         }

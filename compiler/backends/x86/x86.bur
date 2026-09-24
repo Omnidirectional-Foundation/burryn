@@ -170,7 +170,6 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         rf = rf + 1
     }
 
-    let const_data_len = str_len(const_data)
     let mut globals_map = map()
     let mut n_globals = 0
     let mut gf = 0
@@ -440,6 +439,50 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         eb_i = eb_i + 1
     }
 
+    // 位置无关（PIE）：同一镜像按两个基址各装配一遍——先以 PIC_PROBE_SHIFT 平移的
+    // 探针基址，再以真实基址；pic_image 比对两遍的代码/数据字节，把随基址变化的
+    // mov imm64 地址改写成 RIP 相对 lea，见 pic.bur 与 architecture.md §5.22
+    // Position independence (PIE): the same image is assembled at two bases —
+    // first at the probe base shifted by PIC_PROBE_SHIFT, then at the real
+    // base; pic_image diffs the two passes' code/data bytes and rewrites every
+    // base-dependent mov imm64 address into a RIP-relative lea, see pic.bur and
+    // architecture.md §5.22
+    set_pic_pass(true)
+    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types)
+    set_pic_pass(false)
+    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types)
+}
+
+// x86gen_image 从已求解的共享上下文装配整份镜像：内部子程序 + 各函数变体 + 跳转表 +
+// _start（+ 分派器/.pdata），再交给目标格式的 emit_*；地址经 layout.bur 的
+// img_base/data_origin 收口，故可按探针基址重放
+// x86gen_image assembles the whole image from the solved shared context:
+// internal subroutines, every function variant, the jump table and _start
+// (plus the dispatcher/.pdata), then hands off to the target format's emit_*;
+// addresses funnel through layout.bur's img_base/data_origin, so it can be
+// replayed at the probe base
+fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, mut pt_target_shadow, mut pd_sink, fn_extra_base, mut global_type: map(str, str), mut record_field_types: map(str, [str]), mut enum_field_types: map(str, [[str]]), mut enum_variant_types: map(str, [str])) {
+    let f_name = ctx.f_name
+    let f_arity = ctx.f_arity
+    let f_nupvals = ctx.f_nupvals
+    let f_code = ctx.f_code
+    let f_consts = ctx.f_consts
+    let en_qual = ctx.en_qual
+    let en_vnames = ctx.en_vnames
+    let nfn = ctx.nfn
+    let f2s_h = ctx.f2s_h
+    let method_full_map = ctx.method_full_map
+    let fn_ret_type = ctx.fn_ret_type
+    let fn_ret_param = ctx.fn_ret_param
+    let fn_param_types = ctx.fn_param_types
+    let record_encs = ctx.record_encs
+    let record_offs = ctx.record_offs
+    let out_enc = ctx.out_enc
+    let res_out_enc = ctx.res_out_enc
+    let res_int_enc = ctx.res_int_enc
+    let opt_res_enc = ctx.opt_res_enc
+    let fn_variants = ctx.fn_variants
+    let const_data_len = str_len(const_data)
     let gc_rec_bytes = x86gen_gc_record()
     let gc_col = x86gen_gc_collect(n_globals, code_origin() + const_data_len)
     let gc_mark = x86gen_mark_addr()
@@ -521,19 +564,21 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         fh = fh + 1
     }
 
-    // 跳转表：每个函数一个入口地址，供闭包按 fn 索引调用
-    // Jump table: one entry per function, closures call by fn index
+    // 跳转表：每个函数一项，存入口相对表基址的偏移（jt_load 加回 r13），供闭包按
+    // fn 索引调用
+    // Jump table: one entry per function holding the entry's offset from the
+    // table base (jt_load adds r13 back), closures call by fn index
     let mut jt_bytes = ""
     let mut jh = 0
     while jh < nfn {
-        jt_bytes = jt_bytes + e8(code_origin() + const_data_len + func_offsets[jh])
+        jt_bytes = jt_bytes + e8s(func_offsets[jh] - str_len(funcs_bytes))
         jh = jh + 1
     }
     // 多态函数的额外变体槽位（追加在默认表之后，按 fn_extra_base 定位）
     // Extra variant slots for polymorphic functions (appended after the default entries)
     let mut jx = 0
     while jx < len(variant_offsets) {
-        jt_bytes = jt_bytes + e8(code_origin() + const_data_len + variant_offsets[jx])
+        jt_bytes = jt_bytes + e8s(variant_offsets[jx] - str_len(funcs_bytes))
         jx = jx + 1
     }
     // 布局：常量区 + 函数体（GC 子程序在头部）+ 跳转表 + _start 构成代码域；
@@ -544,36 +589,48 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     let gc_rec_addr = code_origin() + const_data_len
     let gc_col_addr = gc_rec_addr + str_len(gc_rec_bytes)
     let gc_mark_addr = gc_col_addr + str_len(gc_col)
-    // runtime 槽初始值：三个 GC 子程序地址编译期写入；waitset/timer 计数槽（16B）
-    // 与数组零填充，使 runtime_bytes 恰好 RUNTIME_SIZE 长；其余 0 由 _start 填充
-    // Runtime slots: the three subroutine addresses are compile-time constants; the
-    // waitset/timer count slots (16B) and arrays are zero-filled so runtime_bytes is
-    // exactly RUNTIME_SIZE long; the rest are set by _start
+    // runtime 槽初始值全零：waitset/timer 计数槽（16B）与数组零填充，使 runtime_bytes
+    // 恰好 RUNTIME_SIZE 长；三个 GC 子程序槽与分派器槽不在镜像里存绝对地址，由
+    // _start 开头按运行期地址写入（rt_init），其余由 _start 后续填充
+    // Runtime slots start zeroed: the waitset/timer count slots (16B) and arrays
+    // are zero-filled so runtime_bytes is exactly RUNTIME_SIZE long; the three GC
+    // subroutine slots and the dispatcher slot keep no absolute address in the
+    // image — _start stores their run-time addresses first thing (rt_init), and
+    // fills the rest later
     let mut rt_zero = ""
     let mut rzi = 0
     while rzi < 16 + WAITSET_CAP * 16 + TIMER_CAP * 16 + WAITSET_CAP * 8 {
         rt_zero = rt_zero + byte_chr(0)
         rzi = rzi + 1
     }
-    let runtime_bytes = e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(gc_rec_addr) + e8(gc_col_addr) + e8(gc_mark_addr) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + rt_zero
+    let runtime_bytes = e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + rt_zero
     let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
-    let start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr)
+    let rt_init = mov_ri64(rax, gc_rec_addr) + mov_ri64(r11, rt_slot(rt_gc_record_fn)) + mov_mr(r11, 0, rax) + mov_ri64(rax, gc_col_addr) + mov_ri64(r11, rt_slot(rt_gc_collect_fn)) + mov_mr(r11, 0, rax) + mov_ri64(rax, gc_mark_addr) + mov_ri64(r11, rt_slot(rt_mark_addr_fn)) + mov_mr(r11, 0, rax)
+    // 分派器（windows/darwin）紧跟 _start；_start 长度与写入值无关，先以 0 量长再定址
+    // The dispatcher (windows/darwin) follows _start; _start's length does not
+    // depend on the stored value, so measure it with 0 first, then address it
+    let mut start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr, rt_init)
+    if target_os != "linux" {
+        let thunk_probe = rt_init + mov_ri64(rax, 0) + mov_ri64(r11, thunk_slot_abs()) + mov_mr(r11, 0, rax)
+        let disp_addr = img_base() + start_off + str_len(x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr, thunk_probe))
+        start_bytes = x86gen_start(nfn + len(variant_offsets), n_globals, sched_addr, done_addr, rt_init + mov_ri64(rax, disp_addr) + mov_ri64(r11, thunk_slot_abs()) + mov_mr(r11, 0, rax))
+    }
     if target_os == "windows" {
         // PE 装配：可写 runtime 区（含分派器地址槽、fd 表、WSA 区）独立进
         // 固定高 RVA 的 .data；kernel32 + ws2_32 导入 blob 跟在 runtime 区之后同
         // 落 .data——加载器解析导入时要原地写 IAT，只读的 .text 收不下。分派器
-        // 接在 _start 后，槽值与长度无关，单次构建即可。
+        // 接在 _start 后，槽由 _start 写入。
         // PE assembly: the writable runtime area (the dispatcher-address slot,
         // fd table and WSA area included) moves into a fixed-high-RVA .data;
         // the kernel32 + ws2_32 import blob follows the runtime area in the
         // same .data — the loader writes the IAT in place while resolving
         // imports, which a read-only .text cannot host. The dispatcher follows
-        // _start; its length is value-independent, so a single build suffices.
+        // _start, which stores the slot.
         let import_dlls = ["kernel32.dll", "ws2_32.dll"]
         let import_counts = [16, 14]
         let import_names = ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError"]
         let disp_off = start_off + str_len(start_bytes)
-        let runtime_with_thunk = runtime_bytes + e8(img_base() + disp_off)
+        let runtime_with_thunk = runtime_bytes + e8(0)
         // fd 表：全 0xFF 填充（kind=-1 空闲），Windows 独有尾区；其后 WSA 区全零
         // （WSAStartup 未调标记 + 写区 + poll 暂存，见 layout.bur wsa_base）
         // fd table: filled with 0xFF (kind=-1 means free), a Windows-only tail;
@@ -666,26 +723,23 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         let internal_pdata = pe_build_pdata_multi(rt_unwind_offsets, rt_unwind_lens, code_base_off, internal_unwind_offs)
         let pdata_bytes = internal_pdata + pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
         let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0]) + pe_unwind_info_pushes(rt_unwind_pushes[2])
-        emit_pe(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + pdata_pad + pdata_bytes + unwind_blobs, start_off, idata_rva, str_len(imports), pdata_off, str_len(pdata_bytes), runtime_with_fd + imports)
+        emit_pe(pic_text(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + pdata_pad + pdata_bytes + unwind_blobs, img_base()), start_off, idata_rva, str_len(imports), pdata_off, str_len(pdata_bytes), pic_data(runtime_with_fd + imports))
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
-        // 固定高 VA 的 __DATA；槽值是分派器绝对地址（在 _start 之后），
-        // 分派器长度与值无关，单次构建即可。
+        // 固定高 VA 的 __DATA；分派器接在 _start 后，槽由 _start 写入。
         // Mach-O assembly: __TEXT carries constants/code/dispatcher while the
-        // writable runtime area lives in a fixed-high-VA __DATA; the slot holds
-        // the dispatcher's absolute address (right after _start), whose length
-        // is value-independent, so a single build suffices.
+        // writable runtime area lives in a fixed-high-VA __DATA; the dispatcher
+        // follows _start, which stores the slot.
         let entry_in_text = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
         let dispatcher = macho_build_dispatcher()
-        let dispatcher_va = img_base() + entry_in_text + str_len(start_bytes)
-        let runtime_with_thunk = runtime_bytes + e8(dispatcher_va)
-        emit_macho(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher, entry_in_text, runtime_with_thunk, pdata_offsets, pdata_lens, MACHO_TEXT_OFF + const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
+        let runtime_with_thunk = runtime_bytes + e8(0)
+        emit_macho(pic_text(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher, img_base()), entry_in_text, pic_data(runtime_with_thunk), pdata_offsets, pdata_lens, MACHO_TEXT_OFF + const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     } else {
         // ELF 装配：代码域（常量/函数/跳转表/_start）R-X；可写 runtime 区独立成
         // 固定高 VA 的 R-W 数据段。
         // ELF assembly: the code domain (constants/functions/jump table/_start)
         // is R-X; the writable runtime area becomes its own R-W data segment at
         // the fixed high VA.
-        emit_elf(const_data + funcs_bytes + jt_bytes + start_bytes, start_off, runtime_bytes, pdata_offsets, pdata_lens, const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
+        emit_elf(pic_text(const_data + funcs_bytes + jt_bytes + start_bytes, img_base()), start_off, pic_data(runtime_bytes), pdata_offsets, pdata_lens, const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     }
 }

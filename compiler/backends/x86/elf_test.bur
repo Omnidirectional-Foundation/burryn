@@ -3,34 +3,40 @@
 
 fn test_eh_cie_encoding() {
     let cie = eh_cie()
-    let want = u32(20) + u32(0) + byte_chr(1) + byte_chr(0) + byte_chr(1) + byte_chr(120) + byte_chr(16) + byte_chr(12) + byte_chr(7) + byte_chr(8) + byte_chr(144) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0)
-    assert(cie == want, "length=20, CIE_id=0, version=1, empty augmentation, code_align=1, data_align=-8 (SLEB128 0x78), RA col=16 (rip), def_cfa(rsp,8), offset(rip,cfa-8), 6-byte nop pad to 8-byte alignment")
+    let want = u32(20) + u32(0) + byte_chr(1) + "zR" + byte_chr(0) + byte_chr(1) + byte_chr(120) + byte_chr(16) + byte_chr(1) + byte_chr(27) + byte_chr(12) + byte_chr(7) + byte_chr(8) + byte_chr(144) + byte_chr(1) + byte_chr(0) + byte_chr(0)
+    assert(cie == want, "length=20, CIE_id=0, version=1, augmentation zR with FDE encoding 0x1b (pcrel sdata4), code_align=1, data_align=-8 (SLEB128 0x78), RA col=16 (rip), def_cfa(rsp,8), offset(rip,cfa-8), 2-byte nop pad to 8-byte alignment")
+}
+
+fn test_eh_fde_pcrel_layout() {
+    let instrs = byte_chr(65) + byte_chr(14) + byte_chr(16)
+    let fde = eh_fde(28, 0 - 100, 20, instrs)
+    let want = u32(20) + u32(28) + e4s(0 - 100) + u32(20) + byte_chr(0) + instrs + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0)
+    assert(fde == want, "CIE_pointer, signed pcrel initial location, udata4 range, zero augmentation length, instructions, nop pad so the record length is a multiple of 8")
 }
 
 fn test_elf_eh_frame_single_function() {
-    let eh = elf_eh_frame([0], [20], 4194304)
+    let eh = elf_eh_frame([0], [20], 4194304, 4198400)
     let cie = eh_cie()
-    let fde_content = u32(str_len(cie) + 4) + u64(4194304) + u64(20) + byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(134) + byte_chr(2) + byte_chr(68) + byte_chr(14) + byte_chr(24)
-    let want = cie + u32(str_len(fde_content)) + fde_content
-    assert(eh == want, "one CIE + one FDE: CIE_pointer back to the shared CIE, absolute initial_location/address_range, fixed advance_loc/def_cfa_offset/offset instruction stream")
+    let instrs = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(134) + byte_chr(2) + byte_chr(68) + byte_chr(14) + byte_chr(24)
+    let want = cie + eh_fde(str_len(cie) + 4, 4194304 - (4198400 + str_len(cie) + 8), 20, instrs)
+    assert(eh == want, "one CIE + one FDE: CIE_pointer back to the shared CIE, initial location relative to its own field inside .eh_frame, fixed advance_loc/def_cfa_offset/offset instruction stream")
 }
 
 fn test_elf_eh_frame_multi_functions_share_one_cie() {
-    let eh = elf_eh_frame([0, 100, 250], [50, 100, 30], 4194304)
+    let eh = elf_eh_frame([0, 100, 250], [50, 100, 30], 4194304, 4198400)
     let cie = eh_cie()
     let instrs = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(134) + byte_chr(2) + byte_chr(68) + byte_chr(14) + byte_chr(24)
-    let fde0_content = u32(str_len(cie) + 4) + u64(4194304 + 0) + u64(50) + instrs
-    let fde0 = u32(str_len(fde0_content)) + fde0_content
-    let fde1_content = u32(str_len(cie) + str_len(fde0) + 4) + u64(4194304 + 100) + u64(100) + instrs
-    let fde1 = u32(str_len(fde1_content)) + fde1_content
-    let fde2_content = u32(str_len(cie) + str_len(fde0) + str_len(fde1) + 4) + u64(4194304 + 250) + u64(30) + instrs
-    let fde2 = u32(str_len(fde2_content)) + fde2_content
-    let want = cie + fde0 + fde1 + fde2
-    assert(eh == want, "3 functions share one CIE; each FDE's CIE_pointer counts back from its own position to the shared CIE's start")
+    let at0 = str_len(cie)
+    let fde0 = eh_fde(at0 + 4, 4194304 + 0 - (4198400 + at0 + 8), 50, instrs)
+    let at1 = at0 + str_len(fde0)
+    let fde1 = eh_fde(at1 + 4, 4194304 + 100 - (4198400 + at1 + 8), 100, instrs)
+    let at2 = at1 + str_len(fde1)
+    let fde2 = eh_fde(at2 + 4, 4194304 + 250 - (4198400 + at2 + 8), 30, instrs)
+    assert(eh == cie + fde0 + fde1 + fde2, "3 functions share one CIE; each FDE's CIE_pointer and pcrel initial location count from its own position")
 }
 
 fn test_elf_eh_frame_empty() {
-    assert(elf_eh_frame([], [], 4194304) == eh_cie(), "no functions means the CIE alone, no FDEs")
+    assert(elf_eh_frame([], [], 4194304, 4198400) == eh_cie(), "no functions means the CIE alone, no FDEs")
 }
 
 fn test_elf_shstrtab_layout() {
@@ -71,14 +77,13 @@ fn test_eh_push_instrs_gc_record_shape() {
 }
 
 fn test_elf_eh_frame_internal_zero_and_push_shapes() {
-    let cie = eh_cie()
-    let user_eh = elf_eh_frame([0], [20], 4194304)
-    let internal = elf_eh_frame_internal([100, 150], [30, 40], 4194304, [[], [rax, rcx]], str_len(user_eh))
-    let zero_content = u32(str_len(user_eh) + 4) + u64(4194304 + 100) + u64(30) + ""
-    let zero_fde = u32(str_len(zero_content)) + zero_content
+    let user_eh = elf_eh_frame([0], [20], 4194304, 4198400)
+    let internal = elf_eh_frame_internal([100, 150], [30, 40], 4194304, 4198400, [[], [rax, rcx]], str_len(user_eh))
+    let at0 = str_len(user_eh)
+    let zero_fde = eh_fde(at0 + 4, 4194304 + 100 - (4198400 + at0 + 8), 30, "")
     let push_instrs = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(65) + byte_chr(14) + byte_chr(24)
-    let push_content = u32(str_len(user_eh) + str_len(zero_fde) + 4) + u64(4194304 + 150) + u64(40) + push_instrs
-    let push_fde = u32(str_len(push_content)) + push_content
+    let at1 = at0 + str_len(zero_fde)
+    let push_fde = eh_fde(at1 + 4, 4194304 + 150 - (4198400 + at1 + 8), 40, push_instrs)
     assert(internal == zero_fde + push_fde, "a zero-prologue entry (empty instruction stream) and a 2-push entry, both counting cie_pointer back across the user FDEs that precede them")
 }
 

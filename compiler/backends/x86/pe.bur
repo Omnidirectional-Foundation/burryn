@@ -2,13 +2,21 @@
 // PE output: headers, section table and the import tables (ILT/IAT/hint),
 // plus the Windows dispatch arms.
 
-// emit_pe 装配 PE32+：头区(1024B) + 代码内容（补齐 512）+ 可写数据内容（补齐 512）；
-// 入口在代码内容内 entry_off 处；idata_rva 是导入 blob 的起始 RVA（落在 .data）
-// emit_pe assembles the PE32+: 1024-byte header area + code content (padded to
-// 512) + the writable data content (padded to 512); the entry point sits at
-// entry_off within the code content; idata_rva is the import blob's starting
-// RVA (inside .data)
-pub fn emit_pe(code, entry_off, idata_rva, idata_len, pdata_off, pdata_len, data_content) {
+// emit_pe 装配 PE32+：头区(1024B) + 代码内容（4 字节对齐后接基址重定位块，再补齐
+// 512）+ 可写数据内容（补齐 512）；入口在代码内容内 entry_off 处；idata_rva 是导入
+// blob 的起始 RVA（落在 .data）
+// emit_pe assembles the PE32+: 1024-byte header area + code content (the base
+// relocation block appended at 4-byte alignment, then padded to 512) + the
+// writable data content (padded to 512); the entry point sits at entry_off
+// within the code content; idata_rva is the import blob's starting RVA
+// (inside .data)
+pub fn emit_pe(text, entry_off, idata_rva, idata_len, pdata_off, pdata_len, data_content) {
+    let reloc_off = pe_align(str_len(text), 4)
+    let mut code = text
+    while str_len(code) < reloc_off {
+        code = code + byte_chr(0)
+    }
+    code = code + pe_build_reloc()
     let mut padded = code
     let n = str_len(code) % 512
     if n != 0 {
@@ -31,7 +39,20 @@ pub fn emit_pe(code, entry_off, idata_rva, idata_len, pdata_off, pdata_len, data
         }
         padded_data = padded_data + dz
     }
-    pe_emit_headers(entry_off, str_len(code), idata_rva, idata_len, pdata_off, pdata_len, str_len(data_content)) + padded + padded_data
+    pe_emit_headers(entry_off, str_len(code), idata_rva, idata_len, pdata_off, pdata_len, reloc_off, str_len(data_content)) + padded + padded_data
+}
+
+// pe_build_reloc 生成只含一个空块的基址重定位目录：页 RVA 4096、块长 12、两项
+// IMAGE_REL_BASED_ABSOLUTE（跳过项，块按 4 字节补齐）。代码 RIP 相对、数据段不存
+// 绝对地址，镜像本无需修补；带上目录是让加载器把镜像视作可重定位，
+// DYNAMIC_BASE 才会实际施加 ASLR
+// pe_build_reloc builds a base-relocation directory holding one empty block:
+// page RVA 4096, block size 12, two IMAGE_REL_BASED_ABSOLUTE entries (skip
+// entries padding the block to 4 bytes). The code is RIP-relative and the data
+// segment holds no absolute address, so nothing needs patching; the directory
+// only marks the image relocatable, so DYNAMIC_BASE actually applies ASLR
+pub fn pe_build_reloc() {
+    e4(4096) + e4(12) + e2(0) + e2(0)
 }
 
 // pe_build_section_entry 生成一条 40B 节表项：名字补零到 8B，字段按
@@ -612,7 +633,7 @@ pub fn pe_build_dispatcher(iat) {
 // RVA). The headers occupy 64+24+240+120=448B inside a 1024B header area (a
 // FileAlignment multiple); SizeOfHeaders and the section raw pointers use that
 // value.
-pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pdata_len, data_len) {
+pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pdata_len, reloc_off, data_len) {
     let hdr_area = 1024
     // DOS：MZ 魔数 + e_lfanew=64，其余补零
     // DOS: MZ magic + e_lfanew=64, zero padding elsewhere
@@ -642,9 +663,15 @@ pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pda
     // COFF: AMD64, two sections (three with the gap filler), executable image + large-address-aware
     let coff = "PE" + byte_chr(0) + byte_chr(0) + e2(34404) + e2(n_sect) + e4(0) + e4(0) + e4(0) + e2(240) + e2(34)
     let image_size = DATA_VA_OFF + pe_align(data_len, 4096)
-    let opt = e2(523) + e1(0) + e1(0) + e4(code_len) + e4(0) + e4(0) + e4(pe_content_rva(entry_off)) + e4(4096) + e8(4194304) + e4(4096) + e4(512) + e2(6) + e2(0) + e2(0) + e2(0) + e2(6) + e2(0) + e4(0) + e4(image_size) + e4(hdr_area) + e4(0) + e2(3) + e2(0) + e8(8388608) + e8(1048576) + e8(1048576) + e8(4096) + e4(0) + e4(16)
-    // 16 个数据目录：[1]=导入表、[3]=异常目录（.pdata），其余零
-    // sixteen data directories: [1]=imports, [3]=exception table (.pdata), rest zero
+    // DllCharacteristics=0x160：HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT——镜像位置
+    // 无关，加载器可在 64 位地址空间任意定基；代码段 R-X、数据段 R-W，无可执行数据页
+    // DllCharacteristics=0x160: HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT — the
+    // image is position-independent, so the loader may base it anywhere in the
+    // 64-bit address space; code is R-X and data R-W, with no executable data page
+    let opt = e2(523) + e1(0) + e1(0) + e4(code_len) + e4(0) + e4(0) + e4(pe_content_rva(entry_off)) + e4(4096) + e8(4194304) + e4(4096) + e4(512) + e2(6) + e2(0) + e2(0) + e2(0) + e2(6) + e2(0) + e4(0) + e4(image_size) + e4(hdr_area) + e4(0) + e2(3) + e2(352) + e8(8388608) + e8(1048576) + e8(1048576) + e8(4096) + e4(0) + e4(16)
+    // 16 个数据目录：[1]=导入表、[3]=异常目录（.pdata）、[5]=基址重定位，其余零
+    // sixteen data directories: [1]=imports, [3]=exception table (.pdata),
+    // [5]=base relocations, rest zero
     let mut dirs = ""
     let mut k = 0
     while k < 16 {
@@ -652,6 +679,8 @@ pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pda
             dirs = dirs + e4(idata_rva) + e4(idata_len)
         } else if k == 3 {
             dirs = dirs + e4(pe_content_rva(pdata_off)) + e4(pdata_len)
+        } else if k == 5 {
+            dirs = dirs + e4(pe_content_rva(reloc_off)) + e4(str_len(pe_build_reloc()))
         } else {
             dirs = dirs + e4(0) + e4(0)
         }

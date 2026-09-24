@@ -1,14 +1,18 @@
 // elf.bur — ELF 输出：程序头、段布局与 Linux syscall 编号。
 // ELF output: program headers, segment layout and Linux syscall numbers.
 
-let et_exec = 2
+let et_dyn = 3
 let em_x86_64 = 62
 let pt_load = 1
 let pf_x = 1
 let pf_r = 4
 let pf_w = 2
 
-// 固定加载基址（静态非 PIE）/ Fixed load base (static, non-PIE)
+// 链接基址：ET_DYN 无解释器（static-pie），内核按 mmap 随机区另择实际基址，
+// 代码全程 RIP 相对，与链接基址无关
+// Link base: ET_DYN without an interpreter (static-pie) — the kernel picks the
+// real base from the randomized mmap region, and the code is RIP-relative
+// throughout, independent of the link base
 pub let base_addr = 4194304
 
 // ELF_CODE_OFF 是代码内容在文件与 VA 中的公共起点：64B ELF 头 + 两条 phdr
@@ -29,7 +33,7 @@ pub let ELF_CODE_OFF = 176
 fn elf_header_with_sh(entry, phnum, shoff, shnum, shstrndx) {
     let ident = byte_chr(127) + "ELF" + byte_chr(2) + byte_chr(1) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0)
 
-    ident + u16(et_exec) + u16(em_x86_64) + u32(1) + u64(entry) + u64(64) + u64(shoff) + u32(0) + u16(64) + u16(56) + u16(phnum) + u16(64) + u16(shnum) + u16(shstrndx)
+    ident + u16(et_dyn) + u16(em_x86_64) + u32(1) + u64(entry) + u64(64) + u64(shoff) + u32(0) + u16(64) + u16(56) + u16(phnum) + u16(64) + u16(shnum) + u16(shstrndx)
 }
 
 // phdr_load 生成 PT_LOAD 程序头，flags 由调用方给：代码段 R-X、数据段 R-W（GC
@@ -43,24 +47,23 @@ fn phdr_load(offset, vaddr, filesz, memsz, flags) {
 
 // eh_cie 是全程序共享的 CIE（.eh_frame 的头部记录）：初始规则 CFA=rsp+8（函数
 // 入口、序言尚未执行时，返回地址在 [rsp]），返回地址列（DWARF 寄存器号 16 =
-// rip）在 cfa-8。空 augmentation（版本 1 后紧跟单个 NUL），FDE 里的地址字段因此
-// 是原生 8 字节绝对值，不带 PC 相对重定位——与本程序固定基址、非 PIE 的现状一致，
-// 也省掉了 LEB128 变长指针编码的复杂度。code_alignment_factor=1、
-// data_alignment_factor=-8（字节 0x78 是 SLEB128(-8) 的单字节编码，因为只有这
-// 一处用得上、不值得写通用 SLEB128）。6 字节 DW_CFA_nop 补齐到 8 字节对齐。
+// rip）在 cfa-8。augmentation "zR"：增补数据长 1，FDE 指针编码 0x1b
+// （DW_EH_PE_pcrel | sdata4），FDE 的起始地址存相对该字段自身的 4 字节偏移，
+// 镜像按任意基址装载都成立。code_alignment_factor=1、data_alignment_factor=-8
+// （字节 0x78 是 SLEB128(-8) 的单字节编码，因为只有这一处用得上、不值得写通用
+// SLEB128）。2 字节 DW_CFA_nop 补齐到 8 字节对齐。
 // eh_cie is the single program-wide CIE (the .eh_frame header record): the
 // initial rule is CFA=rsp+8 (function entry, before the prologue runs, return
 // address sits at [rsp]), and the return-address column (DWARF register 16 =
-// rip) is at cfa-8. Empty augmentation (version 1 followed directly by a
-// single NUL), so FDE address fields are plain native 8-byte absolute values
-// with no PC-relative relocation — matching this backend's fixed-base,
-// non-PIE binaries and skipping LEB128 variable-length pointer encoding
-// entirely. code_alignment_factor=1, data_alignment_factor=-8 (byte 0x78 is
+// rip) is at cfa-8. Augmentation "zR": one byte of augmentation data holding
+// the FDE pointer encoding 0x1b (DW_EH_PE_pcrel | sdata4), so each FDE's
+// initial location is a 4-byte offset from that field itself and holds at any
+// load base. code_alignment_factor=1, data_alignment_factor=-8 (byte 0x78 is
 // the one-byte SLEB128(-8) encoding; a general SLEB128 helper isn't worth it
-// for this single use). Six DW_CFA_nop bytes pad the record to 8-byte
+// for this single use). Two DW_CFA_nop bytes pad the record to 8-byte
 // alignment.
 fn eh_cie() {
-    let content = u32(0) + byte_chr(1) + byte_chr(0) + byte_chr(1) + byte_chr(120) + byte_chr(16) + byte_chr(12) + byte_chr(7) + byte_chr(8) + byte_chr(144) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0)
+    let content = u32(0) + byte_chr(1) + "zR" + byte_chr(0) + byte_chr(1) + byte_chr(120) + byte_chr(16) + byte_chr(1) + byte_chr(27) + byte_chr(12) + byte_chr(7) + byte_chr(8) + byte_chr(144) + byte_chr(1) + byte_chr(0) + byte_chr(0)
     u32(str_len(content)) + content
 }
 
@@ -68,7 +71,8 @@ fn eh_cie() {
 // 全程序唯一（natives.bur 的 x86gen_prologue：push rbp、sub rsp,8，各自结束于
 // 序言第 1/5 字节），故每条 FDE 的指令字节完全相同（advance_loc 1→
 // def_cfa_offset 16→rbp 存于 cfa-16；advance_loc 4→def_cfa_offset 24），只有
-// CIE_pointer/initial_location/address_range 三个字段随函数变化。GC/调度器等
+// CIE_pointer/initial_location/address_range 三个字段随函数变化。eh_va 是
+// .eh_frame 自身的 VA，供 pcrel 起始地址换算。GC/调度器等
 // 内部子程序（普通 call/ret，不建此序言）本轮不纳入覆盖——与已交付的 PE
 // .pdata/Mach-O __unwind_info 同等范围。
 // elf_eh_frame builds .eh_frame: one shared CIE plus one FDE per function.
@@ -77,22 +81,35 @@ fn eh_cie() {
 // respectively), so every FDE's instruction bytes are identical (advance_loc
 // 1 → def_cfa_offset 16 → rbp saved at cfa-16; advance_loc 4 →
 // def_cfa_offset 24); only CIE_pointer/initial_location/address_range vary
-// per function. Internal runtime subroutines (plain call/ret, no such
+// per function. eh_va is .eh_frame's own VA, used to form the pcrel initial
+// locations. Internal runtime subroutines (plain call/ret, no such
 // prologue) aren't covered this round — the same scope already delivered for
 // PE .pdata / Mach-O __unwind_info.
-pub fn elf_eh_frame(offs, lens, code_va_base) {
+pub fn elf_eh_frame(offs, lens, code_va_base, eh_va) {
     let cie = eh_cie()
     let instrs = byte_chr(65) + byte_chr(14) + byte_chr(16) + byte_chr(134) + byte_chr(2) + byte_chr(68) + byte_chr(14) + byte_chr(24)
     let n = len(offs)
     let mut fdes = ""
     let mut i = 0
     while i < n {
-        let cie_pointer = str_len(cie) + str_len(fdes) + 4
-        let content = u32(cie_pointer) + u64(code_va_base + offs[i]) + u64(lens[i]) + instrs
-        fdes = fdes + u32(str_len(content)) + content
+        let at = str_len(cie) + str_len(fdes)
+        fdes = fdes + eh_fde(at + 4, code_va_base + offs[i] - (eh_va + at + 8), lens[i], instrs)
         i = i + 1
     }
     cie + fdes
+}
+
+// eh_fde 生成一条 FDE：CIE_pointer（自本字段回数到 CIE 起点）、pcrel sdata4 起始
+// 地址、udata4 长度、空增补数据，DW_CFA_nop 补齐到 8 字节对齐
+// eh_fde builds one FDE: CIE_pointer (counting back from this field to the
+// CIE's start), a pcrel sdata4 initial location, a udata4 range, empty
+// augmentation data, and DW_CFA_nop padding to 8-byte alignment
+fn eh_fde(cie_pointer, pc_rel, range, instrs) {
+    let mut content = u32(cie_pointer) + e4s(pc_rel) + u32(range) + byte_chr(0) + instrs
+    while (str_len(content) + 4) % 8 != 0 {
+        content = content + byte_chr(0)
+    }
+    u32(str_len(content)) + content
 }
 
 // eh_push_instrs 由入口连续 push 的寄存器列表生成 FDE 指令流：每条 push 各自的
@@ -144,15 +161,14 @@ fn eh_push_instrs(push_regs) {
 // emitted), which cie_pointer counts back across. push_regs_list runs
 // parallel to offs/lens: each entry is the list of registers pushed at that
 // function's entry (an empty array means a zero prologue).
-pub fn elf_eh_frame_internal(offs, lens, code_va_base, push_regs_list, prior_len) {
+pub fn elf_eh_frame_internal(offs, lens, code_va_base, eh_va, push_regs_list, prior_len) {
     let n = len(offs)
     let mut fdes = ""
     let mut i = 0
     while i < n {
         let instrs = eh_push_instrs(push_regs_list[i])
-        let cie_pointer = prior_len + str_len(fdes) + 4
-        let content = u32(cie_pointer) + u64(code_va_base + offs[i]) + u64(lens[i]) + instrs
-        fdes = fdes + u32(str_len(content)) + content
+        let at = prior_len + str_len(fdes)
+        fdes = fdes + eh_fde(at + 4, code_va_base + offs[i] - (eh_va + at + 8), lens[i], instrs)
         i = i + 1
     }
     fdes
@@ -205,10 +221,10 @@ pub fn emit_elf(code, entry_off, data_content, pdata_offsets, pdata_lens, code_b
     let code_offset = ELF_CODE_OFF
     let entry = base_addr + code_offset + entry_off
     let va_base = base_addr + code_offset + code_base
-    let user_eh = elf_eh_frame(pdata_offsets, pdata_lens, va_base)
-    let internal_eh = elf_eh_frame_internal(rt_unwind_offsets, rt_unwind_lens, va_base, rt_unwind_pushes, str_len(user_eh))
-    let eh_frame = user_eh + internal_eh
     let eh_frame_off = code_offset + str_len(code)
+    let user_eh = elf_eh_frame(pdata_offsets, pdata_lens, va_base, base_addr + eh_frame_off)
+    let internal_eh = elf_eh_frame_internal(rt_unwind_offsets, rt_unwind_lens, va_base, base_addr + eh_frame_off, rt_unwind_pushes, str_len(user_eh))
+    let eh_frame = user_eh + internal_eh
     let text_total = eh_frame_off + str_len(eh_frame)
     let data_foff = pe_align(text_total, 4096)
     let mut text_pad = ""

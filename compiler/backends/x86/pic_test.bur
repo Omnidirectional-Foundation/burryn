@@ -1,0 +1,24 @@
+// pic_test.bur — pic.bur 的 bur test 套件：两遍差分改写 mov imm64 为 RIP 相对 lea
+// bur test suite for pic.bur: the two-pass diff rewriting mov imm64 into RIP-relative lea
+
+fn test_pic_rewrite_low_register_site() {
+    let pre = mov_ri64(rcx, 7) + add_rr(rax, rcx)
+    let real = pre + mov_ri64(rax, 4198400 + 64) + ret()
+    let probe = pre + mov_ri64(rax, 4198400 + 64 + PIC_PROBE_SHIFT) + ret()
+    let site = str_len(pre)
+    let want = pre + lea_rip_rel32(rax, 4198400 + 64 - (4198400 + site + 7)) + e1(15) + e1(31) + e1(0) + ret()
+    assert(pic_rewrite(real, probe, 4198400) == want, "mov rax, imm64 address becomes lea rax, [rip+disp32] plus a 3-byte nop; constants that match across passes stay untouched")
+}
+
+fn test_pic_rewrite_rex_b_register_keeps_length() {
+    let real = mov_ri64(r9, 4194304 + 16777216) + mov_ri64(r10, 5)
+    let probe = mov_ri64(r9, 4194304 + 16777216 + PIC_PROBE_SHIFT) + mov_ri64(r10, 5)
+    let got = pic_rewrite(real, probe, 4194304)
+    assert(str_len(got) == str_len(real), "rewritten image keeps its length so every relative jump stays valid")
+    assert(substr(got, 0, 7) == lea_rip_rel32(r9, 16777216 - 7), "REX.B on the mov turns into REX.R on the lea for r8-r15")
+}
+
+fn test_pic_rewrite_identical_passes_unchanged() {
+    let code = mov_ri64(rax, 1) + ret()
+    assert(pic_rewrite(code, code, 4194304) == code, "no base-dependent bytes means no rewrite")
+}

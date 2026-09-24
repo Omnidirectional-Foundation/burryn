@@ -231,7 +231,7 @@ WASM 后端「链接 wasm32 版 burrt.c 获得 CSP」在架构上不成立——
 |--------|------|
 | r15 | 值栈顶（向上增长） |
 | r14 | 帧基（当前函数） |
-| r13 | 跳转表基址 |
+| r13 | 跳转表基址（表项存入口相对表基址的偏移，`jt_load` 加回） |
 | r12 | 堆 bump 指针 |
 | rbx | 全局变量表基址 |
 | rbp | 保存调用者 r14 |
@@ -254,6 +254,7 @@ Raw int64，8 字节/槽，**无 tag**。
 ```
 
 - 可写 runtime 区独立成 R-W 段，与代码域之间留 VA 空洞（ELF/Mach-O 不映射，PE 由只占 VA 的 `.bss` 填洞节补齐），定案见 §5.21
+- 三目标均为 PIE：上图基址是链接基址，实际装载基址由内核/加载器随机选定，代码全程 RIP 相对，定案见 §5.22
 - 堆：16MB via mmap(MAP_ANONYMOUS)，零填充，bump-allocated via r12
 - 值栈：1MB below rsp，向上增长
 - 全局变量：堆首 N*8 字节（rbx = base）
@@ -474,9 +475,9 @@ Linux 目标崩溃可诊断性此前是三个格式里唯一没起步的一个�
 
 **CIE/FDE 编码**：单份全程序共享 CIE（初始规则 CFA=rsp+8、返回地址列 rip 在
 cfa-8）+ 每函数一条 FDE（advance_loc 1→def_cfa_offset 16→rbp 存于 cfa-16；
-advance_loc 4→def_cfa_offset 24——对应序言的 `push rbp`/`sub rsp,8` 两步）。空
-augmentation 字符串，地址字段用原生 8 字节绝对值，不带 PC 相对重定位——与本程序
-固定基址、非 PIE 的现状一致，也避免了 LEB128 变长指针编码。手写字节先与真实
+advance_loc 4→def_cfa_offset 24——对应序言的 `push rbp`/`sub rsp,8` 两步）。
+augmentation `"zR"`、FDE 指针编码 `0x1b`（`DW_EH_PE_pcrel | sdata4`）：起始地址存
+相对字段自身的 4 字节偏移，镜像按任意基址装载都成立（PIE，见 §5.22）。手写字节先与真实
 工具链（GNU `as`）对同一段序言生成的 CIE/FDE 逐字节比对过（`readelf
 --debug-dump=frames`），再用编译器实际产出的 ELF 在 gdb 下跑深度非尾递归到真实
 栈溢出崩溃，回溯逐帧正确（重复调用点、相同返回地址，形态与源码调用链完全吻合）。
@@ -562,7 +563,7 @@ PE/Mach-O 初版时同一验证力度，如实记录，不假装有更高确信�
 
 完成线「节/段拆分（R-X 代码与 R-W 数据分开）」的落地定案：三目标一致把可写
 runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WSA 区）从代码域
-迁出，代码域收成 R-X。仍保持固定基址——PIE 是独立后续项，不绑在本改动里。
+迁出，代码域收成 R-X。本节落地时仍是固定基址，PIE 随后另行落地，见 §5.22。
 
 - **布局**：可写区落在镜像基址 + 16MB 的固定高 VA（`DATA_VA_OFF`，`layout.bur`
   单一定义，取代原 Mach-O 专属的 `MACHO_DATA_VA_OFF`），与代码域之间留未映射
@@ -593,6 +594,40 @@ runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WS
   `test_pe_emit_headers_sections_adjacent_across_data_hole` 锁定三节表。真 Windows
   `x86-pe-run` 全部 hard gate 对 golden 一致。
   Mach-O 字节不变（常量等值改名，既有单测锁定）。
+
+### 5.22 PIE：双基址差分改写成 RIP 相对（定案，2026-09-24）
+
+完成线「PIE（三目标）」的落地定案。取「代码取址一律 RIP 相对、数据不存绝对指针」
+的混合路线：镜像零重定位项，三目标行为一致，W^X 不破（不需要装载期改写代码页）。
+
+- **难点**：后端以字符串拼接发射机器码，片段生成时不知道自己最终落在哪个偏移，
+  约 490 处 `mov r64, imm64` 内嵌 `img_base()`/`data_origin()` 算出的绝对地址，
+  逐处改成位置感知不现实。
+- **双基址差分**（`pic.bur`）：`x86gen_image` 从已求解的共享上下文装配整份镜像，
+  按两个基址各跑一遍——先以 `PIC_PROBE_SHIFT`（`2^32 + 2^20`，高低 32 位都非零、
+  页对齐）平移的探针基址，再以真实基址。平移经 `layout.bur` 的 `addr_shift` 叠加到
+  `img_base`/`data_origin`，所有绝对地址都经这两个函数收口。编码长度与立即数取值
+  无关，两遍代码等长；逐字节比对后，每处差异必须落在某条 `mov r64, imm64`
+  （`REX.W[.B] B8+r`）的立即数内、且两遍取值恰差平移量，该 10 字节指令原地改写成
+  `lea r64, [rip+disp32]`（7 字节）+ 3 字节 nop，长度不变，其余跳转偏移随之有效。
+  任何其他差异（imm32 里的地址、数据里的指针）都是未收口的绝对地址，报内部错误
+  终止编译，不会静默产出坏镜像。可写数据段初值要求两遍逐字节相同。
+- **数据侧去绝对指针**：跳转表项改存「入口 − 表基址」的相对偏移，取表项处经
+  `jt_load` 加回 r13（`_start` 本就用 `lea rip` 定 r13）；三个 GC 子程序地址槽与
+  Windows/darwin 分派器槽不再在镜像里存初值，由 `_start` 开头的 `rt_init` 按运行期
+  地址写入（`_start` 长度与写入值无关，先以 0 量长再定分派器地址）。
+- **格式标志**：ELF `e_type=ET_DYN`、无 `PT_INTERP`（static-pie，内核从随机 mmap
+  区定基），`.eh_frame` 改 pcrel（§5.19）；PE `DllCharacteristics=0x160`
+  （`HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT`）并带一个只含跳过项的基址重定位
+  目录（数据目录 [5]，挂在 `.text` 末尾）——镜像本无需修补，带目录是让加载器把镜像
+  视作可重定位、实际施加 ASLR；Mach-O 置 `MH_PIE`，dyld 施 slide 无需 rebase。
+- **代价**：`x86gen_image` 跑两遍，前段类型求解（psim、签名求解）只跑一遍。
+- **验证**：单测锁定改写形态（低位/REX.B 寄存器、等长、无差异不改写）、pcrel FDE
+  与 CIE 编码、PE DllCharacteristics 与重定位目录；Linux multi-backend 三方 91/0/0，
+  exec pipe 失败三档回归通过；gdb 关闭 `disable-randomization` 两次 `starti` 映射基址
+  不同，代码段 R-X、数据段 R-W 相距 16MB，随机基址下中断深递归回溯逐帧正确；
+  examples 与 testdata/regression 全部 `.bur` 以 windows/darwin 目标构建无内部错误；
+  真 Windows `x86-pe-run` 与 macOS `x86-macho-run` hard gate 对 golden 一致。
 
 ## 6. LSP 与编辑器生态
 
