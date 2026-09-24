@@ -486,6 +486,7 @@ jobs:
           ./gen1 build --backend x86 --os windows examples/net/net_loopback.bur -o pe-out/net_loopback.exe
           ./gen1 build --backend x86 --os windows examples/net/net_nb.bur -o pe-out/net_nb.exe
           ./gen1 build --backend x86 --os windows testdata/pie/spin.bur -o pe-out/spin.exe
+          BUR=./gen1 ./scripts/xos-corpus.sh windows pe-out/corpus
 
       - name: Upload windows programs
         uses: actions/upload-artifact@v4
@@ -499,7 +500,7 @@ jobs:
     needs: x86-pe-build
     if: always() && needs.x86-pe-build.result == 'success'
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -589,6 +590,29 @@ jobs:
           Write-Output ("image base 0x{0:x}" -f $b)
           if ($b -eq 0x400000) { Write-Error "image loaded at its link base"; exit 1 }
 
+      # 全量语料对照 Linux x86 基准（stdout + 退出码）；缺口摸清补齐前只报告不拦截
+      # Full corpus against the Linux x86 reference (stdout + exit code); report
+      # only until the gaps are mapped and closed
+      - name: Cross-target corpus vs Linux x86 (survey)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $pass = 0; $fail = 0
+          foreach ($n in Get-Content pe-out/corpus/CASES) {
+            $want = [int](Get-Content "pe-out/corpus/$n.rc")
+            $p = Start-Process -FilePath "pe-out/corpus/$n.exe" -RedirectStandardOutput "act-$n.txt" -RedirectStandardError "err-$n.txt" -PassThru -NoNewWindow
+            $null = $p.Handle
+            if (-not $p.WaitForExit(20000)) { taskkill /F /T /PID $p.Id | Out-Null; $rc = 124 } else { $rc = $p.ExitCode }
+            $same = (Get-FileHash "act-$n.txt").Hash -eq (Get-FileHash "pe-out/corpus/$n.expected").Hash
+            if ($same -and $rc -eq $want) { $pass++ } else {
+              $fail++
+              Write-Output ("FAIL {0}: rc {1} (want {2})" -f $n, $rc, $want)
+              git diff --no-index --text "pe-out/corpus/$n.expected" "act-$n.txt" | Select-Object -Skip 4 -First 6
+            }
+          }
+          Write-Output "=== corpus: $pass pass, $fail fail ==="
+          if ($fail -ne 0) { exit 1 }
+
   x86-macho-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -619,6 +643,7 @@ jobs:
           ./gen1 build --backend x86 --os darwin examples/net/net_loopback.bur -o macho-out/net_loopback-mac
           ./gen1 build --backend x86 --os darwin examples/net/net_nb.bur -o macho-out/net_nb-mac
           ./gen1 build --backend x86 --os darwin testdata/pie/spin.bur -o macho-out/spin-mac
+          BUR=./gen1 ./scripts/xos-corpus.sh darwin macho-out/corpus
 
       - name: Upload macho programs
         uses: actions/upload-artifact@v4
@@ -632,7 +657,7 @@ jobs:
     needs: x86-macho-build
     if: always() && needs.x86-macho-build.result == 'success'
     runs-on: macos-15-intel
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -710,6 +735,33 @@ jobs:
           done
           set -- $bases
           if [ "$1" = "$2" ]; then echo "same base across launches"; exit 1; fi
+
+      # 全量语料对照 Linux x86 基准（stdout + 退出码）；缺口摸清补齐前只报告不拦截
+      # Full corpus against the Linux x86 reference (stdout + exit code); report
+      # only until the gaps are mapped and closed
+      - name: Cross-target corpus vs Linux x86 (survey)
+        continue-on-error: true
+        run: |
+          set -u
+          pass=0; fail=0
+          while read -r n; do
+            bin="macho-out/corpus/$n-mac"
+            codesign -f -s - "$bin" 2>/dev/null
+            chmod +x "$bin"
+            perl -e 'alarm 20; exec @ARGV' "$bin" >"act-$n.txt" 2>/dev/null
+            rc=$?
+            [ "$rc" -eq 142 ] && rc=124
+            want=$(cat "macho-out/corpus/$n.rc")
+            if cmp -s "act-$n.txt" "macho-out/corpus/$n.expected" && [ "$rc" -eq "$want" ]; then
+              pass=$((pass + 1))
+            else
+              fail=$((fail + 1))
+              echo "FAIL $n: rc $rc (want $want)"
+              diff "macho-out/corpus/$n.expected" "act-$n.txt" | head -6
+            fi
+          done <macho-out/corpus/CASES
+          echo "=== corpus: $pass pass, $fail fail ==="
+          [ "$fail" -eq 0 ]
 
   runtime:
     needs: []
