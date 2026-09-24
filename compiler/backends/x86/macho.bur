@@ -304,8 +304,10 @@ pub fn emit_macho(text_content, entry_in_text, data_content, pdata_offsets, pdat
 // 228 clock_gettime has no number in the BSD table, so it routes through
 // gettimeofday's (0x2000074) third argument uint64_t *mach_absolute_time: that
 // timebase is nanoseconds on x86_64, divided by 1e9 into a timespec.
+// exec 族（57 fork、59 execve、61 wait4、33 dup2、293 pipe2、35 nanosleep）见各臂。
 // 其余号落 ud2 立即崩溃暴露缺口。
-// Every other number hits ud2.
+// The exec family (57 fork, 59 execve, 61 wait4, 33 dup2, 293 pipe2, 35
+// nanosleep) is described at each arm. Every other number hits ud2.
 // 无导入无 API 调用，故帧只需保存六个输入寄存器（mmap 改写 r10、clock 改写
 // rdi/rsi/rdx/r10，尾声弹回），无需影子空间与栈定位。
 // No imports and no API calls, so the frame only saves the six input registers
@@ -469,7 +471,57 @@ pub fn macho_build_dispatcher() {
     let fcntl_set_chk = mov_ri64(r11, 4) + cmp_rr(rsi, r11) + jne_rel32(str_len(fcntl_set)) + fcntl_set
     let fcntl_case = fcntl_set_chk + mov_ri64(rax, 33554524) + e1(15) + e1(5) + errno_tail
 
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 2, 0, 3, 4, 5, 217, 41, 42, 43, 49, 50, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case, socket_case, connect_case, accept_case, bind_case, listen_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
+    // exec 族：fork/execve/wait4/dup2/pipe2/nanosleep。子进程只做裸 syscall
+    // （dup2、close、execve、write、exit），不回到 libSystem，故裸 fork 足够。
+    // The exec family: fork/execve/wait4/dup2/pipe2/nanosleep. The child only
+    // issues raw syscalls (dup2, close, execve, write, exit) and never returns
+    // into libSystem, so a raw fork suffices.
+    let sc = e1(15) + e1(5)
+    // fork()：BSD fork(0x2000002) 在父子两边都返回对方/子 pid，子进程另置
+    // rdx=1；据 rdx 把子进程返回值归零，错误转负。
+    // fork(): BSD fork (0x2000002) returns a pid on both sides and sets rdx=1
+    // in the child; rdx zeroes the child's return value, errors convert negative.
+    let fork_child = xor_rr(rax, rax)
+    let fork_err = neg_r(rax)
+    let fork_ok = test_rr(rdx, rdx) + je_rel32(str_len(fork_child)) + fork_child + jmp_rel32(str_len(fork_err))
+    let fork_case = mov_ri64(rax, 33554434) + sc + jb_rel32(str_len(fork_ok)) + fork_ok + fork_err
+
+    // execve(path=rdi, argv=rsi, envp=rdx)：直通；ENOENT/EACCES 两边同号
+    // execve(path=rdi, argv=rsi, envp=rdx): passes through; ENOENT/EACCES share numbers
+    let execve_case = mov_ri64(rax, 33554491) + sc + errno_tail
+
+    // wait4(pid=rdi, status=rsi, options=rdx, rusage=r10)：BSD 7，第 4 参本在 r10，
+    // 状态字布局两边相同，直通
+    // wait4(pid=rdi, status=rsi, options=rdx, rusage=r10): BSD 7, the 4th arg
+    // already in r10, the status word layout matches; passes through
+    let wait4_case = mov_ri64(rax, 33554439) + sc + errno_tail
+
+    // dup2(old=rdi, new=rsi)：BSD 90，直通 / dup2(old=rdi, new=rsi): BSD 90, passes through
+    let dup2_case = mov_ri64(rax, 33554522) + sc + errno_tail
+
+    // pipe2(fds=rdi, flags=rsi)：BSD 只有 pipe(0x200002A)，两端经 rax/rdx 返回；
+    // 写回 fds[0]/fds[1]（各 4 字节）后按 Linux 标志逐端补 fcntl：O_CLOEXEC
+    // (0x80000)→F_SETFD FD_CLOEXEC，O_NONBLOCK(2048)→F_SETFL 的 BSD 位 4。
+    // r8/r9 暂存 flags 与 fds（头部已保存，尾声弹回）。
+    // pipe2(fds=rdi, flags=rsi): BSD only has pipe (0x200002A), returning both
+    // ends in rax/rdx; after writing fds[0]/fds[1] (4 bytes each) the Linux
+    // flags are applied per end through fcntl: O_CLOEXEC (0x80000) → F_SETFD
+    // FD_CLOEXEC, O_NONBLOCK (2048) → F_SETFL with BSD bit 4. r8/r9 hold the
+    // flags and fds (saved by the head, restored by the epilogue).
+    let pipe_fl = fn(off, bit, cmd, arg) {
+        let call = mov_rm32(rdi, r9, off) + mov_ri64(rsi, cmd) + mov_ri64(rdx, arg) + mov_ri64(rax, 33554524) + e1(15) + e1(5)
+        mov_ri64(r11, bit) + test_rr(r8, r11) + je_rel32(str_len(call)) + call
+    }
+    let pipe_ok = mov_mr32(r9, 0, rax) + mov_mr32(r9, 4, rdx) + pipe_fl(0, 524288, 2, 1) + pipe_fl(4, 524288, 2, 1) + pipe_fl(0, 2048, 4, 4) + pipe_fl(4, 2048, 4, 4) + xor_rr(rax, rax)
+    let pipe_err = neg_r(rax) + jmp_rel32(str_len(pipe_ok))
+    let pipe2_case = mov_rr(r9, rdi) + mov_rr(r8, rsi) + mov_ri64(rax, 33554474) + sc + jae_rel32(str_len(pipe_err)) + pipe_err + pipe_ok
+
+    // nanosleep(req=rdi, rem=rsi)：BSD 无此号，换算成毫秒走 poll(NULL, 0, ms)
+    // nanosleep(req=rdi, rem=rsi): no BSD number, so convert to milliseconds
+    // and take poll(NULL, 0, ms)
+    let nanosleep_case = mov_rm(rax, rdi, 8) + xor_rr(rdx, rdx) + mov_ri64(r11, 1000000) + div_r(r11) + mov_rr(r8, rax) + mov_rm(rax, rdi, 0) + mov_ri64(r11, 1000) + imul_rr(rax, r11) + add_rr(rax, r8) + mov_rr(rdx, rax) + xor_rr(rdi, rdi) + xor_rr(rsi, rsi) + mov_ri64(rax, 33554662) + sc + errno_tail
+
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 2, 0, 3, 4, 5, 217, 41, 42, 43, 49, 50, 54, 55, 72, 57, 59, 61, 33, 293, 35], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case, socket_case, connect_case, accept_case, bind_case, listen_case, setsockopt_case, getsockopt_case, fcntl_case, fork_case, execve_case, wait4_case, dup2_case, pipe2_case, nanosleep_case], epilogue)
 }
 
 // macho_header 生成 mach_header_64 / macho_header builds the mach_header_64
