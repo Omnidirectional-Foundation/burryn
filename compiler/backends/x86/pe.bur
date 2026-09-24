@@ -190,7 +190,7 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_rva_base) {
 // 50 listen、42 connect、43 accept（返槽号，kind=1）、54 setsockopt、
 // 55 getsockopt、72 fcntl（1/3 查表验证，4 走 ioctlsocket）、1000/1001/1002
 // FindFirstFileA/FindNextFileA/FindClose（合成号，无 Linux 对应物，供 read_dir
-// 直调）；其余 ud2 立即崩溃暴露缺口。
+// 直调）、1003 启动向量（合成号，供 _start）；其余 ud2 立即崩溃暴露缺口。
 // Supported: 1 write→WriteFile (via the fd table; kind==1 takes recv), 60
 // exit→ExitProcess, 9 mmap→VirtualAlloc, 228 clock_gettime→QPC/QPF synthesizing
 // timespec, 7 poll→Sleep (nfds==0 timer waits only) or WSAPoll for nfds>0 (with
@@ -203,15 +203,47 @@ pub fn pe_build_imports(dll_names, fn_counts, fns, idata_rva_base) {
 // 54 setsockopt, 55 getsockopt, 72 fcntl (1/3 validate through the table,
 // 4 takes ioctlsocket); 1000/1001/1002 FindFirstFileA/FindNextFileA/FindClose
 // (synthetic numbers with no Linux counterpart, called by read_dir directly,
-// see natives); anything else hits ud2.
-// iat 为三十个 IAT 槽的绝对地址：前十六个见旧表（GetStdHandle … FindClose），
-// 后十四个为 ws2_32：WSAStartup / socket / bind / listen / accept / connect /
-// setsockopt / getsockopt / ioctlsocket / closesocket / recv / send / WSAPoll /
-// WSAGetLastError。
-// iat holds thirty absolute IAT addresses: the first sixteen as before
-// (GetStdHandle through FindClose), then fourteen ws2_32 entries in this order:
-// WSAStartup, socket, bind, listen, accept, connect, setsockopt, getsockopt,
-// ioctlsocket, closesocket, recv, send, WSAPoll, WSAGetLastError.
+// see natives), 1003 the startup vector (synthetic, called by _start);
+// anything else hits ud2.
+// iat 为全部 IAT 槽的绝对地址，与 pe_import_names 平行，经 pe_iat 按名取用。
+// iat holds every IAT slot's absolute address, parallel to pe_import_names and
+// resolved by name through pe_iat.
+
+// pe_import_dlls / pe_import_counts / pe_import_names 是 PE 导入表的唯一定义：
+// DLL 顺序、每个 DLL 的函数数与扁平函数名表（按 DLL 分组连续排列）。分派器按名
+// 经 pe_iat 取 IAT 槽，追加导入不会让既有引用错位。
+// pe_import_dlls / pe_import_counts / pe_import_names are the single definition
+// of the PE import table: the DLL order, each DLL's function count, and the flat
+// function-name list (grouped by DLL, in order). The dispatcher resolves IAT
+// slots by name through pe_iat, so appending an import never shifts an
+// existing reference.
+pub fn pe_import_dlls() {
+    ["kernel32.dll", "ws2_32.dll", "shell32.dll"]
+}
+
+pub fn pe_import_counts() {
+    [18, 14, 1]
+}
+
+pub fn pe_import_names() {
+    ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "GetCommandLineW", "WideCharToMultiByte", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError", "CommandLineToArgvW"]
+}
+
+// pe_iat 按函数名取 IAT 槽绝对地址（iat 与 pe_import_names 平行）
+// pe_iat returns the absolute IAT slot address for a function name (iat runs
+// parallel to pe_import_names)
+fn pe_iat(iat, name) {
+    let names = pe_import_names()
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == name {
+            return iat[i]
+        }
+        i = i + 1
+    }
+    eprintln("internal error: no PE import named " + name)
+    exit(1)
+}
 
 // wsa_err_map 把 WSAGetLastError 码（rax）换成 Linux 式负 errno：WOULDBLOCK
 // (10035)→EAGAIN(11)（调用方 park），WSAEINTR(10004)→EINTR(4)（调用方重试），
@@ -268,7 +300,7 @@ fn pe_fd_lookup(iat, skip_after) {
     // Preserve r11 (the slot) across the lazy call: Win64 caller-saved, and
     // GetStdHandle may clobber it; rdi is dead after this point. The push/pop
     // balances inside the reserved area, invisible to the epilogue.
-    let lazy = push_r(r11) + mov_ri64(rcx, 0 - 10) + sub_rr(rcx, rdi) + mov_ri64(r10, iat[0]) + e1(65) + e1(255) + e1(18) + pop_r(r11) + mov_mr(r11, 0, rax) + xor_rr(r10, r10) + mov_mr(r11, 8, r10)
+    let lazy = push_r(r11) + mov_ri64(rcx, 0 - 10) + sub_rr(rcx, rdi) + mov_ri64(r10, pe_iat(iat, "GetStdHandle")) + e1(65) + e1(255) + e1(18) + pop_r(r11) + mov_mr(r11, 0, rax) + xor_rr(r10, r10) + mov_mr(r11, 8, r10)
     let free_chk = mov_ri64(r10, 2) + cmp_rr(rdi, r10) + ja_rel32(str_len(lazy) + str_len(hop))
     let kind_chk = mov_rm(rax, r11, 8) + mov_ri64(r10, 0 - 1) + cmp_rr(rax, r10) + jne_rel32(str_len(free_chk) + str_len(lazy) + str_len(hop) + str_len(miss))
     let slot = mov_rr(r11, rdi) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + add_rr(r11, r11) + mov_ri64(r10, fd_base()) + add_rr(r11, r10)
@@ -313,9 +345,9 @@ pub fn pe_build_dispatcher(iat) {
     // the written-count home (buf is reloaded first, no conflict).
     // 失败返 -1（成功返 len；旧 `or rax,-1` 是死代码，意图在此复活）。
     // Failure returns -1, success the length (reviving the dead or's intent).
-    let wsa_write_err = wsa_err_map(iat[29])
-    let write_ws = mov_rm(rcx, r11, 0) + mov_rm(rdx, rsp, 48) + mov_rm(r8, rsp, 56) + xor_rr(r9, r9) + mov_ri64(r10, iat[27]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_write_err)) + wsa_write_err
-    let write_tail = mov_rm(rcx, r11, 0) + e1(72) + e1(137) + e1(242) + e1(76) + e1(139) + e1(68) + e1(36) + e1(56) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + e1(76) + e1(141) + e1(76) + e1(36) + e1(48) + mov_ri64(r10, iat[1]) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(mov_rm(rax, rsp, 56))) + mov_rm(rax, rsp, 56)
+    let wsa_write_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let write_ws = mov_rm(rcx, r11, 0) + mov_rm(rdx, rsp, 48) + mov_rm(r8, rsp, 56) + xor_rr(r9, r9) + mov_ri64(r10, pe_iat(iat, "send")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_write_err)) + wsa_write_err
+    let write_tail = mov_rm(rcx, r11, 0) + e1(72) + e1(137) + e1(242) + e1(76) + e1(139) + e1(68) + e1(36) + e1(56) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + e1(76) + e1(141) + e1(76) + e1(36) + e1(48) + mov_ri64(r10, pe_iat(iat, "WriteFile")) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(mov_rm(rax, rsp, 56))) + mov_rm(rax, rsp, 56)
     let write_body = mov_rm(rsi, rsp, 48) + mov_rm(rdx, rsp, 56) + write_tail
     let write_file = write_body + jmp_rel32(str_len(write_ws))
     let write_split = mov_rm(r10, r11, 8) + mov_ri64(rcx, 1) + cmp_rr(r10, rcx) + je_rel32(str_len(write_file))
@@ -332,8 +364,8 @@ pub fn pe_build_dispatcher(iat) {
     // dispatcher local +40 (cases are mutually exclusive, same as mprotect's
     // out-param) and reload it after the call before marking the slot free.
     let close_free = mov_rm(r11, rsp, 40) + mov_ri64(r10, 0 - 1) + mov_mr(r11, 8, r10) + xor_rr(rax, rax)
-    let close_ws = mov_rm(rcx, r11, 0) + mov_mr(rsp, 40, r11) + mov_ri64(r10, iat[25]) + e1(65) + e1(255) + e1(18) + close_free
-    let close_file = mov_rm(rcx, r11, 0) + mov_mr(rsp, 40, r11) + mov_ri64(r10, iat[8]) + e1(65) + e1(255) + e1(18) + close_free + jmp_rel32(str_len(close_ws))
+    let close_ws = mov_rm(rcx, r11, 0) + mov_mr(rsp, 40, r11) + mov_ri64(r10, pe_iat(iat, "closesocket")) + e1(65) + e1(255) + e1(18) + close_free
+    let close_file = mov_rm(rcx, r11, 0) + mov_mr(rsp, 40, r11) + mov_ri64(r10, pe_iat(iat, "CloseHandle")) + e1(65) + e1(255) + e1(18) + close_free + jmp_rel32(str_len(close_ws))
     let close_split = mov_rm(r10, r11, 8) + mov_ri64(rcx, 1) + cmp_rr(r10, rcx) + je_rel32(str_len(close_file))
     let close_case = pe_fd_lookup(iat, str_len(close_split) + str_len(close_file) + str_len(close_ws)) + close_split + close_file + close_ws
 
@@ -343,14 +375,14 @@ pub fn pe_build_dispatcher(iat) {
     // caller only checks the sign). The DWORD result is zero-extended before
     // comparing against -1 (upper bits undefined).
     let stat_ret = mov_ri32(rcx, 32) + shl_rcl(rax) + shr_rcl(rax) + mov_ri32(r10, 4294967295) + cmp_rr(rax, r10) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(xor_rr(rax, rax))) + xor_rr(rax, rax)
-    let stat_case = mov_rr(rcx, rdi) + mov_ri64(r10, iat[11]) + e1(65) + e1(255) + e1(18) + stat_ret
+    let stat_case = mov_rr(rcx, rdi) + mov_ri64(r10, pe_iat(iat, "GetFileAttributesA")) + e1(65) + e1(255) + e1(18) + stat_ret
 
     // fstat(fd=rdi, size_out=rsi)：查表→GetFileSizeEx 写 8B 长度到 rsi，
     // 成功返 0，失败返 -1（调用方传 [rsp+48] 作 dest，见 read_file）。
     // fstat(fd=rdi, size_out=rsi): table lookup → GetFileSizeEx writing the
     // 8-byte size through rsi, 0 on success, -1 on failure (callers pass
     // [rsp+48] as dest, see read_file).
-    let fstat_tail = mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[12]) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(xor_rr(rax, rax))) + xor_rr(rax, rax)
+    let fstat_tail = mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "GetFileSizeEx")) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(xor_rr(rax, rax))) + xor_rr(rax, rax)
     let fstat_case = pe_fd_lookup(iat, str_len(fstat_tail)) + fstat_tail
 
     // read(fd=rdi, buf=rsi, len=rdx)：查表→kind==1 走 recv（WOULDBLOCK 即
@@ -360,9 +392,9 @@ pub fn pe_build_dispatcher(iat) {
     // (WOULDBLOCK parks), ReadFile otherwise, returning the byte count or -1.
     // len spills to a local first (the lookup's lazy call may clobber rdx); buf
     // stays in rsi, which Win64 callees preserve.
-    let wsa_read_err = wsa_err_map(iat[29])
-    let read_ws = mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + xor_rr(r9, r9) + mov_ri64(r10, iat[26]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_read_err)) + wsa_read_err
-    let read_tail = mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + mov_rm(r8, rsp, 56) + lea(r9, rsp, 48) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + mov_ri64(r10, iat[10]) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(mov_rm(rax, rsp, 48))) + mov_rm(rax, rsp, 48)
+    let wsa_read_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let read_ws = mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + xor_rr(r9, r9) + mov_ri64(r10, pe_iat(iat, "recv")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_read_err)) + wsa_read_err
+    let read_tail = mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + mov_rm(r8, rsp, 56) + lea(r9, rsp, 48) + e1(72) + e1(199) + e1(68) + e1(36) + e1(32) + e4(0) + mov_ri64(r10, pe_iat(iat, "ReadFile")) + e1(65) + e1(255) + e1(18) + e1(133) + e1(192) + jne_rel32(str_len(mov_ri64(rax, 0 - 1)) + 5) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(mov_rm(rax, rsp, 48))) + mov_rm(rax, rsp, 48)
     let read_body = mov_mr(rsp, 56, rdx) + read_tail
     let read_file = read_body + jmp_rel32(str_len(read_ws))
     let read_split = mov_rm(r10, r11, 8) + mov_ri64(rcx, 1) + cmp_rr(r10, rcx) + je_rel32(str_len(read_file))
@@ -370,11 +402,11 @@ pub fn pe_build_dispatcher(iat) {
 
     // mmap(addr=0, len=rsi, prot, flags, ...)：固定 RW 私有页，prot/flags 忽略
     // mmap(addr=0, len=rsi, prot, flags, ...): fixed RW private pages, prot/flags ignored
-    let mmap_case = e1(69) + e1(49) + e1(201) + e1(65) + e1(185) + e4(4) + e1(69) + e1(49) + e1(192) + e1(65) + e1(184) + e4(12288) + e1(72) + e1(137) + e1(242) + e1(72) + e1(49) + e1(201) + mov_ri64(r10, iat[3]) + e1(65) + e1(255) + e1(18)
+    let mmap_case = e1(69) + e1(49) + e1(201) + e1(65) + e1(185) + e4(4) + e1(69) + e1(49) + e1(192) + e1(65) + e1(184) + e4(12288) + e1(72) + e1(137) + e1(242) + e1(72) + e1(49) + e1(201) + mov_ri64(r10, pe_iat(iat, "VirtualAlloc")) + e1(65) + e1(255) + e1(18)
 
     // exit(code=rdi)：ExitProcess 不返回；int3 兜底
     // exit(code=rdi): ExitProcess never returns; int3 as a guard
-    let exit_case = e1(72) + e1(137) + e1(249) + mov_ri64(r10, iat[2]) + e1(65) + e1(255) + e1(18) + e1(204)
+    let exit_case = e1(72) + e1(137) + e1(249) + mov_ri64(r10, pe_iat(iat, "ExitProcess")) + e1(65) + e1(255) + e1(18) + e1(204)
 
     // socket(domain=rdi, type=rsi, proto=rdx)：WSAStartup 懒初始化一次
     // （wsa_once 置位，失败留待 socket 以 WSANOTINITIALISED 报错），再调 socket；
@@ -386,10 +418,10 @@ pub fn pe_build_dispatcher(iat) {
     // (INVALID_SOCKET=-1 flows into the existing jl checks) for the native to
     // register. type/proto spill to dispatcher locals +40/+48 first (WSAStartup
     // is a Win64 call, clobbering every volatile register)
-    let wsa_call = mov_ri64(rcx, 514) + mov_ri64(rdx, wsa_base() + WSA_DATA) + mov_ri64(r10, iat[16]) + e1(65) + e1(255) + e1(18) + mov_ri64(r10, wsa_base() + WSA_ONCE) + mov_ri64(rcx, 1) + mov_mr(r10, 0, rcx)
+    let wsa_call = mov_ri64(rcx, 514) + mov_ri64(rdx, wsa_base() + WSA_DATA) + mov_ri64(r10, pe_iat(iat, "WSAStartup")) + e1(65) + e1(255) + e1(18) + mov_ri64(r10, wsa_base() + WSA_ONCE) + mov_ri64(rcx, 1) + mov_mr(r10, 0, rcx)
     let wsa_chk = mov_ri64(r10, wsa_base() + WSA_ONCE) + mov_rm(r10, r10, 0) + test_rr(r10, r10) + jne_rel32(str_len(wsa_call)) + wsa_call
-    let wsa_sock_err = wsa_err_map(iat[29])
-    let sock_call = mov_ri64(r10, iat[17]) + e1(65) + e1(255) + e1(18) + test_rr(rax, rax) + jge_rel32(str_len(wsa_sock_err)) + wsa_sock_err
+    let wsa_sock_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let sock_call = mov_ri64(r10, pe_iat(iat, "socket")) + e1(65) + e1(255) + e1(18) + test_rr(rax, rax) + jge_rel32(str_len(wsa_sock_err)) + wsa_sock_err
     // wsa_chk 自身已含「未初始化则调用」的 wsa_call 分支（already-initialized
     // 走 jne 越过它）；这里不再重复追加，否则 WSAStartup 每次 socket() 都多打一次
     // wsa_chk already embeds the "call if not yet initialized" wsa_call branch
@@ -400,14 +432,14 @@ pub fn pe_build_dispatcher(iat) {
     // bind(fd=rdi, addr=rsi, len=rdx)：查表→bind；失败取负（调用方只看符号）。
     // bind(fd=rdi, addr=rsi, len=rdx): table lookup → bind; failures negate
     // (callers only check the sign)
-    let wsa_bind_err = wsa_err_map(iat[29])
-    let bind_call = mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[18]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_bind_err)) + wsa_bind_err
+    let wsa_bind_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let bind_call = mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "bind")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_bind_err)) + wsa_bind_err
     let bind_case = pe_fd_lookup(iat, str_len(bind_call)) + bind_call
 
     // listen(fd=rdi, backlog=rsi)：查表→listen；失败取负。
     // listen(fd=rdi, backlog=rsi): table lookup → listen; failures negate
-    let wsa_listen_err = wsa_err_map(iat[29])
-    let listen_call = mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[19]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_listen_err)) + wsa_listen_err
+    let wsa_listen_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let listen_call = mov_rm(rcx, r11, 0) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "listen")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_listen_err)) + wsa_listen_err
     let listen_case = pe_fd_lookup(iat, str_len(listen_call)) + listen_call
 
     // connect(fd=rdi, addr=rsi, len=rdx)：查表→connect；非阻塞建连中返
@@ -415,8 +447,8 @@ pub fn pe_build_dispatcher(iat) {
     // connect(fd=rdi, addr=rsi, len=rdx): table lookup → connect; WSAEWOULDBLOCK
     // on a non-blocking connect becomes EAGAIN (11) for parking (the caller
     // verifies via getsockopt)
-    let wsa_conn_err = wsa_err_map(iat[29])
-    let conn_call = mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[21]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_conn_err)) + wsa_conn_err
+    let wsa_conn_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let conn_call = mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "connect")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_conn_err)) + wsa_conn_err
     let connect_case = pe_fd_lookup(iat, str_len(conn_call)) + conn_call
 
     // accept(listen=rdi)：查表→accept，addr/len 用分派器局部 +64/+80
@@ -424,19 +456,26 @@ pub fn pe_build_dispatcher(iat) {
     // accept(listen=rdi): table lookup → accept with dispatcher locals +64/+80
     // as addr/len (callers pass NULL); the raw SOCKET returns for the native
     // to register
-    let wsa_acc_err = wsa_err_map(iat[29])
-    let acc_call = mov_rm(rcx, r11, 0) + lea(rdx, rsp, 64) + mov_ri32(r10, 16) + mov_mr32(rsp, 80, r10) + lea(r8, rsp, 80) + mov_ri64(r10, iat[20]) + e1(65) + e1(255) + e1(18) + test_rr(rax, rax) + jge_rel32(str_len(wsa_acc_err)) + wsa_acc_err
+    let wsa_acc_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let acc_call = mov_rm(rcx, r11, 0) + lea(rdx, rsp, 64) + mov_ri32(r10, 16) + mov_mr32(rsp, 80, r10) + lea(r8, rsp, 80) + mov_ri64(r10, pe_iat(iat, "accept")) + e1(65) + e1(255) + e1(18) + test_rr(rax, rax) + jge_rel32(str_len(wsa_acc_err)) + wsa_acc_err
     let accept_case = pe_fd_lookup(iat, str_len(acc_call)) + acc_call
 
     // setsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8)：查表→调用方传
-    // Linux 常量（SOL_SOCKET=1、SO_REUSEADDR=2），换成 Winsock 值
-    // （0xFFFF、4）再调 setsockopt；失败取负。
+    // Linux 常量（SOL_SOCKET=1、SO_REUSEADDR=2），换成 Winsock 的 SOL_SOCKET
+    // （0xFFFF）与 SO_EXCLUSIVEADDRUSE（~SO_REUSEADDR = -5）再调 setsockopt；失败
+    // 取负。Winsock 的 SO_REUSEADDR 允许抢占正在监听的端口，与 Linux 语义相反；
+    // 独占绑定才对应 Linux「端口占用则 bind 失败」（TIME_WAIT 端口 Windows 默认
+    // 即可重绑）。
     // setsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8): table lookup →
     // callers pass Linux constants (SOL_SOCKET=1, SO_REUSEADDR=2); translate to
-    // the Winsock values (0xFFFF, 4), then call setsockopt; failures negate
-    let wsa_so_err = wsa_err_map(iat[29])
-    let so_call = mov_mr(rsp, 32, r8) + mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[22]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_so_err)) + wsa_so_err
-    let so_name = mov_ri64(rdx, 4)
+    // Winsock's SOL_SOCKET (0xFFFF) and SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR = -5),
+    // then call setsockopt; failures negate. Winsock's SO_REUSEADDR lets a
+    // socket steal a port that is still listening, the opposite of Linux;
+    // exclusive binding matches Linux's "bind fails on a port in use" (Windows
+    // rebinds TIME_WAIT ports by default)
+    let wsa_so_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let so_call = mov_mr(rsp, 32, r8) + mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "setsockopt")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_so_err)) + wsa_so_err
+    let so_name = mov_ri64(rdx, 0 - 5)
     let so_name_chk = mov_ri64(r10, 2) + cmp_rr(rdx, r10) + jne_rel32(str_len(so_name)) + so_name
     let so_level = mov_ri64(rsi, 65535)
     let so_level_chk = mov_ri64(r10, 1) + cmp_rr(rsi, r10) + jne_rel32(str_len(so_level)) + so_level
@@ -460,8 +499,8 @@ pub fn pe_build_dispatcher(iat) {
     // getsockopt(fd=rdi, level=rsi, name=rdx, val=r10, len=r8): table lookup →
     // translate (1,4) to (0xFFFF,0x1007), then call; failures negate (callers
     // check the sign and *val)
-    let wsa_go_err = wsa_err_map(iat[29])
-    let go_call = mov_mr(rsp, 32, r8) + mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[23]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_go_err)) + wsa_go_err
+    let wsa_go_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
+    let go_call = mov_mr(rsp, 32, r8) + mov_rm(rcx, r11, 0) + mov_rr(r8, rdx) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "getsockopt")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_go_err)) + wsa_go_err
     let go_name = mov_ri64(rdx, 4103)
     let go_name_chk = mov_ri64(r10, 4) + cmp_rr(rdx, r10) + jne_rel32(str_len(go_name)) + go_name
     let go_level = mov_ri64(rsi, 65535)
@@ -479,10 +518,10 @@ pub fn pe_build_dispatcher(iat) {
     // 0; 4 takes ioctlsocket (FIONBIO), enabling non-blocking when arg carries
     // the Linux nonblock bit, disabling otherwise (failures on files/consoles
     // negate, and callers ignore SET results anyway); anything else gets -EINVAL
-    let wsa_fcntl_err = wsa_err_map(iat[29])
+    let wsa_fcntl_err = wsa_err_map(pe_iat(iat, "WSAGetLastError"))
     let fcntl_ok = xor_rr(rax, rax)
     let fcntl_jmp_end = jmp_rel32(str_len(fcntl_ok))
-    let fcntl_io = mov_rm(rcx, r11, 0) + mov_rr(rax, rdx) + mov_ri64(r10, 2048) + and_rr(rax, r10) + mov_ri32(r10, 0) + mov_mr32(rsp, 64, r10) + test_rr(rax, rax) + je_rel32(str_len(mov_ri32(r10, 1)) + str_len(mov_mr32(rsp, 64, r10))) + mov_ri32(r10, 1) + mov_mr32(rsp, 64, r10) + mov_ri64(rdx, 2147772030) + lea(r8, rsp, 64) + mov_ri64(r10, iat[24]) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_fcntl_err) + str_len(fcntl_jmp_end)) + wsa_fcntl_err + fcntl_jmp_end
+    let fcntl_io = mov_rm(rcx, r11, 0) + mov_rr(rax, rdx) + mov_ri64(r10, 2048) + and_rr(rax, r10) + mov_ri32(r10, 0) + mov_mr32(rsp, 64, r10) + test_rr(rax, rax) + je_rel32(str_len(mov_ri32(r10, 1)) + str_len(mov_mr32(rsp, 64, r10))) + mov_ri32(r10, 1) + mov_mr32(rsp, 64, r10) + mov_ri64(rdx, 2147772030) + lea(r8, rsp, 64) + mov_ri64(r10, pe_iat(iat, "ioctlsocket")) + e1(65) + e1(255) + e1(18) + cdqe() + test_rr(rax, rax) + jge_rel32(str_len(wsa_fcntl_err) + str_len(fcntl_jmp_end)) + wsa_fcntl_err + fcntl_jmp_end
     let fcntl_bad = mov_ri64(rax, 0 - 22) + jmp_rel32(str_len(fcntl_io) + str_len(fcntl_ok))
     let fcntl_d1 = mov_ri64(r10, 1) + cmp_rr(rsi, r10) + je_rel32(str_len(fcntl_bad) + str_len(fcntl_io))
     let fcntl_d3 = mov_ri64(r10, 3) + cmp_rr(rsi, r10) + je_rel32(str_len(fcntl_d1) + str_len(fcntl_bad) + str_len(fcntl_io))
@@ -504,7 +543,7 @@ pub fn pe_build_dispatcher(iat) {
     // o_call wiring: the disposition (computed in r9) goes to stack param 5
     // [rsp+32] while r9 itself zeroes — Win64 param 4 is lpSecurityAttributes,
     // and a leftover small int there AVs (0xC0000005).
-    let o_call = mov_rr(rcx, r11) + mov_ri64(r8, 7) + mov_mr(rsp, 32, r9) + xor_rr(r9, r9) + xor_rr(r10, r10) + mov_mr(rsp, 48, r10) + mov_ri64(r10, 128) + mov_mr(rsp, 40, r10) + mov_ri64(r10, iat[9]) + e1(65) + e1(255) + e1(18)
+    let o_call = mov_rr(rcx, r11) + mov_ri64(r8, 7) + mov_mr(rsp, 32, r9) + xor_rr(r9, r9) + xor_rr(r10, r10) + mov_mr(rsp, 48, r10) + mov_ri64(r10, 128) + mov_mr(rsp, 40, r10) + mov_ri64(r10, pe_iat(iat, "CreateFileA")) + e1(65) + e1(255) + e1(18)
     let o_t11 = mov_ri32(r9, 2)
     let o_t10 = mov_ri32(r9, 4) + jmp_rel32(str_len(o_t11))
     let o_c1t = mov_rr(r9, rsi) + mov_ri64(r10, 512) + and_rr(r9, r10) + test_rr(r9, r9) + jne_rel32(str_len(o_t10))
@@ -524,7 +563,7 @@ pub fn pe_build_dispatcher(iat) {
     // 商余拆分乘法避免 int64 溢出（与 C runtime 的 bur_mono_ns 同式）
     // clock_gettime(CLOCK_MONOTONIC, ts=rsi): QPC/QPF synthesized {sec, nsec}
     // with quotient/remainder split multiply (same shape as bur_mono_ns)
-    let clock_case = e1(72) + e1(141) + e1(76) + e1(36) + e1(32) + mov_ri64(r10, iat[4]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(141) + e1(76) + e1(36) + e1(40) + mov_ri64(r10, iat[5]) + e1(65) + e1(255) + e1(18) + e1(72) + e1(139) + e1(68) + e1(36) + e1(32) + e1(72) + e1(49) + e1(210) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(72) + e1(105) + e1(192) + e4(1000000000) + e1(73) + e1(137) + e1(193) + e1(72) + e1(137) + e1(208) + mov_ri64(r10, 1000000000) + e1(73) + e1(247) + e1(226) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(76) + e1(1) + e1(200) + mov_ri64(r10, 1000000000) + e1(72) + e1(49) + e1(210) + e1(73) + e1(247) + e1(242) + e1(72) + e1(137) + e1(6) + e1(72) + e1(137) + e1(86) + e1(8)
+    let clock_case = e1(72) + e1(141) + e1(76) + e1(36) + e1(32) + mov_ri64(r10, pe_iat(iat, "QueryPerformanceCounter")) + e1(65) + e1(255) + e1(18) + e1(72) + e1(141) + e1(76) + e1(36) + e1(40) + mov_ri64(r10, pe_iat(iat, "QueryPerformanceFrequency")) + e1(65) + e1(255) + e1(18) + e1(72) + e1(139) + e1(68) + e1(36) + e1(32) + e1(72) + e1(49) + e1(210) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(72) + e1(105) + e1(192) + e4(1000000000) + e1(73) + e1(137) + e1(193) + e1(72) + e1(137) + e1(208) + mov_ri64(r10, 1000000000) + e1(73) + e1(247) + e1(226) + e1(72) + e1(247) + e1(116) + e1(36) + e1(40) + e1(76) + e1(1) + e1(200) + mov_ri64(r10, 1000000000) + e1(72) + e1(49) + e1(210) + e1(73) + e1(247) + e1(242) + e1(72) + e1(137) + e1(6) + e1(72) + e1(137) + e1(86) + e1(8)
 
     // poll_ws_block：nfds>0 的 WSAPoll 翻译。入口 rdi=staged 基址（POLLFD_BASE，
     // Linux pollfd 8B 记录），rsi=nfds，rdx=超时毫秒。分派器局部：+40=i，
@@ -559,7 +598,7 @@ pub fn pe_build_dispatcher(iat) {
     let pw_b_loop = pw_b_top + pw_b_body + pw_b_back
     let pw_zero = xor_rr(rax, rax)
     let pw_map = test_rr(rax, rax) + jge_rel32(str_len(pw_zero)) + pw_zero
-    let pw_call = mov_ri64(rcx, wsa_base() + WSA_POLL) + mov_rm(rdx, rsp, 48) + mov_rm(r8, rsp, 56) + mov_ri64(r10, iat[28]) + e1(65) + e1(255) + e1(18) + cdqe()
+    let pw_call = mov_ri64(rcx, wsa_base() + WSA_POLL) + mov_rm(rdx, rsp, 48) + mov_rm(r8, rsp, 56) + mov_ri64(r10, pe_iat(iat, "WSAPoll")) + e1(65) + e1(255) + e1(18) + cdqe()
     let pw_wzero = xor_rr(rax, rax) + jmp_rel32(str_len(pw_call) + str_len(pw_map))
     let pw_w_chk = mov_rm(rax, rsp, 48) + test_rr(rax, rax) + jne_rel32(str_len(pw_wzero)) + pw_wzero
     let pw_f_miss = mov_ri64(rcx, 32) + mov_mr16(r8, 6, rcx)
@@ -594,7 +633,7 @@ pub fn pe_build_dispatcher(iat) {
     // reachable timer-wait path, same millisecond unit); negative timeouts clamp
     // to a Sleep(0) yield; nfds>0 takes WSAPoll (below)
     let slp_arg = mov_rr(rcx, rdx) + test_rr(rdx, rdx) + jge_rel32(str_len(xor_rr(rcx, rcx))) + xor_rr(rcx, rcx)
-    let slp_call = mov_ri64(r10, iat[6]) + e1(65) + e1(255) + e1(18) + xor_rr(rax, rax)
+    let slp_call = mov_ri64(r10, pe_iat(iat, "Sleep")) + e1(65) + e1(255) + e1(18) + xor_rr(rax, rax)
     // Sleep 路径必须跳过 WSAPoll 块再落到链尾的 epi 跳转（对照 mp_ret 的写法）；
     // jne 的目标同步后移一个 jmp 的长度。
     // The Sleep path must hop over the WSAPoll block before reaching the
@@ -610,16 +649,47 @@ pub fn pe_build_dispatcher(iat) {
     // 0 on success, -1 on failure. The out-param borrows dispatcher local [+40]
     // (cases are mutually exclusive, so locals are reusable).
     let mp_ret = test_rr(rax, rax) + je_rel32(str_len(xor_rr(rax, rax)) + 5 + str_len(mov_ri64(rax, 0 - 1))) + xor_rr(rax, rax) + jmp_rel32(str_len(mov_ri64(rax, 0 - 1))) + mov_ri64(rax, 0 - 1)
-    let mprotect_case = mov_rr(rcx, rdi) + mov_ri64(r8, 64) + test_rr(rdx, rdx) + jne_rel32(str_len(mov_ri64(r8, 1))) + mov_ri64(r8, 1) + mov_rr(rdx, rsi) + lea(r9, rsp, 40) + mov_ri64(r10, iat[7]) + e1(65) + e1(255) + e1(18) + mp_ret
+    let mprotect_case = mov_rr(rcx, rdi) + mov_ri64(r8, 64) + test_rr(rdx, rdx) + jne_rel32(str_len(mov_ri64(r8, 1))) + mov_ri64(r8, 1) + mov_rr(rdx, rsi) + lea(r9, rsp, 40) + mov_ri64(r10, pe_iat(iat, "VirtualProtect")) + e1(65) + e1(255) + e1(18) + mp_ret
 
     // 1000/1001/1002 FindFirstFileA/FindNextFileA/FindClose：合成号直调，
     // 返回 HANDLE/-1、非零继续/0 收尾、忽略返回值。
     // 1000/1001/1002 FindFirstFileA/FindNextFileA/FindClose: synthetic numbers
     // called directly, returning HANDLE/-1, nonzero-more/0-done, and ignored.
-    let findfirst_case = mov_rr(rcx, rdi) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[13]) + e1(65) + e1(255) + e1(18)
-    let findnext_case = mov_rr(rcx, rdi) + mov_rr(rdx, rsi) + mov_ri64(r10, iat[14]) + e1(65) + e1(255) + e1(18)
-    let findclose_case = mov_rr(rcx, rdi) + mov_ri64(r10, iat[15]) + e1(65) + e1(255) + e1(18) + xor_rr(rax, rax)
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 41, 49, 50, 42, 43, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
+    let findfirst_case = mov_rr(rcx, rdi) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "FindFirstFileA")) + e1(65) + e1(255) + e1(18)
+    let findnext_case = mov_rr(rcx, rdi) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "FindNextFileA")) + e1(65) + e1(255) + e1(18)
+    let findclose_case = mov_rr(rcx, rdi) + mov_ri64(r10, pe_iat(iat, "FindClose")) + e1(65) + e1(255) + e1(18) + xor_rr(rax, rax)
+    // 1003 启动向量（合成号）：命令行经 GetCommandLineW → CommandLineToArgvW 拆分，
+    // 逐个 WideCharToMultiByte(CP_UTF8) 转成 UTF-8，写成 Linux 启动栈形状的块
+    // [argc][argv0..argvN-1][NULL][envp NULL][串区]，返回块地址，供 _start 当作
+    // 启动栈指针存入 [rbx-8]。块取自 VirtualAlloc 256KB（命令行上限 32767 个
+    // UTF-16 单元，UTF-8 至多 3 倍，加指针表仍远小于块长），零填充即得两个 NULL。
+    // 局部量：+64 argc(int)、+72 宽 argv、+80 块、+88 串游标、+96 下标；
+    // +32..+63 是 WideCharToMultiByte 的栈参数区。
+    // 1003 startup vector (synthetic number): the command line is split through
+    // GetCommandLineW → CommandLineToArgvW, each argument converted to UTF-8 by
+    // WideCharToMultiByte(CP_UTF8), and written as a Linux-startup-stack-shaped
+    // block [argc][argv0..argvN-1][NULL][envp NULL][string area]; the block
+    // address returns for _start to store as the startup stack pointer at
+    // [rbx-8]. The block comes from a 256KB VirtualAlloc (the command line caps
+    // at 32767 UTF-16 units, at most 3x in UTF-8, so strings plus the pointer
+    // table stay well below it), and zero fill supplies both NULLs. Locals:
+    // +64 argc (int), +72 wide argv, +80 block, +88 string cursor, +96 index;
+    // +32..+63 carry WideCharToMultiByte's stack arguments.
+    let cl = fn(name) {
+        mov_ri64(r10, pe_iat(iat, name)) + e1(65) + e1(255) + e1(18)
+    }
+    let sv_get = cl("GetCommandLineW") + mov_rr(rcx, rax) + lea(rdx, rsp, 64) + cl("CommandLineToArgvW") + mov_mr(rsp, 72, rax)
+    let sv_alloc = xor_rr(rcx, rcx) + mov_ri64(rdx, 262144) + mov_ri64(r8, 12288) + mov_ri64(r9, 4) + cl("VirtualAlloc") + mov_mr(rsp, 80, rax)
+    let sv_init = mov_rm32(rcx, rsp, 64) + mov_mr(rax, 0, rcx) + mov_rr(rdx, rcx) + add_ri32(rdx, 3) + mov_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, rax) + mov_mr(rsp, 88, rdx) + xor_rr(rax, rax) + mov_mr(rsp, 96, rax)
+    let sv_conv = mov_rm(rax, rsp, 96) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(r8, rsp, 72) + add_rr(r8, rax) + mov_rm(r8, r8, 0) + mov_ri64(rcx, 65001) + xor_rr(rdx, rdx) + mov_ri64(r9, 0 - 1) + mov_rm(rax, rsp, 88) + mov_mr(rsp, 32, rax) + mov_rm(r10, rsp, 80) + add_ri32(r10, 262144) + sub_rr(r10, rax) + mov_mr(rsp, 40, r10) + xor_rr(rax, rax) + mov_mr(rsp, 48, rax) + mov_mr(rsp, 56, rax) + cl("WideCharToMultiByte")
+    let sv_one = mov_ri64(rax, 1)
+    let sv_fix = test_rr(rax, rax) + jne_rel32(str_len(sv_one)) + sv_one
+    let sv_store = mov_rm(rdx, rsp, 88) + mov_rm(rcx, rsp, 96) + mov_rr(r8, rcx) + add_ri32(r8, 1) + add_rr(r8, r8) + add_rr(r8, r8) + add_rr(r8, r8) + mov_rm(r9, rsp, 80) + add_rr(r8, r9) + mov_mr(r8, 0, rdx) + add_rr(rdx, rax) + mov_mr(rsp, 88, rdx) + add_ri32(rcx, 1) + mov_mr(rsp, 96, rcx)
+    let sv_body = sv_conv + sv_fix + sv_store
+    let sv_cond = mov_rm(rcx, rsp, 96) + mov_rm32(rdx, rsp, 64) + cmp_rr(rcx, rdx) + jge_rel32(str_len(sv_body) + 5)
+    let sv_back = jmp_rel32(0 - (str_len(sv_cond) + str_len(sv_body) + 5))
+    let argv_case = sv_get + sv_alloc + sv_init + sv_cond + sv_body + sv_back + mov_rm(rax, rsp, 80)
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 1003, 41, 49, 50, 42, 43, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, argv_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
 }
 
 // pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 三节表

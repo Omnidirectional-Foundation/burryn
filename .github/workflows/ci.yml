@@ -597,6 +597,8 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
+          # 语料里的 /tmp 路径在 Windows 解析为当前盘 \tmp / corpus /tmp paths resolve to \tmp on the current drive
+          New-Item -ItemType Directory -Force -Path \tmp | Out-Null
           $pass = 0; $fail = 0
           foreach ($n in Get-Content pe-out/corpus/CASES) {
             $want = [int](Get-Content "pe-out/corpus/$n.rc")
@@ -609,6 +611,14 @@ jobs:
               Write-Output ("FAIL {0}: rc {1} (want {2})" -f $n, $rc, $want)
               git diff --no-index --text "pe-out/corpus/$n.expected" "act-$n.txt" | Select-Object -Skip 4 -First 6
             }
+          }
+          $p = Start-Process -FilePath "pe-out/corpus/examples_basics_args.exe" -ArgumentList 'one "two words" 三' -RedirectStandardOutput "act-argv.txt" -PassThru -NoNewWindow
+          $null = $p.Handle
+          $p.WaitForExit(20000) | Out-Null
+          if ((Get-FileHash "act-argv.txt").Hash -eq (Get-FileHash "pe-out/corpus/ARGV.expected").Hash) { $pass++ } else {
+            $fail++
+            Write-Output "FAIL args with arguments"
+            git diff --no-index --text "pe-out/corpus/ARGV.expected" "act-argv.txt" | Select-Object -Skip 4 -First 6
           }
           Write-Output "=== corpus: $pass pass, $fail fail ==="
           if ($fail -ne 0) { exit 1 }
@@ -760,6 +770,14 @@ jobs:
               diff "macho-out/corpus/$n.expected" "act-$n.txt" | head -6
             fi
           done <macho-out/corpus/CASES
+          macho-out/corpus/examples_basics_args-mac one "two words" 三 >act-argv.txt
+          if cmp -s act-argv.txt macho-out/corpus/ARGV.expected; then
+            pass=$((pass + 1))
+          else
+            fail=$((fail + 1))
+            echo "FAIL args with arguments"
+            diff macho-out/corpus/ARGV.expected act-argv.txt | head -6
+          fi
           echo "=== corpus: $pass pass, $fail fail ==="
           [ "$fail" -eq 0 ]
 
