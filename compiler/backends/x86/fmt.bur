@@ -1,0 +1,424 @@
+// fmt.bur — 值格式化：运行期字符串构建器 + 按静态类型生成的格式化子程序。
+// Value formatting: a run-time string builder plus formatter subroutines
+// generated from static types.
+//
+// 语义对齐 C 的 bur_format：顶层字符串原样输出，容器内字符串加引号并转义
+// （\" \\ \n \t \r，其余控制字节与 0x7f 写作 \xNN，>= 0x80 原样保留，同 VM 的
+// go_quote）；bool 为 true/false，unit 为 ()，list [a, b]，tuple (a, b)，map
+// {k: v}（插入序），record "record { f: v }"，枚举 Variant(a, b)，channel
+// <chan cap=N len=M>。
+// Semantics follow C's bur_format: a top-level string prints verbatim,
+// strings inside containers are quoted and escaped (\" \\ \n \t \r, other
+// control bytes and 0x7f as \xNN, bytes >= 0x80 kept as-is like the VM's
+// go_quote); bool is true/false, unit is (), lists [a, b], tuples (a, b), maps
+// {k: v} in insertion order, records "record { f: v }", enums Variant(a, b),
+// channels <chan cap=N len=M>.
+//
+// 构建器对象 [len:8][cap:8][buf:8]，缓冲按需倍增、从 r12 顺序分配（不登记 GC：
+// 格式化期间只经值栈引用，结束即丢弃）。构建器子程序在内部子程序区（地址经
+// sb_*_g），格式化子程序按类型逐函数生成、接在该函数代码之后（call rel32，
+// 递归类型可自调用）。约定：值在 [r15-8]、构建器在 [r15-16]，返回时弹出值。
+// The builder object is [len:8][cap:8][buf:8]; its buffer doubles on demand,
+// bump-allocated from r12 (not GC-recorded: while formatting it is only
+// referenced from the value stack, and it is dropped afterwards). The builder
+// subroutines live in the internal-subroutine area (addresses in sb_*_g); the
+// formatter subroutines are generated per type and per function, appended
+// after that function's code (call rel32, so recursive types can recurse).
+// Convention: the value at [r15-8], the builder at [r15-16]; the value is
+// popped on return.
+
+pub let mut sb_new_g = 0
+pub let mut sb_app_g = 0
+pub let mut sb_quo_g = 0
+pub let mut sb_int_g = 0
+pub let mut sb_lit_g = 0
+pub let mut sb_fin_g = 0
+
+// sb_call 发射对构建器子程序的调用 / sb_call emits a call to a builder subroutine
+fn sb_call(addr) {
+    mov_ri64(r11, addr) + call_r(r11)
+}
+
+// sb_lit_bytes 发射追加字面量：rdi = 构建器，调用后紧跟 [len:4][bytes]
+// sb_lit_bytes appends a literal: rdi = builder, the call is followed by [len:4][bytes]
+fn sb_lit_bytes(s) {
+    sb_call(sb_lit_g) + u32(str_len(s)) + s
+}
+
+// x86gen_sb_items 生成构建器子程序块（标签 sb_new/sb_app/sb_quo/sb_int/sb_lit/sb_fin）
+// x86gen_sb_items emits the builder subroutine block (labels sb_new/sb_app/
+// sb_quo/sb_int/sb_lit/sb_fin)
+fn x86gen_sb_items() {
+    let mut it = []
+    // sb_new：rax = 新构建器（初始 64B 缓冲） / sb_new: rax = a new builder (64B initial buffer)
+    push(it, la_l("sb_new"))
+    push(it, la_b(mov_rr(rax, r12) + xor_rr(rcx, rcx) + mov_mr(rax, 0, rcx) + mov_ri64(rcx, 64) + mov_mr(rax, 8, rcx) + lea(rcx, rax, 24) + mov_mr(rax, 16, rcx) + add_ri32(r12, 24 + 64) + ret()))
+    // reserve：rdi = 构建器，rdx = 需追加字节数；保留 rdi/rsi/rdx
+    // reserve: rdi = builder, rdx = bytes to add; preserves rdi/rsi/rdx
+    push(it, la_l("reserve"))
+    push(it, la_b(mov_rm(rax, rdi, 0) + add_rr(rax, rdx) + mov_rm(rcx, rdi, 8) + cmp_rr(rax, rcx)))
+    push(it, la_jcc(CC_BE, "reserve_ok"))
+    push(it, la_b(add_rr(rcx, rcx) + cmp_rr(rcx, rax)))
+    push(it, la_jcc(CC_AE, "reserve_cap"))
+    push(it, la_b(mov_rr(rcx, rax)))
+    push(it, la_l("reserve_cap"))
+    push(it, la_b(add_ri32(rcx, 7) + and_ri32(rcx, 0 - 8) + mov_rr(r8, r12) + add_rr(r12, rcx) + mov_mr(rdi, 8, rcx) + mov_rr(r9, rsi) + mov_rr(r10, rdi) + mov_rm(rsi, rdi, 16) + mov_rr(rdi, r8) + mov_rm(rcx, r10, 0) + rep_movsb() + mov_mr(r10, 16, r8) + mov_rr(rdi, r10) + mov_rr(rsi, r9)))
+    push(it, la_l("reserve_ok"))
+    push(it, la_b(ret()))
+    // sb_app：rdi = 构建器，rsi = 源，rdx = 字节数 / sb_app: rdi = builder, rsi = source, rdx = byte count
+    push(it, la_l("sb_app"))
+    push(it, la_call("reserve"))
+    push(it, la_b(mov_rm(r8, rdi, 16) + mov_rm(rax, rdi, 0) + add_rr(r8, rax) + mov_rr(r10, rdi) + mov_rr(rdi, r8) + mov_rr(rcx, rdx) + rep_movsb() + mov_rm(rax, r10, 0) + add_rr(rax, rdx) + mov_mr(r10, 0, rax) + mov_rr(rdi, r10) + ret()))
+    // sb_lit：返回地址处为 [len:4][bytes]；改写返回地址越过数据后尾跳 sb_app
+    // sb_lit: [len:4][bytes] sits at the return address; step the return
+    // address past the data, then tail-jump into sb_app
+    push(it, la_l("sb_lit"))
+    push(it, la_b(mov_rm(r11, rsp, 0) + mov_rm32(rdx, r11, 0) + lea(rsi, r11, 4) + mov_rr(rax, rsi) + add_rr(rax, rdx) + mov_mr(rsp, 0, rax)))
+    push(it, la_jmp("sb_app"))
+    // sb_int：rdi = 构建器，rsi = 有符号整数（INT64_MIN 经无符号除法正确输出）
+    // sb_int: rdi = builder, rsi = signed integer (INT64_MIN prints correctly via
+    // the unsigned divide)
+    push(it, la_l("sb_int"))
+    push(it, la_b(mov_ri64(rdx, 24)))
+    push(it, la_call("reserve"))
+    push(it, la_b(mov_rm(r8, rdi, 16) + mov_rm(rax, rdi, 0) + add_rr(r8, rax) + mov_rr(r10, r8) + mov_rr(rax, rsi) + test_rr(rax, rax)))
+    push(it, la_jcc(CC_GE, "int_pos"))
+    push(it, la_b(mov_mi8(r8, 0, 45) + add_ri32(r8, 1) + neg_r(rax)))
+    push(it, la_l("int_pos"))
+    push(it, la_b(xor_rr(rcx, rcx) + mov_ri64(r9, 10)))
+    push(it, la_l("int_div"))
+    push(it, la_b(xor_rr(rdx, rdx) + div_r(r9) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)))
+    push(it, la_jcc(CC_NE, "int_div"))
+    push(it, la_l("int_out"))
+    push(it, la_b(pop_r(rax) + mov_mr8(r8, 0, rax) + add_ri32(r8, 1) + sub_ri32(rcx, 1)))
+    push(it, la_jcc(CC_NE, "int_out"))
+    push(it, la_b(sub_rr(r8, r10) + mov_rm(rax, rdi, 0) + add_rr(rax, r8) + mov_mr(rdi, 0, rax) + ret()))
+    // sb_quo：rdi = 构建器，rsi = 字符串对象；加引号并按 C 的 bur_quote 转义
+    // sb_quo: rdi = builder, rsi = string object; quoted and escaped like C's bur_quote
+    push(it, la_l("sb_quo"))
+    push(it, la_b(mov_rm(rdx, rsi, 0) + shl_ri(rdx, 2) + add_ri32(rdx, 2)))
+    push(it, la_call("reserve"))
+    push(it, la_b(mov_rm(r8, rdi, 16) + mov_rm(rax, rdi, 0) + add_rr(r8, rax) + mov_rr(r10, r8) + lea(r9, rsi, 8) + mov_rm(r11, rsi, 0) + mov_mi8(r8, 0, 34) + add_ri32(r8, 1)))
+    push(it, la_l("q_loop"))
+    push(it, la_b(test_rr(r11, r11)))
+    push(it, la_jcc(CC_E, "q_done"))
+    push(it, la_b(movzx_rm8(rax, r9, 0) + add_ri32(r9, 1) + sub_ri32(r11, 1)))
+    let escs = [[34, 34], [92, 92], [10, 110], [9, 116], [13, 114]]
+    let mut ei = 0
+    while ei < len(escs) {
+        push(it, la_b(cmp_ri32(rax, escs[ei][0])))
+        push(it, la_jcc(CC_NE, "q_not" + str(ei)))
+        push(it, la_b(mov_mi8(r8, 0, 92) + mov_mi8(r8, 1, escs[ei][1]) + add_ri32(r8, 2)))
+        push(it, la_jmp("q_loop"))
+        push(it, la_l("q_not" + str(ei)))
+        ei = ei + 1
+    }
+    push(it, la_b(cmp_ri32(rax, 32)))
+    push(it, la_jcc(CC_B, "q_hex"))
+    push(it, la_b(cmp_ri32(rax, 127)))
+    push(it, la_jcc(CC_E, "q_hex"))
+    push(it, la_b(mov_mr8(r8, 0, rax) + add_ri32(r8, 1)))
+    push(it, la_jmp("q_loop"))
+    push(it, la_l("q_hex"))
+    // \xNN（小写十六进制，同 %02x） / \xNN (lowercase hex, like %02x)
+    push(it, la_b(mov_mi8(r8, 0, 92) + mov_mi8(r8, 1, 120) + mov_rr(rcx, rax) + shr_ri(rcx, 4) + cmp_ri32(rcx, 10)))
+    push(it, la_jcc(CC_B, "q_hi_dig"))
+    push(it, la_b(add_ri32(rcx, 87 - 48)))
+    push(it, la_l("q_hi_dig"))
+    push(it, la_b(add_ri32(rcx, 48) + mov_mr8(r8, 2, rcx) + mov_rr(rcx, rax) + and_ri32(rcx, 15) + cmp_ri32(rcx, 10)))
+    push(it, la_jcc(CC_B, "q_lo_dig"))
+    push(it, la_b(add_ri32(rcx, 87 - 48)))
+    push(it, la_l("q_lo_dig"))
+    push(it, la_b(add_ri32(rcx, 48) + mov_mr8(r8, 3, rcx) + add_ri32(r8, 4)))
+    push(it, la_jmp("q_loop"))
+    push(it, la_l("q_done"))
+    push(it, la_b(mov_mi8(r8, 0, 34) + add_ri32(r8, 1) + sub_rr(r8, r10) + mov_rm(rax, rdi, 0) + add_rr(rax, r8) + mov_mr(rdi, 0, rax) + ret()))
+    // sb_fin：rdi = 构建器 → rax = 新字符串对象 [len][bytes]（登记 GC）
+    // sb_fin: rdi = builder -> rax = a new string object [len][bytes] (GC-recorded)
+    push(it, la_l("sb_fin"))
+    push(it, la_b(mov_rm(rcx, rdi, 0) + mov_rr(r11, r12) + mov_mr(r11, 0, rcx) + lea(rdx, rcx, 8) + add_rr(r12, rdx) + mov_rm(rsi, rdi, 16) + lea(rdi, r11, 8) + rep_movsb() + mov_rm(rcx, r11, 0) + lea(rdx, rcx, 8) + gc_rec(r11, mov_rr(rsi, rdx)) + mov_rr(rax, r11) + ret()))
+    it
+}
+
+// sb_set_addrs 由块起址设定各构建器子程序地址 / sb_set_addrs sets each builder
+// subroutine's address from the block start
+fn sb_set_addrs(base) {
+    let it = x86gen_sb_items()
+    sb_new_g = base + la_pos(it, "sb_new")
+    sb_app_g = base + la_pos(it, "sb_app")
+    sb_quo_g = base + la_pos(it, "sb_quo")
+    sb_int_g = base + la_pos(it, "sb_int")
+    sb_lit_g = base + la_pos(it, "sb_lit")
+    sb_fin_g = base + la_pos(it, "sb_fin")
+}
+
+// FmtGen 是单个函数的格式化子程序池：items 为标签汇编项，keys 为「引号标志+类型」→ 标签
+// FmtGen is one function's formatter subroutine pool: items are label-assembly
+// items, keys maps "quote flag + type" to a label
+type FmtGen = record { items: [str], keys: map(str, str) }
+
+fn fmt_gen_new() {
+    record { items: [], keys: map() }
+}
+
+// fmt_label 取（必要时生成）类型 t 的格式化子程序标签 / fmt_label returns (generating if
+// needed) the formatter subroutine label for type t
+fn fmt_label(ctx: X86Ctx, mut g: FmtGen, t0, quote) {
+    let t = fmt_norm(t0)
+    let key = if quote {
+        "q" + t
+    } else {
+        "u" + t
+    }
+    match get(g.keys, key) {
+        Some(l) => l,
+        None => {
+            let lbl = "fmt" + str(len(keys(g.keys)))
+            put(g.keys, key, lbl)
+            let body = fmt_body(ctx, g, t, quote, lbl)
+            push(g.items, la_l(lbl))
+            let mut k = 0
+            while k < len(body) {
+                push(g.items, body[k])
+                k = k + 1
+            }
+            lbl
+        },
+    }
+}
+
+// fmt_norm 归一化类型键：落到默认整数格式化的类型（含未知 ""）一律记为 int，使探针遍
+// 与真实遍类型跟踪略有出入时子程序池仍一致（PIC 差分要求两遍代码等长）
+// fmt_norm normalizes the type key: every type that falls to the default
+// integer formatter (unknown "" included) is keyed as int, so the subroutine
+// pool stays identical when the probe and real passes track types slightly
+// differently (the PIC diff needs both passes to emit equal-length code)
+fn fmt_norm(t) {
+    if t == "str" || t == "bool" || t == "unit" || t == "float" || is_list_type(t) || str_len(t) > 4 && substr(t, 0, 4) == "tup:" || is_map_type(t) || is_record_type(t) || is_enum_enc(t) || str_len(t) >= 4 && substr(t, 0, 4) == "chan" {
+        t
+    } else {
+        "int"
+    }
+}
+
+// fmt_b_lit 追加字面量（rdi 取 [r15+boff] 的构建器） / fmt_b_lit appends a literal
+// (rdi from the builder at [r15+boff])
+fn fmt_b_lit(boff, s) {
+    la_b(mov_rm(rdi, r15, boff) + sb_lit_bytes(s))
+}
+
+// fmt_nested 格式化 [r15+voff] 处的子值：压构建器副本与子值、调子程序、弹副本
+// fmt_nested formats the sub-value at [r15+voff]: push a builder copy and the
+// sub-value, call the subroutine, pop the copy
+fn fmt_nested(ctx: X86Ctx, mut g: FmtGen, mut it, boff, load, t) {
+    let lbl = fmt_label(ctx, g, t, true)
+    push(it, la_b(mov_rm(rax, r15, boff) + vs_push(rax) + load + vs_push(rax)))
+    push(it, la_call(lbl))
+    push(it, la_b(vs_pop_n(1)))
+}
+
+// fmt_enum_eh 从枚举编码取枚举下标 / fmt_enum_eh gets the enum index from an enum encoding
+fn fmt_enum_eh(ctx: X86Ctx, enc) {
+    if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
+        let eb = substr(enc, 6, str_len(enc) - 6)
+        let digits = match str_index_of(eb, "#") {
+            Some(h) => substr(eb, 0, h),
+            None => eb,
+        }
+        match parse_int(digits) {
+            Some(v) => v,
+            None => 0,
+        }
+    } else {
+        enum_qual_to_eh(ctx, enum_qual(enc))
+    }
+}
+
+// fmt_body 生成类型 t 的格式化子程序体（值 [r15-8]、构建器 [r15-16]，返回前弹值）
+// fmt_body emits the formatter body for type t (value at [r15-8], builder at
+// [r15-16]; pops the value before returning)
+fn fmt_body(ctx: X86Ctx, mut g: FmtGen, t, quote, lbl) {
+    let mut it = []
+    if t == "str" {
+        if quote {
+            push(it, la_b(mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + sb_call(sb_quo_g)))
+        } else {
+            push(it, la_b(mov_rm(rdi, r15, 0 - 16) + mov_rm(rax, r15, 0 - 8) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + sb_call(sb_app_g)))
+        }
+    } else if t == "bool" {
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax)))
+        push(it, la_jcc(CC_E, "b_false"))
+        push(it, fmt_b_lit(0 - 16, "true"))
+        push(it, la_jmp("b_end"))
+        push(it, la_l("b_false"))
+        push(it, fmt_b_lit(0 - 16, "false"))
+        push(it, la_l("b_end"))
+    } else if t == "unit" {
+        push(it, fmt_b_lit(0 - 16, "()"))
+    } else if t == "float" {
+        // 注入的 format_float(bits) 返回字符串；值栈 [B][v][s] / the injected
+        // format_float(bits) returns a string; value stack [B][v][s]
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rdi, r15, 0 - 24) + mov_rm(rax, r15, 0 - 8) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + sb_call(sb_app_g) + vs_pop_n(1)))
+    } else if is_list_type(t) {
+        // 值栈 [B][L][i] / value stack [B][L][i]
+        let et = list_elem_type(t)
+        push(it, fmt_b_lit(0 - 16, "["))
+        push(it, la_b(vs_push_zero()))
+        push(it, la_l("l_loop"))
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + cmp_rr(rax, rcx)))
+        push(it, la_jcc(CC_GE, "l_end"))
+        push(it, la_b(test_rr(rax, rax)))
+        push(it, la_jcc(CC_E, "l_first"))
+        push(it, fmt_b_lit(0 - 24, ", "))
+        push(it, la_l("l_first"))
+        fmt_nested(ctx, g, it, 0 - 24, mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 16) + mov_rm(rax, r15, 0 - 16) + shl_ri(rax, 3) + add_rr(rcx, rax) + mov_rm(rax, rcx, 0), et)
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + add_ri32(rax, 1) + mov_mr(r15, 0 - 8, rax)))
+        push(it, la_jmp("l_loop"))
+        push(it, la_l("l_end"))
+        push(it, la_b(vs_pop_n(1)))
+        push(it, fmt_b_lit(0 - 16, "]"))
+    } else if str_len(t) > 4 && substr(t, 0, 4) == "tup:" {
+        let ets = tup_elems(t)
+        push(it, fmt_b_lit(0 - 16, "("))
+        let mut ti = 0
+        while ti < len(ets) {
+            if ti > 0 {
+                push(it, fmt_b_lit(0 - 16, ", "))
+            }
+            fmt_nested(ctx, g, it, 0 - 16, mov_rm(rax, r15, 0 - 16) + mov_rm(rax, rax, 8 + 8 * ti), ets[ti])
+            ti = ti + 1
+        }
+        push(it, fmt_b_lit(0 - 16, ")"))
+    } else if is_map_type(t) {
+        // 值栈 [B][M][i]；键数组 [M+16]，值数组 [M+24] / value stack [B][M][i];
+        // keys at [M+16], values at [M+24]
+        let kt = map_key_type(t)
+        let vt = map_val_type(t)
+        push(it, fmt_b_lit(0 - 16, chr(123)))
+        push(it, la_b(vs_push_zero()))
+        push(it, la_l("m_loop"))
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + cmp_rr(rax, rcx)))
+        push(it, la_jcc(CC_GE, "m_end"))
+        push(it, la_b(test_rr(rax, rax)))
+        push(it, la_jcc(CC_E, "m_first"))
+        push(it, fmt_b_lit(0 - 24, ", "))
+        push(it, la_l("m_first"))
+        fmt_nested(ctx, g, it, 0 - 24, mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 16) + mov_rm(rax, r15, 0 - 16) + shl_ri(rax, 3) + add_rr(rcx, rax) + mov_rm(rax, rcx, 0), kt)
+        push(it, fmt_b_lit(0 - 24, ": "))
+        fmt_nested(ctx, g, it, 0 - 24, mov_rm(rcx, r15, 0 - 24) + mov_rm(rcx, rcx, 24) + mov_rm(rax, r15, 0 - 16) + shl_ri(rax, 3) + add_rr(rcx, rax) + mov_rm(rax, rcx, 0), vt)
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + add_ri32(rax, 1) + mov_mr(r15, 0 - 8, rax)))
+        push(it, la_jmp("m_loop"))
+        push(it, la_l("m_end"))
+        push(it, la_b(vs_pop_n(1)))
+        push(it, fmt_b_lit(0 - 16, chr(125)))
+    } else if is_record_type(t) {
+        let schema = record_schema(t)
+        let names = enc_names(schema)
+        let fts = match get(ctx.record_field_types, schema) {
+            Some(v) => v,
+            None => [],
+        }
+        push(it, fmt_b_lit(0 - 16, "record " + chr(123) + " "))
+        let mut ri = 0
+        while ri < len(names) {
+            let ft = if ri < len(fts) {
+                fts[ri]
+            } else {
+                "int"
+            }
+            let sep = if ri > 0 {
+                ", "
+            } else {
+                ""
+            }
+            push(it, fmt_b_lit(0 - 16, sep + names[ri] + ": "))
+            fmt_nested(ctx, g, it, 0 - 16, mov_rm(rax, r15, 0 - 16) + mov_rm(rax, rax, 16 + 8 * ri), ft)
+            ri = ri + 1
+        }
+        push(it, fmt_b_lit(0 - 16, " " + chr(125)))
+    } else if is_enum_enc(t) {
+        let eh = fmt_enum_eh(ctx, t)
+        let nv = if eh >= 0 && eh < len(ctx.en_vnames) {
+            len(ctx.en_vnames[eh])
+        } else {
+            0
+        }
+        let mut vi = 0
+        while vi < nv {
+            push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 8) + cmp_ri32(rax, vi)))
+            push(it, la_jcc(CC_NE, "e_next" + str(vi)))
+            let fts = enum_fields_resolve(ctx, t, vi)
+            let vname = enum_variant_name(ctx, eh, vi)
+            if len(fts) == 0 {
+                push(it, fmt_b_lit(0 - 16, vname))
+            } else {
+                push(it, fmt_b_lit(0 - 16, vname + "("))
+                let mut fi = 0
+                while fi < len(fts) {
+                    if fi > 0 {
+                        push(it, fmt_b_lit(0 - 16, ", "))
+                    }
+                    fmt_nested(ctx, g, it, 0 - 16, mov_rm(rax, r15, 0 - 16) + mov_rm(rax, rax, 16 + 8 * fi), fts[fi])
+                    fi = fi + 1
+                }
+                push(it, fmt_b_lit(0 - 16, ")"))
+            }
+            push(it, la_jmp("e_end"))
+            push(it, la_l("e_next" + str(vi)))
+            vi = vi + 1
+        }
+        push(it, la_l("e_end"))
+    } else if str_len(t) >= 4 && substr(t, 0, 4) == "chan" {
+        push(it, fmt_b_lit(0 - 16, "<chan cap="))
+        push(it, la_b(mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + mov_rm(rsi, rsi, CH_CAP) + sb_call(sb_int_g)))
+        push(it, fmt_b_lit(0 - 16, " len="))
+        push(it, la_b(mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + mov_rm(rsi, rsi, CH_BUFLEN) + sb_call(sb_int_g)))
+        push(it, fmt_b_lit(0 - 16, ">"))
+    } else {
+        push(it, la_b(mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + sb_call(sb_int_g)))
+    }
+    push(it, la_b(vs_pop_n(1) + ret()))
+    // 子程序内标签加前缀避免与池内其他子程序冲突 / prefix the local labels so
+    // they cannot clash with other subroutines in the pool
+    fmt_scope(it, lbl + "_")
+}
+
+// fmt_scope 给项里的本地标签（非 fmt<n> 子程序标签）加前缀
+// fmt_scope prefixes the local labels in the items (not the fmt<n> subroutine labels)
+fn fmt_scope(items, pre) {
+    let mut out = []
+    let mut i = 0
+    while i < len(items) {
+        let it = items[i]
+        let tag = substr(it, 0, 1)
+        if tag == "L" {
+            push(out, "L" + pre + substr(it, 1, str_len(it) - 1))
+        } else if tag == "J" {
+            let pl = byte_at(it, 1)
+            let name = substr(it, 2 + pl, str_len(it) - 2 - pl)
+            if str_len(name) > 3 && substr(name, 0, 3) == "fmt" && str_index_of(name, "_") == None {
+                push(out, it)
+            } else {
+                push(out, substr(it, 0, 2 + pl) + pre + name)
+            }
+        } else {
+            push(out, it)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// fmt_top_pre 发射顶层格式化前半：把 [r15+off] 的值复制上栈并在其下插入新构建器，
+// 随后由调用方 call 子程序；fmt_top_post 取结果字符串写回 [r15+off]
+// fmt_top_pre emits the first half of top-level formatting: copy the value at
+// [r15+off] onto the stack with a fresh builder inserted beneath it; the
+// caller then calls the subroutine, and fmt_top_post stores the resulting
+// string back into [r15+off]
+fn fmt_top_pre(off) {
+    mov_rm(rax, r15, off) + vs_push(rax) + sb_call(sb_new_g) + mov_rm(rcx, r15, 0 - 8) + mov_mr(r15, 0 - 8, rax) + vs_push(rcx)
+}
+
+fn fmt_top_post(off) {
+    mov_rm(rdi, r15, 0 - 8) + sb_call(sb_fin_g) + mov_mr(r15, off - 8, rax) + vs_pop_n(1)
+}

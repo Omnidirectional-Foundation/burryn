@@ -1604,22 +1604,6 @@ fn x86gen_read_stdin_native() {
     head
 }
 
-// x86gen_str_native 内联 str(int)：带符号十进制，逐位除 10 + 负号
-// x86gen_str_native inlines str(int): signed decimal, digit-wise /10 plus the sign
-// str(int) inline: signed decimal, digit-by-digit div-10 with a minus sign
-fn x86gen_str_native() {
-    let loop_body = xor_rr(rdx, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 10) + div_r(rcx) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(r10, 1) + test_rr(rax, rax)
-    let loop_jne = jne_rel32(0 - (str_len(loop_body) + 6))
-    let neg_write = mov_ri64(rdx, 45) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 1)
-    let alloc = mov_rr(rdx, r10) + add_rr(rdx, r8) + mov_rr(r11, r12) + mov_mr(r11, 0, rdx) + lea(rcx, rdx, 8) + add_rr(r12, rcx) + gc_rec(r11, mov_rr(rsi, rcx)) + lea(rdi, r11, 8) + test_rr(r8, r8) + je_rel32(str_len(neg_write)) + neg_write
-    let pop_body = pop_r(rax) + e1(136) + e1(7) + add_ri32(rdi, 1) + sub_ri32(r10, 1)
-    let pop_jne = jne_rel32(0 - (str_len(pop_body) + 6))
-    let neg_path = mov_ri64(r8, 1) + neg_r(rax)
-    let head = mov_rm(rax, r15, 0 - 8) + xor_rr(r8, r8) + test_rr(rax, rax) + jge_rel32(str_len(neg_path))
-    let loop_start = xor_rr(r10, r10)
-    head + neg_path + loop_start + loop_body + loop_jne + alloc + pop_body + pop_jne + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1)
-}
-
 // x86gen_str_const_at 在堆上构造编译期字符串并写回 [r15+off]
 // x86gen_str_const_at builds a compile-time string on the heap and stores it at [r15+off]
 fn x86gen_str_const_at(off, s) {
@@ -1680,31 +1664,6 @@ fn x86gen_tcp_listen_native() {
     let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
     head + sockaddr + socket_seq + nonblock_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close
-}
-
-// x86gen_chan_format_at 生成 chan→str 转换：<chan cap=<cap> len=<len>>
-// x86gen_chan_format_at emits chan-to-str: <chan cap=<cap> len=<len>>
-fn x86gen_chan_format_at(off) {
-    let mb_al = e1(136) + e1(7)
-    let mb = fn(c) {
-        e1(198) + e1(7) + sb(c)
-    }
-    let dl_loop = xor_rr(rdx, rdx) + mov_ri64(rdi, 10) + idiv_r(rdi) + add_ri32(rsi, 1) + test_rr(rax, rax)
-    let dl_jne = jne_rel32(0 - (str_len(dl_loop) + 6))
-    let int2_loop = xor_rr(rdx, rdx) + mov_ri64(rsi, 10) + idiv_r(rsi) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)
-    let int2_jne = jne_rel32(0 - (str_len(int2_loop) + 6))
-    let write2_body = pop_r(rax) + mb_al + add_ri32(rdi, 1) + sub_ri32(rcx, 1) + test_rr(rcx, rcx)
-    let write2 = write2_body + jne_rel32(0 - (str_len(write2_body) + 6))
-    let int2_zero = mb(48) + add_ri32(rdi, 1) + jmp_rel32(str_len(int2_loop) + str_len(int2_jne) + str_len(write2))
-    let int2_at = fn(r, foff) {
-        mov_rm(rax, r, foff) + xor_rr(rcx, rcx) + test_rr(rax, rax) + jne_rel32(str_len(int2_zero)) + int2_zero + int2_loop + int2_jne + write2
-    }
-    let l1 = mov_rm(r9, r15, off) + mov_rr(r10, r9) + mov_ri64(rcx, 16) + mov_rm(rax, r10, CH_CAP) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi) + mov_rm(rax, r10, CH_BUFLEN) + xor_rr(rsi, rsi) + dl_loop + dl_jne + add_rr(rcx, rsi)
-    let alloc = mov_rr(r9, r12) + mov_mr(r9, 0, rcx) + lea(rdi, r9, 8) + add_rr(r12, rcx) + add_ri32(r12, 8) + gc_rec(r9, mov_rr(rsi, rcx))
-    let lit_head = mov_ri64(rdx, 7017488302826087228) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 8) + mov_ri64(rdx, 15728) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 2)
-    let lit_mid = mov_ri64(rdx, 263845145632) + mov_mr(rdi, 0, rdx) + add_ri32(rdi, 5)
-    let l2 = lit_head + int2_at(r10, CH_CAP) + lit_mid + int2_at(r10, CH_BUFLEN) + mb(62) + add_ri32(rdi, 1)
-    l1 + alloc + l2 + mov_mr(r15, off, r9)
 }
 
 // x86gen_join_native 内联 join：字符串列表用分隔符连接

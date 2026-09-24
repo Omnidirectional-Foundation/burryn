@@ -730,6 +730,32 @@ x86 的运行时检查与错误文本对齐 C 的 `bur_trap`：`runtime error: <
   multi-backend 改为三方同时比对 stdout、stderr 与退出码（构建期拒绝时 C/x86 取构建
   诊断），123/0/0。
 
+### 5.25 值格式化：运行期构建器 + 按类型生成的子程序（定案，2026-09-24）
+
+print/println/eprintln 与 `str()` 对非字符串值统一走 `compiler/backends/x86/fmt.bur`，
+取代此前按类型逐处内联、只认 str/int/float 的格式化代码（容器内字符串不转义、
+`Some(true)` 印成 `Some(1)`、枚举/列表嵌套 payload 印成指针、`Some(())` 段错误）。
+
+- **语义**：对齐 C 的 `bur_format`——顶层字符串原样，容器内字符串加引号转义；bool
+  `true`/`false`，unit `()`，list/tuple/map（插入序）/record（`record { f: v }`）/
+  枚举 `Variant(a, b)`/channel `<chan cap=N len=M>`。引号转义以 VM 的 `go_quote`
+  为准：`\"` `\\` `\n` `\t` `\r`，其余控制字节与 0x7f 写作 `\xNN`，>= 0x80 的字节
+  原样保留（UTF-8 文本可读）；C 的 `bur_quote` 原先把 >= 0x80 也转义，已改为同一规则。
+- **构建器**：内部子程序区（die 之后）的 `sb_new/sb_app/sb_lit/sb_int/sb_quo/sb_fin`；
+  构建器对象 `[len][cap][buf]`，缓冲按需倍增、从 r12 顺序分配、不登记 GC（格式化
+  期间只经值栈引用）；`sb_lit` 的字面量紧跟在 call 之后，由它改写返回地址越过数据。
+- **格式化子程序**：每函数一个池，按（引号标志, 类型）各生成一个子程序，接在函数
+  代码之后，调用点与子程序之间、子程序之间都走 `call rel32`，递归类型可以自调用；
+  约定值在 `[r15-8]`、构建器在 `[r15-16]`，全部循环状态放值栈，跨嵌套调用与 GC 安全。
+  落到默认整数格式化的类型（含未知 `""`）统一记为 `int`：PIC 两遍装配的类型跟踪略有
+  出入时子程序池仍一致（两遍代码必须等长）。
+- **顺带修正**：print 族返回值记为 unit（此前顶层 `let u = println(..)` 之后打印 `u`
+  会被当成字符串解引用而段错误）。
+- **验证**：`testdata/regression/format_values.bur` 覆盖转义、嵌套 list/tuple/map/
+  record/枚举、bool/unit payload，三方一致；multi-backend 124/0/0。
+- **已知边界**：格式化只能用到后端跟踪到的静态类型——map 值类型只跟踪 int/str/float，
+  其余（如 map 的值是 list）仍按整数印；函数值尚未印成 `<fn name>`。
+
 ## 6. LSP 与编辑器生态
 
 **架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0（LSP 3.17 规范）。

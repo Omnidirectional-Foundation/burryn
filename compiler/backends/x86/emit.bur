@@ -8,7 +8,7 @@ import "burryn.dev/compiler/lib"
 
 // emit_one_variant：单函数单变体发射（含嵌套 emit_inst）
 // emit_one_variant: emit one function variant (nested emit_inst included)
-fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, _en_vnames, nfn, f2s_h, p_depth_maps, mut pt_target_shadow, mut pd_sink, globals_map, n_globals, mut global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, mut record_field_types, mut _enum_field_types, mut _enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, mut ln_sink) {
+fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, _en_vnames, nfn, _f2s_h, p_depth_maps, mut pt_target_shadow, mut pd_sink, globals_map, n_globals, mut global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, mut record_field_types, mut _enum_field_types, mut _enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, mut ln_sink) {
     let code = f_code[fh]
     let arity = f_arity[fh]
     let locals = count_locals(ctx, fh)
@@ -95,15 +95,31 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     fn w(s) {
         push(out, s)
     }
+    // 格式化子程序池：本函数用到的类型各生成一个子程序，接在函数代码之后
+    // formatter pool: one subroutine per type this function formats, appended
+    // after the function's code
+    let mut fmtg = fmt_gen_new()
+    let mut fmt_call_pos = []
+    let mut fmt_call_lbl = []
     // cur_byte 取当前字节位置 / cur_byte returns the current byte position
     // Current byte position
     fn cur_byte() {
         str_len(join(out, ""))
     }
+    // w_fmt 把 [r15+off] 的值按类型 t 就地格式化为字符串 / w_fmt formats the value at
+    // [r15+off] in place into a string by type t
+    fn w_fmt(off, t) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl) {
+        let lbl = fmt_label(ctx, fmtg, t, false)
+        w(fmt_top_pre(off) + e1(232))
+        push(fmt_call_pos, cur_byte())
+        push(fmt_call_lbl, lbl)
+        w(e4(0))
+        w(fmt_top_post(off))
+    }
 
     // emit_inst 发射单条指令 / emit_inst emits one instruction
     // Emit one instruction
-    fn emit_inst(ip, in_dead) capture(ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
+    fn emit_inst(ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
         if in_dead {
             // 死代码不可达：只发占位 trap，不做任何 shadow 维护
             // unreachable code: emit a placeholder trap, no shadow bookkeeping
@@ -933,6 +949,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(cl_check + cl_body_full + jmp_rel32(str_len(cl_trap)) + cl_trap)
                 ret_type = "unit"
             } else if callee == "print" {
+                ret_type = "unit"
                 let mut all_str = true
                 let mut ai = 0
                 while ai < n {
@@ -948,43 +965,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         let mut ci = 0
                         while ci < n {
                             let atype = type_shadow[len(type_shadow) - n + ci]
-                            if atype == "bool" {
-                                w(x86gen_bool_convert_at(0 - 8 * (n - ci)))
-                            } else if atype == "unit" {
-                                w(x86gen_unit_convert_at(0 - 8 * (n - ci)))
-                            } else if atype == "float" {
-                                w(x86gen_float_to_str_at(ctx, 0 - 8 * (n - ci)))
-                            } else if is_list_type(atype) {
-                                let aelt = list_elem_type(atype)
-                                w(x86gen_list_format_at(0 - 8 * (n - ci), aelt, list_elem_format_code(ctx, aelt, f2s_h), f2s_h))
-                            } else if str_len(atype) > 4 && substr(atype, 0, 4) == "tup:" {
-                                w(x86gen_tuple_format_at(ctx, 0 - 8 * (n - ci), tup_elems(atype), f2s_h))
-                            } else if is_map_type(atype) {
-                                w(x86gen_map_format_at(0 - 8 * (n - ci), map_key_type(atype) == "str", map_val_type(atype) == "str", map_val_type(atype) == "float", f2s_h))
-                            } else if is_record_type(atype) {
-                                let arc_schema = record_schema(atype)
-                                if str_len(arc_schema) > 0 {
-                                    match get(record_field_types, arc_schema) {
-                                        Some(arc_ft) => {
-                                            if len(arc_ft) > 0 {
-                                                w(x86gen_record_format_at(0 - 8 * (n - ci), enc_names(arc_schema), arc_ft, f2s_h))
-                                            }
-                                        },
-                                        None => {},
-                                    }
-                                }
-                            } else if is_enum_enc(atype) && (match str_index_of(atype, "#") {
-                                Some(_) => true,
-                                None => match str_index_of(atype, "|") {
-                                    Some(_) => true,
-                                    None => false,
-                                },
-                            }) {
-                                w(enum_format_for_enc(ctx, 0 - 8 * (n - ci), atype))
-                            } else if str_len(atype) >= 4 && substr(atype, 0, 4) == "chan" {
-                                w(x86gen_chan_format_at(0 - 8 * (n - ci)))
-                            } else if atype != "str" {
-                                w(x86gen_str_convert_at(0 - 8 * (n - ci)))
+                            if atype != "str" {
+                                w_fmt(0 - 8 * (n - ci), atype)
                             }
                             ci = ci + 1
                         }
@@ -1007,6 +989,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                 }
             } else if callee == "println" {
+                ret_type = "unit"
                 let mut all_str = true
                 let mut ai = 0
                 while ai < n {
@@ -1022,37 +1005,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         let mut cj = 0
                         while cj < n {
                             let btype = type_shadow[len(type_shadow) - n + cj]
-                            if btype == "bool" {
-                                w(x86gen_bool_convert_at(0 - 8 * (n - cj)))
-                            } else if btype == "unit" {
-                                w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
-                            } else if btype == "float" {
-                                w(x86gen_float_to_str_at(ctx, 0 - 8 * (n - cj)))
-                            } else if is_list_type(btype) {
-                                let belt = list_elem_type(btype)
-                                w(x86gen_list_format_at(0 - 8 * (n - cj), belt, list_elem_format_code(ctx, belt, f2s_h), f2s_h))
-                            } else if str_len(btype) > 4 && substr(btype, 0, 4) == "tup:" {
-                                w(x86gen_tuple_format_at(ctx, 0 - 8 * (n - cj), tup_elems(btype), f2s_h))
-                            } else if is_map_type(btype) {
-                                w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str", map_val_type(btype) == "float", f2s_h))
-                            } else if is_record_type(btype) {
-                                let brc_schema = record_schema(btype)
-                                if str_len(brc_schema) > 0 {
-                                    match get(record_field_types, brc_schema) {
-                                        Some(brc_ft) => {
-                                            if len(brc_ft) > 0 {
-                                                w(x86gen_record_format_at(0 - 8 * (n - cj), enc_names(brc_schema), brc_ft, f2s_h))
-                                            }
-                                        },
-                                        None => {},
-                                    }
-                                }
-                            } else if is_enum_enc(btype) {
-                                w(enum_format_for_enc(ctx, 0 - 8 * (n - cj), btype))
-                            } else if str_len(btype) >= 4 && substr(btype, 0, 4) == "chan" {
-                                w(x86gen_chan_format_at(0 - 8 * (n - cj)))
-                            } else if btype != "str" {
-                                w(x86gen_str_convert_at(0 - 8 * (n - cj)))
+                            if btype != "str" {
+                                w_fmt(0 - 8 * (n - cj), btype)
                             }
                             cj = cj + 1
                         }
@@ -1075,6 +1029,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                 }
             } else if callee == "eprintln" {
+                ret_type = "unit"
                 let mut all_str = true
                 let mut ai = 0
                 while ai < n {
@@ -1090,35 +1045,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         let mut cj = 0
                         while cj < n {
                             let btype = type_shadow[len(type_shadow) - n + cj]
-                            if btype == "bool" {
-                                w(x86gen_bool_convert_at(0 - 8 * (n - cj)))
-                            } else if btype == "unit" {
-                                w(x86gen_unit_convert_at(0 - 8 * (n - cj)))
-                            } else if btype == "float" {
-                                w(x86gen_float_to_str_at(ctx, 0 - 8 * (n - cj)))
-                            } else if is_list_type(btype) {
-                                let belt = list_elem_type(btype)
-                                w(x86gen_list_format_at(0 - 8 * (n - cj), belt, list_elem_format_code(ctx, belt, f2s_h), f2s_h))
-                            } else if str_len(btype) > 4 && substr(btype, 0, 4) == "tup:" {
-                                w(x86gen_tuple_format_at(ctx, 0 - 8 * (n - cj), tup_elems(btype), f2s_h))
-                            } else if is_map_type(btype) {
-                                w(x86gen_map_format_at(0 - 8 * (n - cj), map_key_type(btype) == "str", map_val_type(btype) == "str", map_val_type(btype) == "float", f2s_h))
-                            } else if is_record_type(btype) {
-                                let brc_schema = record_schema(btype)
-                                if str_len(brc_schema) > 0 {
-                                    match get(record_field_types, brc_schema) {
-                                        Some(brc_ft) => {
-                                            if len(brc_ft) > 0 {
-                                                w(x86gen_record_format_at(0 - 8 * (n - cj), enc_names(brc_schema), brc_ft, f2s_h))
-                                            }
-                                        },
-                                        None => {},
-                                    }
-                                }
-                            } else if is_enum_enc(btype) {
-                                w(enum_format_for_enc(ctx, 0 - 8 * (n - cj), btype))
-                            } else if btype != "str" {
-                                w(x86gen_str_convert_at(0 - 8 * (n - cj)))
+                            if btype != "str" {
+                                w_fmt(0 - 8 * (n - cj), btype)
                             }
                             cj = cj + 1
                         }
@@ -1154,44 +1082,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     ""
                 }
-                if str_arg_t == "bool" {
-                    w(x86gen_bool_convert_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if str_arg_t == "str" {
-                    w(mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if str_arg_t == "unit" {
-                    w(x86gen_unit_convert_at(0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if str_arg_t == "float" {
-                    w(x86gen_float_to_str_at(ctx, 0 - 8) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if is_list_type(str_arg_t) {
-                    let selt = list_elem_type(str_arg_t)
-                    w(x86gen_list_format_at(0 - 8, selt, list_elem_format_code(ctx, selt, f2s_h), f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if str_len(str_arg_t) > 4 && substr(str_arg_t, 0, 4) == "tup:" {
-                    w(x86gen_tuple_format_at(ctx, 0 - 8, tup_elems(str_arg_t), f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if is_map_type(str_arg_t) {
-                    w(x86gen_map_format_at(0 - 8, map_key_type(str_arg_t) == "str", map_val_type(str_arg_t) == "str", map_val_type(str_arg_t) == "float", f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else if is_record_type(str_arg_t) {
-                    let arc_schema = record_schema(str_arg_t)
-                    if str_len(arc_schema) > 0 {
-                        match get(record_field_types, arc_schema) {
-                            Some(arc_ft) => {
-                                if len(arc_ft) > 0 {
-                                    w(x86gen_record_format_at(0 - 8, enc_names(arc_schema), arc_ft, f2s_h) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                                }
-                            },
-                            None => {},
-                        }
-                    }
-                } else if is_enum_enc(str_arg_t) && (match str_index_of(str_arg_t, "#") {
-                    Some(_) => true,
-                    None => match str_index_of(str_arg_t, "|") {
-                        Some(_) => true,
-                        None => false,
-                    },
-                }) {
-                    w(enum_format_for_enc(ctx, 0 - 8, str_arg_t) + mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
-                } else {
-                    w(x86gen_str_native())
+                if str_arg_t != "str" {
+                    w_fmt(0 - 8, str_arg_t)
                 }
+                w(mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
                 ret_type = "str"
             } else if callee == "len" {
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1))
@@ -2541,6 +2435,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         fbytes = substr(fbytes, 0, rel32_pos) + e4s(rel32) + substr(fbytes, rel32_pos + 4, str_len(fbytes) - rel32_pos - 4)
         pi = pi + 1
     }
+    // 格式化子程序池接在末尾，回填各 call rel32 / append the formatter pool and
+    // fill in each call rel32
+    if len(fmt_call_pos) > 0 {
+        let tail_start = str_len(fbytes)
+        let mut fk = 0
+        while fk < len(fmt_call_pos) {
+            let cpos = fmt_call_pos[fk]
+            let target = tail_start + la_pos(fmtg.items, fmt_call_lbl[fk])
+            fbytes = substr(fbytes, 0, cpos) + e4s(target - (cpos + 4)) + substr(fbytes, cpos + 4, str_len(fbytes) - cpos - 4)
+            fk = fk + 1
+        }
+        fbytes = fbytes + la_link(fmtg.items)
+    }
     fbytes
 }
 
@@ -3157,20 +3064,6 @@ fn find_field_in_enc(enc, fname) {
         i = i + 1
     }
     0 - 1
-}
-
-// x86gen_float_to_str_at 生成 float→str 转换（调用注入的 format_float），作用于 [r15+off] 的 float 盒
-// x86gen_float_to_str_at emits float-to-str by calling the injected format_float
-// (operates on the box at [r15+off])
-// 调用约定：压 fn_ref+bits 两槽后 call，返回后 r15 少 8、返回值在原 fn_ref 槽（新 [r15-8]）；写回 [r15+off] 并恢复 r15
-// call convention: push fn_ref+bits, call; r15 drops by 8 and the result sits at the former
-// fn_ref slot (new [r15-8]);
-// write it back to [r15+off] and restore r15
-fn x86gen_float_to_str_at(ctx: X86Ctx, off) {
-    let ff_h = find_fn_by_name(ctx.f_name, "frt_format_float")
-    let f2s_call = mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ff_h) + call_r(rax)
-    let f2s_fin = mov_rm(rax, r15, 0 - 8) + mov_mr(r15, off - 8, rax) + sub_ri32(r15, 8)
-    f2s_call + f2s_fin
 }
 
 // enum_format_for_enc 为任意枚举编码生成格式化 / enum_format_for_enc emits formatting for any enum encoding
