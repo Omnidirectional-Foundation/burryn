@@ -633,6 +633,52 @@ runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WS
   基址；Linux 与 macOS 另要求两次启动基址不同（Windows 映像 ASLR 按开机选偏移，同一
   镜像多次运行基址相同）。
 
+### 5.23 Windows / macOS 与 Linux 功能对齐（定案，2026-09-24）
+
+完成线「PE / Mach-O 功能对齐 Linux」的落地定案。对齐的判据不是各平台自有
+golden，而是**同一源程序在 Linux x86 上的 stdout 与退出码**：Linux x86 已由
+multi-backend 与 C 后端逐例对齐，以它为基准即把 Windows/macOS 间接对齐到 C。
+
+- **语料**（`scripts/xos-corpus.sh`）：examples 各分类与 `testdata/{basics,types,
+  regression}` 的全部 `.bur`，在 Linux 构建机上先跑 Linux x86 版记下 stdout
+  （`.expected`）与退出码（`.rc`），再以 `--os windows|darwin` 构建目标二进制；另有
+  两例带输入：`args` 以空格参数与非 ASCII 参数运行（`ARGV.expected`），`stdin` 以
+  固定输入文件重定向运行（`STDIN.in` / `STDIN.expected`）。真 Windows/macOS runner
+  逐例运行（每例 20 秒看门狗，超时记退出码 124）并对照，任一例不符即失败（hard gate）。
+- **启动向量**：`[rbx-8]` 存一份 Linux 启动栈形状的指针（argc、argv…、NULL、
+  envp…、NULL），`args`/exec 由此取参。Linux 即入口 `rsp`；darwin 的 LC_MAIN 入口
+  `rsi` 是 dyld 传入的 argv，指向内核参数区（argc 紧邻其前），取 `rsi-8` 在 mmap
+  覆写 `rsi` 之前暂存 r14；Windows 经分派器合成号 1003：`GetCommandLineW` →
+  `CommandLineToArgvW` 拆分，逐个 `WideCharToMultiByte(CP_UTF8)` 写进 256KB
+  `VirtualAlloc` 块，零填充即得 argv/envp 两个 NULL（Windows 上 envp 为空，与 C
+  运行时的 Windows 路径一致：exec 子进程继承父进程环境）。
+- **端口语义**：Winsock 的 `SO_REUSEADDR` 允许抢占正在监听的端口，与 Linux 相反；
+  PE 分派器与 C 运行时在 Windows 上一律改设 `SO_EXCLUSIVEADDRUSE`，对应 Linux
+  「端口占用则 bind 失败」（TIME_WAIT 端口 Windows 默认即可重绑）。
+- **Mach-O exec 族**：`fork` 译 BSD fork（子进程由 rdx 判别，返回值清零）、
+  `execve`/`wait4`/`dup2` 直译 BSD 号、`pipe2` 由 BSD `pipe` 加 `fcntl`
+  （`FD_CLOEXEC`、`O_NONBLOCK` 的 BSD 位）合成、`nanosleep` 以零描述符 `poll` 毫秒
+  超时实现。
+- **Windows exec**（无 fork）：spawn 在 windows 目标改调分派器合成号 1004，与 C
+  运行时 `bur_proc_spawn` 的 Windows 路径同构——argv 按 `CommandLineToArgvW` 规则
+  拼命令行（含空白、引号或空串的参数加引号，引号前的反斜杠翻倍，内嵌引号写作
+  `2n+1` 个反斜杠加 `"`），两条可继承管道的父端去继承标志，`STARTF_USESTDHANDLES`
+  继承 stdin、stdout/stderr 入管道，`CreateProcessA` 带 `CREATE_NO_WINDOW`；启动后
+  关写端与线程句柄。暂存区取 r12 之上的空闲堆（不前移 r12）。两个读端登记进 fd 表，
+  kind 置 2：read 先 `PeekNamedPipe`，写端已关返 0（EOF）、无数据返 `-EAGAIN`、
+  有数据才 `ReadFile`——匿名管道没有非阻塞模式，先窥再读使 Linux 的排空循环原样
+  复用。`CreateProcess` 失败同步报错，failfd 恒为 -1。`wait4` 走
+  `WaitForSingleObject` + `GetExitCodeProcess`，status 写「32 位退出码 << 8」，
+  调用方在 windows 上右移后按 int 符号扩展，与 C 的 `(int)code` 一致；`nanosleep`
+  译 `Sleep`。exec 语料调用的 `echo`/`false`/`sh` 在 runner 上取自 Git for Windows。
+- **非确定性样例**：`examples/net/net_nb.bur` 的服务端原先只让出 5 轮，回环投递
+  稍慢即放弃读、客户端永远阻塞在 `net_read`（macOS runner 上出现过一次 30 分钟
+  卡死）；改为读到数据前一直让出，golden 不变。macOS 的固定 slice 另加每例 30 秒
+  看门狗，卡死即失败而不拖到 job 超时。
+- **验证**：真 Windows `x86-pe-run` 与 macOS `x86-macho-run` 全量语料 70 例加
+  `args` 带参例全过（stdin 例随本次加入，由下一轮 CI 验证）；Linux x86 产物字节不变，multi-backend
+  三方 91/0/0，testdata 三代 fixpoint 通过。
+
 ## 6. LSP 与编辑器生态
 
 **架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0（LSP 3.17 规范）。

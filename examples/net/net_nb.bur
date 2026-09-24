@@ -5,9 +5,13 @@ fn server(lh) {
         Ok(conn_str) => {
             match parse_int(conn_str) {
                 Some(conn) => {
-                    let mut tries = 0
+                    // 读到数据前一直让出：限定轮数会在回环投递稍慢时放弃，
+                    // 客户端随即永远阻塞在 net_read 上
+                    // keep yielding until data arrives: a bounded retry count gives
+                    // up when loopback delivery lags, leaving the client blocked in
+                    // net_read forever
                     let mut said_block = false
-                    while tries < 5 {
+                    while true {
                         match net_nb(1, conn, "", 64) {
                             Ok(data) => {
                                 println("server read:", data)
@@ -30,7 +34,6 @@ fn server(lh) {
                                 }
                             },
                         }
-                        tries = tries + 1
                         yield()
                     }
                 },
