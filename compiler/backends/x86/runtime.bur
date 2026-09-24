@@ -73,31 +73,34 @@ fn x86gen_chan_remove_waiter_block() {
     rm_head + rm_loop + rm_found + rm_none
 }
 
-// x86gen_deadlock_seq 生成死锁检测与报告：扫描 fiber 列表，有 channel 阻塞者写文本并
-// exit 4，全完成则 exit 0 / x86gen_deadlock_seq emits deadlock detection: scan the fiber
-// list; any channel-blocked fiber writes the message and exits 4, otherwise exit 0
+// x86gen_deadlock_seq 生成死锁检测与报告：数 fiber 列表里阻塞在 channel 上的
+// （status 1..=3）；有则经 die 报 "fatal: deadlock — all N remaining fiber(s) are
+// blocked on channels" 并 exit 4（与 C 调度器同文），否则 exit 0
+// x86gen_deadlock_seq emits deadlock detection: count the fibers in the fiber
+// list blocked on channels (status 1..=3); if any, report "fatal: deadlock — all
+// N remaining fiber(s) are blocked on channels" through die and exit 4 (the C
+// scheduler's text), otherwise exit 0
 fn x86gen_deadlock_seq() {
-    // 死锁文本 "fatal: deadlock — all fibers blocked on channels\n"（51B）按 8B 块写入 [rsp-56..]
-    let exit0 = xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
-    let exit4 = sys_mov_rdi(4) + sys_mov_rax(60) + syscall()
-    let c0 = mov_ri64(rax, 7214830840213430630) + mov_mr(rsp, -56, rax)
-    let c1 = mov_ri64(rax, 2336070161932771685) + mov_mr(rsp, -48, rax)
-    let c2 = mov_ri64(rax, 2336361471112675554) + mov_mr(rsp, -40, rax)
-    let c3 = mov_ri64(rax, 7070778350136093030) + mov_mr(rsp, -32, rax)
-    let c4 = mov_ri64(rax, 8007510524220895084) + mov_mr(rsp, -24, rax)
-    let c5 = mov_ri64(rax, 7308900609911103598) + mov_mr(rsp, -16, rax)
-    let c6 = mov_ri64(rax, 684908) + mov_mr(rsp, -8, rax)
-    let write_msg = mov_ri64(rdi, 2) + lea(rsi, rsp, 0 - 56) + mov_ri64(rdx, 51) + sys_mov_rax(1) + syscall()
-    let blocked_seq = c0 + c1 + c2 + c3 + c4 + c5 + c6 + write_msg + exit4
-    // 扫描：rax = 游标；blocked = status in 1..=3；段序 dl_init+dl_head2+dl_stat+dl_zero+blocked_seq+dl_next_body+dl_back+dl_exit0_body
-    let dl_exit0_body = exit0
-    let dl_next_body = mov_rm(rax, rax, FB_LIST_NEXT)
-    let dl_zero = test_rr(rcx, rcx) + je_rel32(str_len(blocked_seq))
-    let dl_stat = mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, 3) + cmp_rr(rcx, rdx) + jg_rel32(str_len(dl_zero) + str_len(blocked_seq))
-    let dl_head2 = test_rr(rax, rax) + je_rel32(str_len(dl_stat) + str_len(dl_zero) + str_len(blocked_seq) + str_len(dl_next_body) + 5)
-    let dl_init = mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0)
-    let dl_back = jmp_rel32(0 - (str_len(dl_head2) + str_len(dl_stat) + str_len(dl_zero) + str_len(blocked_seq) + str_len(dl_next_body) + 5))
-    dl_init + dl_head2 + dl_stat + dl_zero + blocked_seq + dl_next_body + dl_back + dl_exit0_body
+    let mut it = []
+    push(it, la_b(xor_rr(rdi, rdi) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0)))
+    push(it, la_l("dl_loop"))
+    push(it, la_b(test_rr(rax, rax)))
+    push(it, la_jcc(CC_E, "dl_done"))
+    push(it, la_b(mov_rm(rcx, rax, FB_STATUS) + cmp_ri32(rcx, 1)))
+    push(it, la_jcc(CC_L, "dl_next"))
+    push(it, la_b(cmp_ri32(rcx, 3)))
+    push(it, la_jcc(CC_G, "dl_next"))
+    push(it, la_b(add_ri32(rdi, 1)))
+    push(it, la_l("dl_next"))
+    push(it, la_b(mov_rm(rax, rax, FB_LIST_NEXT)))
+    push(it, la_jmp("dl_loop"))
+    push(it, la_l("dl_done"))
+    push(it, la_b(test_rr(rdi, rdi)))
+    push(it, la_jcc(CC_E, "dl_exit0"))
+    push(it, la_b(x86gen_die_call("fatal: deadlock — all " + byte_chr(1) + " remaining fiber(s) are blocked on channels", 0)))
+    push(it, la_l("dl_exit0"))
+    push(it, la_b(xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()))
+    la_link(it)
 }
 
 // x86gen_fiber_done_block 生成 fiber 完成块：状态置 DONE 后回调度器
@@ -402,7 +405,7 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // resume 后第一次 ret 弹 main 入口，main 返回时 ret 弹 done 块
     let fake_frame = sub_ri32(rsp, 16) + mov_ri64(rax, done_addr) + mov_mr(rsp, 8, rax) + jt_load(rax, 0) + mov_mr(rsp, 0, rax)
     // fb 建设：r11 = fb（gc_rec 保护 r11），bump r12；status 清零为 READY
-    let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + gc_rec(r11, mov_ri32(rsi, FB_SIZE)) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx)
+    let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + gc_rec(r11, mov_ri32(rsi, FB_SIZE)) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx) + lea(rcx, rsp, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx)
     // ctx 保存：saved_rsp = fake frame 后（含两槽），rsp 下方的 prologue 由 resume 后函数自身建立
     let ctx_save = mov_rr(rcx, rsp) + mov_mr(r11, FB_RSP, rcx) + mov_rr(rcx, rbp) + mov_mr(r11, FB_RBP, rcx) + mov_rr(rcx, r14) + mov_mr(r11, FB_R14, rcx) + mov_rr(rcx, r15) + mov_mr(r11, FB_R15, rcx) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx)
     let ready_join = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + branch + empty_head + to_set + nonempty + set_tail
@@ -439,7 +442,7 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // leaves r15 = r14 = rsp - 1048576, matching the plain-subtract path.
     let probe_body = sub_ri32(r15, 4096) + e1(65) + e1(198) + e1(7) + e1(0) + e1(77) + e1(57) + e1(247) + e1(117) + e1(240)
     let regs_set = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, global_flag_disp(n_globals, (n_globals + 7) / 8 * 8)) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
 }
 
 // x86gen_waitset_add_block 生成 waitset 追加子程序（rax=fd 低 32 位、rcx=events 低 16 位、

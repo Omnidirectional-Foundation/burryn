@@ -72,6 +72,32 @@ let vm_time_slice = 10000
 // run_program 是运行入口：装载平行表（代码/常量/枚举元数据），创建主 fiber，进入调度器
 // run_program is the entry: load the parallel tables (code/constants/enum metadata),
 // create the main fiber, enter the scheduler
+// VM 侧的网络/进程句柄有效性表（宿主 native 的句柄表对 VM 不可见）：句柄由宿主
+// 自 0 顺序分配、永不复用，VM 记下经手的每个句柄，net_close/exec_poll 据此给出与
+// C 相同的 trap，而不是让宿主 trap 带出 VM 自身的调用栈
+// VM-side validity tables for net/process handles (the host natives' tables are
+// invisible to the VM): the host hands out handles sequentially from 0 and never
+// reuses them, so the VM records each handle it sees; net_close/exec_poll then
+// trap exactly like C instead of letting the host trap leak the VM's own stack
+let mut vm_net_open = []
+let mut vm_proc_live = []
+
+// vm_net_note 记录新开的网络句柄 / vm_net_note records a newly opened net handle
+fn vm_net_note(h) {
+    while len(vm_net_open) <= h {
+        push(vm_net_open, false)
+    }
+    vm_net_open[h] = true
+}
+
+// vm_proc_note 记录新启动的进程句柄 / vm_proc_note records a newly started process handle
+fn vm_proc_note(h) {
+    while len(vm_proc_live) <= h {
+        push(vm_proc_live, false)
+    }
+    vm_proc_live[h] = true
+}
+
 pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, vm_args, ls_files, ls_names, ls_tables) {
     let max_int = 9223372036854775807
     let min_int = -9223372036854775807 - 1
@@ -859,6 +885,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                                 0
                             },
                         }
+                        vm_net_note(ch)
                         fb_iores[f] = make_ok(f, VInt(ch))
                         fb_iohas[f] = true
                         fb_netop[f] = -1
@@ -1511,12 +1538,22 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 push(hargs, str_of(e))
             }
             match exec_start(str_of(fpeek(f, 1)), hargs) {
-                Ok(h) => make_ok(f, VInt(h)),
+                Ok(h) => {
+                    vm_proc_note(h)
+                    make_ok(f, VInt(h))
+                },
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "exec_poll" {
-            match exec_poll(int_of(fpeek(f, 0))) {
-                Some(r) => make_some(f, conv_exec_result(f, r)),
+            let ph = int_of(fpeek(f, 0))
+            if ph < 0 || ph >= len(vm_proc_live) || !vm_proc_live[ph] {
+                trap("exec_poll: invalid or consumed handle " + str(ph))
+            }
+            match exec_poll(ph) {
+                Some(r) => {
+                    vm_proc_live[ph] = false
+                    make_some(f, conv_exec_result(f, r))
+                },
                 None => make_none(),
             }
         } else if nm == "args" {
@@ -1634,7 +1671,10 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 trap("tcp_listen() needs (str, int)")
             }
             match tcp_listen(str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
-                Ok(h) => make_ok(f, VInt(h)),
+                Ok(h) => {
+                    vm_net_note(h)
+                    make_ok(f, VInt(h))
+                },
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "tcp_accept" {
@@ -1657,6 +1697,7 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                                 0
                             },
                         }
+                        vm_net_note(ch)
                         make_ok(f, VInt(ch))
                     },
                     Err(m) => {
@@ -1677,7 +1718,10 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
                 trap("tcp_dial() needs (str, int)")
             }
             match tcp_dial(str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
-                Ok(h) => make_ok(f, VInt(h)),
+                Ok(h) => {
+                    vm_net_note(h)
+                    make_ok(f, VInt(h))
+                },
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "net_read" {
@@ -1762,14 +1806,31 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if !is_int(fpeek(f, 0)) {
                 trap("net_close() needs an int")
             }
-            let _ = net_close(int_of(fpeek(f, 0)))
+            let nh = int_of(fpeek(f, 0))
+            if nh < 0 || nh >= len(vm_net_open) || !vm_net_open[nh] {
+                trap("net_close: invalid or closed handle " + str(nh))
+            }
+            vm_net_open[nh] = false
+            let _ = net_close(nh)
             VUnit
         } else if nm == "net_nb" {
             if !is_int(fpeek(f, 3)) || !is_int(fpeek(f, 2)) || !is_str(fpeek(f, 1)) || !is_int(fpeek(f, 0)) {
                 trap("net_nb() needs (int, int, str, int)")
             }
-            match net_nb(int_of(fpeek(f, 3)), int_of(fpeek(f, 2)), str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
-                Ok(s) => make_ok(f, VStr(s)),
+            let nb_op = int_of(fpeek(f, 3))
+            if nb_op < 0 || nb_op > 2 {
+                trap("net_nb: invalid op " + str(nb_op))
+            }
+            match net_nb(nb_op, int_of(fpeek(f, 2)), str_of(fpeek(f, 1)), int_of(fpeek(f, 0))) {
+                Ok(s) => {
+                    if nb_op == 0 {
+                        match parse_int(s) {
+                            Some(ah) => vm_net_note(ah),
+                            None => {},
+                        }
+                    }
+                    make_ok(f, VStr(s))
+                },
                 Err(m) => make_err(f, VStr(m)),
             }
         } else if nm == "read_stdin" {
@@ -1825,7 +1886,12 @@ pub fn run_program(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts
             if argc != f_arity[fnh] {
                 trap(format_val(callee, false) + " expects " + str(f_arity[fnh]) + " argument(s), got " + str(argc))
             }
-            if len(fb_fr_cl[f]) >= 2048 {
+            // 深度只数入口之上的调用：fiber 入口帧（主 fiber 即顶层脚本）在深度 0，
+            // 与 C 的 call_depth 一致
+            // depth counts calls above the entry: a fiber's entry frame (the
+            // top-level script for the main fiber) sits at depth 0, matching C's
+            // call_depth
+            if len(fb_fr_cl[f]) - 1 >= 2048 {
                 trap("stack overflow (call depth > 2048)")
             }
             push(fb_fr_cl[f], h)

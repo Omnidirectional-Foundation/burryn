@@ -14,7 +14,7 @@ if [ -z "${BUR:-}" ]; then
 fi
 fails=0
 
-if ! ./scripts/golden-verify.sh testdata/basics testdata/types testdata/regression; then
+if ! ./scripts/golden-verify.sh testdata/basics testdata/types testdata/regression testdata/traps; then
     fails=$((fails + 1))
 fi
 

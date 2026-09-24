@@ -14,7 +14,12 @@ type X86Ctx = record { f_name: [str], f_arity: [int], f_nupvals: [int], f_code: 
 // x86gen_program_to_buf 是 x86 后端入口：字节码表 → x86-64 ELF 二进制字节
 // x86gen_program_to_buf is the x86 backend entry: bytecode tables to x86-64 ELF binary bytes
 // Entry: bytecode tables to x86-64 ELF binary bytes
-pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spans, f_consts, en_qual, en_vnames, _en_varities) {
+// ls_files/ls_names/ls_tables/ls_bases：回溯用源文件表（f_file 键、显示名、行起始表、
+// 该文件在源码文本中的起始偏移——单文件模式下注入的 float_rt 位于其前）
+// ls_files/ls_names/ls_tables/ls_bases: the source-file tables for traces (f_file
+// key, display name, line-start table, and the file's start offset within the
+// source text — in single-file mode the injected float_rt precedes it)
+pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, _en_varities, ls_files, ls_names, ls_tables, ls_bases) {
     // format_float 注入函数 handle（列表/枚举浮点格式化用）
     // handle of the injected format_float (used by list/enum float formatting)
     let f2s_h = find_fn_by_name(f_name, "frt_format_float")
@@ -194,6 +199,10 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
         }
         gf = gf + 1
     }
+    // 隐藏全局槽：exec 进程表（见 natives.bur 的 proc_reg_g）
+    // hidden global slot: the exec process table (see natives.bur's proc_reg_g)
+    proc_reg_g = n_globals
+    n_globals = n_globals + 1
     // 方法全名映射：CLOSURE + DEF_GLOBAL 配对记录「全局名 → fn handle」
     // map from fully-qualified method names to fn handles (CLOSURE + DEF_GLOBAL pairs)
     // 被 SET_GLOBAL 重赋值的全局不是稳定函数定义（如闭包变量），不注册——否则调用
@@ -448,9 +457,9 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
     // base-dependent mov imm64 address into a RIP-relative lea, see pic.bur and
     // architecture.md §5.22
     set_pic_pass(true)
-    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types)
+    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
     set_pic_pass(false)
-    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types)
+    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
 }
 
 // x86gen_image 从已求解的共享上下文装配整份镜像：内部子程序 + 各函数变体 + 跳转表 +
@@ -461,7 +470,7 @@ pub fn x86gen_program_to_buf(f_name, _f_file, f_arity, f_nupvals, f_code, _f_spa
 // (plus the dispatcher/.pdata), then hands off to the target format's emit_*;
 // addresses funnel through layout.bur's img_base/data_origin, so it can be
 // replayed at the probe base
-fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, mut pt_target_shadow, mut pd_sink, fn_extra_base, mut global_type: map(str, str), mut record_field_types: map(str, [str]), mut enum_field_types: map(str, [[str]]), mut enum_variant_types: map(str, [str])) {
+fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, mut pt_target_shadow, mut pd_sink, fn_extra_base, mut global_type: map(str, str), mut record_field_types: map(str, [str]), mut enum_field_types: map(str, [[str]]), mut enum_variant_types: map(str, [str]), f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases) {
     let f_name = ctx.f_name
     let f_arity = ctx.f_arity
     let f_nupvals = ctx.f_nupvals
@@ -489,6 +498,10 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // 调度器块（sched/yield/done）与 channel 子程序（schedule/wake_waiters/push_queue）在
     // funcs 头部、GC 子程序之后；地址编译期确定，供 _start / prologue 插桩 / spawn 的
     // fake frame / channel opcode 引用
+    // die 引用在各块内都是定长 mov imm64：先以 0 量出各块长度，定址后再重建
+    // die references are fixed-size mov imm64s in every block: measure the blocks
+    // with 0 first, then rebuild once the address is known
+    die_addr_g = 0
     let sched_bytes = x86gen_sched_block()
     let sched_addr = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
     let yield_bytes = x86gen_yield_block(sched_addr)
@@ -511,7 +524,12 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     let waitset_add_addr = chan_remove_waiter_addr + str_len(chan_remove_waiter_bytes)
     let timer_add_bytes = x86gen_timer_add_block()
     let timer_add_addr = waitset_add_addr + str_len(waitset_add_bytes)
-    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + sched_bytes + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + waitset_add_bytes + timer_add_bytes
+    let die_addr = timer_add_addr + str_len(timer_add_bytes)
+    die_undef_g = die_addr
+    die_addr_g = die_addr + die_entry_off()
+    let die_len = str_len(x86gen_die_block(0, 0, 0, 0))
+    let die_off = die_addr - (code_origin() + const_data_len)
+    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0)
     // 内部子程序 unwind 覆盖：gc_record（9-push）、mark_addr（7-push）与其余六个纯
     // call/ret、零序言的子程序（gc_collect、chan 系四个、waitset_add、timer_add）——
     // 序言形态逐个核对自 runtime.bur 源码（push_r 出现次数与顺序）。调度器三块
@@ -544,6 +562,17 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // sorted ascending by BeginAddress)
     let mut pdata_offsets = []
     let mut pdata_lens = []
+    // 回溯表项（扁平 [off, line, fh]，off 相对首个用户函数）；fh_li 为各函数的行表下标
+    // trace-table entries (flat [off, line, fh], off relative to the first user
+    // function); fh_li is each function's line-table index
+    let user_lo = str_len(funcs_bytes)
+    let mut tr_ents = []
+    let mut fh_li = []
+    let mut tli = 0
+    while tli < nfn {
+        push(fh_li, trace_fh_li(f_file, tli, ls_files))
+        tli = tli + 1
+    }
     let mut fh = 0
     while fh < nfn {
         let vsigs = fn_variants[fh]
@@ -556,8 +585,35 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
                 push(variant_offsets, str_len(funcs_bytes))
             }
             push(pdata_offsets, str_len(funcs_bytes))
-            let fbytes = emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, en_vnames, nfn, f2s_h, p_depth_maps, pt_target_shadow, pd_sink, globals_map, n_globals, global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, record_field_types, enum_field_types, enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr)
+            let mut ln_sink = []
+            let fbytes = emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, en_vnames, nfn, f2s_h, p_depth_maps, pt_target_shadow, pd_sink, globals_map, n_globals, global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, record_field_types, enum_field_types, enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, ln_sink)
             push(pdata_lens, str_len(fbytes))
+            let vstart = str_len(funcs_bytes) - user_lo
+            let mut cur_line = 0
+            let mut lk = 0
+            while lk + 1 < len(ln_sink) {
+                let ln = trace_ip_line(f_spans, fh, ln_sink[lk], fh_li[fh], ls_tables, ls_bases)
+                if ln >= 0 {
+                    cur_line = ln
+                }
+                let efh = if cur_line == 0 {
+                    0 - 1
+                } else {
+                    fh
+                }
+                let eoff = if lk == 0 {
+                    vstart
+                } else {
+                    vstart + ln_sink[lk + 1]
+                }
+                let ne = len(tr_ents)
+                if ne == 0 || tr_ents[ne - 1] != efh || tr_ents[ne - 2] != cur_line {
+                    push(tr_ents, eoff)
+                    push(tr_ents, cur_line)
+                    push(tr_ents, efh)
+                }
+                lk = lk + 2
+            }
             funcs_bytes = funcs_bytes + fbytes
             vi = vi + 1
         }
@@ -581,6 +637,29 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
         jt_bytes = jt_bytes + e8s(variant_offsets[jx] - str_len(funcs_bytes))
         jx = jx + 1
     }
+    // 回溯表（只读）落在代码域末尾——跳转表必须紧贴 _start（_start 以 RIP 相对
+    // 定位它）；各目标定出表址后，die 以真实地址重建并原位换入（定长）
+    // The trace table (read-only) goes at the very end of the code domain — the
+    // jump table must sit right before _start, which locates it RIP-relative;
+    // once each target fixes the table address, die is rebuilt with the real
+    // addresses and swapped in place (same length)
+    push(tr_ents, str_len(funcs_bytes) - user_lo)
+    push(tr_ents, 0)
+    push(tr_ents, 0 - 1)
+    let mut gnames = []
+    while len(gnames) < n_globals {
+        push(gnames, "")
+    }
+    for gk in keys(globals_map) {
+        match get(globals_map, gk) {
+            Some(gs) => {
+                gnames[gs] = gk
+            },
+            None => {},
+        }
+    }
+    let tr_bytes = trace_table_bytes(tr_ents, f_name, f_file, ls_files, ls_names, gnames)
+    let fn_base = code_origin() + const_data_len
     // 布局：常量区 + 函数体（GC 子程序在头部）+ 跳转表 + _start 构成代码域；
     // runtime 区独立成数据段，不再挤进代码流
     // Layout: constants + function bodies (GC subroutines at the head) + jump
@@ -723,7 +802,8 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
         let internal_pdata = pe_build_pdata_multi(rt_unwind_offsets, rt_unwind_lens, code_base_off, internal_unwind_offs)
         let pdata_bytes = internal_pdata + pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
         let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0]) + pe_unwind_info_pushes(rt_unwind_pushes[2])
-        emit_pe(pic_text(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher + pdata_pad + pdata_bytes + unwind_blobs, img_base()), start_off, idata_rva, str_len(imports), pdata_off, str_len(pdata_bytes), pic_data(runtime_with_fd + imports))
+        let pe_tail = jt_bytes + start_bytes + dispatcher + pdata_pad + pdata_bytes + unwind_blobs
+        emit_pe(pic_text(const_data + die_splice(funcs_bytes, die_off, die_len, fn_base + str_len(funcs_bytes) + str_len(pe_tail), fn_base, user_lo, done_addr) + pe_tail + tr_bytes, img_base()), start_off, idata_rva, str_len(imports), pdata_off, str_len(pdata_bytes), pic_data(runtime_with_fd + imports))
     } else if target_os == "darwin" {
         // Mach-O 装配：__TEXT 承载常量/代码/分派器，可写 runtime 区独立进
         // 固定高 VA 的 __DATA；分派器接在 _start 后，槽由 _start 写入。
@@ -733,13 +813,15 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
         let entry_in_text = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
         let dispatcher = macho_build_dispatcher()
         let runtime_with_thunk = runtime_bytes + e8(0)
-        emit_macho(pic_text(const_data + funcs_bytes + jt_bytes + start_bytes + dispatcher, img_base()), entry_in_text, pic_data(runtime_with_thunk), pdata_offsets, pdata_lens, MACHO_TEXT_OFF + const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
+        let mo_tail = jt_bytes + start_bytes + dispatcher
+        emit_macho(pic_text(const_data + die_splice(funcs_bytes, die_off, die_len, fn_base + str_len(funcs_bytes) + str_len(mo_tail), fn_base, user_lo, done_addr) + mo_tail + tr_bytes, img_base()), entry_in_text, pic_data(runtime_with_thunk), pdata_offsets, pdata_lens, MACHO_TEXT_OFF + const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     } else {
         // ELF 装配：代码域（常量/函数/跳转表/_start）R-X；可写 runtime 区独立成
         // 固定高 VA 的 R-W 数据段。
         // ELF assembly: the code domain (constants/functions/jump table/_start)
         // is R-X; the writable runtime area becomes its own R-W data segment at
         // the fixed high VA.
-        emit_elf(pic_text(const_data + funcs_bytes + jt_bytes + start_bytes, img_base()), start_off, pic_data(runtime_bytes), pdata_offsets, pdata_lens, const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
+        let elf_tail = jt_bytes + start_bytes
+        emit_elf(pic_text(const_data + die_splice(funcs_bytes, die_off, die_len, fn_base + str_len(funcs_bytes) + str_len(elf_tail), fn_base, user_lo, done_addr) + elf_tail + tr_bytes, img_base()), start_off, pic_data(runtime_bytes), pdata_offsets, pdata_lens, const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     }
 }

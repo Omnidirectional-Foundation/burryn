@@ -1042,7 +1042,10 @@ void bur_call(int argc) {
         OClosure *cl = (OClosure *)callee.u.o;
         if (argc != cl->fn->arity)
             bur_trap("%s expects %d argument(s), got %d", cl->fn->name, cl->fn->arity, argc);
-        if (++bur_cur->call_depth > 2048) bur_trap("stack overflow (call depth > 2048)");
+        // check before bumping: the trace must not walk the frame that was
+        // never entered (its trace slot is unset, possibly fresh realloc memory)
+        if (bur_cur->call_depth >= 2048) bur_trap("stack overflow (call depth > 2048)");
+        ++bur_cur->call_depth;
         int d = bur_cur->call_depth;
         if (d >= bur_cur->trace_cap) {
             int nc = bur_cur->trace_cap ? bur_cur->trace_cap : 8;
