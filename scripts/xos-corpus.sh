@@ -46,4 +46,10 @@ for f in examples/basics/*.bur examples/types/*.bur examples/concurrency/*.bur e
         rm -f "$out/$name.expected" "$out/$name.rc"
     fi
 done
+# 带参运行的 args：空格参数与非 ASCII 参数，runner 以同一组参数运行目标二进制，对照 ARGV.expected
+# args with arguments: a spaced and a non-ASCII argument; runners run the
+# target binary with the same arguments and compare against ARGV.expected
+if "$BUR" build --backend x86 examples/basics/args.bur -o "$tmp/ref"; then
+    "$tmp/ref" one "two words" 三 >"$out/ARGV.expected"
+fi
 echo "cases: $(wc -l <"$out/CASES"), build failures: $(wc -l <"$out/BUILD_FAIL")"

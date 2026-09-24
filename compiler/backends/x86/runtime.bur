@@ -406,6 +406,30 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // ctx 保存：saved_rsp = fake frame 后（含两槽），rsp 下方的 prologue 由 resume 后函数自身建立
     let ctx_save = mov_rr(rcx, rsp) + mov_mr(r11, FB_RSP, rcx) + mov_rr(rcx, rbp) + mov_mr(r11, FB_RBP, rcx) + mov_rr(rcx, r14) + mov_mr(r11, FB_R14, rcx) + mov_rr(rcx, r15) + mov_mr(r11, FB_R15, rcx) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx)
     let ready_join = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + branch + empty_head + to_set + nonempty + set_tail
+    // 启动向量：堆首 [rbx-8] 存一份 Linux 启动栈形状的指针（argc、argv…、NULL、envp…、
+    // NULL），args/exec 据此取参。Linux 即入口 rsp；darwin 的 LC_MAIN 入口 rsi 是 dyld
+    // 传入的 argv，指向内核参数区（KernelArgs：argc 之后紧跟 argv/envp），故 rsi-8
+    // 就是该形状，须在 mmap 覆写 rsi 之前先存进 r14；windows 经分派器合成号 1003 现场
+    // 合成。
+    // Startup vector: the heap's first word, [rbx-8], holds a pointer shaped
+    // like the Linux startup stack (argc, argv…, NULL, envp…, NULL), which
+    // args/exec read. On Linux it is the entry rsp; darwin's LC_MAIN entry has
+    // dyld's argv in rsi, pointing into the kernel argument area (KernelArgs:
+    // argc directly precedes argv/envp), so rsi-8 already has that shape and
+    // is parked in r14 before mmap clobbers rsi; windows synthesizes it through
+    // the dispatcher's synthetic number 1003.
+    let argv_capture = if target_os == "darwin" {
+        lea(r14, rsi, 0 - 8)
+    } else {
+        ""
+    }
+    let startup_vec = if target_os == "windows" {
+        sys_mov_rax(1003) + syscall() + mov_rr(r11, rax)
+    } else if target_os == "darwin" {
+        mov_rr(r11, r14)
+    } else {
+        mov_rr(r11, rsp)
+    }
     // 主纤程栈下探：Windows 只在距 rsp 一页内自动扩展栈，直接写 1MB 下方
     // 会踩未提交的 guard 页；逐页触碰（每页 4096B，共 256 页）强制按序提交，
     // 结束时 r15 = r14 = rsp - 1048576，与直减路径终态一致。
@@ -415,7 +439,7 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // leaves r15 = r14 = rsp - 1048576, matching the plain-subtract path.
     let probe_body = sub_ri32(r15, 4096) + e1(65) + e1(198) + e1(7) + e1(0) + e1(77) + e1(57) + e1(247) + e1(117) + e1(240)
     let regs_set = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_mr(rax, 0, r11) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + rt_init + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + mov_rr(r11, rsp) + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + mov_ri64(rdi, 0) + mov_ri64(rsi, 16777216) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, 8 * n_globals + 4096) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
 }
 
 // x86gen_waitset_add_block 生成 waitset 追加子程序（rax=fd 低 32 位、rcx=events 低 16 位、

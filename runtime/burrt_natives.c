@@ -811,7 +811,13 @@ Value nat_tcp_listen(Value *args, int argc) {
         fd = bur_net_socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0) { saved = bur_sock_err(); continue; }
         int one = 1;
+#ifdef _WIN32
+        /* Winsock 的 SO_REUSEADDR 允许抢占正在监听的端口；独占绑定才对应 Linux 语义 */
+        /* Winsock's SO_REUSEADDR lets a socket steal a listening port; exclusive binding matches Linux */
+        setsockopt((SOCKET)fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one);
+#else
         setsockopt((int)fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#endif
         if (bind((int)fd, a->ai_addr, a->ai_addrlen) == 0 && listen((int)fd, 128) == 0) break;
         saved = bur_sock_err();
         bur_sock_close(fd);
