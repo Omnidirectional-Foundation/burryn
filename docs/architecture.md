@@ -627,7 +627,11 @@ runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WS
   exec pipe 失败三档回归通过；gdb 关闭 `disable-randomization` 两次 `starti` 映射基址
   不同，代码段 R-X、数据段 R-W 相距 16MB，随机基址下中断深递归回溯逐帧正确；
   examples 与 testdata/regression 全部 `.bur` 以 windows/darwin 目标构建无内部错误；
-  真 Windows `x86-pe-run` 与 macOS `x86-macho-run` hard gate 对 golden 一致。
+  真 Windows `x86-pe-run` 与 macOS `x86-macho-run` hard gate 对 golden 一致。CI 另以
+  常驻程序 `testdata/pie/spin.bur` 在三平台读进程实际映像基址（Linux `/proc/<pid>/maps`、
+  Windows `MainModule.BaseAddress`、macOS `lldb` attach 后 `image list -h`）：须偏离链接
+  基址；Linux 与 macOS 另要求两次启动基址不同（Windows 映像 ASLR 按开机选偏移，同一
+  镜像多次运行基址相同）。
 
 ## 6. LSP 与编辑器生态
 
