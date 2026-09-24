@@ -1352,7 +1352,7 @@ fn x86gen_exec_spawn_native() {
     // copy_one：rcx = 源 str，堆上建 NUL 结尾副本，rdx 返回指针（破坏 rcx/rdx/rsi/rdi/r9）
     // copy_one: rcx = source str, builds a NUL-terminated heap copy, rdx returns the pointer
     // (clobbers rcx/rdx/rsi/rdi/r9)
-    fn copy_one() capture(ref c1, ref def_path, ref defb, ref di, ref argv_alloc, ref cmd_copy, ref body, ref cond, ref back, ref argv_loop, ref null_tail, ref pipe1, ref pipe2, ref pipe3, ref envp_load, ref fail_write, ref found_seq, ref env_adv, ref default_seq, ref b5, ref b4, ref b3, ref b2, ref b1, ref env_loop_head, ref env_loop_back, ref env_scan, ref strlen_add, ref strlen_head, ref strlen_body, ref strlen_loop, ref cmd_len_seq, ref dir_len, ref cand_base, ref src_tmp, ref r8_next, ref src, ref bump, ref dst, ref copy_dir, ref slash, ref copy_cmd, ref nul, ref save_cand, ref exec_seq, ref flag_set, ref eacces, ref seg_end_body, ref seg_end_len, ref nul_chk, ref seg_body, ref scan_back, ref seg_head, ref seg_back, ref seg_end, ref set13, ref path_end, ref walk, ref direct, ref nul_je, ref slash_body, ref slash_head, ref slash_back, ref dup1, ref dup2, ref child_closes, ref child_seq, ref init_out, ref init_err, ref parent_ok, ref fork_fail, ref parent_seq, ref done_seq, ref fork_seq, ref f3, ref f2, ref f1, ref skip_fail, ref p3_fail, ref p2_fail, ref p1_fail, ref pipes) {
+    fn copy_one() capture(ref c1, ref def_path, ref defb, ref di, ref argv_alloc, ref cmd_copy, ref body, ref cond, ref back, ref argv_loop, ref null_tail, ref pipe1, ref pipe2, ref pipe3, ref envp_load, ref fail_write, ref found_seq, ref env_adv, ref default_seq, ref b5, ref b4, ref b3, ref b2, ref b1, ref env_loop_head, ref env_loop_back, ref env_scan, ref strlen_add, ref strlen_head, ref strlen_body, ref strlen_loop, ref cmd_len_seq, ref dir_len, ref cand_base, ref src_tmp, ref r8_next, ref src, ref bump, ref dst, ref copy_dir, ref slash, ref copy_cmd, ref nul, ref save_cand, ref exec_seq, ref flag_set, ref eacces, ref seg_end_body, ref seg_end_len, ref nul_chk, ref seg_body, ref scan_back, ref seg_head, ref seg_back, ref seg_end, ref set13, ref path_end, ref walk, ref direct, ref nul_je, ref slash_body, ref slash_head, ref slash_back, ref dup1, ref dup2, ref child_closes, ref child_seq, ref init_out, ref init_err, ref parent_ok, ref fork_fail, ref parent_seq, ref done_seq, ref fork_seq, ref fail_tail, ref close_p1, ref close_p2, ref skip_fail, ref p3_fail, ref p2_fail, ref p1_fail, ref pipes) {
         let copy = mov_rm(r9, rcx, 0) + mov_rr(rdx, r12) + lea(rsi, rcx, 8) + mov_rr(rdi, rdx) + mov_rr(rcx, r9) + rep_movsb()
         let nul = xor_rr(rax, rax) + e1(136) + e1(7) + add_rr(r12, r9) + add_ri32(r12, 1)
         copy + nul
@@ -1374,9 +1374,8 @@ fn x86gen_exec_spawn_native() {
     let back = jmp_rel32(0 - (str_len(cond) + str_len(body) + 5))
     let argv_loop = xor_rr(r10, r10) + cond + body + back
     let null_tail = mov_rm(r9, rsp, 40) + add_ri32(r9, 1) + mov_rr(rax, r9) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r11) + xor_rr(rdx, rdx) + mov_mr(rax, 0, rdx)
-    // pipe2×3（O_NONBLOCK|O_CLOEXEC）；失败链在 fork 后（f1→f2→f3 逐级关闭），成功跳过
-    // three pipe2 calls (O_NONBLOCK|O_CLOEXEC); the failure chain sits after fork_seq, success
-    // skips it
+    // pipe2×3（O_NONBLOCK|O_CLOEXEC）；失败链紧随其后，成功跳过
+    // three pipe2 calls (O_NONBLOCK|O_CLOEXEC); the failure chain follows them, success skips it
     let pipe1 = mov_rr(rdi, rsp) + mov_ri64(rsi, pipe2_nonblock_cloexec) + sys_mov_rax(293) + syscall()
     let pipe2 = lea(rdi, rsp, 8) + mov_ri64(rsi, pipe2_nonblock_cloexec) + sys_mov_rax(293) + syscall()
     let pipe3 = lea(rdi, rsp, 16) + mov_ri64(rsi, pipe2_nonblock_cloexec) + sys_mov_rax(293) + syscall()
@@ -1458,15 +1457,19 @@ fn x86gen_exec_spawn_native() {
     let parent_seq = mov_mr(rsp, 24, rax) + c1(4) + c1(12) + c1(20) + test_rr(rax, rax) + jl_rel32(str_len(parent_ok) + 5) + parent_ok + jmp_rel32(str_len(fork_fail)) + fork_fail
     let done_seq = add_ri32(rsp, 80)
     let fork_seq = sys_mov_rax(57) + syscall() + test_rr(rax, rax) + jne_rel32(str_len(child_seq)) + child_seq + parent_seq + done_seq
-    // 管道失败链：f3 跳过整个 fork 直接回收栈 / pipe failure chain: f3 skips the whole fork and restores the stack
-    let f3 = c1(0) + c1(4) + c1(8) + c1(12) + c1(16) + c1(20) + mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(fork_seq) - str_len(done_seq))
-    let f2 = c1(0) + c1(4) + c1(8) + c1(12) + f3
-    let f1 = c1(0) + c1(4) + f2
-    let skip_fail = jmp_rel32(str_len(f1) + str_len(f2) + str_len(f3))
-    let p3_fail = test_rr(rax, rax) + jl_rel32(5 + str_len(f1) + str_len(f2))
-    let p2_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(f1))
-    let p1_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5)
-    let pipes = pipe1 + p1_fail + pipe2 + p2_fail + pipe3 + p3_fail + skip_fail + f1 + f2 + f3
+    // 管道失败链按级贯通：pipe3 失败落 close_p2（关 pipe2 再关 pipe1），pipe2 失败落 close_p1，
+    // pipe1 失败直落 fail_tail；fail_tail 跳过整个 fork 直接回收栈。只关已建成的管道端。
+    // Pipe failure chain falls through by level: a pipe3 failure lands on close_p2 (pipe2
+    // then pipe1), a pipe2 failure on close_p1, a pipe1 failure straight on fail_tail, which
+    // skips the whole fork and restores the stack. Only already-created pipe ends are closed.
+    let fail_tail = mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(fork_seq) - str_len(done_seq))
+    let close_p1 = c1(0) + c1(4)
+    let close_p2 = c1(8) + c1(12)
+    let skip_fail = jmp_rel32(str_len(close_p2) + str_len(close_p1) + str_len(fail_tail))
+    let p3_fail = test_rr(rax, rax) + jl_rel32(5)
+    let p2_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(close_p2))
+    let p1_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5 + str_len(close_p2) + str_len(close_p1))
+    let pipes = pipe1 + p1_fail + pipe2 + p2_fail + pipe3 + p3_fail + skip_fail + close_p2 + close_p1 + fail_tail
     sub_ri32(rsp, 80) + defb + argv_alloc + cmd_copy + argv_loop + null_tail + pipes + fork_seq
 }
 
