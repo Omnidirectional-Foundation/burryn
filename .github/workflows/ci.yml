@@ -403,6 +403,26 @@ jobs:
             grep -q '^echo: Err: ' <<<"$out"
           done
 
+      # PIE：两次启动的首条映射（代码段）基址都不得等于链接基址 0x400000，且彼此不同
+      # PIE: across two launches the first mapping's (code segment) base must
+      # differ from the link base 0x400000 and from each other
+      - name: x86 PIE image base
+        run: |
+          set -euo pipefail
+          ./bur build --backend x86 testdata/pie/spin.bur -o spin_x86
+          bases=""
+          for i in 1 2; do
+            ./spin_x86 & pid=$!
+            sleep 0.5
+            b=$(head -1 "/proc/$pid/maps" | cut -d- -f1)
+            kill -9 "$pid"
+            echo "code base 0x$b"
+            if [ "$((16#$b))" -eq 4194304 ]; then echo "image not relocated"; exit 1; fi
+            bases="$bases $b"
+          done
+          set -- $bases
+          if [ "$1" = "$2" ]; then echo "same base across launches"; exit 1; fi
+
   x86-repro:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -465,6 +485,7 @@ jobs:
           ./gen1 build --backend x86 --os windows examples/io/sleep.bur -o pe-out/sleep.exe
           ./gen1 build --backend x86 --os windows examples/net/net_loopback.bur -o pe-out/net_loopback.exe
           ./gen1 build --backend x86 --os windows examples/net/net_nb.bur -o pe-out/net_nb.exe
+          ./gen1 build --backend x86 --os windows testdata/pie/spin.bur -o pe-out/spin.exe
 
       - name: Upload windows programs
         uses: actions/upload-artifact@v4
@@ -552,6 +573,22 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
+      # PIE：常驻进程的实际映像基址不得等于链接基址 0x400000（Windows 映像 ASLR 按
+      # 开机选偏移，同一镜像多次运行基址相同，故只查偏离链接基址）
+      # PIE: the resident process's real image base must differ from the link
+      # base 0x400000 (Windows image ASLR picks the bias per boot, so repeated
+      # runs share a base; only the departure from the link base is checked)
+      - name: PIE image base (hard gate)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\pe-out\spin.exe" -PassThru -NoNewWindow
+          Start-Sleep -Milliseconds 500
+          $p.Refresh()
+          $b = $p.MainModule.BaseAddress.ToInt64()
+          taskkill /F /PID $p.Id | Out-Null
+          Write-Output ("image base 0x{0:x}" -f $b)
+          if ($b -eq 0x400000) { Write-Error "image loaded at its link base"; exit 1 }
+
   x86-macho-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -581,6 +618,7 @@ jobs:
           ./gen1 build --backend x86 --os darwin examples/io/fs.bur -o macho-out/fs-mac
           ./gen1 build --backend x86 --os darwin examples/net/net_loopback.bur -o macho-out/net_loopback-mac
           ./gen1 build --backend x86 --os darwin examples/net/net_nb.bur -o macho-out/net_nb-mac
+          ./gen1 build --backend x86 --os darwin testdata/pie/spin.bur -o macho-out/spin-mac
 
       - name: Upload macho programs
         uses: actions/upload-artifact@v4
@@ -650,6 +688,27 @@ jobs:
           check_one fs-mac examples/io/fs.golden
           check_one net_loopback-mac examples/net/net_loopback.golden
           check_one net_nb-mac examples/net/net_nb.golden
+
+      # PIE：两次启动的 __TEXT 实际基址都不得等于链接基址 0x100000000，且彼此不同
+      # PIE: across two launches the real __TEXT base must differ from the link
+      # base 0x100000000 and from each other
+      - name: PIE image base (hard gate)
+        run: |
+          set -euo pipefail
+          codesign -f -s - macho-out/spin-mac
+          chmod +x macho-out/spin-mac
+          bases=""
+          for i in 1 2; do
+            macho-out/spin-mac & pid=$!
+            sleep 0.5
+            b=$(sudo vmmap -wide "$pid" | awk '/^__TEXT/ {split($2, r, "-"); print r[1]; exit}')
+            kill -9 "$pid"
+            echo "__TEXT base 0x$b"
+            if [ -z "$b" ] || [ "$((16#$b))" -eq 4294967296 ]; then echo "image not slid"; exit 1; fi
+            bases="$bases $b"
+          done
+          set -- $bases
+          if [ "$1" = "$2" ]; then echo "same base across launches"; exit 1; fi
 
   runtime:
     needs: []
