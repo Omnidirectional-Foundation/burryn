@@ -25,7 +25,7 @@
 | **S5 删 Go** | CLI 用 Burryn 写；main 清零 Go；`seed/go-host` 留档 | 已实现 |
 | **S6 生态工具链** | S6.1–S6.8：依赖、fmt、test、诊断、std/json、runtime IO、checker 债 | 已实现 |
 | **S7 语言特性扩展** | S7.1–S7.8（S7.4 命名参数已否决，编号保留） | 已实现 |
-| **S8 所有后端完工** | S8.2–S8.4 / S8.6 / S8.7 已实现；S8.1 / S8.5 因「x86 完成线收紧」标为部分实现（余项见 §3「x86 完成线收紧」）；S8.8–S8.10 未实现 | 部分实现 |
+| **S8 所有后端完工** | S8.1–S8.7 已实现（含「x86 完成线收紧」全部条目，见 §3）；S8.8–S8.10 未实现 | 部分实现 |
 | **S9 LSP 与编辑器生态** | S9.1 核心服务器；S9.2 语言特性（清单见 §4）；S9.3 VSCode 扩展；S9.4 其他编辑器。前置 = S8.2 | 部分实现 |
 | **S10 包生态** | 已有 std：`json`/`net`/`testing`/`cli`/`encoding`/`path`/`log`/`crypto`/`regex`。待扩展：`datetime`/`http`。S10.2 包模板；S10.3 `bur doc`；S10.4 包质量基础设施 | 部分实现 |
 
@@ -41,7 +41,7 @@ S8 = 所有后端完工，一条完成线：C 后端 + x86 后端（Linux / Wind
 |---|---|---|
 | S8.1 | Linux ELF 单文件后端 | 已实现 |
 | S8.2 / S8.3 / S8.4 / S8.7 | 语法冻结、row poly、封闭 record 按名合一、类型别名 | 已实现 |
-| S8.5 | PE 与 Mach-O 序列化层，实心版 | 部分实现（见下方「x86 完成线收紧」） |
+| S8.5 | PE 与 Mach-O 序列化层，实心版 | 已实现（2026-09-24，三端全量语料对照 hard gate） |
 | S8.6 | x86 模块包 | 已实现 |
 | S8.8 | LLVM 后端 | 未实现 |
 | S8.9 | Cranelift 后端 | 未实现 |
@@ -53,7 +53,7 @@ S8 = 所有后端完工，一条完成线：C 后端 + x86 后端（Linux / Wind
 **x86 完成线收紧（2026-09-14 作者拍板）**：x86 后端（不分 S8.1/S8.5/S8.6 子项，统一一条线）须与 C 后端全面对齐，不留任何已知功能缺口，具体逐项：
 
 - **`scripts/multi-backend-verify.sh` 全 PASS**：SKIP 恒为 0（不接受"跳过不算"），当前 91 pass / 0 fail / 0 skip 已达标，往后每次改动都不能倒退。
-- **PE / Mach-O 功能对齐 Linux**：PE 与 Mach-O 的 syscall 分派器缺 exec 族分支（`fork`/`execve`/`wait4`/`pipe2`/`dup2`/`nanosleep`），未知调用号落到默认臂 `ud2`，`exec`/`spawn` 在 Windows/macOS 上直接崩溃；两平台 CI 各只跑约 10 例子集，其余缺口尚未摸清。先把 examples 与 testdata 带 golden 的样例全量搬上真 Windows/macOS runner，逐条登记缺口，再逐项补齐（Windows 无 `fork`，exec 需改走 `CreateProcess` + 匿名管道），全部对 golden 一致后转 hard gate。
+- **PE / Mach-O 功能对齐 Linux** ✅ 已完成（2026-09-24）：`scripts/xos-corpus.sh` 把 examples 与 `testdata/{basics,types,regression}` 的全部样例（70 例，另加带参 `args` 与文件重定向 `stdin` 两例）以 Linux x86 的 stdout 与退出码为基准，在真 Windows/macOS runner 上逐例对照，两端全过后转为 hard gate。摸出的缺口逐项补齐：`args`（Windows 经分派器合成号 1003 由 `CommandLineToArgvW` + UTF-8 转换合成启动向量；darwin 取 LC_MAIN 入口 `rsi-8`）、Windows 监听端口独占（`SO_REUSEADDR` 译成 `SO_EXCLUSIVEADDRUSE`）、Mach-O exec 族（`fork`/`execve`/`wait4`/`dup2`/`pipe2`/`nanosleep` 译 BSD 调用）、Windows exec（合成号 1004 走 `CreatePipe` + `CreateProcessA`，管道读端 `PeekNamedPipe` 先窥后读，`wait4` 走 `WaitForSingleObject` + `GetExitCodeProcess`），见 `architecture.md` §5.23。
 - **PIE**（三目标）✅ 已完成（2026-09-24）：代码取址一律 RIP 相对、数据不存绝对指针，镜像零重定位项——以探针基址与真实基址各装配一遍，逐字节差分定位 `mov imm64` 地址站点并原地改写成 `lea rip`，未收口的绝对地址报内部错误；跳转表存相对偏移，地址槽由 `_start` 运行期写入。ELF `ET_DYN`（static-pie，`.eh_frame` 改 pcrel）、PE `DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT` 加空重定位目录、Mach-O `MH_PIE`，见 `architecture.md` §5.22。
 - **节/段拆分（R-X 代码与 R-W 数据分开）** ✅ 已完成（2026-09-23）：三目标一致把可写 runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表、WSA 区）迁到镜像基址 + 16MB（`DATA_VA_OFF`）的独立 R-W 段——ELF 第二条 PT_LOAD、PE `.data`（头区随之抬到 1024B，另以只占 VA 的 `.bss` 填洞节使节 VA 相邻）、Mach-O `__DATA`（先行落地）；代码域收成 R-X——ELF 首条 PT_LOAD、PE `.text`、Mach-O `__TEXT`。定案与验证见 `architecture.md` §5.21；其后 PIE 落地见 §5.22。
 - **崩溃可诊断性对齐 C 的覆盖面** ✅ 已完成（2026-09-14）：C 运行时的纤程切换走 `ucontext`/Win32 Fiber API（`runtime/burrt_impl.c` 的 `getcontext`/`bur_switch_to_sched`），这类系统级协程切换本身对栈回溯就是不透明的——所以 PE/Mach-O/ELF 落地的"只覆盖用户函数与内部子程序，纤程切换点（yield/调度器恢复）不覆盖"这条边界，其实已经对齐 C 的真实能力，不是缺口。(a) **ELF `.eh_frame`（DWARF CFI）**：单份共享 CIE + 每函数一条 FDE，用真实工具链逐字节核对编码，再用编译器实际产出的 ELF 在 gdb 下跑深度非尾递归到真实栈溢出崩溃验证回溯正确，详见 `architecture.md` §5.19。(b) **内部子程序 unwind 覆盖扩展**：GC/调度器里纯 `call`/`ret` 的内部子程序（`gc_record` 9-push、`gc_collect`/`mark_addr` 7-push、`chan_schedule`/`wake_waiters`/`push_queue`×3/`remove_waiter`/`waitset_add`/`timer_add` 共 11 个代码实例）三个格式（PE/Mach-O/ELF）都已纳入 unwind 覆盖——序言形态逐个核对 `runtime.bur` 源码分三类（零序言/9-push/7-push），ELF 用真实 gdb 断点+GC 压力测试验证回溯正确，PE/Mach-O 逐字节核对真实构建产物的二进制内容，详见 `architecture.md` §5.20。
@@ -84,7 +84,7 @@ S8 = 所有后端完工，一条完成线：C 后端 + x86 后端（Linux / Wind
 
 ## 6. 后端次序
 
-主线（细节见 §3）：x86 Linux ELF（S8.1，已完成）→ x86 模块包（S8.6，已完成）→ PE 与 Mach-O 序列化层（S8.5，部分实现）→ **x86 完成线收紧**（PIE / 节拆分 / unwind 覆盖对齐 C / multi-backend 零缺口 / PE 与 Mach-O 功能对齐，§3 详列）→ runtime 平台抽象与工具链探测 → LLVM（S8.8）→ Cranelift（S8.9）→ WASM（S8.10）→ LSP（S9）彻底完工 → 基础生态（S10 新增包）。
+主线（细节见 §3）：x86 Linux ELF（S8.1，已完成）→ x86 模块包（S8.6，已完成）→ PE 与 Mach-O 序列化层（S8.5，已完成）→ **x86 完成线收紧**（PIE / 节拆分 / unwind 覆盖对齐 C / multi-backend 零缺口 / PE 与 Mach-O 功能对齐，§3 详列，已完成）→ runtime 平台抽象与工具链探测 → LLVM（S8.8）→ Cranelift（S8.9）→ WASM（S8.10）→ LSP（S9）彻底完工 → 基础生态（S10 新增包）。
 后端矩阵、工具链探测与值模型见 [`architecture.md`](architecture.md) §3，不在此复述。
 
 ## 7. 明确排除（不接受重新提案）

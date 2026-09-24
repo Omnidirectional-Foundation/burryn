@@ -590,11 +590,10 @@ jobs:
           Write-Output ("image base 0x{0:x}" -f $b)
           if ($b -eq 0x400000) { Write-Error "image loaded at its link base"; exit 1 }
 
-      # 全量语料对照 Linux x86 基准（stdout + 退出码）；缺口摸清补齐前只报告不拦截
-      # Full corpus against the Linux x86 reference (stdout + exit code); report
-      # only until the gaps are mapped and closed
-      - name: Cross-target corpus vs Linux x86 (survey)
-        continue-on-error: true
+      # 全量语料对照 Linux x86 基准（stdout + 退出码），任一例不符即失败
+      # Full corpus against the Linux x86 reference (stdout + exit code); any
+      # mismatch fails the job
+      - name: Cross-target corpus vs Linux x86 (hard gate)
         shell: pwsh
         run: |
           # 语料里的 /tmp 路径在 Windows 解析为当前盘 \tmp / corpus /tmp paths resolve to \tmp on the current drive
@@ -621,6 +620,14 @@ jobs:
             $fail++
             Write-Output "FAIL args with arguments"
             git diff --no-index --text "pe-out/corpus/ARGV.expected" "act-argv.txt" | Select-Object -Skip 4 -First 6
+          }
+          $p = Start-Process -FilePath "pe-out/corpus/examples_io_stdin.exe" -RedirectStandardInput "pe-out/corpus/STDIN.in" -RedirectStandardOutput "act-stdin.txt" -PassThru -NoNewWindow
+          $null = $p.Handle
+          $p.WaitForExit(20000) | Out-Null
+          if ((Get-FileHash "act-stdin.txt").Hash -eq (Get-FileHash "pe-out/corpus/STDIN.expected").Hash) { $pass++ } else {
+            $fail++
+            Write-Output "FAIL stdin from a file"
+            git diff --no-index --text "pe-out/corpus/STDIN.expected" "act-stdin.txt" | Select-Object -Skip 4 -First 6
           }
           Write-Output "=== corpus: $pass pass, $fail fail ==="
           if ($fail -ne 0) { exit 1 }
@@ -710,10 +717,13 @@ jobs:
       - name: Run clock and corpus slice
         run: |
           set -euo pipefail
+          # 每例 30 秒看门狗（perl alarm，SIGALRM 退出码 142）：卡死即失败，不拖到 job 超时
+          # 30-second watchdog per program (perl alarm, SIGALRM exits 142): a hang
+          # fails fast instead of holding the job until its timeout
           check_one() {
             codesign -f -s - "macho-out/$1"
             chmod +x "macho-out/$1"
-            "macho-out/$1" > "actual-$1.txt"
+            perl -e 'alarm 30; exec @ARGV' "macho-out/$1" > "actual-$1.txt"
             diff "$2" "actual-$1.txt"
           }
           check_one clock-mac testdata/regression/clock.golden
@@ -748,11 +758,10 @@ jobs:
           set -- $bases
           if [ "$1" = "$2" ]; then echo "same base across launches"; exit 1; fi
 
-      # 全量语料对照 Linux x86 基准（stdout + 退出码）；缺口摸清补齐前只报告不拦截
-      # Full corpus against the Linux x86 reference (stdout + exit code); report
-      # only until the gaps are mapped and closed
-      - name: Cross-target corpus vs Linux x86 (survey)
-        continue-on-error: true
+      # 全量语料对照 Linux x86 基准（stdout + 退出码），任一例不符即失败
+      # Full corpus against the Linux x86 reference (stdout + exit code); any
+      # mismatch fails the job
+      - name: Cross-target corpus vs Linux x86 (hard gate)
         run: |
           set -u +e
           pass=0; fail=0
@@ -779,6 +788,16 @@ jobs:
             fail=$((fail + 1))
             echo "FAIL args with arguments"
             diff macho-out/corpus/ARGV.expected act-argv.txt | head -6
+          fi
+          codesign -f -s - macho-out/corpus/examples_io_stdin-mac 2>/dev/null
+          chmod +x macho-out/corpus/examples_io_stdin-mac
+          perl -e 'alarm 20; exec @ARGV' macho-out/corpus/examples_io_stdin-mac <macho-out/corpus/STDIN.in >act-stdin.txt
+          if cmp -s act-stdin.txt macho-out/corpus/STDIN.expected; then
+            pass=$((pass + 1))
+          else
+            fail=$((fail + 1))
+            echo "FAIL stdin from a file"
+            diff macho-out/corpus/STDIN.expected act-stdin.txt | head -6
           fi
           echo "=== corpus: $pass pass, $fail fail ==="
           [ "$fail" -eq 0 ]

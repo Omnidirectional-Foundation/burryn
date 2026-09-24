@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # xos-corpus.sh — x86 跨目标语料：以 Linux x86 运行结果为基准，构建同一批样例的
 # windows/darwin 版本，供真 Windows/macOS runner 逐例对照 stdout 与退出码。
-# 语料 = examples 各分类 + testdata/{basics,types,regression} 的全部 .bur（stdin.bur
-# 需管道输入，豁免）。每例在 <outdir> 下产出：
+# 语料 = examples 各分类 + testdata/{basics,types,regression} 的全部 .bur；stdin.bur
+# 需要输入，单列为 STDIN 例（固定输入文件 STDIN.in 重定向）。每例在 <outdir> 下产出：
 #   <name>.expected  Linux x86 的 stdout
 #   <name>.rc        Linux x86 的退出码
 #   <name>.exe / <name>-mac  目标二进制（构建失败则记入 BUILD_FAIL）
@@ -51,5 +51,17 @@ done
 # target binary with the same arguments and compare against ARGV.expected
 if "$BUR" build --backend x86 examples/basics/args.bur -o "$tmp/ref"; then
     "$tmp/ref" one "two words" 三 >"$out/ARGV.expected"
+fi
+# stdin：固定输入文件重定向（不经管道，三端语义一致），runner 以同一文件喂目标二进制，对照 STDIN.expected
+# stdin: a fixed input file redirected in (not a pipe, so all three targets see
+# the same semantics); runners feed the same file and compare against STDIN.expected
+printf 'helloWORLD' >"$out/STDIN.in"
+if [ "$os" = windows ]; then
+    stdin_bin="$out/examples_io_stdin.exe"
+else
+    stdin_bin="$out/examples_io_stdin-mac"
+fi
+if "$BUR" build --backend x86 examples/io/stdin.bur -o "$tmp/ref" && "$BUR" build --backend x86 --os "$os" examples/io/stdin.bur -o "$stdin_bin"; then
+    "$tmp/ref" <"$out/STDIN.in" >"$out/STDIN.expected"
 fi
 echo "cases: $(wc -l <"$out/CASES"), build failures: $(wc -l <"$out/BUILD_FAIL")"
