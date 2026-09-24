@@ -1,6 +1,6 @@
 # GOALS — Burryn 路线与里程碑
 
-> v0.8 · active · 2026-09-07 ~ 09-23
+> v0.8 · active · 2026-09-07 ~ 09-24
 > 状态：前瞻规划 · 编号 `S<n>[.<m>]`
 > 相关文档：[`architecture.md`](architecture.md) 实现权威 · [`NUMBERING.md`](NUMBERING.md) 旧编号对照 · [`grammar.md`](grammar.md) 表层语法 · [`../README.md`](../README.md)
 
@@ -54,7 +54,7 @@ S8 = 所有后端完工，一条完成线：C 后端 + x86 后端（Linux / Wind
 
 - **`scripts/multi-backend-verify.sh` 全 PASS**：SKIP 恒为 0（不接受"跳过不算"），当前 91 pass / 0 fail / 0 skip 已达标，往后每次改动都不能倒退。
 - **PIE**（三目标）：现状 ELF 固定基址静态执行、PE 无 ASLR 标记、Mach-O 显式 `MH_PIE` 未置位——三个都是位置相关。根因：后端约 488 处用 `mov_ri64` 内嵌按固定 `img_base()`/`macho_base` 算出的绝对地址，仅 8 处用 `lea_rip_rel32` 相对寻址；`architecture.md` 目前没有任何 PIE 机制设计。落地前需要先定设计（大改现有绝对寻址成 RIP 相对，或保留绝对寻址但按平台各自的重定位表格式在装载时打补丁——ELF `.rela.dyn`/`R_X86_64_RELATIVE`、PE `.reloc` 基址重定位目录、Mach-O chained fixups 的 rebase 项，三种格式互不相通）。范围与风险目前最大的一项，值得单独开一轮设计讨论，不建议直接开工。
-- **节/段拆分（R-X 代码与 R-W 数据分开）** ✅ 已完成（2026-09-23）：三目标一致把可写 runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表、WSA 区）迁到镜像基址 + 16MB（`DATA_VA_OFF`）的独立 R-W 段——ELF 第二条 PT_LOAD、PE `.data`（头区随之抬到 1024B）、Mach-O `__DATA`（先行落地）；代码域收成 R-X——ELF 首条 PT_LOAD、PE `.text`、Mach-O `__TEXT`。仍保持固定基址，PIE 单独后续跟上，定案与验证见 `architecture.md` §5.21。
+- **节/段拆分（R-X 代码与 R-W 数据分开）** ✅ 已完成（2026-09-23）：三目标一致把可写 runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表、WSA 区）迁到镜像基址 + 16MB（`DATA_VA_OFF`）的独立 R-W 段——ELF 第二条 PT_LOAD、PE `.data`（头区随之抬到 1024B，另以只占 VA 的 `.bss` 填洞节使节 VA 相邻）、Mach-O `__DATA`（先行落地）；代码域收成 R-X——ELF 首条 PT_LOAD、PE `.text`、Mach-O `__TEXT`。仍保持固定基址，PIE 单独后续跟上，定案与验证见 `architecture.md` §5.21。
 - **崩溃可诊断性对齐 C 的覆盖面** ✅ 已完成（2026-09-14）：C 运行时的纤程切换走 `ucontext`/Win32 Fiber API（`runtime/burrt_impl.c` 的 `getcontext`/`bur_switch_to_sched`），这类系统级协程切换本身对栈回溯就是不透明的——所以 PE/Mach-O/ELF 落地的"只覆盖用户函数与内部子程序，纤程切换点（yield/调度器恢复）不覆盖"这条边界，其实已经对齐 C 的真实能力，不是缺口。(a) **ELF `.eh_frame`（DWARF CFI）**：单份共享 CIE + 每函数一条 FDE，用真实工具链逐字节核对编码，再用编译器实际产出的 ELF 在 gdb 下跑深度非尾递归到真实栈溢出崩溃验证回溯正确，详见 `architecture.md` §5.19。(b) **内部子程序 unwind 覆盖扩展**：GC/调度器里纯 `call`/`ret` 的内部子程序（`gc_record` 9-push、`gc_collect`/`mark_addr` 7-push、`chan_schedule`/`wake_waiters`/`push_queue`×3/`remove_waiter`/`waitset_add`/`timer_add` 共 11 个代码实例）三个格式（PE/Mach-O/ELF）都已纳入 unwind 覆盖——序言形态逐个核对 `runtime.bur` 源码分三类（零序言/9-push/7-push），ELF 用真实 gdb 断点+GC 压力测试验证回溯正确，PE/Mach-O 逐字节核对真实构建产物的二进制内容，详见 `architecture.md` §5.20。
 - **`net_nb` / fiber 感知 IO 真机验收**：Windows 侧仍卡 R1/R2（`net_loopback` 双修复复验、`WSAPoll` vs `select` P/Invoke 对照），等工作站真机回写，非代码缺口，状态不变，见 `reports/ROADMAP.md`。
 - **multi-backend 已知缺陷显式登记** ✅ 已完成（2026-09-14）：`testdata/pkg/{annotations,cached,constcycle,consts,deepmut,extimport,extmissing,pipeline,stdjson}` 九例逐条重新核实后，原"三方一致拒绝"的归类本身是错的——4 例（`annotations`/`consts`/`pipeline`/`stdjson`）是 fixture 用 `.` 代替 `::` 做跨包访问的语法笔误，改正后三方一致成功；3 例（`deepmut`/`constcycle`/`extmissing`）是三方一致的正确诊断拒绝（deep-mut 安全检查/const 环检测/缺失 `require`），不是缺陷；2 例（`cached`/`extimport`）依赖文档占位域名，环境缺依赖导致三方一致拒绝，用假缓存验证过依赖可用时三方一致成功。**零 x86 缺陷、零语言级限制**，以"已知缺陷清零"满足本条完成线，详见 `architecture.md` §5.18。

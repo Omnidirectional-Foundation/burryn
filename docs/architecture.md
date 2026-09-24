@@ -1,6 +1,6 @@
 # Architecture — Burryn 实现架构
 
-> v0.7 · active · 2026-09-23
+> v0.7 · active · 2026-09-24
 > 状态：实现权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
 > 相关文档：[`GOALS.md`](GOALS.md) 路线与完成线 · [`grammar.md`](grammar.md) 表层语法 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`../README.md`](../README.md)
 
@@ -253,7 +253,7 @@ Raw int64，8 字节/槽，**无 tag**。
                 ^data_origin = 镜像基址 + DATA_VA_OFF (16MB)
 ```
 
-- 可写 runtime 区独立成 R-W 段，与代码域之间留未映射 VA 空洞，定案见 §5.21
+- 可写 runtime 区独立成 R-W 段，与代码域之间留 VA 空洞（ELF/Mach-O 不映射，PE 由只占 VA 的 `.bss` 填洞节补齐），定案见 §5.21
 - 堆：16MB via mmap(MAP_ANONYMOUS)，零填充，bump-allocated via r12
 - 值栈：1MB below rsp，向上增长
 - 全局变量：堆首 N*8 字节（rbx = base）
@@ -567,10 +567,13 @@ runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WS
   单一定义，取代原 Mach-O 专属的 `MACHO_DATA_VA_OFF`），与代码域之间留未映射
   VA 空洞，使 `rt_slot` 等地址公式在代码长度确定前即可求值。可写段按目标分别
   是：ELF 第二条 PT_LOAD（`p_flags=R|W`，文件内页对齐紧跟 `.eh_frame`）；PE
-  `.data`（两节表使头区 496B→536B，`SizeOfHeaders` 随 FileAlignment 抬到
-  1024B，`SizeOfImage` 覆盖固定数据 RVA；kernel32 + ws2_32 导入 blob 跟在
-  runtime 区之后同落 `.data`——加载器解析导入要原地写 IAT，只读节收不下，
-  描述符与 IAT 预填写 RVA（基底 `DATA_VA_OFF`），代码引用 IAT 槽用绝对 VA（经
+  `.data`（三节表：`.text`、`.bss` 填洞节、`.data`，头区实占 448B，
+  `SizeOfHeaders` 取 1024B，`SizeOfImage` 覆盖固定数据 RVA；PE 规范要求各节 VA
+  升序且相邻，真 Windows 加载器对 `.text` 与 `.data` 之间的 VA 空洞直接报
+  `ERROR_BAD_EXE_FORMAT`（Wine 不查），故以 `.bss` 填洞节补齐：`VirtualSize` =
+  空洞长度、`RawSize=0`、`UNINITIALIZED_DATA|READ`，只占 VA 不占文件；
+  kernel32 + ws2_32 导入 blob 跟在 runtime 区之后同落 `.data`——加载器解析导入
+  要原地写 IAT，只读节收不下，描述符与 IAT 预填写 RVA（基底 `DATA_VA_OFF`），代码引用 IAT 槽用绝对 VA（经
   `data_origin()`））；Mach-O `__DATA`（先行落地）。代码域
   R-X：ELF 首条 PT_LOAD（两条 phdr 使 `img_base` 从 base+120 移到 base+176）、
   PE `.text`（`CODE|EXECUTE|READ`）、Mach-O `__TEXT`。
@@ -584,7 +587,10 @@ runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WS
   （R E / RW）与 VA；`readelf --debug-dump=frames` 核对 76 条 FDE 全部落在新
   代码域内且升序。PE 用 Python 结构校验头区/节表/SizeOfHeaders/SizeOfImage 与
   数据段内三个 GC 子程序地址槽（须指向代码域）——该校验当场揪出初版把 `.text`
-  的 Characteristics 误算成 `0x60000040`（INITIALIZED_DATA 而非 CODE）的错常数。
+  的 Characteristics 误算成 `0x60000040`（INITIALIZED_DATA 而非 CODE）的错常数；
+  结构校验含「各节 VA 升序且相邻」一项，单测
+  `test_pe_emit_headers_sections_adjacent_across_data_hole` 锁定三节表。真 Windows
+  `x86-pe-run` 全部 hard gate 对 golden 一致。
   Mach-O 字节不变（常量等值改名，既有单测锁定）。
 
 ## 6. LSP 与编辑器生态

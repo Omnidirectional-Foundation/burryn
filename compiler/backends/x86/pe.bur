@@ -601,15 +601,17 @@ pub fn pe_build_dispatcher(iat) {
     sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 41, 49, 50, 42, 43, 54, 55, 72], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case], epilogue)
 }
 
-// pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 两节表
-// （.text R-X 承载代码域，.data R-W 在固定高 RVA 承载可写 runtime 区）。头区总量
-// 64+24+240+128+80=536B，按 FileAlignment 抬到 1024B，SizeOfHeaders 与节 raw 指针
-// 一致用这个值。
+// pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 三节表
+// （.text R-X 承载代码域；.bss 只占 VA 填满代码域与数据段之间的空洞；.data R-W 在
+// 固定高 RVA 承载可写 runtime 区）。头区实占 64+24+240+120=448B，头区取 1024B
+// （FileAlignment 倍数），SizeOfHeaders 与节 raw 指针一致用这个值。
 // pe_emit_headers lays out DOS + COFF + PE32+ optional header (240B with 16 data
-// directories) + the two-entry section table (.text R-X carrying the code
-// domain, .data R-W holding the writable runtime area at the fixed high RVA).
-// The header block totals 64+24+240+128+80=536B, rounded up to 1024B by
-// FileAlignment; SizeOfHeaders and the section raw pointers use that value.
+// directories) + the three-entry section table (.text R-X carrying the code
+// domain; .bss taking VA only to fill the hole between the code domain and the
+// data segment; .data R-W holding the writable runtime area at the fixed high
+// RVA). The headers occupy 64+24+240+120=448B inside a 1024B header area (a
+// FileAlignment multiple); SizeOfHeaders and the section raw pointers use that
+// value.
 pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pdata_len, data_len) {
     let hdr_area = 1024
     // DOS：MZ 魔数 + e_lfanew=64，其余补零
@@ -621,9 +623,24 @@ pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pda
         di = di + 1
     }
     dos = dos + e4(64)
-    // COFF：AMD64、两节、可执行镜像 + 大地址感知
-    // COFF: AMD64, two sections, executable image + large-address-aware
-    let coff = "PE" + byte_chr(0) + byte_chr(0) + e2(34404) + e2(2) + e4(0) + e4(0) + e4(0) + e2(240) + e2(34)
+    // 填洞节：.text 对齐末尾到 DATA_VA_OFF 之间的 VA 空洞。PE 规范要求镜像各节 VA
+    // 升序且相邻，真 Windows 加载器对不相邻的节表报 ERROR_BAD_EXE_FORMAT（Wine 不查）；
+    // 填洞节只占 VA、不占文件（RawSize=0），UNINITIALIZED_DATA|READ。
+    // Gap-filler section: the VA hole between .text's aligned end and
+    // DATA_VA_OFF. The PE spec requires image section VAs to be ascending and
+    // adjacent; the real Windows loader rejects a non-adjacent table with
+    // ERROR_BAD_EXE_FORMAT (Wine does not check). The filler takes VA only, no
+    // file bytes (RawSize=0), UNINITIALIZED_DATA|READ.
+    let gap_va = 4096 + pe_align(code_len, 4096)
+    let mut sect_gap = ""
+    let mut n_sect = 2
+    if gap_va < DATA_VA_OFF {
+        sect_gap = pe_build_section_entry(".bss", DATA_VA_OFF - gap_va, gap_va, 0, 0, 1073741952)
+        n_sect = 3
+    }
+    // COFF：AMD64、两节（加填洞节为三节）、可执行镜像 + 大地址感知
+    // COFF: AMD64, two sections (three with the gap filler), executable image + large-address-aware
+    let coff = "PE" + byte_chr(0) + byte_chr(0) + e2(34404) + e2(n_sect) + e4(0) + e4(0) + e4(0) + e2(240) + e2(34)
     let image_size = DATA_VA_OFF + pe_align(data_len, 4096)
     let opt = e2(523) + e1(0) + e1(0) + e4(code_len) + e4(0) + e4(0) + e4(pe_content_rva(entry_off)) + e4(4096) + e8(4194304) + e4(4096) + e4(512) + e2(6) + e2(0) + e2(0) + e2(0) + e2(6) + e2(0) + e4(0) + e4(image_size) + e4(hdr_area) + e4(0) + e2(3) + e2(0) + e8(8388608) + e8(1048576) + e8(1048576) + e8(4096) + e4(0) + e4(16)
     // 16 个数据目录：[1]=导入表、[3]=异常目录（.pdata），其余零
@@ -647,7 +664,7 @@ pub fn pe_emit_headers(entry_off, code_len, idata_rva, idata_len, pdata_off, pda
     // fixed high RVA, its raw data right after .text's
     let sect_text = pe_build_section_entry(".text", code_len, 4096, pe_align(code_len, 512), hdr_area, 1610612768)
     let sect_data = pe_build_section_entry(".data", data_len, DATA_VA_OFF, pe_align(data_len, 512), hdr_area + pe_align(code_len, 512), 3221225536)
-    let hdr = dos + coff + opt + dirs + sect_text + sect_data
+    let hdr = dos + coff + opt + dirs + sect_text + sect_gap + sect_data
     let mut pad = ""
     let mut pi = str_len(hdr)
     while pi < hdr_area {
