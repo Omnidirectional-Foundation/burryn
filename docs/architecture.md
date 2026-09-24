@@ -326,7 +326,8 @@ op_set_global 和 op_set_local PEEK（不 pop）——匹配 VM 语义。
 x86 后端的 net/exec IO 为 fiber 感知等待，语义对齐 C runtime（`bur_wait_current_fd` + 调度器轮询）。
 
 - **禁止裸阻塞 syscall 卡死全进程**：`O_NONBLOCK` + 当前 fiber park + 调度器等已注册 fd 就绪后唤醒
-- **等 fd 用 `poll(2)`**，不上 epoll
+- **等 fd 用 `poll(2)`**，不上 epoll；Windows 由分派器译成 `WSAPoll`（fd 经 fd 表换成
+  SOCKET），`x86-pe-run` 以 30 秒看门狗把 `net_loopback`/`net_nb` 作为 hard gate
 - **覆盖面**：`tcp_accept` / `tcp_dial` / `net_read` / `net_write` / `sleep`；`exec_poll` 的等待不得在别的 fiber 做 net 时把整进程卡住。不改 §7.1 的 exec「收尾式、非流式」
 - **不链 `burrt.c` 的 CSP**：park/wake 走 8 槽 fiber 调度器（8B raw int64 与 C runtime 16B tagged Value 不兼容）
 - **`net_nb` 与本项同一设计**：非阻塞原语与阻塞 native 的 park 路径一并落地，不做 int3 占位再推翻

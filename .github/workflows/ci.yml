@@ -526,6 +526,20 @@ jobs:
           if ((Get-Item actual-fs.txt).Length -eq 0) { Write-Error "empty stdout from actual-fs.txt"; exit 1 }
           if ((Get-Item actual-sleep.txt).Length -eq 0) { Write-Error "empty stdout from actual-sleep.txt"; exit 1 }
 
+      # net 用例走看门狗：卡死的 fiber 唤醒路径不该把 job 拖到超时才暴露。
+      # Net cases run under a watchdog: a stuck fiber wake path must fail fast
+      # rather than hold the job until its timeout.
+      - name: Run net slice (hard gate)
+        shell: pwsh
+        run: |
+          foreach ($t in @("net_loopback", "net_nb")) {
+            $p = Start-Process -FilePath ".\pe-out\$t.exe" -RedirectStandardOutput "actual-$t.txt" -PassThru -NoNewWindow
+            if (-not $p.WaitForExit(30000)) { taskkill /F /T /PID $p.Id | Out-Null; Write-Error "$t timed out"; exit 1 }
+            if ($p.ExitCode -ne 0) { Write-Error "$t exit code $($p.ExitCode)"; exit 1 }
+            git diff --no-index --exit-code --text "examples/net/$t.golden" "actual-$t.txt"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
   x86-macho-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
