@@ -606,11 +606,19 @@ jobs:
             $p = Start-Process -FilePath "pe-out/corpus/$n.exe" -RedirectStandardOutput "act-$n.txt" -RedirectStandardError "err-$n.txt" -PassThru -NoNewWindow
             $null = $p.Handle
             if (-not $p.WaitForExit(20000)) { taskkill /F /T /PID $p.Id | Out-Null; $rc = 124 } else { $rc = $p.ExitCode }
-            $same = (Get-FileHash "act-$n.txt").Hash -eq (Get-FileHash "pe-out/corpus/$n.expected").Hash
+            # 子进程可能仍持有继承的输出句柄：读哈希失败时稍候重试，不让一例中断整步
+            # a child may still hold the inherited output handle: retry the
+            # hash briefly instead of letting one case abort the whole step
+            $h = $null
+            for ($try = 0; $try -lt 10 -and $null -eq $h; $try++) {
+              try { $h = (Get-FileHash "act-$n.txt" -ErrorAction Stop).Hash } catch { Start-Sleep -Milliseconds 500 }
+            }
+            $same = $h -eq (Get-FileHash "pe-out/corpus/$n.expected").Hash
             if ($same -and $rc -eq $want) { $pass++ } else {
               $fail++
-              Write-Output ("FAIL {0}: rc {1} (want {2})" -f $n, $rc, $want)
+              Write-Output ("FAIL {0}: rc {1} (want {2}) hash-read={3}" -f $n, $rc, $want, ($null -ne $h))
               git diff --no-index --text "pe-out/corpus/$n.expected" "act-$n.txt" | Select-Object -Skip 4 -First 6
+              if (Test-Path "err-$n.txt") { Get-Content "err-$n.txt" -TotalCount 6 }
             }
           }
           $p = Start-Process -FilePath "pe-out/corpus/examples_basics_args.exe" -ArgumentList 'one "two words" 三' -RedirectStandardOutput "act-argv.txt" -PassThru -NoNewWindow
@@ -829,6 +837,21 @@ jobs:
           set -euo pipefail
           cc --version | head -n 1
           cc -c runtime/burrt_impl.c runtime/burrt_natives.c
+
+      # 本平台 C 运行时的错误文本（strerror/gai_strerror/fopen errno），x86 的 Err
+      # 文本逐平台对齐的数据源 / this platform's C runtime error texts, the
+      # source the x86 Err texts are matched against per platform
+      - name: Dump C error texts (MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: cl /nologo /W3 scripts\errtext-dump.c /Fe:errtext-dump.exe && errtext-dump.exe
+
+      - name: Dump C error texts (clang)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          cc -o errtext-dump scripts/errtext-dump.c
+          ./errtext-dump
 
   gate:
     needs:
