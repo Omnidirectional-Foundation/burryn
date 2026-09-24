@@ -679,6 +679,57 @@ multi-backend 与 C 后端逐例对齐，以它为基准即把 Windows/macOS 间
   `args` 带参例全过（stdin 例随本次加入，由下一轮 CI 验证）；Linux x86 产物字节不变，multi-backend
   三方 91/0/0，testdata 三代 fixpoint 通过。
 
+### 5.24 运行时错误出口与源码回溯（定案，2026-09-24）
+
+x86 的运行时检查与错误文本对齐 C 的 `bur_trap`：`runtime error: <msg>\n` 之后逐帧
+`  at <fn> (<file>:<line>)\n`（最内层在前，无源文件的帧跳过），退出码 4。实现在
+`compiler/backends/x86/trap.bur`。
+
+- **die 子程序**：内部子程序区（`timer_add` 之后）的一个共享块，两个入口。入口 A：
+  `mov r11, die; call r11` 后紧跟模板 `[len:4][flags:4][bytes]`，永不返回；模板字节
+  1/2/3 插入 rdi/rsi/rdx 的有符号十进制，字节 4 插入 rdx 所指字符串对象；flags bit0 =
+  打印回溯，bit1 = 跳过最内层帧（尚未进入的帧，见下文调用深度）。入口 B（块首）：
+  `rdi` = 全局槽号，报 `undefined variable "<名>"`。die 先在原生栈上预留 8KB 暂存区
+  再写 fd 2——Windows 分派器的栈帧开在 rsp 之下，缓冲区必须在它之上。
+- **回溯**：从 die 自身的返回地址槽起沿原生栈向上扫描，直到 fiber 假帧里的 `done`
+  地址（主 fiber 与 spawn 出的 fiber 栈顶都是它）。落在用户代码区、且前一条指令是
+  `call r/m64`（`[w-2]=FF`、`[w-1]&F8=D0`）的字即一帧返回地址——不依赖帧形状，
+  内联 native 在调用前压的寄存器不会打乱扫描。最内层帧就是 trap 站点自身的返回
+  地址，行号即 trap 所在指令的行。
+- **回溯表**：代码域末尾的只读表（跳转表须紧贴 `_start`，`_start` 以 RIP 相对定位
+  它，故表不能插在二者之间）：`[n:8][names_off:8]` + n 项 `[off:4][line:4][desc:8]`
+  + 帧前缀串池（`  at <fn> (<file>:`）+ 全局名表。项按地址升序、相邻同 (函数, 行)
+  合并，二分查找；`off` 相对首个用户函数。行号取 bytecode span，与 C 的 `BUR_LN`
+  同粒度（逐指令）。单文件模式下 float_rt 注入在用户源码之前，行表按用户源码起始
+  偏移平移，落在注入区的指令记为无源文件；模块模式的回溯文件表不含 float_rt（C
+  的浮点格式化是原生实现，其帧不出现）。die 的表址、用户代码区上下界在各目标定出
+  整份代码域后以真实地址重建 die 并原位换入（全为 `mov imm64`，定长）。
+- **检查项**：整数 `+ - *` 与取负用 `jo`（与 C 的溢出判定等价）；除/模先查零，除法
+  另查 `INT64_MIN / -1`（`INT64_MIN % -1` 与 C 同为硬件异常）；列表读写、元组、
+  `char_at`/`byte_at` 下标以无符号比较一并挡负数；`substr`/`slice` 区间、空列表
+  `pop`、`ord("")`、`chr` 码点、`byte_chr` 范围、`assert`、`chan` 负容量、
+  `net_nb` 非法操作码。死锁报告与 C 同文：`fatal: deadlock — all N remaining
+  fiber(s) are blocked on channels`（N 为 status 1..=3 的 fiber 数），无回溯。
+- **调用深度**：每 fiber 上限 2048，fiber 入口帧（主 fiber 即顶层脚本）在深度 0——
+  C 的 `call_depth` 语义；VM 原先把入口帧计入、差一层，已改为与 C 一致。用户函数帧
+  恒占 24B 原生栈，第 d 层序言处 `rsp = done 槽 + 8 - 24d`，故 fiber 结构新增
+  `FB_LIMIT`（rsp 下限），序言只多一次比较，返回路径零开销；超深时新帧尚未算入，
+  die 以 flags bit1 跳过它。C 自身原先在此处先自增深度再 trap，回溯读到 realloc
+  后未初始化的槽而段错误，已改为先判后增。
+- **全局已定义**：C 的全局按名动态定义，定义前读写即 `undefined variable`（含函数：
+  定义语句执行前的前向调用也 trap）。x86 在全局区后 `rbx + 8*n_globals + 4096`
+  起为每槽一字节标志，`DEF_GLOBAL` 置 1，读写前检查（内联约 28 字节，失败走入口
+  B）；顶层脚本里已按序执行过 `DEF_GLOBAL` 的名字，其后同函数内的读写免检。
+- **句柄编号**：exec 句柄改为与 C 相同的自 0 顺序编号、永不复用——隐藏全局槽存
+  `[proc 指针]` 列表，同步 `exec` 也占号；`exec_poll` 查表，越界或已消费即 trap。
+  VM 经宿主 native 执行 exec/net，宿主句柄表对它不可见，改在 VM 侧记下经手的句柄，
+  `net_close`/`exec_poll`/`net_nb` 的非法参数由 VM 自己按 C 文案 trap，不再让宿主
+  trap 带出 VM 内部调用栈。
+- **验证**：`testdata/traps/` 每类 trap 一例（`*_trap.bur` + `.stderr`，有输出的另配
+  `.golden`），golden-verify 对 `*_trap.bur` 比对退出码 4、stdout 与 stderr；
+  multi-backend 改为三方同时比对 stdout、stderr 与退出码（构建期拒绝时 C/x86 取构建
+  诊断），123/0/0。
+
 ## 6. LSP 与编辑器生态
 
 **架构定案**：LSP 服务器用 Burryn 写（延续自举原则），作为 `bur lsp` 子命令，stdin/stdout 走 JSON-RPC 2.0（LSP 3.17 规范）。

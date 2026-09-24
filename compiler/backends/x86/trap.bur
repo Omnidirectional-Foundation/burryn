@@ -1,0 +1,481 @@
+// trap.bur — 运行时错误出口：共享 die 子程序 + 源码回溯表。
+// Runtime-error exit: the shared die subroutine and the source trace table.
+//
+// 调用约定：mov r11, die; call r11; 紧跟模板 [len:4][flags:4][bytes]，永不返回。
+// 模板字节 1/2/3 在该处插入 rdi/rsi/rdx 的十进制（有符号），字节 4 插入 rdx
+// 所指的字符串对象；flags bit0 = 打印回溯，bit1 = 跳过最内层帧。die 先 write(2) 消息行，再从自身返回
+// 地址起沿原生栈向上扫描到 fiber 的 done 假帧：落在用户代码区、且前一条指令是
+// call r/m64 的字即为一帧返回地址，按回溯表查出 "  at 函数 (文件:" 与行号；无源
+// 文件的函数（注入的 float_rt 等）跳过。最后 exit(4)。对齐 C 的 bur_trap：
+// "runtime error: <msg>\n" + 逐帧 "  at fn (file:line)\n"（最内层在前）。
+// Calling convention: mov r11, die; call r11; followed by the template
+// [len:4][flags:4][bytes]; never returns. Template bytes 1/2/3 insert the signed
+// decimal of rdi/rsi/rdx, byte 4 inserts the string object rdx points to;
+// flags bit0 = print the trace, bit1 = skip the innermost frame. die writes the message line to fd 2, then scans
+// the native stack upward from its own return address to the fiber's done fake
+// frame: a word inside user code whose preceding instruction is a call r/m64 is
+// a frame's return address, looked up in the trace table for "  at fn (file:"
+// and the line; functions without a source file (the injected float_rt etc.)
+// are skipped. Finally exit(4). Mirrors C's bur_trap: "runtime error: <msg>\n"
+// plus one "  at fn (file:line)\n" per frame, innermost first.
+
+import "burryn.dev/compiler/frontend"
+
+// die 子程序入口 A 的绝对地址（x86gen_image 每遍装配前设定） / the absolute
+// address of the die subroutine's entry A (set by x86gen_image before each pass)
+pub let mut die_addr_g = 0
+
+// die_undef_g 是入口 B（未定义全局）的绝对地址，即 die 块首
+// die_undef_g is entry B's absolute address (undefined global), the die block start
+pub let mut die_undef_g = 0
+
+// DIE_RESERVE 是 die 在原生栈上预留的暂存区（消息缓冲 + 参数槽）
+// DIE_RESERVE is die's scratch reservation on the native stack (message buffer + argument slots)
+pub let DIE_RESERVE = 8192
+
+// DIE_SCAN_WORDS 是回溯扫描的字数上限（2MB，超出 1MB fiber 栈）
+// DIE_SCAN_WORDS caps the trace scan in words (2MB, past a 1MB fiber stack)
+pub let DIE_SCAN_WORDS = 262144
+
+// x86gen_die_call 发射一次 die 调用：参数寄存器由调用方预先装好
+// x86gen_die_call emits one die call; the caller loads the argument registers first
+fn x86gen_die_call(template, flags) {
+    mov_ri64(r11, die_addr_g) + call_r(r11) + u32(str_len(template)) + u32(flags) + template
+}
+
+// x86gen_trap_exit 发射无参数运行时错误（带回溯） / x86gen_trap_exit emits an
+// argument-free runtime error (with trace)
+fn x86gen_trap_exit(msg) {
+    x86gen_die_call("runtime error: " + msg, 1)
+}
+
+// x86gen_trap_fmt 发射带参数的运行时错误：setup 装 rdi/rsi/rdx，模板含占位字节
+// x86gen_trap_fmt emits a runtime error with arguments: setup loads rdi/rsi/rdx and
+// the template carries placeholder bytes
+fn x86gen_trap_fmt(setup, msg) {
+    setup + x86gen_die_call("runtime error: " + msg, 1)
+}
+
+// die_flush 把缓冲 [r14, r15) 写到 fd 2 并复位游标 / die_flush writes the buffer
+// [r14, r15) to fd 2 and resets the cursor
+fn die_flush(tag) {
+    [la_b(mov_rr(rdx, r15) + sub_rr(rdx, r14) + test_rr(rdx, rdx)), la_jcc(CC_E, "fl_" + tag), la_b(mov_ri64(rdi, 2) + mov_rr(rsi, r14) + sys_mov_rax(1) + syscall() + mov_rr(r15, r14)), la_l("fl_" + tag)]
+}
+
+// die_itoa 把 rax 的有符号十进制追加到 [r15]（INT64_MIN 经无符号除法正确输出）
+// die_itoa appends rax's signed decimal at [r15] (INT64_MIN prints correctly via
+// the unsigned divide)
+fn die_itoa(tag) {
+    [la_b(test_rr(rax, rax)), la_jcc(CC_GE, "ip_" + tag), la_b(mov_mi8(r15, 0, 45) + add_ri32(r15, 1) + neg_r(rax)), la_l("ip_" + tag), la_b(xor_rr(rcx, rcx) + mov_ri64(r9, 10)), la_l("id_" + tag), la_b(xor_rr(rdx, rdx) + div_r(r9) + add_ri32(rdx, 48) + push_r(rdx) + add_ri32(rcx, 1) + test_rr(rax, rax)), la_jcc(CC_NE, "id_" + tag), la_l("io_" + tag), la_b(pop_r(rax) + mov_mr8(r15, 0, rax) + add_ri32(r15, 1) + sub_ri32(rcx, 1)), la_jcc(CC_NE, "io_" + tag)]
+}
+
+// x86gen_die_block 生成 die 子程序；table/lo/hi 为回溯表与用户代码区的绝对地址，
+// 长度与这些值无关（全是 mov imm64），故可先以 0 量长再定址
+// x86gen_die_block emits the die subroutine; table/lo/hi are the absolute
+// addresses of the trace table and the user-code range. Its length does not
+// depend on them (all mov imm64), so it can be measured with zeros first
+fn x86gen_die_items(table_addr, lo_addr, hi_addr, done_addr) {
+    let mut it = []
+    // 入口 B（块首，die_undef_g）：rdi = 全局槽号，报 undefined variable "<名>"，
+    // 名字取自回溯表的全局名表
+    // entry B (block start, die_undef_g): rdi = global slot, reports
+    // undefined variable "<name>" with the name from the trace table's global
+    // name table
+    let pre = "runtime error: undefined variable " + byte_chr(34)
+    let mut pre_code = ""
+    let mut pk = 0
+    while pk < str_len(pre) {
+        pre_code = pre_code + mov_mi8(r15, pk, byte_at(pre, pk))
+        pk = pk + 1
+    }
+    push(it, la_b(mov_rr(rbp, rsp) + sub_ri32(rsp, DIE_RESERVE) + mov_mr(rbp, 0 - 8, rdi) + mov_rr(r14, rsp) + mov_rr(r15, rsp) + pre_code + add_ri32(r15, str_len(pre))))
+    let fu = die_flush("undef")
+    let mut uk = 0
+    while uk < len(fu) {
+        push(it, fu[uk])
+        uk = uk + 1
+    }
+    push(it, la_b(mov_ri64(r9, table_addr) + mov_rm(rax, r9, 8) + add_rr(rax, r9) + mov_rm(rcx, rbp, 0 - 8) + shl_ri(rcx, 3) + add_rr(rax, rcx) + mov_rm(rax, rax, 0) + add_rr(rax, r9) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + mov_ri64(rdi, 2) + sys_mov_rax(1) + syscall() + mov_mi8(r15, 0, 34) + mov_mi8(r15, 1, 10) + add_ri32(r15, 2)))
+    let fu2 = die_flush("undef2")
+    uk = 0
+    while uk < len(fu2) {
+        push(it, fu2[uk])
+        uk = uk + 1
+    }
+    push(it, la_b(mov_ri64(rax, 1)))
+    push(it, la_jmp("common"))
+    // 入口 A（die_addr_g）：rbp = 返回地址所在槽；预留暂存区后 r14/r15 = 缓冲基址/游标，参数存 [rbp-8/16/24]
+    // entry: rbp = the return-address slot; after the reservation r14/r15 are the
+    // buffer base/cursor, arguments go to [rbp-8/16/24]
+    push(it, la_l("entry_a"))
+    push(it, la_b(mov_rr(rbp, rsp) + sub_ri32(rsp, DIE_RESERVE) + mov_mr(rbp, 0 - 8, rdi) + mov_mr(rbp, 0 - 16, rsi) + mov_mr(rbp, 0 - 24, rdx) + mov_rm(r13, rbp, 0) + mov_rm32(r12, r13, 0) + add_ri32(r13, 8) + mov_rr(r14, rsp) + mov_rr(r15, rsp)))
+    // 模板循环 / template loop
+    push(it, la_l("t_loop"))
+    push(it, la_b(test_rr(r12, r12)))
+    push(it, la_jcc(CC_E, "t_done"))
+    push(it, la_b(movzx_rm8(rax, r13, 0) + test_rr(rax, rax)))
+    push(it, la_jcc(CC_E, "t_lit"))
+    push(it, la_b(cmp_ri32(rax, 4)))
+    push(it, la_jcc(CC_A, "t_lit"))
+    push(it, la_jcc(CC_E, "t_str"))
+    // 1..3：[rbp - 8*n] 的整数 / 1..3: the integer at [rbp - 8*n]
+    push(it, la_b(shl_ri(rax, 3) + mov_rr(rcx, rbp) + sub_rr(rcx, rax) + mov_rm(rax, rcx, 0)))
+    let ia = die_itoa("arg")
+    let mut k = 0
+    while k < len(ia) {
+        push(it, ia[k])
+        k = k + 1
+    }
+    push(it, la_jmp("t_next"))
+    push(it, la_l("t_lit"))
+    push(it, la_b(mov_mr8(r15, 0, rax) + add_ri32(r15, 1)))
+    push(it, la_jmp("t_next"))
+    // 4：先冲刷缓冲，再直接写字符串对象 [len:8][bytes]
+    // 4: flush the buffer, then write the string object [len:8][bytes] directly
+    push(it, la_l("t_str"))
+    let fs = die_flush("str")
+    k = 0
+    while k < len(fs) {
+        push(it, fs[k])
+        k = k + 1
+    }
+    push(it, la_b(mov_rm(rax, rbp, 0 - 24) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + mov_ri64(rdi, 2) + sys_mov_rax(1) + syscall()))
+    push(it, la_l("t_next"))
+    push(it, la_b(add_ri32(r13, 1) + sub_ri32(r12, 1)))
+    push(it, la_jmp("t_loop"))
+    push(it, la_l("t_done"))
+    push(it, la_b(mov_mi8(r15, 0, 10) + add_ri32(r15, 1)))
+    let fm = die_flush("msg")
+    k = 0
+    while k < len(fm) {
+        push(it, fm[k])
+        k = k + 1
+    }
+    push(it, la_b(mov_rm(rax, rbp, 0) + mov_rm32(rax, rax, 4)))
+    // 汇合：rax = flags / join: rax = flags
+    push(it, la_l("common"))
+    push(it, la_b(mov_rr(rcx, rax) + and_ri32(rcx, 1)))
+    push(it, la_jcc(CC_E, "exit"))
+    // 回溯扫描：rbx = 扫描指针（从返回地址槽起），r12 = 剩余字数
+    // trace scan: rbx = scan pointer (from the return-address slot), r12 = words left
+    push(it, la_b(mov_rr(rbx, rbp) + mov_ri64(r12, DIE_SCAN_WORDS) + and_ri32(rax, 2)))
+    // flags bit1：跳过最内层（trap 自身的返回地址），用于尚未进入的帧
+    // flags bit1: skip the innermost word (the trap's own return address), for a
+    // frame that was never entered
+    push(it, la_jcc(CC_E, "s_loop"))
+    push(it, la_b(add_ri32(rbx, 8)))
+    push(it, la_l("s_loop"))
+    push(it, la_b(test_rr(r12, r12)))
+    push(it, la_jcc(CC_E, "exit"))
+    push(it, la_b(sub_ri32(r12, 1) + mov_rm(rax, rbx, 0) + mov_ri64(r8, done_addr) + cmp_rr(rax, r8)))
+    push(it, la_jcc(CC_E, "exit"))
+    push(it, la_b(mov_ri64(r8, lo_addr) + cmp_rr(rax, r8)))
+    push(it, la_jcc(CC_B, "s_next"))
+    push(it, la_b(mov_ri64(r9, hi_addr) + cmp_rr(rax, r9)))
+    push(it, la_jcc(CC_AE, "s_next"))
+    // 前一条须是 call r/m64（FF /2 寄存器形式：[w-2]=FF、[w-1]&F8=D0）
+    // the preceding instruction must be call r/m64 (FF /2 register form:
+    // [w-2]=FF, [w-1]&F8=D0)
+    push(it, la_b(movzx_rm8(rcx, rax, 0 - 2) + cmp_ri32(rcx, 255)))
+    push(it, la_jcc(CC_NE, "s_next"))
+    push(it, la_b(movzx_rm8(rcx, rax, 0 - 1) + and_ri32(rcx, 248) + cmp_ri32(rcx, 208)))
+    push(it, la_jcc(CC_NE, "s_next"))
+    // 键 = 返回地址 - 1 - lo；二分找最大的 off <= 键（r11 = lo 下标，r10 = hi 下标）
+    // key = return address - 1 - lo; binary-search the greatest off <= key
+    // (r11 = low index, r10 = high index)
+    push(it, la_b(sub_rr(rax, r8) + sub_ri32(rax, 1) + mov_ri64(r9, table_addr) + mov_rm(r10, r9, 0) + sub_ri32(r10, 1) + xor_rr(r11, r11)))
+    push(it, la_l("b_loop"))
+    push(it, la_b(cmp_rr(r11, r10)))
+    push(it, la_jcc(CC_GE, "b_found"))
+    push(it, la_b(mov_rr(rcx, r11) + add_rr(rcx, r10) + add_ri32(rcx, 1) + shr_ri(rcx, 1) + mov_rr(rdx, rcx) + shl_ri(rdx, 4) + add_rr(rdx, r9) + mov_rm32(rdx, rdx, 16) + cmp_rr(rdx, rax)))
+    push(it, la_jcc(CC_A, "b_hi"))
+    push(it, la_b(mov_rr(r11, rcx)))
+    push(it, la_jmp("b_loop"))
+    push(it, la_l("b_hi"))
+    push(it, la_b(mov_rr(r10, rcx) + sub_ri32(r10, 1)))
+    push(it, la_jmp("b_loop"))
+    // 项 = table + 16 + 16*i：[off:4][line:4][desc:8]，desc 为相对 table 的偏移，0 = 无源文件
+    // entry = table + 16 + 16*i: [off:4][line:4][desc:8], desc is an offset from the
+    // table, 0 = no source file
+    push(it, la_l("b_found"))
+    push(it, la_b(mov_rr(rdx, r11) + shl_ri(rdx, 4) + add_rr(rdx, r9) + mov_rm(rax, rdx, 24) + test_rr(rax, rax)))
+    push(it, la_jcc(CC_E, "s_next"))
+    push(it, la_b(mov_rm32(rcx, rdx, 20) + mov_mr(rbp, 0 - 32, rcx) + add_rr(rax, r9) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + mov_ri64(rdi, 2) + sys_mov_rax(1) + syscall() + mov_rm(rax, rbp, 0 - 32)))
+    let il = die_itoa("line")
+    k = 0
+    while k < len(il) {
+        push(it, il[k])
+        k = k + 1
+    }
+    push(it, la_b(mov_mi8(r15, 0, 41) + mov_mi8(r15, 1, 10) + add_ri32(r15, 2)))
+    let ff = die_flush("frame")
+    k = 0
+    while k < len(ff) {
+        push(it, ff[k])
+        k = k + 1
+    }
+    push(it, la_l("s_next"))
+    push(it, la_b(add_ri32(rbx, 8)))
+    push(it, la_jmp("s_loop"))
+    push(it, la_l("exit"))
+    push(it, la_b(mov_ri64(rdi, 4) + sys_mov_rax(60) + syscall()))
+    it
+}
+
+// trace_line_of 偏移转 1 起行号（二分） / trace_line_of maps an offset to a 1-based line (binary search)
+fn trace_line_of(table, off) {
+    let mut lo = 0
+    let mut hi = len(table) - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if table[mid] <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo + 1
+}
+
+// trace_desc 生成函数 fh 的帧前缀 "  at 名 (文件:"；无源文件返回 ""
+// trace_desc builds function fh's frame prefix "  at name (file:"; "" when it has no source file
+fn trace_desc(f_name, f_file, fh, ls_files, ls_names) {
+    let mut li = 0
+    while li < len(ls_files) {
+        if ls_files[li] == f_file[fh] {
+            let nm = if f_name[fh] == "" {
+                "<fn>"
+            } else {
+                f_name[fh]
+            }
+            return "  at " + nm + " (" + ls_names[li] + ":"
+        }
+        li = li + 1
+    }
+    ""
+}
+
+// trace_fh_li 取函数所属行表下标（-1 = 无源文件）
+// trace_fh_li returns the function's line-table index (-1 = no source file)
+fn trace_fh_li(f_file, fh, ls_files) {
+    let mut li = 0
+    while li < len(ls_files) {
+        if ls_files[li] == f_file[fh] {
+            return li
+        }
+        li = li + 1
+    }
+    0 - 1
+}
+
+// trace_ip_line 取 fh 第 ip 条指令的行号：-1 = 无 span（沿用上一行），0 = 注入区（无源文件）
+// trace_ip_line returns the line of fh's instruction at ip: -1 = no span (keep the
+// previous line), 0 = injected region (no source file)
+fn trace_ip_line(f_spans, fh, ip, li, ls_tables, ls_bases) {
+    if li < 0 || ip >= len(f_spans[fh]) {
+        return 0 - 1
+    }
+    match f_spans[fh][ip] {
+        frontend::SpanT::Sp(s0, _) => {
+            if s0 < ls_bases[li] {
+                0
+            } else {
+                trace_line_of(ls_tables[li], s0 - ls_bases[li])
+            }
+        },
+    }
+}
+
+// trace_table_bytes 装配回溯表：[n:8] + n 项 [off:4][line:4][desc:8] + 前缀串池；
+// ents 为扁平 [off, line, fh]（fh = -1 表无源文件），desc 为相对表首的偏移
+// trace_table_bytes assembles the trace table: [n:8] + n entries
+// [off:4][line:4][desc:8] + the prefix string pool; ents is a flat
+// [off, line, fh] list (fh = -1 means no source file), desc is an offset from the
+// table start
+fn trace_table_bytes(ents, f_name, f_file, ls_files, ls_names, gnames) {
+    let n = len(ents) / 3
+    let pool_base = 16 + 16 * n
+    let mut pool = []
+    let mut pool_len = 0
+    let mut desc_at = map()
+    let mut out = [e8(n), ""]
+    let mut i = 0
+    while i < n {
+        let fh = ents[3 * i + 2]
+        let mut d = 0
+        if fh >= 0 {
+            match get(desc_at, fh) {
+                Some(v) => {
+                    d = v
+                },
+                None => {
+                    let s = trace_desc(f_name, f_file, fh, ls_files, ls_names)
+                    if s != "" {
+                        d = pool_base + pool_len
+                        push(pool, e8(str_len(s)) + s)
+                        pool_len = pool_len + 8 + str_len(s)
+                    }
+                    put(desc_at, fh, d)
+                },
+            }
+        }
+        push(out, u32(ents[3 * i]) + u32(ents[3 * i + 1]) + e8(d))
+        i = i + 1
+    }
+    // 全局名表：[槽数个 8B 偏移]（相对表首）+ 名字串 [len:8][bytes]
+    // global name table: one 8B offset per slot (from the table start) + the
+    // name strings [len:8][bytes]
+    let names_off = pool_base + pool_len
+    out[1] = e8(names_off)
+    let mut noffs = []
+    let mut nstrs = []
+    let mut at = names_off + 8 * len(gnames)
+    let mut gi = 0
+    while gi < len(gnames) {
+        push(noffs, e8(at))
+        push(nstrs, e8(str_len(gnames[gi])) + gnames[gi])
+        at = at + 8 + str_len(gnames[gi])
+        gi = gi + 1
+    }
+    join(out, "") + join(pool, "") + join(noffs, "") + join(nstrs, "")
+}
+
+// die_splice 以真实表址/用户代码区重建 die 并原位换入函数字节（定长替换）；
+// 用户代码区止于函数字节末尾
+// die_splice rebuilds die with the real table address and user-code range and
+// swaps it into the function bytes in place (same length); the user-code range
+// ends at the end of the function bytes
+fn die_splice(funcs_bytes, die_off, die_len, table_addr, fn_base, user_lo, done_addr) {
+    let die_real = la_link(x86gen_die_items(table_addr, fn_base + user_lo, fn_base + str_len(funcs_bytes), done_addr))
+    substr(funcs_bytes, 0, die_off) + die_real + substr(funcs_bytes, die_off + die_len, str_len(funcs_bytes) - die_off - die_len)
+}
+
+// x86gen_guard 条件 cc_ok 成立则跳过 trap 序列 / x86gen_guard skips the trap sequence when cc_ok holds
+fn x86gen_guard(cc_ok, trap) {
+    jcc_rel32(cc_ok, str_len(trap)) + trap
+}
+
+// x86gen_int_binop_checked 发射带溢出检查的整数二元运算（rax op= rcx，OF 置位即 trap）
+// x86gen_int_binop_checked emits an overflow-checked integer binop (rax op= rcx; OF traps)
+fn x86gen_int_binop_checked(opb, sym) {
+    let trap = x86gen_trap_fmt(mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8), "integer overflow: " + byte_chr(1) + " " + sym + " " + byte_chr(2))
+    mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + opb + x86gen_guard(CC_NO, trap) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1)
+}
+
+// x86gen_int_divmod_checked 发射整数除/模：除数 0 trap；除法另查 INT64_MIN / -1
+// x86gen_int_divmod_checked emits integer div/mod: a zero divisor traps; division
+// also checks INT64_MIN / -1
+fn x86gen_int_divmod_checked(is_div) {
+    let zero_msg = if is_div {
+        "integer division by zero"
+    } else {
+        "integer modulo by zero"
+    }
+    let head = mov_rm(rcx, r15, 0 - 8) + test_rr(rcx, rcx) + x86gen_guard(CC_NE, x86gen_trap_exit(zero_msg)) + mov_rm(rax, r15, 0 - 16)
+    let res = if is_div {
+        rax
+    } else {
+        rdx
+    }
+    let body = cqo() + idiv_r(rcx) + mov_mr(r15, 0 - 16, res) + vs_pop_n(1)
+    if !is_div {
+        return head + body
+    }
+    let ovf = x86gen_trap_fmt(mov_rr(rdi, rax) + mov_rr(rsi, rcx), "integer overflow: " + byte_chr(1) + " / " + byte_chr(2))
+    let min_chk = mov_ri64(rdx, 1) + shl_ri(rdx, 63) + cmp_rr(rax, rdx) + x86gen_guard(CC_NE, ovf)
+    let m1_chk = cmp_ri32(rcx, 0 - 1) + jcc_rel32(CC_NE, str_len(min_chk)) + min_chk
+    head + m1_chk + body
+}
+
+// x86gen_int_neg_checked 发射带溢出检查的整数取负 / x86gen_int_neg_checked emits an overflow-checked integer negation
+fn x86gen_int_neg_checked() {
+    let trap = x86gen_trap_fmt(mov_rm(rdi, r15, 0 - 8), "integer overflow: -(" + byte_chr(1) + ")")
+    mov_rm(rax, r15, 0 - 8) + neg_r(rax) + x86gen_guard(CC_NO, trap) + mov_mr(r15, 0 - 8, rax)
+}
+
+// x86gen_idx_check 发射下标检查：[r15+idx_off] 须满足 0 <= idx < [[r15+obj_off]]（无符号比较一并挡负数）
+// x86gen_idx_check emits an index check: [r15+idx_off] must satisfy
+// 0 <= idx < [[r15+obj_off]] (the unsigned compare also rejects negatives)
+fn x86gen_idx_check(obj_off, idx_off, what) {
+    let trap = x86gen_trap_fmt(mov_rr(rdi, r9) + mov_rr(rsi, rdx), what + " " + byte_chr(1) + " out of bounds (len " + byte_chr(2) + ")")
+    mov_rm(rax, r15, obj_off) + mov_rm(r9, r15, idx_off) + mov_rm(rdx, rax, 0) + cmp_rr(r9, rdx) + x86gen_guard(CC_B, trap)
+}
+
+// x86gen_range_check 发射区间检查：r8 = a、r9 = b、rdx = len，bad 为一组 (cmp 序列, 违规条件码)，
+// 任一成立即 trap "<name>(a, b) out of bounds (len n)"
+// x86gen_range_check emits a range check with r8 = a, r9 = b, rdx = len; bad is a
+// list of (cmp sequence, violating condition code) pairs, any of which traps with
+// "<name>(a, b) out of bounds (len n)"
+fn x86gen_range_check(load, bad_cmps, bad_ccs, name) {
+    let trap = x86gen_trap_fmt(mov_rr(rdi, r8) + mov_rr(rsi, r9), name + "(" + byte_chr(1) + ", " + byte_chr(2) + ") out of bounds (len " + byte_chr(3) + ")")
+    let mut it = [la_b(load)]
+    let mut i = 0
+    while i < len(bad_cmps) {
+        push(it, la_b(bad_cmps[i]))
+        push(it, la_jcc(bad_ccs[i], "bad"))
+        i = i + 1
+    }
+    push(it, la_jmp("ok"))
+    push(it, la_l("bad"))
+    push(it, la_b(trap))
+    push(it, la_l("ok"))
+    la_link(it)
+}
+
+// x86gen_substr_check：start < 0 || cnt < 0 || start + cnt > len（rdx 同时作 len 与 die 第 3 参）
+// x86gen_substr_check: start < 0 || cnt < 0 || start + cnt > len (rdx doubles as
+// len and die's third argument)
+fn x86gen_substr_check() {
+    let load = mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0)
+    x86gen_range_check(load, [test_rr(r8, r8), test_rr(r9, r9), mov_rr(rcx, r8) + add_rr(rcx, r9) + cmp_rr(rcx, rdx)], [CC_L, CC_L, CC_G], "substr")
+}
+
+// x86gen_slice_check：start < 0 || end < start || end > len
+// x86gen_slice_check: start < 0 || end < start || end > len
+fn x86gen_slice_check() {
+    let load = mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0)
+    x86gen_range_check(load, [test_rr(r8, r8), cmp_rr(r9, r8), cmp_rr(r9, rdx)], [CC_L, CC_L, CC_G], "slice")
+}
+
+// x86gen_nonempty_check 发射 [[r15+off]] != 0 检查 / x86gen_nonempty_check emits a [[r15+off]] != 0 check
+fn x86gen_nonempty_check(off, msg) {
+    mov_rm(rax, r15, off) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + x86gen_guard(CC_NE, x86gen_trap_exit(msg))
+}
+
+// x86gen_uint_max_check 发射 0 <= [r15+off] <= max 检查（无符号比较） / x86gen_uint_max_check
+// emits a 0 <= [r15+off] <= max check (unsigned compare)
+fn x86gen_uint_max_check(off, max, msg) {
+    mov_rm(rax, r15, off) + mov_ri64(rcx, max) + cmp_rr(rax, rcx) + x86gen_guard(CC_BE, x86gen_trap_exit(msg))
+}
+
+// x86gen_assert_native 发射 assert：假则 trap "assertion failed: <msg>"
+// x86gen_assert_native emits assert: false traps with "assertion failed: <msg>"
+fn x86gen_assert_native(n) {
+    let trap = x86gen_trap_fmt(mov_rm(rdx, r15, 0 - 8), "assertion failed: " + byte_chr(4))
+    mov_rm(rax, r15, 0 - 16) + test_rr(rax, rax) + x86gen_guard(CC_NE, trap) + vs_pop_n(n + 1) + vs_push_zero()
+}
+
+// x86gen_die_block 链接 die 块；die_entry_off 为入口 A 相对块首的偏移
+// x86gen_die_block links the die block; die_entry_off is entry A's offset from the block start
+fn x86gen_die_block(table_addr, lo_addr, hi_addr, done_addr) {
+    la_link(x86gen_die_items(table_addr, lo_addr, hi_addr, done_addr))
+}
+
+fn die_entry_off() {
+    la_pos(x86gen_die_items(0, 0, 0, 0), "entry_a")
+}
+
+// x86gen_global_check 发射全局已定义检查（C 的 undefined variable）：标志字节在
+// rbx + 8*n_globals + 4096 + slot，DEF_GLOBAL 置 1
+// x86gen_global_check emits the global-defined check (C's undefined variable): the
+// flag byte lives at rbx + 8*n_globals + 4096 + slot, set to 1 by DEF_GLOBAL
+fn x86gen_global_check(n_globals, slot) {
+    let fail = mov_ri32(rdi, slot) + mov_ri64(r11, die_undef_g) + call_r(r11)
+    cmp_mi8(rbx, global_flag_disp(n_globals, slot), 0) + e1(117) + sb(str_len(fail)) + fail
+}
+
+// global_flag_disp 为槽 slot 的已定义标志相对 rbx 的位移 / global_flag_disp is slot's
+// defined-flag displacement from rbx
+fn global_flag_disp(n_globals, slot) {
+    8 * n_globals + 4096 + slot
+}

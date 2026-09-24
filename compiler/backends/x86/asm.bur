@@ -516,3 +516,162 @@ pub fn subsd_xmm(xdst, xsrc) {
 pub fn cmpsd_xmm(xdst, xsrc, imm) {
     e1(242) + rex(0, xdst, 0, xsrc) + e1(15) + e1(194) + modrm(3, xdst, xsrc) + e1(imm)
 }
+
+// movzx_rm8 发射字节加载并零扩展到 64 位 / movzx_rm8 emits a byte load zero-extended to 64 bits
+pub fn movzx_rm8(dst, base, disp) {
+    rex(0, dst, 0, base) + e1(15) + e1(182) + mem_operand(dst, base, disp)
+}
+
+// mov_mr8 发射低 8 位寄存器到内存；src 仅限 rax/rcx/rdx/rbx（无 REX 时 4..7 编码的是 ah..bh）
+// mov_mr8 emits a low-8-bit register store; src is limited to rax/rcx/rdx/rbx (without
+// REX, encodings 4..7 name ah..bh)
+pub fn mov_mr8(base, disp, src) {
+    rex(0, src, 0, base) + e1(136) + mem_operand(src, base, disp)
+}
+
+// mov_mi8 发射字节立即数写内存 / mov_mi8 emits a byte-immediate store to memory
+pub fn mov_mi8(base, disp, imm) {
+    rex(0, 0, 0, base) + e1(198) + mem_operand(0, base, disp) + sb(imm)
+}
+
+// cmp_ri32 发射 cmp 立即数 / cmp_ri32 emits cmp with an immediate
+pub fn cmp_ri32(dst, imm) {
+    alu_ri32(7, dst, imm)
+}
+
+// and_ri32 发射 and 立即数 / and_ri32 emits and with an immediate
+pub fn and_ri32(dst, imm) {
+    alu_ri32(4, dst, imm)
+}
+
+// shl_ri 发射按立即数左移 / shl_ri emits shift-left by an immediate
+pub fn shl_ri(dst, n) {
+    rex(1, 0, 0, dst) + e1(193) + modrm_reg(4, dst) + e1(n)
+}
+
+// shr_ri 发射按立即数逻辑右移 / shr_ri emits logical shift-right by an immediate
+pub fn shr_ri(dst, n) {
+    rex(1, 0, 0, dst) + e1(193) + modrm_reg(5, dst) + e1(n)
+}
+
+// jo_rel32 发射 jo rel32（有符号溢出） / jo_rel32 emits jo rel32 (signed overflow)
+pub fn jo_rel32(off) {
+    e1(15) + e1(128) + e4s(off)
+}
+
+// 条件码（jcc 0F 80+cc）/ condition codes (jcc is 0F 80+cc)
+pub let CC_O = 0
+pub let CC_B = 2
+pub let CC_AE = 3
+pub let CC_E = 4
+pub let CC_NE = 5
+pub let CC_BE = 6
+pub let CC_A = 7
+pub let CC_L = 12
+pub let CC_GE = 13
+pub let CC_LE = 14
+pub let CC_G = 15
+
+// 标签汇编：项为带标记的字符串——"B"+字节、"L"+标签名、"J"+前缀长度+前缀+标签名；
+// 跳转一律 rel32 定长，la_link 两遍解析（先定标签位置，再回填位移）
+// Label assembly: items are tagged strings — "B"+bytes, "L"+label, "J"+prefix
+// length+prefix+label; every jump is a fixed-size rel32, so la_link resolves in
+// two passes (place labels first, then fill in displacements)
+
+// la_b 原始字节项 / la_b wraps raw bytes as an item
+pub fn la_b(bytes) {
+    "B" + bytes
+}
+
+// la_l 标签项 / la_l is a label item
+pub fn la_l(name) {
+    "L" + name
+}
+
+// la_jmp 无条件跳转到标签 / la_jmp jumps to a label
+pub fn la_jmp(name) {
+    "J" + byte_chr(1) + e1(233) + name
+}
+
+// la_jcc 条件跳转到标签（cc 见 CC_*） / la_jcc jumps to a label on condition cc (see CC_*)
+pub fn la_jcc(cc, name) {
+    "J" + byte_chr(2) + e1(15) + e1(128 + cc) + name
+}
+
+// cmp_mi8 发射字节内存与立即数比较 / cmp_mi8 emits a byte-memory compare with an immediate
+pub fn cmp_mi8(base, disp, imm) {
+    rex(0, 0, 0, base) + e1(128) + mem_operand(7, base, disp) + sb(imm)
+}
+
+// la_pos 求标签在链接结果中的字节位置 / la_pos returns a label's byte position in the linked output
+pub fn la_pos(items, name) {
+    let mut at = 0
+    let mut i = 0
+    while i < len(items) {
+        let it = items[i]
+        let tag = substr(it, 0, 1)
+        if tag == "B" {
+            at = at + str_len(it) - 1
+        } else if tag == "L" {
+            if substr(it, 1, str_len(it) - 1) == name {
+                return at
+            }
+        } else {
+            at = at + byte_at(it, 1) + 4
+        }
+        i = i + 1
+    }
+    0 - 1
+}
+
+// la_link 解析标签并拼出字节 / la_link resolves labels and concatenates the bytes
+pub fn la_link(items) {
+    let mut pos = map()
+    let mut at = 0
+    let mut i = 0
+    while i < len(items) {
+        let it = items[i]
+        let tag = substr(it, 0, 1)
+        if tag == "B" {
+            at = at + str_len(it) - 1
+        } else if tag == "L" {
+            put(pos, substr(it, 1, str_len(it) - 1), at)
+        } else {
+            at = at + byte_at(it, 1) + 4
+        }
+        i = i + 1
+    }
+    let mut out = []
+    at = 0
+    i = 0
+    while i < len(items) {
+        let it = items[i]
+        let tag = substr(it, 0, 1)
+        if tag == "B" {
+            push(out, substr(it, 1, str_len(it) - 1))
+            at = at + str_len(it) - 1
+        } else if tag == "J" {
+            let pl = byte_at(it, 1)
+            let name = substr(it, 2 + pl, str_len(it) - 2 - pl)
+            let target = match get(pos, name) {
+                Some(p) => p,
+                None => {
+                    eprintln("internal error: la_link: undefined label " + name)
+                    exit(70)
+                },
+            }
+            let end = at + pl + 4
+            push(out, substr(it, 2, pl) + e4s(target - end))
+            at = end
+        }
+        i = i + 1
+    }
+    join(out, "")
+}
+
+// jcc_rel32 发射条件跳转 rel32（cc 见 CC_*） / jcc_rel32 emits a conditional rel32 jump (cc: see CC_*)
+pub fn jcc_rel32(cc, off) {
+    e1(15) + e1(128 + cc) + e4s(off)
+}
+
+pub let CC_NO = 1
