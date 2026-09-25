@@ -10,9 +10,7 @@
 // POLLIN on the waitset and parks; on wake it retries
 fn x86gen_tcp_accept_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
-    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1)
-    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
-    let fail = err_str + err_inst + add_ri32(rsp, 8)
+    let fail = mov_rr(rdi, rax) + x86gen_err_op_errno("tcp_accept") + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1) + add_ri32(rsp, 8)
     let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 8, 1)
     let retry_seq = mov_rm(rdi, r15, 0 - 8) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall()
     let ok_tail = mov_mr(rsp, 0, rax) + x86gen_set_nonblock_at(rsp, 0) + mov_rm(rax, rsp, 0) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
@@ -50,11 +48,15 @@ fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
     // an int, so GC pointer updates never apply)
     let close_ops = mov_rm(rdi, rsp, 8) + sys_mov_rax(3) + syscall()
     let fail_close = close_ops + fail
+    // fail_errno：SO_ERROR 路径（rcx = 正 errno，失败时 fd 待关）——文本对齐 C 的
+    // bur_net_err("tcp_dial", strerror)；socket/connect 立即失败保留 os error；解析失败走 gai_fail
+    let gai_fail = x86gen_err_lit("tcp_dial: " + gai_noname_text()) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + add_ri32(rsp, 32)
+    let fail_errno = mov_rr(r10, rcx) + mov_rm(rdi, rsp, 8) + sys_mov_rax(3) + syscall() + mov_rr(rdi, r10) + x86gen_err_op_errno("tcp_dial") + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + add_ri32(rsp, 32) + jmp_rel32(str_len(gai_fail))
     let sockaddr = x86gen_sockaddr_at()
-    let connect_ok = mov_rm(rax, rsp, 8) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    let connect_ok = mov_rm(rax, rsp, 8) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close) + str_len(fail_errno) + str_len(gai_fail))
     // sockcheck：getsockopt(SO_ERROR) == 0 才算连通；失败走 fail_close
     // sockcheck: getsockopt(SO_ERROR) == 0 confirms the connection; failures go to fail_close
-    let sockcheck = mov_rm(rdi, rsp, 8) + mov_ri64(rsi, 1) + mov_ri64(rdx, 4) + lea(r10, rsp, 12) + lea(r8, rsp, 4) + mov_ri32(rcx, 4) + mov_mr32(rsp, 4, rcx) + sys_mov_rax(55) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(mov_rm32(rcx, rsp, 12)) + str_len(test_rr(rcx, rcx)) + str_len(je_rel32(0)) + str_len(connect_ok)) + mov_rm32(rcx, rsp, 12) + test_rr(rcx, rcx) + jne_rel32(str_len(connect_ok))
+    let sockcheck = mov_rm(rdi, rsp, 8) + mov_ri64(rsi, 1) + mov_ri64(rdx, 4) + lea(r10, rsp, 12) + lea(r8, rsp, 4) + mov_ri32(rcx, 4) + mov_mr32(rsp, 4, rcx) + sys_mov_rax(55) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(mov_rm32(rcx, rsp, 12)) + str_len(test_rr(rcx, rcx)) + str_len(je_rel32(0)) + str_len(connect_ok)) + mov_rm32(rcx, rsp, 12) + test_rr(rcx, rcx) + jne_rel32(str_len(connect_ok) + str_len(fail_close))
     let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, rsp, 8, 4)
     let connect_check = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 115)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(fd_park) + str_len(sockcheck)) + neg_r(rax) + mov_ri64(rdx, 115) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(jmp_rel32(0))) + jmp_rel32(str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
     let connect_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(42) + syscall()
@@ -67,9 +69,9 @@ fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
         ""
     }
     let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + reg_sock + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
-    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok) + str_len(fail_close) + str_len(fail_errno))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
-    head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close
+    head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close + fail_errno + gai_fail
 }
 
 // x86gen_bool_convert_at 生成 bool→str 转换：true/false 常量字符串
@@ -868,9 +870,7 @@ fn x86gen_net_nb_native() {
 // retries; EINTR retries directly
 fn x86gen_net_read_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
-    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
-    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
-    let fail = err_str + err_inst
+    let fail = mov_rr(rdi, rax) + x86gen_err_op_errno("net_read") + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     // alloc_seq 先按 max 分配 str（len 头 + 字节区），root 存 [r15-24]；park 后 GC 会更新 root，
     // retry_seq 从 root 重载 buf 指针（r8 在 park 间不可靠）
     // alloc_seq allocates the str for max bytes (len header plus byte area), rooting it at
@@ -901,9 +901,7 @@ fn x86gen_net_read_native(sched_addr, waitset_add_addr) {
 // clobbers rcx, so w_adv reloads it from memory)
 fn x86gen_net_write_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
-    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
-    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
-    let fail = err_str + err_inst
+    let fail = mov_rr(rdi, rax) + x86gen_err_op_errno("net_write") + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let done = ok_inst + jmp_rel32(str_len(fail))
     let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 4)
     // w_adv：off += n；随后的 w_adv_jmp 跳回 loop_check（两处 5 = 各自 jmp_rel32 长度）
@@ -1649,11 +1647,12 @@ fn x86gen_eq_str() {
 // str>
 fn x86gen_tcp_listen_native() {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
-    let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
-    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
-    let fail = err_str + err_inst + add_ri32(rsp, 32)
-    let fail_close = mov_rr(rdi, r9) + sys_mov_rax(3) + syscall() + fail
-    let listen_ok = mov_rr(rax, r9) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close))
+    // fail_close：rax = 负 errno（socket/bind/listen 失败）——errno 经 r10 跨 close 的
+    // syscall，文本对齐 C 的 bur_net_err("tcp_listen", strerror)；解析失败（rax = -1，
+    // 无 fd）经 ip_fail 改道 gai_fail
+    let gai_fail = x86gen_err_lit("tcp_listen: " + gai_noname_text()) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + add_ri32(rsp, 32)
+    let fail_close = mov_rr(r10, rax) + mov_rr(rdi, r9) + sys_mov_rax(3) + syscall() + neg_r(r10) + mov_rr(rdi, r10) + x86gen_err_op_errno("tcp_listen") + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2) + add_ri32(rsp, 32) + jmp_rel32(str_len(gai_fail))
+    let listen_ok = mov_rr(rax, r9) + ok_inst + add_ri32(rsp, 32) + jmp_rel32(str_len(fail_close) + str_len(gai_fail))
     let listen_fail = test_rr(rax, rax) + jl_rel32(str_len(listen_ok))
     let listen_seq = mov_rr(rdi, r9) + mov_ri64(rsi, 128) + sys_mov_rax(50) + syscall()
     let bind_seq = mov_rr(rdi, r9) + lea(rsi, rsp, 16) + mov_ri64(rdx, 16) + sys_mov_rax(49) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
@@ -1674,9 +1673,9 @@ fn x86gen_tcp_listen_native() {
     }
     let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + reg_sock + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
     let sockaddr = x86gen_sockaddr_at()
-    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok))
+    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(reuse_seq) + str_len(bind_seq) + str_len(listen_seq) + str_len(listen_fail) + str_len(listen_ok) + str_len(fail_close))
     let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
-    head + sockaddr + socket_seq + nonblock_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close
+    head + sockaddr + socket_seq + nonblock_seq + reuse_seq + bind_seq + listen_seq + listen_fail + listen_ok + fail_close + gai_fail
 }
 
 // x86gen_join_native 内联 join：字符串列表用分隔符连接
