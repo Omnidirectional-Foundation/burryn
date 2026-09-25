@@ -1,0 +1,171 @@
+// net.bur — 网络句柄表：句柄编号与校验对齐 C 的 bur_nets。
+// The net handle table: handle numbering and validation matching C's bur_nets.
+//
+// C 的网络句柄自 0 顺序分配、永不复用，并区分监听与连接两类；x86 原先直接把 fd
+// （Windows 为 fd 表槽号）当句柄。隐藏全局槽 net_reg_g 存 [项] 列表，项 = fd*2 +
+// 类（0 监听、1 连接），关闭后置 -1。调用点先按 C 的顺序做参数检查（端口范围、
+// 空主机、max 为负/为 0、空写），再把句柄换成 fd 交给原有 native，新得的 fd 登记
+// 后换回句柄。
+// C hands out net handles sequentially from 0, never reusing them, and tells
+// listeners from connections; x86 used to hand out the fd itself (the fd-table
+// slot on Windows). The hidden global slot net_reg_g holds a list of entries,
+// entry = fd*2 + kind (0 listener, 1 connection), set to -1 once closed. Each
+// call site first checks arguments in C's order (port range, empty host,
+// negative or zero max, empty write), then swaps the handle for its fd before
+// the existing native runs, and registers any new fd, swapping back a handle.
+
+pub let mut net_reg_g = 0
+
+pub let NET_LISTENER = 0
+pub let NET_CONN = 1
+
+// x86gen_reg_append 把 rax 追加到隐藏全局槽 gslot 的列表：rdx = 下标，rax 不变
+// x86gen_reg_append appends rax to the list in hidden global slot gslot:
+// rdx = the index, rax unchanged
+fn x86gen_reg_append(gslot) {
+    let goff = 8 * gslot
+    let alloc = mov_rr(r11, r12) + xor_rr(rcx, rcx) + mov_mr(r11, 0, rcx) + mov_mr(r11, 8, rcx) + mov_mr(r11, 16, rcx) + add_ri32(r12, 24) + gc_rec_imm(r11, 24) + mov_mr(rbx, goff, r11)
+    let ensure = mov_rm(rcx, rbx, goff) + test_rr(rcx, rcx) + jne_rel32(str_len(alloc)) + alloc
+    vs_push(rax) + ensure + vs_push_zero() + mov_rm(rcx, rbx, goff) + vs_push(rcx) + mov_rm(rax, r15, 0 - 24) + vs_push(rax) + x86gen_push_native() + vs_pop_n(1) + mov_rm(rax, rbx, goff) + mov_rm(rdx, rax, 0) + sub_ri32(rdx, 1) + mov_rm(rax, r15, 0 - 8) + vs_pop_n(1)
+}
+
+// x86gen_net_register 登记 rax 里的新 fd（kind 类）→ rax = 句柄
+// x86gen_net_register registers the new fd in rax (of the given kind) -> rax = handle
+fn x86gen_net_register(kind) {
+    mov_rr(rcx, rax) + add_rr(rcx, rcx) + add_ri32(rcx, kind) + mov_rr(rax, rcx) + x86gen_reg_append(net_reg_g) + mov_rr(rax, rdx)
+}
+
+// x86gen_net_lookup 查句柄 rax：有效且类相符（kind < 0 不限类）→ rax = fd，否则 rax = -1；
+// rdx = 表项地址（仅有效时有意义）
+// x86gen_net_lookup resolves handle rax: valid and of the right kind (kind < 0
+// accepts either) -> rax = fd, otherwise rax = -1; rdx = the entry address
+// (meaningful only when valid)
+fn x86gen_net_lookup(kind) {
+    let mut it = []
+    push(it, la_b(mov_rm(rcx, rbx, 8 * net_reg_g) + test_rr(rcx, rcx)))
+    push(it, la_jcc(CC_E, "nl_bad"))
+    push(it, la_b(mov_rm(rdx, rcx, 0) + cmp_rr(rax, rdx)))
+    push(it, la_jcc(CC_AE, "nl_bad"))
+    push(it, la_b(mov_rm(rcx, rcx, 16) + shl_ri(rax, 3) + lea(rdx, rcx, 0) + add_rr(rdx, rax) + mov_rm(rax, rdx, 0) + test_rr(rax, rax)))
+    push(it, la_jcc(CC_L, "nl_bad"))
+    if kind >= 0 {
+        push(it, la_b(mov_rr(rcx, rax) + and_ri32(rcx, 1) + cmp_ri32(rcx, kind)))
+        push(it, la_jcc(CC_NE, "nl_bad"))
+    }
+    push(it, la_b(shr_ri(rax, 1)))
+    push(it, la_jmp("nl_ok"))
+    push(it, la_l("nl_bad"))
+    push(it, la_b(mov_ri64(rax, 0 - 1)))
+    push(it, la_l("nl_ok"))
+    la_link(it)
+}
+
+// net_result 把 rax 里的 Result 实例写到调用槽并弹 n 个实参
+// net_result stores the Result instance in rax into the call slot and pops n arguments
+fn net_result(n) {
+    mov_mr(r15, 0 - 8 * (n + 1), rax) + vs_pop_n(n)
+}
+
+// x86gen_ok_str_lit / x86gen_ok_unit 构造 Ok(字面量串) / Ok(()) 实例（rax 返回）
+// x86gen_ok_str_lit / x86gen_ok_unit build Ok(literal string) / Ok(()) (returned in rax)
+fn x86gen_ok_str_lit(text) {
+    x86gen_str_lit(text) + mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_rr(rax, rcx)
+}
+
+fn x86gen_ok_unit() {
+    mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_rr(rax, rcx)
+}
+
+// net_early 条件成立则直接以 res（构造 rax 的代码）返回，跳过 native
+// net_early returns res (code building rax) straight away when the condition
+// holds, skipping the native
+fn net_early(mut it, test, cc, res, n) {
+    let k = "ns" + str(len(it))
+    let inv = if cc % 2 == 0 {
+        cc + 1
+    } else {
+        cc - 1
+    }
+    push(it, la_b(test))
+    push(it, la_jcc(inv, k))
+    push(it, la_b(res + net_result(n)))
+    push(it, la_jmp("net_end"))
+    push(it, la_l(k))
+}
+
+// net_swap 把 [r15+off] 的句柄换成 kind 类 fd；无效则以 bad（构造 rax 的代码）返回
+// net_swap swaps the handle at [r15+off] for its fd of the given kind; an
+// invalid handle returns bad (code building rax)
+fn net_swap(mut it, off, kind, bad, n) {
+    push(it, la_b(mov_rm(rax, r15, off) + x86gen_net_lookup(kind)))
+    net_early(it, test_rr(rax, rax), CC_L, bad, n)
+    push(it, la_b(mov_mr(r15, off, rax)))
+}
+
+// net_port_check：端口 [r15+off] 不在 0..65535 即 Err("<op>: port out of range")
+// net_port_check: a port at [r15+off] outside 0..65535 gives Err("<op>: port out of range")
+fn net_port_check(mut it, op, off, n) {
+    net_early(it, mov_rm(rax, r15, off) + mov_ri64(rcx, 65535) + cmp_rr(rax, rcx), CC_A, x86gen_err_lit(op + ": port out of range"), n)
+}
+
+// net_reg_ok：调用槽里的 Result 若为 Ok(fd)，登记 fd 并把载荷换成句柄
+// net_reg_ok: when the Result in the call slot is Ok(fd), register the fd and
+// swap the payload for the handle
+fn net_reg_ok(kind) {
+    let body = mov_rm(rax, rax, 16) + x86gen_net_register(kind) + mov_rm(rcx, r15, 0 - 8) + mov_mr(rcx, 16, rax)
+    mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 8) + test_rr(rcx, rcx) + jne_rel32(str_len(body)) + body
+}
+
+// x86gen_net_wrap 包装网络 native 的调用点 / x86gen_net_wrap wraps a net native's call site
+fn x86gen_net_wrap(name, native) {
+    let mut it = []
+    if name == "tcp_listen" {
+        net_port_check(it, "tcp_listen", 0 - 8, 2)
+        push(it, la_b(native + net_reg_ok(NET_LISTENER)))
+    } else if name == "tcp_dial" {
+        net_early(it, mov_rm(rax, r15, 0 - 16) + mov_rm(rax, rax, 0) + test_rr(rax, rax), CC_E, x86gen_err_lit("tcp_dial: empty host"), 2)
+        net_port_check(it, "tcp_dial", 0 - 8, 2)
+        push(it, la_b(native + net_reg_ok(NET_CONN)))
+    } else if name == "tcp_accept" {
+        net_swap(it, 0 - 8, NET_LISTENER, x86gen_err_lit("tcp_accept: invalid listener handle"), 1)
+        push(it, la_b(native + net_reg_ok(NET_CONN)))
+    } else if name == "net_read" {
+        net_early(it, mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax), CC_L, x86gen_err_lit("net_read: max must not be negative"), 2)
+        net_early(it, mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax), CC_E, x86gen_ok_str_lit(""), 2)
+        net_swap(it, 0 - 16, NET_CONN, x86gen_err_lit("net_read: invalid connection handle"), 2)
+        push(it, la_b(native))
+    } else if name == "net_write" {
+        net_early(it, mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + test_rr(rax, rax), CC_E, x86gen_ok_unit(), 2)
+        net_swap(it, 0 - 16, NET_CONN, x86gen_err_lit("net_write: invalid connection handle"), 2)
+        push(it, la_b(native))
+    } else if name == "net_close" {
+        let trap = x86gen_trap_fmt(mov_rm(rdi, r15, 0 - 8), "net_close: invalid or closed handle " + byte_chr(1))
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + x86gen_net_lookup(0 - 1) + test_rr(rax, rax)))
+        push(it, la_jcc(CC_GE, "nc_ok"))
+        push(it, la_b(trap))
+        push(it, la_l("nc_ok"))
+        push(it, la_b(mov_ri64(rcx, 0 - 1) + mov_mr(rdx, 0, rcx) + mov_mr(r15, 0 - 8, rax) + native))
+    } else {
+        // net_nb：op 0 accept（监听句柄）、1 read、2 write（连接句柄），各按 C 的顺序检查
+        // net_nb: op 0 accept (listener handle), 1 read, 2 write (connection
+        // handle), each checked in C's order
+        push(it, la_b(mov_rm(rax, r15, 0 - 32) + test_rr(rax, rax)))
+        push(it, la_jcc(CC_NE, "nb_not_acc"))
+        net_swap(it, 0 - 24, NET_LISTENER, x86gen_err_lit("tcp_accept: invalid listener handle"), 4)
+        push(it, la_jmp("nb_go"))
+        push(it, la_l("nb_not_acc"))
+        push(it, la_b(cmp_ri32(rax, 1)))
+        push(it, la_jcc(CC_NE, "nb_not_read"))
+        net_early(it, mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax), CC_L, x86gen_err_lit("net_read: max must not be negative"), 4)
+        net_early(it, mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax), CC_E, x86gen_ok_str_lit(""), 4)
+        net_swap(it, 0 - 24, NET_CONN, x86gen_err_lit("net_read: invalid connection handle"), 4)
+        push(it, la_jmp("nb_go"))
+        push(it, la_l("nb_not_read"))
+        net_swap(it, 0 - 24, NET_CONN, x86gen_err_lit("net_write: invalid connection handle"), 4)
+        net_early(it, mov_rm(rax, r15, 0 - 16) + mov_rm(rax, rax, 0) + test_rr(rax, rax), CC_E, x86gen_ok_str_lit("0"), 4)
+        push(it, la_l("nb_go"))
+        push(it, la_b(native))
+    }
+    push(it, la_l("net_end"))
+    la_link(it)
+}
