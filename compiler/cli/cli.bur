@@ -100,6 +100,65 @@ fn fold_script_or_exit(stmts, path) {
     }
 }
 
+// shift_diag 把诊断 span 整体平移 -base：单文件 x86 构建把 float_rt 文本拼接在用户源码
+// 之前，checker 产出的 span 落在拼接坐标上，渲染前按注入长度平移回用户文件坐标。
+// labels 随行；fixes 的渲染只用到替换文本，span 原样带过。
+// shift_diag shifts a diagnostic's spans by -base: the single-file x86 build
+// concatenates float_rt ahead of the user source, so checker spans live in
+// concat coordinates and must move back before rendering. Labels shift with
+// them; fixes render only their replacement text, so their spans pass through.
+fn shift_diag(d, base) {
+    match d {
+        lib::DiagT::Diag(ie, code, msg, help, s, e) => lib::DiagT::Diag(ie, code, msg, help, s - base, e - base),
+        lib::DiagT::DiagX(ie, code, msg, help, s, e, labs, fixes) => lib::DiagT::DiagX(ie, code, msg, help, s - base, e - base, shift_labs(labs, base), fixes),
+    }
+}
+
+// shift_labs 平移标签 span / shift_labs shifts label spans by -base
+fn shift_labs(labs, base) {
+    let mut out = []
+    for lab in labs {
+        match lab {
+            lib::LabelT::Lab(ls, le, text) => push(out, lib::LabelT::Lab(ls - base, le - base, text)),
+        }
+    }
+    out
+}
+
+// emit_errors_base 带注入基差的 emit_errors：base = 0 时与 emit_errors 等价
+// emit_errors_base is emit_errors with an injection base; base = 0 degenerates
+// to emit_errors
+fn emit_errors_base(diags, path, errors_only, base) {
+    if base == 0 {
+        return emit_errors(diags, path, errors_only)
+    }
+    let mut errs = false
+    for d in diags {
+        let is_err = diag_is_error(d)
+        if is_err {
+            errs = true
+        }
+        if is_err || !errors_only {
+            eprintln(tooling::render_diag(shift_diag(d, base), path))
+        }
+    }
+    errs
+}
+
+// fold_script_or_exit_base 带注入基差的脚本折叠（失败即退出）
+// fold_script_or_exit_base folds a script with an injection base, exiting on failure
+fn fold_script_or_exit_base(stmts, path, base) {
+    match frontend::fold_consts(stmts) {
+        frontend::FoldOut::FoldedScript(out, diags) => {
+            if emit_errors_base(diags, path, false, base) {
+                exit(exit_static)
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
 // fold_packages_or_exit 折叠包（失败即退出） / fold_packages_or_exit folds packages or exits on failure
 fn fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {
     match frontend::fold_const_packages(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports) {

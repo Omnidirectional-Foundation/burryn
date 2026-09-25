@@ -375,25 +375,31 @@ fn compile_file_to_x86(path) {
     } else {
         src
     }
+    // base = 注入前缀长度：checker 的 span 落在拼接坐标上，渲染前整体平移回用户文件
+    // 坐标（emit_errors_base / shift_diag）；trace 侧由 ls_bases 承担同一偏移
+    // base = the injected prefix length: checker spans live in concat coordinates
+    // and shift back before rendering (emit_errors_base / shift_diag); the trace
+    // side carries the same offset via ls_bases
+    let base = str_len(injected)
     match frontend::lex(injected + src2) {
         lib::LexOut::Lexed(toks, ldiags, _) => {
-            if emit_errors(ldiags, path, false) {
+            if emit_errors_base(ldiags, path, false, base) {
                 exit(exit_static)
             }
             match frontend::parse(toks) {
                 frontend::ParseOut::Parsed(stmts, pdiags) => {
-                    if emit_errors(pdiags, path, false) {
+                    if emit_errors_base(pdiags, path, false, base) {
                         exit(exit_static)
                     }
-                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    let checked_stmts = fold_script_or_exit_base(stmts, path, base)
                     match frontend::typecheck_script(checked_stmts) {
                         lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
-                            if emit_errors(cdiags, path, true) {
+                            if emit_errors_base(cdiags, path, true, base) {
                                 exit(exit_static)
                             }
                             match bytecode::compile_script(checked_stmts, chan_fors) {
                                 bytecode::CompileOut::CompileFailed(d, _) => {
-                                    eprintln(tooling::render_diag(d, path))
+                                    eprintln(tooling::render_diag(shift_diag(d, base), path))
                                     exit(exit_static)
                                 },
                                 bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => x86::x86gen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src2)], [str_len(injected)]),
