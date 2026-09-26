@@ -34,6 +34,9 @@ pub let mut sb_int_g = 0
 pub let mut sb_lit_g = 0
 pub let mut sb_fin_g = 0
 pub let mut sb_res_g = 0
+// fn 名表基址（x86.bur 建表时定，供 closure 打印取名字） / base of the fn-name
+// table (set by x86.bur when the table is built; used by closure printing)
+pub let mut fn_names_g = 0
 
 // sb_call 发射对构建器子程序的调用 / sb_call emits a call to a builder subroutine
 fn sb_call(addr) {
@@ -198,6 +201,10 @@ fn fmt_label(ctx: X86Ctx, mut g: FmtGen, t0, quote) {
 fn fmt_norm(t) {
     if t == "str" || t == "bool" || t == "unit" || t == "float" || is_list_type(t) || str_len(t) > 4 && substr(t, 0, 4) == "tup:" || is_map_type(t) || is_record_type(t) || is_enum_enc(t) || str_len(t) >= 4 && substr(t, 0, 4) == "chan" {
         t
+    } else if t == "closure" || str_len(t) > 8 && substr(t, 0, 8) == "closure:" {
+        // fn 值类型统一键为 closure（正文与句柄无关，池更小） / all fn-value
+        // types key as closure (the body ignores the handle, keeping the pool small)
+        "closure"
     } else {
         "int"
     }
@@ -370,6 +377,15 @@ fn fmt_body(ctx: X86Ctx, mut g: FmtGen, t, quote, lbl) {
             vi = vi + 1
         }
         push(it, la_l("e_end"))
+    } else if t == "closure" {
+        // fn 值：closure[0] = fn 句柄，查 fn 名表（基址 fn_names_g + 句柄*8 的偏移
+        // → [len:8][bytes] 名字串）追加；与 quote 无关。对齐 C 的 bur_format。
+        // fn values: closure[0] is the fn handle; look it up in the fn-name
+        // table (base fn_names_g, offset at handle*8 → a [len:8][bytes] name
+        // string) and append it; quote is irrelevant. Matches C's bur_format.
+        push(it, fmt_b_lit(0 - 16, "<fn "))
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + shl_ri(rax, 3) + mov_ri64(rcx, fn_names_g) + add_rr(rax, rcx) + mov_rm(rax, rax, 0) + add_rr(rax, rcx) + mov_rm(rdi, r15, 0 - 16) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + sb_call(sb_app_g)))
+        push(it, fmt_b_lit(0 - 16, ">"))
     } else if str_len(t) >= 4 && substr(t, 0, 4) == "chan" {
         push(it, fmt_b_lit(0 - 16, "<chan cap="))
         push(it, la_b(mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + mov_rm(rsi, rsi, CH_CAP) + sb_call(sb_int_g)))
