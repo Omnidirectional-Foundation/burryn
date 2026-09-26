@@ -877,6 +877,70 @@ jobs:
           echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
+      # TEMP §18 probe (2026-09-26 值机夜班): the mac corpus step intermittently SIGSEGVs
+      # the small exec cases (io_exec/exec_large, ~3/5 runs at b9330b3–264b3af). Re-run
+      # them under a loop and dump the ReportCrash .ips payloads (exception, faulting
+      # address, fault-thread frames with imageOffset) so the exact faulting instruction
+      # can be located against macho-out. Never gates: always exits 0; delete once the
+      # root cause lands.
+      - name: "TEMP: section-18 exec flake probe (crash reports)"
+        if: always()
+        run: |
+          set +e
+          [ -d macho-out/corpus ] || { echo "no corpus dir"; exit 0; }
+          total=0; hits=0
+          for n in examples_io_exec exec_large; do
+            bin="macho-out/corpus/$n-mac"
+            [ -f "$bin" ] || { echo "missing $bin"; continue; }
+            codesign -f -s - "$bin" 2>/dev/null
+            chmod +x "$bin"
+            for i in $(seq 1 30); do
+              total=$((total + 1))
+              perl -e 'alarm 20; exec @ARGV' "$bin" >probe-out.txt 2>&1
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                hits=$((hits + 1))
+                echo "PROBE $n run=$i rc=$rc"
+              fi
+            done
+          done
+          echo "PROBE summary: $hits/$total non-zero exits"
+          sleep 5
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -5); do
+            echo "===== $f ====="
+            python3 - "$f" <<'PY'
+          import json, sys
+          raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          nl = raw.find("\n")
+          try:
+              j = json.loads(raw[nl + 1:])
+          except Exception as e:
+              print("payload parse failed:", e)
+              print(raw[:600])
+              sys.exit(0)
+          print("proc:", j.get("procName"), "pid:", j.get("pid"))
+          print("exception:", json.dumps(j.get("exception")))
+          print("termination:", json.dumps(j.get("termination")))
+          print("vmRegionInfo:", j.get("vmRegionInfo"))
+          imgs = j.get("usedImages", [])
+          ft = j.get("faultingThread")
+          threads = j.get("threads", [])
+          if isinstance(ft, int) and ft < len(threads):
+              t = threads[ft]
+              print("faulting thread:", t.get("queue"), t.get("name"))
+              for fr in t.get("frames", [])[:30]:
+                  ii = fr.get("imageIndex")
+                  nm = imgs[ii].get("name") if isinstance(ii, int) and ii < len(imgs) else "?"
+                  print("  frame:", nm, "imageOffset=", hex(fr.get("imageOffset", 0)), fr.get("symbol", ""))
+              for k in ("usedRegisters", "lastExceptionBacktrace"):
+                  if k in t:
+                      print(k + ":", json.dumps(t[k])[:1500])
+          else:
+              print("faultingThread idx:", ft, "threads:", len(threads))
+          PY
+          done
+          exit 0
+
   runtime:
     needs: []
     runs-on: ${{ matrix.os }}
