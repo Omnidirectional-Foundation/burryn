@@ -889,7 +889,7 @@ jobs:
           set +e
           [ -d macho-out/corpus ] || { echo "no corpus dir"; exit 0; }
           total=0; hits=0
-          for n in examples_io_exec exec_large; do
+          for n in examples_io_exec testdata_regression_exec_large; do
             bin="macho-out/corpus/$n-mac"
             [ -f "$bin" ] || { echo "missing $bin"; continue; }
             codesign -f -s - "$bin" 2>/dev/null
@@ -906,7 +906,7 @@ jobs:
           done
           echo "PROBE summary: $hits/$total non-zero exits"
           sleep 5
-          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -5); do
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -6); do
             echo "===== $f ====="
             python3 - "$f" <<'PY'
           import json, sys
@@ -923,20 +923,35 @@ jobs:
           print("termination:", json.dumps(j.get("termination")))
           print("vmRegionInfo:", j.get("vmRegionInfo"))
           imgs = j.get("usedImages", [])
+          print("usedImages:")
+          for k, im in enumerate(imgs):
+              b = im.get("base", 0)
+              sz = im.get("size", 0)
+              print("  [%d]" % k, repr(im.get("name")), "base=", hex(b), "size=", hex(sz))
           ft = j.get("faultingThread")
           threads = j.get("threads", [])
+          print("threads:", len(threads), "faulting idx:", ft)
+          for ti, t in enumerate(threads):
+              mark = " <<<" if ti == ft else ""
+              print("thread[%d]%s" % (ti, mark), t.get("queue"), t.get("name"))
+              for fr in t.get("frames", [])[:14]:
+                  ii = fr.get("imageIndex")
+                  if isinstance(ii, int) and 0 <= ii < len(imgs):
+                      im = imgs[ii]
+                      nm = im.get("name")
+                      off = fr.get("imageOffset", 0)
+                      vma = im.get("base", 0) + off
+                      print("   ", ("%-28s" % (repr(nm))), "off=", hex(off), "vma=", hex(vma), fr.get("symbol", ""))
+                  else:
+                      print("    imageIdx?", ii, "off=", hex(fr.get("imageOffset", 0)))
           if isinstance(ft, int) and ft < len(threads):
               t = threads[ft]
-              print("faulting thread:", t.get("queue"), t.get("name"))
-              for fr in t.get("frames", [])[:30]:
-                  ii = fr.get("imageIndex")
-                  nm = imgs[ii].get("name") if isinstance(ii, int) and ii < len(imgs) else "?"
-                  print("  frame:", nm, "imageOffset=", hex(fr.get("imageOffset", 0)), fr.get("symbol", ""))
-              for k in ("usedRegisters", "lastExceptionBacktrace"):
+              for k in ("usedRegisters", "notableAddresses", "lastExceptionBacktrace"):
                   if k in t:
-                      print(k + ":", json.dumps(t[k])[:1500])
-          else:
-              print("faultingThread idx:", ft, "threads:", len(threads))
+                      print(k, ":", json.dumps(t[k])[:1800])
+          for k in ("asi", "ktriageinfo", "vmRegionInfo"):
+              if k in j:
+                  print(k, ":", json.dumps(j[k])[:600])
           PY
           done
           exit 0
