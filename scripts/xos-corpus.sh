@@ -57,6 +57,10 @@ done
 # simply fail to build and land in BUILD_FAIL
 for d in testdata/pkg/*/; do
     [ -f "${d}bur.mod" ] || continue
+    # sccorder 打印地址值（随平台/ASLR 变化），永远无法跨目标对照，剔除
+    # sccorder prints an address value that differs per platform and per ASLR
+    # layout; it can never match across targets
+    case "$d" in */sccorder/) continue ;; esac
     name="testdata_pkg_$(basename "$d")"
     if ! "$BUR" build --backend x86 "$d" -o "$tmp/ref" >/dev/null 2>&1; then
         continue
