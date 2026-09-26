@@ -350,8 +350,16 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 None => w(vs_push_zero()),
             }
             push(shadow, name)
+            // fn 名引用跟踪为 closure（全局槽里本就是闭包对象），使 str/println 与
+            // map 值类型能落到 closure 格式化分支；不带句柄：动态调用的 parse_int
+            // 必然失败而走默认体，与从未跟踪时的行为一致；具名调用不读被调跟踪类型
+            // fn-name references track as "closure" (the global slot holds the closure
+            // object) so str/println and map value types reach the closure formatter;
+            // handle-less on purpose: the dynamic-call parse fails and takes the
+            // default body, matching the never-tracked behavior; named calls never
+            // read the callee's tracked type
             let gtype = if find_fn_by_name(f_name, name) >= 0 {
-                ""
+                "closure"
             } else if contains(lib::native_names, name) {
                 "native:" + name
             } else {
@@ -1328,7 +1336,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 if callee == "get" {
                     w(x86gen_get_map_native(kk == "str"))
                     let v_kind = map_val_type(m_t)
-                    if v_kind == "" {
+                    if v_kind == "" || v_kind == "closure" {
                         ret_type = "enum"
                     } else {
                         ret_type = enum_payload_enc_ctx(ctx, "Option", [[v_kind]])
@@ -3225,9 +3233,9 @@ fn find_fn_by_name(f_name, name) {
 
 // map_key_type 取 map 键类型 / map_key_type extracts the map key type
 fn map_key_type(t) {
-    if t == "map-str" || t == "map-str-int" || t == "map-str-str" || t == "map-str-float" {
+    if t == "map-str" || t == "map-str-int" || t == "map-str-str" || t == "map-str-float" || t == "map-str-closure" {
         "str"
-    } else if t == "map-int" || t == "map-int-str" || t == "map-int-int" || t == "map-int-float" {
+    } else if t == "map-int" || t == "map-int-str" || t == "map-int-int" || t == "map-int-float" || t == "map-int-closure" {
         "int"
     } else {
         ""
@@ -3242,6 +3250,11 @@ fn map_val_type(t) {
         "str"
     } else if t == "map-str-float" || t == "map-int-float" {
         "float"
+    } else if t == "map-str-closure" || t == "map-int-closure" {
+        // fn 值 map：fmt 用；get 的 Option 编码不支持 closure（emit 侧回退 untyped）
+        // fn-valued map: for fmt; get's Option encoding cannot carry a closure
+        // (the emit side falls back to untyped)
+        "closure"
     } else {
         ""
     }

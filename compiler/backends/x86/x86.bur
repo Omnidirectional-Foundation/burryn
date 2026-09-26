@@ -536,6 +536,39 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     sb_set_addrs(die_addr + die_len)
     errtext_g = die_addr + die_len + str_len(la_link(x86gen_sb_items()))
     let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items())
+    // fn 名表：每函数一项 8B 偏移（自表基址起算），指向 [len:8][bytes] 名字串；
+    // 空名记为 anonymous（对齐 C 的 bur_format）。放在用户代码之前，其绝对地址在此
+    // 处即已最终确定（与 sb_set_addrs 同基准），fmt 子程序经 mov_ri64 取基址。
+    // fn-name table: one 8B offset per fn (from the table base) into [len:8][bytes]
+    // name strings; empty names are stored as "anonymous" (matching C's
+    // bur_format). It sits before user code and its absolute address is final
+    // right here (same basis as sb_set_addrs), so fmt subroutines can reach it
+    // through a mov_ri64 base.
+    let mut fn_names_bytes = ""
+    let mut fn_name_strs = []
+    let mut fnh = 0
+    while fnh < nfn {
+        push(fn_name_strs, if f_name[fnh] == "" {
+            "anonymous"
+        } else {
+            f_name[fnh]
+        })
+        fnh = fnh + 1
+    }
+    let mut fn_at = 8 * nfn
+    fnh = 0
+    while fnh < nfn {
+        fn_names_bytes = fn_names_bytes + e8(fn_at)
+        fn_at = fn_at + 8 + str_len(fn_name_strs[fnh])
+        fnh = fnh + 1
+    }
+    fnh = 0
+    while fnh < nfn {
+        fn_names_bytes = fn_names_bytes + e8(str_len(fn_name_strs[fnh])) + fn_name_strs[fnh]
+        fnh = fnh + 1
+    }
+    fn_names_g = code_origin() + const_data_len + str_len(funcs_bytes)
+    funcs_bytes = funcs_bytes + fn_names_bytes
     // 内部子程序 unwind 覆盖：gc_record（9-push）、mark_addr（7-push）与其余六个纯
     // call/ret、零序言的子程序（gc_collect、chan 系四个、waitset_add、timer_add）——
     // 序言形态逐个核对自 runtime.bur 源码（push_r 出现次数与顺序）。调度器三块
