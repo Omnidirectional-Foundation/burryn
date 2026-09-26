@@ -1514,6 +1514,20 @@ void bur_fiber_fd_ready(int64_t owner, short revents) {
 // timer entry supplies poll's timeout; fd callbacks handle ready sources.
 void bur_wait_poll(bool block) {
     bur_wait_reset();
+#ifdef _WIN32
+    // WSAPoll accepts sockets only, and child pipes are named-pipe handles:
+    // they cannot join the wait set (a bare WSAPoll over them fails without
+    // firing callbacks, which used to hang exec forever). Pump live procs
+    // directly here instead, and cap a blocking poll below so the scheduler
+    // wakes up to keep pumping.
+    bool procs_live = false;
+    for (int64_t i = 0; i < bur_nprocs; i++) {
+        BurProc *p = &bur_procs[i];
+        if (!p->used || p->complete) continue;
+        bur_proc_pump(p);
+        procs_live = true;
+    }
+#else
     for (int64_t i = 0; i < bur_nprocs; i++) {
         BurProc *p = &bur_procs[i];
         if (!p->used || p->complete) continue;
@@ -1521,6 +1535,7 @@ void bur_wait_poll(bool block) {
         bur_wait_fd(p->errfd, POLLIN, i, bur_proc_ready);
         bur_wait_fd(p->failfd, POLLIN, i, bur_proc_ready);
     }
+#endif
     for (int64_t i = 0; i < bur_nfibers; i++) {
         Fiber *f = bur_fibers[i];
         if (f->status == FBLOCKED_TIMER) bur_wait_timer(f->wake_ns);
@@ -1534,9 +1549,16 @@ void bur_wait_poll(bool block) {
             int64_t d = bur_waitset.deadline_ns - bur_now_ns();
             timeout_ms = d <= 0 ? 0 : (int)(d / 1000000) + 1;
         }
+#ifdef _WIN32
+        if (timeout_ms < 0 && procs_live) timeout_ms = 10; // wake to pump procs
+#endif
     }
 #ifdef _WIN32
-    WSAPoll(bur_waitset.fds, (ULONG)bur_waitset.n, timeout_ms);
+    if (bur_waitset.n == 0) {
+        if (timeout_ms > 0) Sleep((DWORD)timeout_ms); // nothing pollable: just wait
+    } else {
+        WSAPoll(bur_waitset.fds, (ULONG)bur_waitset.n, timeout_ms);
+    }
 #else
     poll(bur_waitset.fds, (nfds_t)bur_waitset.n, timeout_ms);
 #endif
