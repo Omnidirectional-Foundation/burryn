@@ -877,19 +877,22 @@ jobs:
           echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
-      # TEMP §18 probe (2026-09-26 值机夜班): the mac corpus step intermittently SIGSEGVs
-      # the small exec cases (io_exec/exec_large, ~3/5 runs at b9330b3–264b3af). Re-run
-      # them under a loop and dump the ReportCrash .ips payloads (exception, faulting
-      # address, fault-thread frames with imageOffset) so the exact faulting instruction
-      # can be located against macho-out. Never gates: always exits 0; delete once the
-      # root cause lands.
-      - name: "TEMP: section-18 exec flake probe (crash reports)"
+      # TEMP §18 probe v3 (2026-09-26 值机夜班): v2 proved the crash PC is a live
+      # uptime-ns value (2.18e11..2.19e11, tracks runner time across jobs), i.e. a
+      # wild ret/jmp onto a clock quantity in the sync-exec timer-park path. v3:
+      # (a) same raw loop, but dump the TOP-LEVEL usedRegisters/notableAddresses
+      # from the .ips payload (v2 only looked inside thread records, printed none);
+      # (b) lldb batch loop to catch the scene live: registers plus the memory the
+      # stale resume consumed (stack slots around rsp, candidate fibers at rax/rdi).
+      # Never gates: always exits 0; delete once the root cause lands.
+      - name: "TEMP: section-18 exec flake probe (lldb scene + ips registers)"
         if: always()
         run: |
           set +e
           [ -d macho-out/corpus ] || { echo "no corpus dir"; exit 0; }
+          CASES="examples_io_exec testdata_regression_exec_large"
           total=0; hits=0
-          for n in examples_io_exec testdata_regression_exec_large; do
+          for n in $CASES; do
             bin="macho-out/corpus/$n-mac"
             [ -f "$bin" ] || { echo "missing $bin"; continue; }
             codesign -f -s - "$bin" 2>/dev/null
@@ -898,13 +901,10 @@ jobs:
               total=$((total + 1))
               perl -e 'alarm 20; exec @ARGV' "$bin" >probe-out.txt 2>&1
               rc=$?
-              if [ "$rc" -ne 0 ]; then
-                hits=$((hits + 1))
-                echo "PROBE $n run=$i rc=$rc"
-              fi
+              [ "$rc" -ne 0 ] && { hits=$((hits + 1)); echo "PROBE $n run=$i rc=$rc"; }
             done
           done
-          echo "PROBE summary: $hits/$total non-zero exits"
+          echo "PROBE-a summary: $hits/$total non-zero exits"
           sleep 5
           for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -6); do
             echo "===== $f ====="
@@ -915,44 +915,41 @@ jobs:
           try:
               j = json.loads(raw[nl + 1:])
           except Exception as e:
-              print("payload parse failed:", e)
-              print(raw[:600])
-              sys.exit(0)
+              print("payload parse failed:", e); sys.exit(0)
           print("proc:", j.get("procName"), "pid:", j.get("pid"))
           print("exception:", json.dumps(j.get("exception")))
-          print("termination:", json.dumps(j.get("termination")))
-          print("vmRegionInfo:", j.get("vmRegionInfo"))
-          imgs = j.get("usedImages", [])
-          print("usedImages:")
-          for k, im in enumerate(imgs):
-              b = im.get("base", 0)
-              sz = im.get("size", 0)
-              print("  [%d]" % k, repr(im.get("name")), "base=", hex(b), "size=", hex(sz))
-          ft = j.get("faultingThread")
-          threads = j.get("threads", [])
-          print("threads:", len(threads), "faulting idx:", ft)
-          for ti, t in enumerate(threads):
-              mark = " <<<" if ti == ft else ""
-              print("thread[%d]%s" % (ti, mark), t.get("queue"), t.get("name"))
-              for fr in t.get("frames", [])[:14]:
-                  ii = fr.get("imageIndex")
-                  if isinstance(ii, int) and 0 <= ii < len(imgs):
-                      im = imgs[ii]
-                      nm = im.get("name")
-                      off = fr.get("imageOffset", 0)
-                      vma = im.get("base", 0) + off
-                      print("   ", ("%-28s" % (repr(nm))), "off=", hex(off), "vma=", hex(vma), fr.get("symbol", ""))
-                  else:
-                      print("    imageIdx?", ii, "off=", hex(fr.get("imageOffset", 0)))
-          if isinstance(ft, int) and ft < len(threads):
-              t = threads[ft]
-              for k in ("usedRegisters", "notableAddresses", "lastExceptionBacktrace"):
-                  if k in t:
-                      print(k, ":", json.dumps(t[k])[:1800])
-          for k in ("asi", "ktriageinfo", "vmRegionInfo"):
+          print("vmRegionInfo:", str(j.get("vmRegionInfo"))[:300])
+          for k in ("usedRegisters", "notableAddresses"):
               if k in j:
-                  print(k, ":", json.dumps(j[k])[:600])
+                  print(k, ":", json.dumps(j[k])[:2000])
+          ft = j.get("faultingThread"); th = j.get("threads", [])
+          if isinstance(ft, int) and ft < len(th):
+              t = th[ft]
+              for k in ("usedRegisters", "notableAddresses"):
+                  if k in t:
+                      print("in-thread", k, ":", json.dumps(t[k])[:2000])
           PY
+          done
+          for n in $CASES; do
+            bin="macho-out/corpus/$n-mac"
+            [ -f "$bin" ] || continue
+            for i in $(seq 1 25); do
+              sudo lldb --batch --file "$bin" \
+                -o "run" \
+                -k "register read rip rsp rbp rbx rcx rdx rsi rdi rax r8 r9 r10 r11 r12 r13 r14 r15" \
+                -k "image lookup -a \$rip" \
+                -k "x/28gx \$rsp" \
+                -k "x/8gx \$rax" \
+                -k "x/8gx \$rdi" \
+                -k "thread backtrace" \
+                > lldb-out.txt 2>&1
+              if grep -q "stop reason = EXC_BAD_ACCESS" lldb-out.txt; then
+                echo "=== LPROBE $n run=$i CRASHED ==="
+                grep -vE "^\(lldb\)|^Process [0-9]+ launched" lldb-out.txt | head -120
+                break
+              fi
+            done
+            echo "LPROBE $n loop done"
           done
           exit 0
 
