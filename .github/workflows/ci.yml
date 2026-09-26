@@ -816,7 +816,7 @@ jobs:
             bin="macho-out/corpus/$n-mac"
             codesign -f -s - "$bin" 2>/dev/null
             chmod +x "$bin"
-            perl -e 'alarm 20; exec @ARGV' "$bin" >"act-$n.txt" 2>/dev/null
+            perl -e 'alarm 20; exec @ARGV' "$bin" >"act-$n.txt" 2>"act-$n.err"
             rc=$?
             [ "$rc" -eq 142 ] && rc=124
             want=$(cat "macho-out/corpus/$n.rc")
@@ -826,6 +826,9 @@ jobs:
               fail=$((fail + 1))
               echo "FAIL $n: rc $rc (want $want)"
               diff "macho-out/corpus/$n.expected" "act-$n.txt" | head -6
+              # §18 v6 插桩现场：exec 语料若因 waitset 计数腐化触发 dump（exit 38），
+              # stderr 前 64B 即现场块；一并打印原始 stderr 尾部供核对。
+              [ -s "act-$n.err" ] && { echo "-- $n stderr head:"; od -An -tx1 -N80 "act-$n.err"; }
             fi
           done <macho-out/corpus/CASES
           macho-out/corpus/examples_basics_args-mac one "two words" 三 >act-argv.txt
@@ -885,38 +888,10 @@ jobs:
       # count. The 65th pollfd write lands exactly on the thunk slot (0xA90) with the
       # timer[0] 16B entry as source — first 8B = deadline — so the corrupted waitset
       # count is what turns staging into "write a timestamp over the dispatcher pointer".
-      # Normal exec flow NEVER writes [0x101000080] (no waitset_add, cb/fd_drop only run
-      # when it is >0), so a hardware watchpoint on it fires on the FIRST bogus write:
-      # registers + backtrace there name the culprit instruction directly.
-      # Never gates: always exit 0; delete once the root cause lands.
-      - name: "TEMP: section-18 exec flake probe v5 (watchpoint on rt_waitset_n)"
-        if: always()
-        run: |
-          set +e
-          [ -d macho-out/corpus ] || { echo "no corpus dir"; exit 0; }
-          for n in examples_io_exec testdata_regression_exec_large; do
-            bin="macho-out/corpus/$n-mac"
-            [ -f "$bin" ] || { echo "missing $bin"; continue; }
-            codesign -f -s - "$bin" 2>/dev/null
-            chmod +x "$bin"
-            for i in $(seq 1 20); do
-              sudo lldb --batch --file "$bin" \
-                -o "watchpoint set expression -w write -s 8 -- 0x101000080" \
-                -o "run" \
-                -k "register read rip rsp rax rcx rdx rsi rdi r8 r9 r10 r11 rbx r12 r13 r14 r15" \
-                -k "thread backtrace" \
-                -k "memory read --size 8 --format x --count 4 0x101000078" \
-                > wp-out.txt 2>&1
-              if grep -qE "stop reason = (watchpoint|EXC_BAD_ACCESS)" wp-out.txt; then
-                echo "=== V5PROBE $n run=$i STOPPED ==="
-                grep -vE "^Process [0-9]+ launched" wp-out.txt | head -110
-                grep -q "EXC_BAD_ACCESS" wp-out.txt && echo "(this stop is the crash, not the watchpoint)" || echo "(WATCHPOINT HIT — culprit above)"
-                break
-              fi
-            done
-            echo "V5PROBE $n loop done"
-          done
-          exit 0
+      # v5's hardware watchpoint changed timing and the flake vanished entirely — v6
+      # instead gates inside the scheduler itself (runtime.bur dbg_guard: on n>CAP dump
+      # a 64B scene block to stderr and exit(38)); the corpus step above prints the dump.
+      # The probe step is retired; the scene arrives via the FAIL branch output.
 
   runtime:
     needs: []

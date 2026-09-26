@@ -328,6 +328,19 @@ fn x86gen_sched_block() {
     // zeroed) before polling; afterwards write revents back to entry+6, where fd_loop_rev
     // keeps reading readiness ----
     let st_init = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rsi, rsi, 0) + xor_rr(rdi, rdi) + mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_ri64(r11, rt_slot(POLLFD_BASE))
+    // TEMP §18 v6 插桩（取到腐化源后整体回退）：waitset 计数超过槽容量意味着
+    // [rt_waitset_n] 已被腐化——在 staging 把 pollfd[64]==thunk 槽覆写之前，把
+    // 64B 现场块写 stderr 并 exit(38)，让 corpus 硬闸在该例失败、err 落盘可读；
+    // 健康路径永不触发（guard 不跳），输出零影响。
+    // TEMP §18 v6 probe (revert once the corrupter is known): a waitset count above the
+    // capacity means [rt_waitset_n] is corrupted — before staging clobbers
+    // pollfd[64]==thunk, dump a 64B scene block to stderr and exit(38). Healthy runs
+    // never take the guard.
+    let dbg_fields = mov_mr(rsp, 0, rsi) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 8, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 16, rax) + mov_ri64(rax, rt_slot(TIMER_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 24, rdx) + mov_rm(rdx, rax, 8) + mov_mr(rsp, 32, rdx) + mov_ri64(rax, rt_slot(WAITSET_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 40, rdx) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 48, rax) + mov_mr(rsp, 56, rbx)
+    let dbg_out = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 64) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 38) + sys_mov_rax(60) + syscall()
+    let dbg_seq = sub_ri32(rsp, 64) + dbg_fields + dbg_out
+    let dbg_bypass = jmp_rel32(str_len(dbg_seq))
+    let dbg_guard = cmp_ri32(rsi, WAITSET_CAP) + ja_rel32(5) + dbg_bypass + dbg_seq
     let st_body = mov_rm(rcx, r10, 0) + mov_mr32(r11, 0, rcx) + mov_rm(rcx, r10, 4) + mov_mr32(r11, 4, rcx) + xor_rr(rcx, rcx) + mov_mr16(r11, 6, rcx) + add_ri32(r10, 16) + add_ri32(r11, 8) + add_ri32(rdi, 1)
     let st_top = cmp_rr(rdi, rsi) + jge_rel32(str_len(st_body) + 5)
     let st_back = jmp_rel32(0 - (str_len(st_top) + str_len(st_body) + 5))
@@ -354,7 +367,7 @@ fn x86gen_sched_block() {
     let fd_tmo = fd_tmo_zero + fd_tmo_head + fd_tmo_scan_body + fd_tmo_scan_upd + fd_tmo_scan_skip_pre + fd_tmo_scan_check + fd_tmo_scan_done + fd_tmo_calc + fd_tmo_clamp
     let fd_none = mov_ri64(rdx, -1) + jmp_rel32(str_len(fd_tmo))
     let fd_head = mov_ri64(r9, rt_slot(rt_waitset_n)) + mov_rm(r9, r9, 0) + sub_ri32(r9, 1) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(fd_none))
-    let pw_fd_path = fd_head + fd_none + fd_tmo + st_init + st_top + st_body + st_back + fd_poll_pre + fd_poll_test + cb_init + cb_top + cb_step + cb_back + fd_cursor + fd_loop_body + fd_drop + fd_next + fd_loop_check + fd_done
+    let pw_fd_path = fd_head + fd_none + fd_tmo + st_init + dbg_guard + st_top + st_body + st_back + fd_poll_pre + fd_poll_test + cb_init + cb_top + cb_step + cb_back + fd_cursor + fd_loop_body + fd_drop + fd_next + fd_loop_check + fd_done
     // ---- checks：waitset 或 timer 非空 → fd_path（timer 只调 poll 超时）；皆空 → dl ----
     let checks_dl = jmp_rel32(str_len(pw_fd_path) + str_len(pw_timer_due) + 5)
     let checks_timer = mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(checks_dl))
