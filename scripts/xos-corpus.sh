@@ -98,4 +98,11 @@ fi
 if "$BUR" build --backend x86 examples/io/stdin.bur -o "$tmp/ref" && "$BUR" build --backend x86 --os "$os" examples/io/stdin.bur -o "$stdin_bin"; then
     "$tmp/ref" <"$out/STDIN.in" >"$out/STDIN.expected"
 fi
+# --emit c 把 bur_units.h 与 program.c 拼成单文件，但 program.c 头部的
+# #include "bur_units.h" 仍在：语料目录放一个空桩让 include 就地消化，
+# 单元声明已在拼接文件前部生效
+# --emit c concatenates bur_units.h and program.c into one file while the
+# program part still #includes "bur_units.h": an empty stub in the corpus dir
+# lets the include resolve locally, with the declarations already in front
+: >"$out/bur_units.h"
 echo "cases: $(wc -l <"$out/CASES"), build failures: $(wc -l <"$out/BUILD_FAIL")"
