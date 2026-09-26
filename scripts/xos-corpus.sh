@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # xos-corpus.sh — x86 跨目标语料：以 Linux x86 运行结果为基准，构建同一批样例的
 # windows/darwin 版本，供真 Windows/macOS runner 逐例对照 stdout 与退出码。
-# 语料 = examples 各分类 + testdata/{basics,types,regression} 的全部 .bur；stdin.bur
-# 需要输入，单列为 STDIN 例（固定输入文件 STDIN.in 重定向）。每例在 <outdir> 下产出：
+# 语料 = examples 各分类 + testdata/{basics,types,regression} 的全部 .bur +
+# testdata/pkg 模块目录 + std 各包的合并测试套件（同 multi-backend-verify.sh 口径）；
+# stdin.bur 需要输入，单列为 STDIN 例（固定输入文件 STDIN.in 重定向）。每例在 <outdir> 下产出：
 #   <name>.expected  Linux x86 的 stdout
 #   <name>.rc        Linux x86 的退出码
 #   <name>.exe / <name>-mac  目标二进制（构建失败则记入 BUILD_FAIL）
@@ -84,6 +85,42 @@ for d in testdata/pkg/*/; do
         rm -f "$out/$name.expected" "$out/$name.rc"
     fi
     "$BUR" build --backend c --emit c "$d" -o "$out/$name.c" >/dev/null 2>&1 || true
+    if [ -f "$out/$name.c" ]; then
+        { printf '#include "burrt.h"\n'; cat "$out/$name.c"; } >"$out/$name.c.tmp" && mv "$out/$name.c.tmp" "$out/$name.c"
+    fi
+done
+# std 包测试：与 multi-backend-verify.sh 同款合并（去 pub + 拼接包文件与测试文件），
+# 以合并单文件进跨目标语料；断言式套件输出确定（Linux 双跑逐字节一致，stdout 为空），
+# 三方一致拒绝的合并例构建失败自然落 BUILD_FAIL
+# std package tests: merged exactly like multi-backend-verify.sh (strip `pub`,
+# concatenate package + test file) and fed into the cross-target corpus as one
+# file; the suites are deterministic assert-only (byte-identical across runs on
+# Linux, empty stdout); triagonally-rejected merges fail to build and fall into
+# BUILD_FAIL
+for t in std/*/*_test.bur; do
+    [ -f "$t" ] || continue
+    pkgdir="${t%/*}"
+    pkgfile="$pkgdir/$(basename "$pkgdir").bur"
+    merged="$tmp/$(basename "$pkgdir")_merged.bur"
+    sed 's/^pub //' "$pkgfile" "$t" > "$merged"
+    name="stdtest_$(basename "$pkgdir")"
+    if ! "$BUR" build --backend x86 "$merged" -o "$tmp/ref" >/dev/null 2>&1; then
+        continue
+    fi
+    timeout 20 "$tmp/ref" >"$out/$name.expected" 2>/dev/null
+    echo $? >"$out/$name.rc"
+    if [ "$os" = windows ]; then
+        bin="$out/$name.exe"
+    else
+        bin="$out/$name-mac"
+    fi
+    if "$BUR" build --backend x86 --os "$os" "$merged" -o "$bin" >/dev/null 2>&1; then
+        echo "$name" >>"$out/CASES"
+    else
+        echo "$name" >>"$out/BUILD_FAIL"
+        rm -f "$out/$name.expected" "$out/$name.rc"
+    fi
+    "$BUR" build --backend c --emit c "$merged" -o "$out/$name.c" >/dev/null 2>&1 || true
     if [ -f "$out/$name.c" ]; then
         { printf '#include "burrt.h"\n'; cat "$out/$name.c"; } >"$out/$name.c.tmp" && mv "$out/$name.c.tmp" "$out/$name.c"
     fi
