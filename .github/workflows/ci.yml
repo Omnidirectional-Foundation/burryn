@@ -877,44 +877,44 @@ jobs:
           echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
-      # TEMP §18 probe v4 (2026-09-26 值机夜班): v3's lldb scene located the crash at
-      # fd_poll_pre's `movabs rcx,<thunk>; call [rcx]` — the thunk slot (runtime+0xA90)
-      # holds a live time value. Registers: rax=7 (poll), rdi=POLLFD_BASE, rsi=nfds=616/618
-      # (from [rt_waitset_n], whose cap trap is 64 — impossible unless the slot got
-      # corrupted), r10/r11 = staging cursors walked 616/618 entries past the tables;
-      # waitset[64]=TIMER_BASE, pollfd[64]=thunk slot — staging writes deadline into thunk.
-      # v4: dump the runtime slot region + table heads at the crash so the 616/618 writer is
-      # identified (waitset_n, timer_n, waitset/timer/pollfd contents, heap objects at rbx).
+      # TEMP §18 probe v5 (2026-09-26 值机夜班): v4 decoded the scene — rip equals
+      # timer[0].deadline exactly; frame#1 lands on the scheduler poll call site
+      # (lea rdi,POLLFD / movabs rax,7 / lea rcx,<thunk slot> / call [rcx]) and the
+      # staging loop ran nfds=616/2075 entries (r10=waitset+16n, r11=pollfd+8n match),
+      # i.e. [rt_waitset_n] (runtime slot 0x101000080, fixed VA) held a bogus huge
+      # count. The 65th pollfd write lands exactly on the thunk slot (0xA90) with the
+      # timer[0] 16B entry as source — first 8B = deadline — so the corrupted waitset
+      # count is what turns staging into "write a timestamp over the dispatcher pointer".
+      # Normal exec flow NEVER writes [0x101000080] (no waitset_add, cb/fd_drop only run
+      # when it is >0), so a hardware watchpoint on it fires on the FIRST bogus write:
+      # registers + backtrace there name the culprit instruction directly.
       # Never gates: always exit 0; delete once the root cause lands.
-      - name: "TEMP: section-18 exec flake probe v4 (runtime slot dump)"
+      - name: "TEMP: section-18 exec flake probe v5 (watchpoint on rt_waitset_n)"
         if: always()
         run: |
           set +e
           [ -d macho-out/corpus ] || { echo "no corpus dir"; exit 0; }
-          RT=0x101000000
           for n in examples_io_exec testdata_regression_exec_large; do
             bin="macho-out/corpus/$n-mac"
             [ -f "$bin" ] || { echo "missing $bin"; continue; }
             codesign -f -s - "$bin" 2>/dev/null
             chmod +x "$bin"
-            for i in $(seq 1 25); do
+            for i in $(seq 1 20); do
               sudo lldb --batch --file "$bin" \
+                -o "watchpoint set expression -w write -s 8 -- 0x101000080" \
                 -o "run" \
-                -k "register read rip rsp rbp rbx r12 r13 r14 r15 rax rcx rdx rsi rdi r8 r9 r10 r11" \
-                -k "x/20gx $RT" \
-                -k "x/20gx $RT+0x490" \
-                -k "x/24gx $RT+0x890" \
-                -k "x/40gx \$r15" \
-                -k "x/16gx \$rbx" \
+                -k "register read rip rsp rax rcx rdx rsi rdi r8 r9 r10 r11 rbx r12 r13 r14 r15" \
                 -k "thread backtrace" \
-                > lldb-out.txt 2>&1
-              if grep -q "stop reason = EXC_BAD_ACCESS" lldb-out.txt; then
-                echo "=== V4PROBE $n run=$i CRASHED ==="
-                grep -vE "^\(lldb\)|^Process [0-9]+ launched" lldb-out.txt | head -150
+                -k "memory read --size 8 --format x --count 4 0x101000078" \
+                > wp-out.txt 2>&1
+              if grep -qE "stop reason = (watchpoint|EXC_BAD_ACCESS)" wp-out.txt; then
+                echo "=== V5PROBE $n run=$i STOPPED ==="
+                grep -vE "^Process [0-9]+ launched" wp-out.txt | head -110
+                grep -q "EXC_BAD_ACCESS" wp-out.txt && echo "(this stop is the crash, not the watchpoint)" || echo "(WATCHPOINT HIT — culprit above)"
                 break
               fi
             done
-            echo "V4PROBE $n loop done"
+            echo "V5PROBE $n loop done"
           done
           exit 0
 
