@@ -807,23 +807,28 @@ fn x86gen_net_close_native() {
 fn x86gen_net_nb_native() {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, rcx) + vs_pop_n(4)
     let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 40, rcx) + vs_pop_n(4)
-    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
     let eagain_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 7955997313370251103) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
-    let fail = err_str + err_inst + add_ri32(rsp, 8)
-    let eagain = eagain_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(fail))
+    let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
+    // 三条 per-op 错误尾：前缀对齐 C 的 nat_net_nb（tcp_accept/net_read/net_write + strerror）；
+    // rax = 正 errno，Err 存 [r15-40] 后弹 4 参；acc_full_fail 是 Windows fd 表满的专用尾
+    //（保持原 os error 行为，reg_chk 前向直达，避免与 acc_ok_body 的长度循环）
+    let acc_full_fail = err_str + err_inst + add_ri32(rsp, 8)
+    let wr_fail = mov_rr(rdi, rax) + x86gen_err_op_errno("net_write") + mov_mr(r15, 0 - 40, rax) + vs_pop_n(4) + add_ri32(rsp, 8) + jmp_rel32(str_len(acc_full_fail))
+    let rd_fail = mov_rr(rdi, rax) + x86gen_err_op_errno("net_read") + mov_mr(r15, 0 - 40, rax) + vs_pop_n(4) + add_ri32(rsp, 8) + jmp_rel32(str_len(wr_fail) + str_len(acc_full_fail))
+    let eagain = eagain_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
     // wr_zero：len == 0 → Ok("0")（VM 语义：0 字节的十进制字符串）
     // wr_zero: len == 0 yields Ok("0") (VM semantics: the decimal string of 0 bytes)
-    let wr_zero = mov_rr(r8, r12) + mov_ri64(r10, 1) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 48) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(eagain) + str_len(fail))
-    let wr_jmp = jmp_rel32(str_len(wr_zero) + str_len(eagain) + str_len(fail))
+    let wr_zero = mov_rr(r8, r12) + mov_ri64(r10, 1) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 48) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(eagain) + str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
+    let wr_jmp = jmp_rel32(str_len(wr_zero) + str_len(eagain) + str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
     let wr_ok = mov_mr(r15, 0 - 40, rax) + x86gen_str_convert_at(0 - 40) + mov_rm(rax, r15, 0 - 40) + ok_inst + add_ri32(rsp, 8)
     let wr_send = mov_rm(rdi, r15, 0 - 24) + mov_rr(rsi, r9) + add_ri32(rsi, 8) + mov_rr(rdx, rax) + sys_mov_rax(1) + syscall()
-    let wr_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(wr_send))) + jmp_rel32(str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero) + str_len(eagain))
+    let wr_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(wr_send))) + jmp_rel32(str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero) + str_len(eagain) + str_len(rd_fail))
     let wr_head = mov_rm(r9, r15, 0 - 16) + mov_rm(rax, r9, 0) + test_rr(rax, rax) + je_rel32(str_len(wr_send) + str_len(wr_err) + str_len(wr_ok) + str_len(wr_jmp))
     let wr_path_len = str_len(wr_head) + str_len(wr_send) + str_len(wr_err) + str_len(wr_ok) + str_len(wr_jmp) + str_len(wr_zero)
     // rd_zero_body：max == 0 → Ok("")（VM 语义：立即空串）
     // rd_zero_body: max == 0 yields Ok("") (VM semantics: an immediate empty string)
-    let rd_zero_body = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(wr_path_len + str_len(eagain) + str_len(fail))
-    let rd_jmp = jmp_rel32(str_len(rd_zero_body) + wr_path_len + str_len(eagain) + str_len(fail))
+    let rd_zero_body = mov_rr(r8, r12) + xor_rr(rdx, rdx) + mov_mr(r8, 0, rdx) + add_ri32(r12, 8) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8) + jmp_rel32(wr_path_len + str_len(eagain) + str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
+    let rd_jmp = jmp_rel32(str_len(rd_zero_body) + wr_path_len + str_len(eagain) + str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
     let rd_ok_body = mov_mr(r8, 0, rax) + mov_rr(rax, r8) + ok_inst + add_ri32(rsp, 8)
     let rd_read = mov_rm(rdi, r15, 0 - 24) + mov_rm(r8, r15, 0 - 40) + lea(rsi, r8, 8) + mov_rm(rdx, r15, 0 - 8) + sys_mov_rax(0) + syscall()
     let rd_alloc = mov_rr(r8, r12) + mov_mr(r8, 0, r9) + add_ri32(r12, 8) + add_rr(r12, r9) + mov_mr(r15, 0 - 40, r8)
@@ -839,7 +844,7 @@ fn x86gen_net_nb_native() {
     // on windows register the accepted SOCKET (kind 1); a full table jumps
     // forward past acc/rd/wr to fail (acc_jmp is a fixed 5B, same form as acc_err)
     let reg_chk = if target_os == "windows" {
-        test_rr(rax, rax) + jl_rel32(str_len(acc_tail) + 5 + rd_path_len + wr_path_len + str_len(eagain))
+        test_rr(rax, rax) + jl_rel32(str_len(acc_tail) + 5 + rd_path_len + wr_path_len + str_len(eagain) + str_len(rd_fail) + str_len(wr_fail))
     } else {
         ""
     }
@@ -849,9 +854,9 @@ fn x86gen_net_nb_native() {
         ""
     }
     let acc_ok_body = reg_sock + reg_chk + acc_tail
-    let acc_err = err_str + err_inst + add_ri32(rsp, 8) + jmp_rel32(str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
+    let acc_err = test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax))) + neg_r(rax) + mov_rr(rdi, rax) + x86gen_err_op_errno("tcp_accept") + mov_mr(r15, 0 - 40, rax) + vs_pop_n(4) + add_ri32(rsp, 8) + jmp_rel32(str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len + str_len(eagain) + str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
     let acc_seq = mov_rm(rdi, r15, 0 - 24) + xor_rr(rsi, rsi) + xor_rr(rdx, rdx) + sys_mov_rax(43) + syscall() + test_rr(rax, rax) + jge_rel32(str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err)) + neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(acc_err) + str_len(acc_ok_body) + 5 + rd_path_len + wr_path_len) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 4)) + 6 + str_len(cmp_rr(rax, rdx)) + str_len(mov_ri64(rdx, 11)) + str_len(neg_r(rax)) + 6 + str_len(test_rr(rax, rax)) + str_len(syscall()) + str_len(sys_mov_rax(43)) + str_len(xor_rr(rdx, rdx)) + str_len(xor_rr(rsi, rsi)) + str_len(mov_rm(rdi, r15, 0 - 24)))) + jmp_rel32(0)
-    let acc_jmp = jmp_rel32(rd_path_len + wr_path_len + str_len(eagain) + str_len(fail))
+    let acc_jmp = jmp_rel32(rd_path_len + wr_path_len + str_len(eagain) + str_len(rd_fail) + str_len(wr_fail) + str_len(acc_full_fail))
     let acc_path_len = str_len(acc_seq) + str_len(acc_err) + str_len(acc_ok_body) + str_len(acc_jmp)
     let wr_path = wr_head + wr_send + wr_err + wr_ok + wr_jmp + wr_zero
     let rd_path = rd_head + rd_alloc + rd_read + rd_err + rd_ok_body + rd_jmp + rd_zero_body
@@ -860,7 +865,7 @@ fn x86gen_net_nb_native() {
     // head: dispatches on op (0=accept, 1=read, 2=write); op 2 must jump explicitly since
     // fall-through would enter acc_path
     let head = sub_ri32(rsp, 8) + mov_rm(rax, r15, 0 - 32) + test_rr(rax, rax) + je_rel32(str_len(mov_ri64(rdx, 1)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 2)) + str_len(cmp_rr(rax, rdx)) + str_len(jne_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 1) + cmp_rr(rax, rdx) + je_rel32(acc_path_len + str_len(mov_ri64(rdx, 2)) + str_len(cmp_rr(rax, rdx)) + str_len(jne_rel32(0)) + str_len(jmp_rel32(0))) + mov_ri64(rdx, 2) + cmp_rr(rax, rdx) + jne_rel32(str_len(jmp_rel32(0)) + acc_path_len + rd_path_len + wr_path_len + str_len(eagain)) + jmp_rel32(acc_path_len + rd_path_len)
-    head + acc_path + rd_path + wr_path + eagain + fail
+    head + acc_path + rd_path + wr_path + eagain + rd_fail + wr_fail + acc_full_fail
 }
 
 // x86gen_net_read_native 内联 net_read：read syscall 进新 str，返回 Result<str, str>。
