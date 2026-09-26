@@ -877,79 +877,44 @@ jobs:
           echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
-      # TEMP §18 probe v3 (2026-09-26 值机夜班): v2 proved the crash PC is a live
-      # uptime-ns value (2.18e11..2.19e11, tracks runner time across jobs), i.e. a
-      # wild ret/jmp onto a clock quantity in the sync-exec timer-park path. v3:
-      # (a) same raw loop, but dump the TOP-LEVEL usedRegisters/notableAddresses
-      # from the .ips payload (v2 only looked inside thread records, printed none);
-      # (b) lldb batch loop to catch the scene live: registers plus the memory the
-      # stale resume consumed (stack slots around rsp, candidate fibers at rax/rdi).
-      # Never gates: always exits 0; delete once the root cause lands.
-      - name: "TEMP: section-18 exec flake probe (lldb scene + ips registers)"
+      # TEMP §18 probe v4 (2026-09-26 值机夜班): v3's lldb scene located the crash at
+      # fd_poll_pre's `movabs rcx,<thunk>; call [rcx]` — the thunk slot (runtime+0xA90)
+      # holds a live time value. Registers: rax=7 (poll), rdi=POLLFD_BASE, rsi=nfds=616/618
+      # (from [rt_waitset_n], whose cap trap is 64 — impossible unless the slot got
+      # corrupted), r10/r11 = staging cursors walked 616/618 entries past the tables;
+      # waitset[64]=TIMER_BASE, pollfd[64]=thunk slot — staging writes deadline into thunk.
+      # v4: dump the runtime slot region + table heads at the crash so the 616/618 writer is
+      # identified (waitset_n, timer_n, waitset/timer/pollfd contents, heap objects at rbx).
+      # Never gates: always exit 0; delete once the root cause lands.
+      - name: "TEMP: section-18 exec flake probe v4 (runtime slot dump)"
         if: always()
         run: |
           set +e
           [ -d macho-out/corpus ] || { echo "no corpus dir"; exit 0; }
-          CASES="examples_io_exec testdata_regression_exec_large"
-          total=0; hits=0
-          for n in $CASES; do
+          RT=0x101000000
+          for n in examples_io_exec testdata_regression_exec_large; do
             bin="macho-out/corpus/$n-mac"
             [ -f "$bin" ] || { echo "missing $bin"; continue; }
             codesign -f -s - "$bin" 2>/dev/null
             chmod +x "$bin"
-            for i in $(seq 1 30); do
-              total=$((total + 1))
-              perl -e 'alarm 20; exec @ARGV' "$bin" >probe-out.txt 2>&1
-              rc=$?
-              [ "$rc" -ne 0 ] && { hits=$((hits + 1)); echo "PROBE $n run=$i rc=$rc"; }
-            done
-          done
-          echo "PROBE-a summary: $hits/$total non-zero exits"
-          sleep 5
-          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -6); do
-            echo "===== $f ====="
-            python3 - "$f" <<'PY'
-          import json, sys
-          raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-          nl = raw.find("\n")
-          try:
-              j = json.loads(raw[nl + 1:])
-          except Exception as e:
-              print("payload parse failed:", e); sys.exit(0)
-          print("proc:", j.get("procName"), "pid:", j.get("pid"))
-          print("exception:", json.dumps(j.get("exception")))
-          print("vmRegionInfo:", str(j.get("vmRegionInfo"))[:300])
-          for k in ("usedRegisters", "notableAddresses"):
-              if k in j:
-                  print(k, ":", json.dumps(j[k])[:2000])
-          ft = j.get("faultingThread"); th = j.get("threads", [])
-          if isinstance(ft, int) and ft < len(th):
-              t = th[ft]
-              for k in ("usedRegisters", "notableAddresses"):
-                  if k in t:
-                      print("in-thread", k, ":", json.dumps(t[k])[:2000])
-          PY
-          done
-          for n in $CASES; do
-            bin="macho-out/corpus/$n-mac"
-            [ -f "$bin" ] || continue
             for i in $(seq 1 25); do
               sudo lldb --batch --file "$bin" \
                 -o "run" \
-                -k "register read rip rsp rbp rbx rcx rdx rsi rdi rax r8 r9 r10 r11 r12 r13 r14 r15" \
-                -k "image lookup -a \$rip" \
-                -k "x/28gx \$rsp" \
-                -k "x/8gx \$rax" \
-                -k "x/8gx \$rdi" \
+                -k "register read rip rsp rbp rbx r12 r13 r14 r15 rax rcx rdx rsi rdi r8 r9 r10 r11" \
+                -k "x/20gx $RT" \
+                -k "x/20gx $RT+0x490" \
+                -k "x/24gx $RT+0x890" \
+                -k "x/40gx \$r15" \
+                -k "x/16gx \$rbx" \
                 -k "thread backtrace" \
                 > lldb-out.txt 2>&1
               if grep -q "stop reason = EXC_BAD_ACCESS" lldb-out.txt; then
-                echo "=== LPROBE $n run=$i CRASHED ==="
-                grep -vE "^\(lldb\)|^Process [0-9]+ launched" lldb-out.txt | head -120
+                echo "=== V4PROBE $n run=$i CRASHED ==="
+                grep -vE "^\(lldb\)|^Process [0-9]+ launched" lldb-out.txt | head -150
                 break
               fi
             done
-            echo "LPROBE $n loop done"
+            echo "V4PROBE $n loop done"
           done
           exit 0
 
