@@ -51,6 +51,11 @@ for f in examples/basics/*.bur examples/types/*.bur examples/concurrency/*.bur e
     # same-platform C build to compare against the x86 binary (stdout/stderr/
     # exit code; strerror text is per-platform by design, never cross-target)
     "$BUR" build --backend c --emit c "$f" -o "$out/$name.c" >/dev/null 2>&1 || true
+    if [ -f "$out/$name.c" ]; then
+        # 拼接文件里 units 声明先于 program.c 的 #include "burrt.h"：预置一行 include
+        # 让 Obj/Value 等类型先可见（stub 见文件尾）
+        { printf '#include "burrt.h"\n'; cat "$out/$name.c"; } >"$out/$name.c.tmp" && mv "$out/$name.c.tmp" "$out/$name.c"
+    fi
 done
 # testdata/pkg 模块样例：模块模式构建；三方一致拒绝的例构建失败，自然落 BUILD_FAIL 跳过
 # testdata/pkg module samples: built in module mode; triagonally-rejected cases
@@ -79,6 +84,9 @@ for d in testdata/pkg/*/; do
         rm -f "$out/$name.expected" "$out/$name.rc"
     fi
     "$BUR" build --backend c --emit c "$d" -o "$out/$name.c" >/dev/null 2>&1 || true
+    if [ -f "$out/$name.c" ]; then
+        { printf '#include "burrt.h"\n'; cat "$out/$name.c"; } >"$out/$name.c.tmp" && mv "$out/$name.c.tmp" "$out/$name.c"
+    fi
 done
 # 带参运行的 args：空格参数与非 ASCII 参数，runner 以同一组参数运行目标二进制，对照 ARGV.expected
 # args with arguments: a spaced and a non-ASCII argument; runners run the
