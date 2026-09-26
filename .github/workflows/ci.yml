@@ -880,6 +880,35 @@ jobs:
           echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
+      # TEMP §18 v6 采样步（抓到 guard dump 或修复落地后即删）：单轮 corpus 复现率
+      # ~36% 两个都不崩就全绿；此处对两个 flake 例各连跑 20 轮，任何非零退出都打印
+      # stderr 的 64B guard dump hex + 原文，不 gate（永远 exit 0）。
+      - name: "TEMP: section-18 v6 sample loop (20x flaky exec cases)"
+        run: |
+          set +e
+          for n in examples_io_exec testdata_regression_exec_large; do
+            bin="macho-out/corpus/$n-mac"
+            [ -f "$bin" ] || { echo "missing $bin"; continue; }
+            codesign -f -s - "$bin" 2>/dev/null
+            chmod +x "$bin"
+            hits=0
+            for i in $(seq 1 20); do
+              perl -e 'alarm 20; exec @ARGV' "$bin" >/dev/null 2>"s-$n.err"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                hits=$((hits + 1))
+                echo "SAMPLE $n run=$i rc=$rc"
+                if [ "$rc" -eq 38 ]; then
+                  echo "-- guard dump (64B):"
+                  od -An -tx1 -N64 "s-$n.err"
+                fi
+                head -c 120 "s-$n.err" | od -An -c
+              fi
+            done
+            echo "SAMPLE $n hits=$hits/20"
+          done
+          exit 0
+
       # TEMP §18 probe v5 (2026-09-26 值机夜班): v4 decoded the scene — rip equals
       # timer[0].deadline exactly; frame#1 lands on the scheduler poll call site
       # (lea rdi,POLLFD / movabs rax,7 / lea rcx,<thunk slot> / call [rcx]) and the
