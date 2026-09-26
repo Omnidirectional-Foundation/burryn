@@ -663,9 +663,13 @@ jobs:
             $p2 = Start-Process -FilePath "pe-out/corpus/c-$n.exe" -RedirectStandardOutput "c-out.txt" -RedirectStandardError "c-err.txt" -PassThru -NoNewWindow
             $null = $p2.Handle
             if (-not $p2.WaitForExit(20000)) { taskkill /F /T /PID $p2.Id | Out-Null; $rc2 = 124 } else { $rc2 = $p2.ExitCode }
-            $h1o = (Get-FileHash "x-out.txt").Hash; $h2o = (Get-FileHash "c-out.txt").Hash
-            $h1e = (Get-FileHash "x-err.txt").Hash; $h2e = (Get-FileHash "c-err.txt").Hash
-            if ($h1o -eq $h2o -and $h1e -eq $h2e -and $rc1 -eq $rc2) { $pass++ } else {
+            # MSVC CRT 的 stdout/stderr 是文本模式（\n→\r\n），x86 是裸 write（LF）：
+            # 比对前做 CRLF 归一，剔除 CRT 平台工件
+            $o1 = [IO.File]::ReadAllText("x-out.txt") -replace "`r`n", "`n"
+            $o2 = [IO.File]::ReadAllText("c-out.txt") -replace "`r`n", "`n"
+            $e1 = [IO.File]::ReadAllText("x-err.txt") -replace "`r`n", "`n"
+            $e2 = [IO.File]::ReadAllText("c-err.txt") -replace "`r`n", "`n"
+            if ($o1 -eq $o2 -and $e1 -eq $e2 -and $rc1 -eq $rc2) { $pass++ } else {
               $fail++
               Write-Output ("FAIL {0}: x86 rc {1}, C rc {2}" -f $n, $rc1, $rc2)
               git diff --no-index --text "x-out.txt" "c-out.txt" | Select-Object -First 6
