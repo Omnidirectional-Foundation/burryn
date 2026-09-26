@@ -45,6 +45,36 @@ for f in examples/basics/*.bur examples/types/*.bur examples/concurrency/*.bur e
         echo "$name" >>"$out/BUILD_FAIL"
         rm -f "$out/$name.expected" "$out/$name.rc"
     fi
+    # C 源随 artifact 上船：runner 上当场编译成同平台 C 版，与 x86 版同跑对照
+    #（同平台 x86 vs C 的 stdout/stderr/退出码；strerror 文本天然逐平台，不能跨目标比）
+    # the C source ships with the artifact: the runner compiles it into a
+    # same-platform C build to compare against the x86 binary (stdout/stderr/
+    # exit code; strerror text is per-platform by design, never cross-target)
+    "$BUR" build --backend c --emit c "$f" -o "$out/$name.c" >/dev/null 2>&1 || true
+done
+# testdata/pkg 模块样例：模块模式构建；三方一致拒绝的例构建失败，自然落 BUILD_FAIL 跳过
+# testdata/pkg module samples: built in module mode; triagonally-rejected cases
+# simply fail to build and land in BUILD_FAIL
+for d in testdata/pkg/*/; do
+    [ -f "${d}bur.mod" ] || continue
+    name="testdata_pkg_$(basename "$d")"
+    if ! "$BUR" build --backend x86 "$d" -o "$tmp/ref" >/dev/null 2>&1; then
+        continue
+    fi
+    timeout 20 "$tmp/ref" >"$out/$name.expected" 2>/dev/null
+    echo $? >"$out/$name.rc"
+    if [ "$os" = windows ]; then
+        bin="$out/$name.exe"
+    else
+        bin="$out/$name-mac"
+    fi
+    if "$BUR" build --backend x86 --os "$os" "$d" -o "$bin" >/dev/null 2>&1; then
+        echo "$name" >>"$out/CASES"
+    else
+        echo "$name" >>"$out/BUILD_FAIL"
+        rm -f "$out/$name.expected" "$out/$name.rc"
+    fi
+    "$BUR" build --backend c --emit c "$d" -o "$out/$name.c" >/dev/null 2>&1 || true
 done
 # 带参运行的 args：空格参数与非 ASCII 参数，runner 以同一组参数运行目标二进制，对照 ARGV.expected
 # args with arguments: a spaced and a non-ASCII argument; runners run the

@@ -640,6 +640,41 @@ jobs:
           Write-Output "=== corpus: $pass pass, $fail fail ==="
           if ($fail -ne 0) { exit 1 }
 
+      - name: Set up MSVC for x86-vs-C corpus
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      # 同平台 x86 vs C（stdout + stderr + 退出码逐项对照）：完成线「同一程序在三平台
+      # x86 上与同平台 C 完全一致」的机械闸；strerror 文本天然逐平台，不做跨目标比对
+      - name: Corpus x86 vs C on this platform (hard gate)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path \tmp | Out-Null
+          cl /nologo /O1 /c runtime\burrt_impl.c runtime\burrt_natives.c /Iruntime 2>&1 | Select-Object -First 3
+          $pass = 0; $fail = 0; $skip = 0
+          foreach ($n in Get-Content pe-out/corpus/CASES) {
+            if (-not (Test-Path "pe-out/corpus/$n.c")) { $skip++; continue }
+            $cc = Start-Process -FilePath "cl" -ArgumentList @("/nologo", "/O1", "/Fe:pe-out/corpus/c-$n.exe", "pe-out/corpus/$n.c", "burrt_impl.obj", "burrt_natives.obj", "/Iruntime", "ws2_32.lib") -RedirectStandardOutput "cc-out.txt" -RedirectStandardError "cc-err.txt" -NoNewWindow -PassThru -Wait
+            if ($cc.ExitCode -ne 0) { $fail++; Write-Output "CCFAIL $n"; Get-Content "cc-err.txt" -TotalCount 5; continue }
+            $p1 = Start-Process -FilePath "pe-out/corpus/$n.exe" -RedirectStandardOutput "x-out.txt" -RedirectStandardError "x-err.txt" -PassThru -NoNewWindow
+            $null = $p1.Handle
+            if (-not $p1.WaitForExit(20000)) { taskkill /F /T /PID $p1.Id | Out-Null; $rc1 = 124 } else { $rc1 = $p1.ExitCode }
+            $p2 = Start-Process -FilePath "pe-out/corpus/c-$n.exe" -RedirectStandardOutput "c-out.txt" -RedirectStandardError "c-err.txt" -PassThru -NoNewWindow
+            $null = $p2.Handle
+            if (-not $p2.WaitForExit(20000)) { taskkill /F /T /PID $p2.Id | Out-Null; $rc2 = 124 } else { $rc2 = $p2.ExitCode }
+            $h1o = (Get-FileHash "x-out.txt").Hash; $h2o = (Get-FileHash "c-out.txt").Hash
+            $h1e = (Get-FileHash "x-err.txt").Hash; $h2e = (Get-FileHash "c-err.txt").Hash
+            if ($h1o -eq $h2o -and $h1e -eq $h2e -and $rc1 -eq $rc2) { $pass++ } else {
+              $fail++
+              Write-Output ("FAIL {0}: x86 rc {1}, C rc {2}" -f $n, $rc1, $rc2)
+              git diff --no-index --text "x-out.txt" "c-out.txt" | Select-Object -First 6
+              git diff --no-index --text "x-err.txt" "c-err.txt" | Select-Object -First 6
+            }
+          }
+          Write-Output "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
+          if ($fail -ne 0) { exit 1 }
+
   x86-macho-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -808,6 +843,34 @@ jobs:
             diff macho-out/corpus/STDIN.expected act-stdin.txt | head -6
           fi
           echo "=== corpus: $pass pass, $fail fail ==="
+          [ "$fail" -eq 0 ]
+
+      # 同平台 x86 vs C：完成线「同一程序在三平台 x86 上与同平台 C 完全一致」的机械闸
+      - name: Corpus x86 vs C on this platform (hard gate)
+        run: |
+          set -u +e
+          cc -O1 -c runtime/burrt_impl.c runtime/burrt_natives.c -Iruntime 2>/dev/null
+          pass=0; fail=0; skip=0
+          while read -r n; do
+            [ -f "macho-out/corpus/$n.c" ] || { skip=$((skip + 1)); continue; }
+            cc -O1 -o "macho-out/corpus/c-$n" "macho-out/corpus/$n.c" burrt_impl.o burrt_natives.o -Iruntime -lm 2>/dev/null || { fail=$((fail + 1)); echo "CCFAIL $n"; continue; }
+            codesign -f -s - "macho-out/corpus/c-$n" 2>/dev/null
+            perl -e 'alarm 20; exec @ARGV' "macho-out/corpus/$n-mac" >"x-out.txt" 2>"x-err.txt"
+            rc1=$?
+            [ "$rc1" -eq 142 ] && rc1=124
+            perl -e 'alarm 20; exec @ARGV' "macho-out/corpus/c-$n" >"c-out.txt" 2>"c-err.txt"
+            rc2=$?
+            [ "$rc2" -eq 142 ] && rc2=124
+            if cmp -s x-out.txt c-out.txt && cmp -s x-err.txt c-err.txt && [ "$rc1" -eq "$rc2" ]; then
+              pass=$((pass + 1))
+            else
+              fail=$((fail + 1))
+              echo "FAIL $n: x86 rc $rc1, C rc $rc2"
+              diff x-out.txt c-out.txt | head -6
+              diff x-err.txt c-err.txt | head -6
+            fi
+          done <macho-out/corpus/CASES
+          echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
   runtime:
