@@ -1,0 +1,259 @@
+// dns_rt.bur — x86 后端的桩解析器（stub resolver），按 float_rt 的注入模式整份
+// 前置注入到每个 x86 目标程序之前（cli/build.bur 的 compile_file_to_x86，仅
+// 非 windows 目标；windows 解析体系另案）。tcp_dial 的发射器在数字解析失败时
+// 经跳转表调用 drt_resolve(host)：返回空串则报 gai 文本（与 C 的 getaddrinfo
+// 失败一致），否则用返回的点分十进制重新解析后连接。
+//
+// 解析顺序：/etc/hosts → （localhost 兜底 127.0.0.1）→ /etc/resolv.conf 的每个
+// IPv4 nameserver，按 RFC 1035 §4.2 用 TCP/53 发送 A 查询（2 字节长度前缀帧）。
+// 选择 TCP 是为了只用既有 native（read_file/tcp_dial/net_read/net_write/net_close）：
+// 不引入新的 socket/sendto/recvfrom 发射器。UDP 快速路径可日后升级。
+// 与 float_rt 同一纪律：只能引用自身声明；无位运算，全部用 + - * / % 表达。
+// drt_resolve — the x86 backend's stub resolver, injected ahead of every
+// non-windows x86 program (see compile_file_to_x86; the windows resolver is a
+// separate charter). On numeric-parse failure tcp_dial calls it through the
+// jump table: "" means report the gai text (matching C's getaddrinfo failure),
+// otherwise the returned dotted quad is re-parsed and connected.
+// Order: /etc/hosts → localhost fallback → each IPv4 nameserver from
+// /etc/resolv.conf over TCP port 53 (RFC 1035 length-prefixed framing), using
+// only existing natives so no new syscall emitters are needed.
+
+// drt_words 按空格/制表切词 / drt_words splits on spaces and tabs
+fn drt_words(s) {
+    let mut out = []
+    let n = str_len(s)
+    let mut i = 0
+    while i < n {
+        let mut skipping = true
+        while skipping && i < n {
+            if byte_at(s, i) == 9 || byte_at(s, i) == 32 {
+                i = i + 1
+            } else {
+                skipping = false
+            }
+        }
+        let mut j = i
+        let mut eow = n
+        let mut scanning = true
+        while scanning && j < n {
+            if byte_at(s, j) == 9 || byte_at(s, j) == 32 {
+                eow = j
+                scanning = false
+            } else {
+                j = j + 1
+            }
+        }
+        if eow > i {
+            push(out, substr(s, i, eow - i))
+        }
+        i = eow + 1
+    }
+    out
+}
+
+// drt_dec 无符号十进制（仅非负入参） / drt_dec renders a non-negative int in decimal
+fn drt_dec(v) {
+    if v == 0 {
+        return "0"
+    }
+    let mut x = v
+    let mut out = ""
+    while x > 0 {
+        out = byte_chr(48 + x % 10) + out
+        x = x / 10
+    }
+    out
+}
+
+fn drt_u16(s, i) {
+    byte_at(s, i) * 256 + byte_at(s, i + 1)
+}
+
+// drt_qname 编码查询名并接 qtype=A、qclass=IN / drt_qname encodes the query
+// name plus qtype A and class IN
+fn drt_qname(host) {
+    let mut out = ""
+    let parts = split(host, ".")
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if str_len(p) > 0 {
+            out = out + byte_chr(str_len(p)) + p
+        }
+        i = i + 1
+    }
+    out + byte_chr(0) + byte_chr(0) + byte_chr(1) + byte_chr(0) + byte_chr(1)
+}
+
+// drt_query 标准查询报文：flags=0x0100（RD）、qd=1，其余计数 0
+// drt_query builds a standard query: flags 0x0100 (RD), qdcount 1, rest zero
+fn drt_query(id, host) {
+    byte_chr(id / 256) + byte_chr(id % 256) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(1) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + byte_chr(0) + drt_qname(host)
+}
+
+// drt_skip_name 跳过报文中的域名（压缩指针视为两字节终点） / drt_skip_name
+// advances past an encoded name; a compression pointer counts as a 2-byte end
+fn drt_skip_name(s, i0) {
+    let mut i = i0
+    let n = str_len(s)
+    while i < n {
+        let l = byte_at(s, i)
+        if l == 0 {
+            return i + 1
+        }
+        if l >= 192 {
+            return i + 2
+        }
+        i = i + 1 + l
+    }
+    i
+}
+
+// drt_readn 读到凑满 want 字节或 EOF/出错为止；want 0 直接返回空 / drt_readn
+// reads until want bytes accumulate or EOF/error; want 0 returns ""
+fn drt_readn(fd, want) {
+    let mut buf = ""
+    let mut done = false
+    while !done && str_len(buf) < want {
+        match net_read(fd, want - str_len(buf)) {
+            Ok(chunk) => {
+                if str_len(chunk) == 0 {
+                    done = true
+                } else {
+                    buf = buf + chunk
+                }
+            },
+            Err(_) => {
+                done = true
+            },
+        }
+    }
+    buf
+}
+
+// drt_parse 从 A 查询响应里取第一个 IN/A 记录的点分地址；无解返回空串
+// drt_parse extracts the dotted quad of the first IN/A answer; "" if none
+fn drt_parse(resp) {
+    if str_len(resp) < 12 {
+        return ""
+    }
+    if byte_at(resp, 2) < 128 {
+        return ""
+    }
+    if byte_at(resp, 3) % 16 != 0 {
+        return ""
+    }
+    let an = drt_u16(resp, 6)
+    if an == 0 {
+        return ""
+    }
+    let mut i = drt_skip_name(resp, 12)
+    i = i + 4
+    let mut ai = 0
+    let mut ip = ""
+    while ai < an && ip == "" {
+        i = drt_skip_name(resp, i)
+        let rtype = drt_u16(resp, i)
+        let rdlen = drt_u16(resp, i + 8)
+        if rtype == 1 && rdlen == 4 && i + 14 <= str_len(resp) {
+            ip = drt_dec(byte_at(resp, i + 10)) + "." + drt_dec(byte_at(resp, i + 11)) + "." + drt_dec(byte_at(resp, i + 12)) + "." + drt_dec(byte_at(resp, i + 13))
+        }
+        i = i + 10 + rdlen
+        ai = ai + 1
+    }
+    ip
+}
+
+fn drt_query_server(server, id, host) {
+    let mut ip = ""
+    match tcp_dial(server, 53) {
+        Ok(fd) => {
+            let q = drt_query(id, host)
+            let frame = byte_chr(str_len(q) / 256) + byte_chr(str_len(q) % 256) + q
+            match net_write(fd, frame) {
+                Ok(_) => {
+                    let hdr = drt_readn(fd, 2)
+                    if str_len(hdr) == 2 {
+                        let total = drt_u16(hdr, 0)
+                        if total >= 12 && total <= 65000 {
+                            let resp = drt_readn(fd, total)
+                            if str_len(resp) >= total {
+                                ip = drt_parse(resp)
+                            }
+                        }
+                    }
+                },
+                Err(_) => {},
+            }
+            net_close(fd)
+        },
+        Err(_) => {},
+    }
+    ip
+}
+
+fn drt_resolve(host) {
+    let mut ip = ""
+    if str_len(host) > 0 {
+        match read_file("/etc/hosts") {
+            Ok(text) => {
+                let lines = split(text, byte_chr(10))
+                let mut li = 0
+                while li < len(lines) && ip == "" {
+                    let ln = lines[li]
+                    let cut = match str_index_of(ln, "#") {
+                        Some(h) => h,
+                        None => str_len(ln),
+                    }
+                    let words = drt_words(substr(ln, 0, cut))
+                    let mut wi = 1
+                    while wi < len(words) && ip == "" {
+                        if words[wi] == host {
+                            ip = words[0]
+                        }
+                        wi = wi + 1
+                    }
+                    li = li + 1
+                }
+            },
+            Err(_) => {},
+        }
+        if ip == "" && host == "localhost" {
+            ip = "127.0.0.1"
+        }
+        if ip == "" {
+            let mut servers = []
+            match read_file("/etc/resolv.conf") {
+                Ok(text) => {
+                    let lines = split(text, byte_chr(10))
+                    let mut li = 0
+                    while li < len(lines) && len(servers) < 3 {
+                        let ln = trim(lines[li])
+                        if str_len(ln) >= 10 && substr(ln, 0, 10) == "nameserver" {
+                            let val = trim(substr(ln, 10, str_len(ln) - 10))
+                            let colon = match str_index_of(val, ":") {
+                                Some(_) => true,
+                                None => false,
+                            }
+                            if str_len(val) > 0 && !colon {
+                                push(servers, val)
+                            }
+                        }
+                        li = li + 1
+                    }
+                },
+                Err(_) => {},
+            }
+            let mut id = trunc(clock() * 1000000.0) % 65536
+            if id < 0 {
+                id = 0 - id
+            }
+            let mut si = 0
+            while si < len(servers) && ip == "" {
+                ip = drt_query_server(servers[si], id, host)
+                si = si + 1
+            }
+        }
+    }
+    ip
+}

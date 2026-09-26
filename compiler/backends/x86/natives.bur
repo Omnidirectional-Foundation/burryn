@@ -34,11 +34,17 @@ fn x86gen_tcp_accept_native(sched_addr, waitset_add_addr) {
 }
 
 // x86gen_tcp_dial_native 内联 tcp_dial：socket/connect/getsockopt syscalls，返回 Result<int, str>。
-// fd 非阻塞：EINPROGRESS/EAGAIN → waitset 注册 POLLOUT → park；唤醒后 getsockopt(SO_ERROR) 验连通
+// fd 非阻塞：EINPROGRESS/EAGAIN → waitset 注册 POLLOUT → park；唤醒后 getsockopt(SO_ERROR) 验连通。
+// dns_h >= 0 时数字解析失败先经跳转表调注入的 drt_resolve(host)：空串走 gai 尾，
+// 否则把返回的点分串写回原 host 槽、重解析后连。windows（未注入）dns_h=-1，尾接
+// 与旧行为逐字节一致。
 // x86gen_tcp_dial_native inlines tcp_dial: socket/connect/getsockopt syscalls, returning
 // Result<int, str>. The fd is non-blocking: EINPROGRESS/EAGAIN registers POLLOUT on the waitset
-// and parks; on wake, getsockopt(SO_ERROR) confirms the connection
-fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
+// and parks; on wake, getsockopt(SO_ERROR) confirms the connection. With dns_h >= 0 a numeric
+// parse failure first calls the injected drt_resolve(host) through the jump table: "" takes the
+// gai tail, otherwise the returned dotted quad replaces the host slot and is re-parsed. On
+// windows (not injected) dns_h is -1 and the emitted tail is byte-identical to the old one.
+fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr, dns_h) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
@@ -69,9 +75,35 @@ fn x86gen_tcp_dial_native(sched_addr, waitset_add_addr) {
         ""
     }
     let socket_seq = mov_ri64(rdi, 2) + mov_ri64(rsi, 1) + xor_rr(rdx, rdx) + sys_mov_rax(41) + syscall() + reg_sock + mov_rr(r9, rax) + test_rr(rax, rax) + jl_rel32(str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok))
-    let ip_fail = test_rr(rax, rax) + jne_rel32(str_len(mov_rm(r9, r15, 0 - 8)) + str_len(sockaddr) + str_len(socket_seq) + str_len(nonblock_seq) + str_len(connect_seq) + str_len(connect_check) + str_len(fd_park) + str_len(sockcheck) + str_len(connect_ok) + str_len(fail_close) + str_len(fail_errno))
-    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + ip_fail + mov_rm(r9, r15, 0 - 8)
-    head + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close + fail_errno + gai_fail
+    let main_block = mov_rm(r9, r15, 0 - 8) + sockaddr + socket_seq + nonblock_seq + connect_seq + connect_check + fd_park + sockcheck + connect_ok + fail_close + fail_errno
+    // dns_glue：rax=-1（解析失败）入；调 drt_resolve(host)。调用惯例（同 f2s，
+    // 由 fmt float 分支的偏移反证）：callee 吃掉 receiver+arg 两槽、压回一个结果，
+    // 故 call 后栈为 [host][port][res]，r15 只比原 top 高 8。空串 → gai_fail，
+    // 非空 → 把 res 写进 host 槽（[r15-24]）弹掉 res 槽、重解析；失败 → gai_fail
+    // （rax 已是 -1，err 尾直接消费），成功 → 落入 main_block
+    // dns_glue: entered with rax = -1 (parse failed); calls drt_resolve(host).
+    // Calling convention (same as f2s, proven by the fmt float branch offsets):
+    // the callee consumes receiver+arg and pushes one result, so after the call
+    // the stack is [host][port][res] with r15 only 8 above the original top.
+    // "" jumps to gai_fail; otherwise res replaces the host slot ([r15-24]), the
+    // result slot is popped, and the string is re-parsed — failure leaves rax =
+    // -1 for the gai tail, success falls into main_block.
+    let dns_glue = if dns_h >= 0 {
+        let push_call = mov_rm(rax, r15, 0 - 16) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * dns_h) + call_r(rax)
+        let len_check = mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + test_rr(rax, rax)
+        let dns_empty = vs_pop_n(1)
+        let dns_hit = mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(1) + x86gen_parse_ip_at(0 - 16)
+        push_call + len_check + jne_rel32(str_len(dns_empty) + 5) + dns_empty + jmp_rel32(str_len(dns_hit) + str_len(test_rr(rax, rax)) + 6 + str_len(main_block)) + dns_hit + test_rr(rax, rax) + jne_rel32(str_len(main_block))
+    } else {
+        ""
+    }
+    let gate = if dns_h >= 0 {
+        test_rr(rax, rax) + je_rel32(str_len(dns_glue))
+    } else {
+        test_rr(rax, rax) + jne_rel32(str_len(main_block))
+    }
+    let head = sub_ri32(rsp, 32) + x86gen_parse_ip_at(0 - 16) + gate + dns_glue
+    head + main_block + gai_fail
 }
 
 // x86gen_bool_convert_at 生成 bool→str 转换：true/false 常量字符串

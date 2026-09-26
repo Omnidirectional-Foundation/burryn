@@ -358,12 +358,30 @@ fn compile_file_to_x86(path) {
     // calls format_float at runtime; reading a not-yet-defined constant yields 0 and
     // triggers an idiv trap. C/VM println goes through runtime natives and does not
     // depend on the injection, but the ordering is harmless for all three.
-    let injected = match read_file("compiler/lib/float_rt.bur") {
+    let mut injected = match read_file("compiler/lib/float_rt.bur") {
         Ok(s) => s,
         Err(msg) => {
             eprintln("error: " + msg)
             exit(exit_no_input)
         },
+    }
+    // dns 桩解析器（compiler/lib/dns_rt.bur）同模式前置注入，仅非 windows 目标：
+    // windows 的解析器体系另案（见 reports/ROADMAP.md DNS 节）。tcp_dial 发射器在
+    // 数字解析失败时按名字经跳转表调 drt_resolve；windows 目标不注入 → 找不到名字
+    // → 走原有 gai 失败尾，行为与今天一致。
+    // the dns stub resolver follows the float_rt injection pattern on non-windows
+    // targets only (the windows resolver is a separate charter); tcp_dial's
+    // emitter looks up drt_resolve by name, so a windows build (not injected)
+    // keeps the old gai-fail tail unchanged.
+    if x86::get_target_os() != "windows" {
+        let dns_src = match read_file("compiler/lib/dns_rt.bur") {
+            Ok(s) => s,
+            Err(msg) => {
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+        injected = injected + dns_src
     }
     // 首行 shebang 只在文本偏移 1 处被识别（lexer.bur），注入把用户代码推到中间；
     // 编译产物是 ELF 不需要 shebang，把 #! 换为 // 注释以保持行号与列偏移。
