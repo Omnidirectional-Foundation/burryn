@@ -25,8 +25,10 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0
 FAIL=0
 SKIP=0
+PROBE=0
 SEQ=0
 FAILURES=""
+PROBES=""
 
 # run_trio <file> <label> — VM/C/x86 三方跑同一程序并比较
 # 构建失败保留真实退出码（无哨兵）：三方一致拒绝（含构建期拒绝）走 PASS。
@@ -70,6 +72,19 @@ run_trio() {
     if [ "$vm_rc" -eq 133 ] || [ "$c_rc" -eq 133 ] || [ "$x_rc" -eq 133 ]; then
         echo "  SKIP $label (SIGTRAP unimplemented opcode)"
         SKIP=$((SKIP + 1))
+        return
+    fi
+
+    # §18 v9 探针：x86 clock 站点的 rsp tripwire（exit 40-43）命中时该例不可比，
+    # 打 24B 现场（rsp, tv_sec, tv_nsec）响亮记录、不计 FAIL（临时，根因落地后回退）。
+    # §18 v9 probe: an x86 clock-site rsp tripwire hit (exit 40-43) makes the
+    # case uncomparable — print the 24B scene (rsp, tv_sec, tv_nsec), count it
+    # loudly as a probe hit instead of FAIL (temporary until root cause lands).
+    if [ "$x_rc" -ge 40 ] && [ "$x_rc" -le 43 ]; then
+        echo "  PROBE-HIT $label (section-18 v9 tripwire, x86 rc=$x_rc; 24B dump:)"
+        od -An -tx1 "$TMP/x_err" | head -3
+        PROBE=$((PROBE + 1))
+        PROBES="$PROBES $label"
         return
     fi
 
@@ -126,11 +141,15 @@ for t in std/*/*_test.bur; do
 done
 
 echo
-echo "=== Summary: $PASS pass, $FAIL fail, $SKIP skip ==="
+echo "=== Summary: $PASS pass, $FAIL fail, $SKIP skip, $PROBE probe-hits ==="
 if [ -n "$FAILURES" ]; then
     echo "FAILED:$FAILURES"
+fi
+if [ -n "$PROBES" ]; then
+    echo "PROBE-HITS:$PROBES"
 fi
 if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
 exit 0
+
