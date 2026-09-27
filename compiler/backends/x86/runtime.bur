@@ -253,6 +253,32 @@ fn gc_rec(ptr_reg, size) {
     push_r(rdi) + push_r(rsi) + push_r(r8) + mov_rr(rdi, ptr_reg) + size + call + pop_r(r8) + pop_r(rsi) + pop_r(rdi)
 }
 
+// TEMP §18 v9 写侧布防（取到腐化源后整体回退）：clock_gettime 的 timespec 由内核
+// 写进 [rsp] 刮痕区；若进站点时栈指针已腐化指向 __DATA，内核就把 tv_sec（≈开机
+// 秒数）直接砸进相邻槽位。v8 判读已证腐化值≈uptime 秒、但读侧 dump 无法看到"谁
+// 写的"——本布防在每个 clock 站点 syscall 返回后立刻校验 rsp 高 32 位：活栈应为
+// 0x7ff7…量级，≤0x100 即视为已指向镜像数据区，把 {命中时 rsp, tv_sec, tv_nsec}
+// 共 24B 写 stderr 并以站点码退出（40 td_now / 41 fd_tmo_head / 42 timer_park /
+// 43 clock_native，natives.bur 内有同构副本，两处需同步改）。校验只经 r11 且
+// push/pop 包裹，健康路径零副作用；guard 触发时 dump 首字段=rsp+8（push 之后
+// 的 rsp），decode 时注意加回 8。
+// TEMP §18 v9 write-side tripwires (revert once the corrupter is known):
+// clock_gettime's timespec is written BY THE KERNEL into the [rsp] scratch; if
+// the stack pointer is already corrupted into __DATA on entry, tv_sec (~uptime
+// seconds) lands straight in neighbouring slots. v8 showed the corrupt value is
+// uptime-like seconds but the read-side dump cannot see the writer — so right
+// after the syscall at every clock site, check rsp's high 32 bits: a live stack
+// reads 0x7ff7…; ≤0x100 means the pointer sits in the image data region — dump
+// {rsp at hit, tv_sec, tv_nsec} (24B) to stderr and exit with the site code
+// (40 td_now, 41 fd_tmo_head, 42 timer_park, 43 clock_native; natives.bur keeps
+// an isomorphic copy, change both together). Only r11 is touched, wrapped in
+// push/pop; healthy paths are unaffected. Note the dump's first field is rsp+8
+// (captured after the push) — add 8 back when decoding.
+fn clk_guard(code) {
+    let d = mov_mr(rsp, 0, rsp) + mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 24) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, code) + sys_mov_rax(60) + syscall()
+    push_r(r11) + mov_rr(r11, rsp) + shr_ri(r11, 32) + cmp_ri32(r11, 256) + ja_rel32(5) + jmp_rel32(str_len(d)) + d + pop_r(r11)
+}
+
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
 // 空队时先等 waitset（poll）与 timer（nanosleep），两者皆空才扫描死锁
 // x86gen_sched_block emits the scheduler loop: pop ready, restore ctx, ret; exit when the
@@ -297,7 +323,7 @@ fn x86gen_sched_block() {
     let td_loop_check_pre = test_rr(r8, r8)
     let td_loop_back = jne_rel32(0 - (str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check_pre) + 6))
     let td_loop_check = td_loop_check_pre + td_loop_back
-    let td_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(r9, rt_slot(rt_timer_n)) + mov_rm(r9, r9, 0) + mov_rr(r8, r9) + mov_ri64(r11, rt_slot(TIMER_BASE)) + test_rr(r8, r8) + je_rel32(str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check))
+    let td_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + clk_guard(40) + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(r9, rt_slot(rt_timer_n)) + mov_rm(r9, r9, 0) + mov_rr(r8, r9) + mov_ri64(r11, rt_slot(TIMER_BASE)) + test_rr(r8, r8) + je_rel32(str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check))
     let pw_timer_due = td_now + td_body + td_drop + td_next + td_loop_check + td_done
     // ---- fd_path：timeout 计算（有 timer 则按最短 deadline）+ poll + 就绪清理
     // （反向遍历，就绪者 schedule + 末项压缩）+ timer 到期检查 ----
@@ -342,11 +368,11 @@ fn x86gen_sched_block() {
     // hypothesis (the only self-consistent reading of the v6b dump); rbp/r14/r15/
     // r12/rbx narrow down which register carries the pollution. Healthy runs never
     // take the guard.
-    let dbg_fields = mov_mr(rsp, 0, rsp) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 8, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 16, rax) + mov_ri64(rax, rt_slot(TIMER_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 24, rdx) + mov_rm(rdx, rax, 8) + mov_mr(rsp, 32, rdx) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 40, rax) + mov_mr(rsp, 48, rbx) + mov_mr(rsp, 56, rbp) + mov_mr(rsp, 64, r14) + mov_mr(rsp, 72, r15) + mov_mr(rsp, 80, r12) + mov_mr(rsp, 88, rsi)
-    let dbg_out38 = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 96) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 38) + sys_mov_rax(60) + syscall()
-    let dbg_out39 = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 96) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 39) + sys_mov_rax(60) + syscall()
-    let dbg_seq = sub_ri32(rsp, 96) + dbg_fields + dbg_out38
-    let dbg_seq_sw = sub_ri32(rsp, 96) + dbg_fields + dbg_out39
+    let dbg_fields = mov_mr(rsp, 0, rsp) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 8, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 16, rax) + mov_ri64(rax, rt_slot(TIMER_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 24, rdx) + mov_rm(rdx, rax, 8) + mov_mr(rsp, 32, rdx) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 40, rax) + mov_mr(rsp, 48, rbx) + mov_mr(rsp, 56, rbp) + mov_mr(rsp, 64, r14) + mov_mr(rsp, 72, r15) + mov_mr(rsp, 80, r12) + mov_mr(rsp, 88, rsi) + mov_ri64(rax, rt_slot(112)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 96, rax) + mov_ri64(rax, rt_slot(120)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 104, rax) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 112, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 120, rax)
+    let dbg_out38 = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 128) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 38) + sys_mov_rax(60) + syscall()
+    let dbg_out39 = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 128) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 39) + sys_mov_rax(60) + syscall()
+    let dbg_seq = sub_ri32(rsp, 128) + dbg_fields + dbg_out38
+    let dbg_seq_sw = sub_ri32(rsp, 128) + dbg_fields + dbg_out39
     let dbg_bypass = jmp_rel32(str_len(dbg_seq))
     let dbg_bypass_sw = jmp_rel32(str_len(dbg_seq_sw))
     let dbg_guard = cmp_ri32(rsi, WAITSET_CAP) + ja_rel32(5) + dbg_bypass + dbg_seq
@@ -373,7 +399,7 @@ fn x86gen_sched_block() {
     let fd_tmo_scan_back = jne_rel32(0 - (str_len(fd_tmo_scan_body) + str_len(fd_tmo_scan_upd) + str_len(fd_tmo_scan_skip_pre) + str_len(fd_tmo_scan_check_pre) + 6))
     let fd_tmo_scan_check = fd_tmo_scan_check_pre + fd_tmo_scan_back
     let fd_tmo_scan_done = mov_rr(rcx, r11) + sub_rr(rcx, r10) + test_rr(rcx, rcx) + jle_rel32(str_len(fd_tmo_calc) + str_len(fd_tmo_clamp_mov) + str_len(fd_tmo_clamp))
-    let fd_tmo_head = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(rdx, rt_slot(rt_timer_n)) + mov_rm(rdx, rdx, 0) + mov_ri64(r11, 9223372036854775807) + mov_ri64(r8, rt_slot(TIMER_BASE)) + test_rr(rdx, rdx) + je_rel32(str_len(fd_tmo_calc) + str_len(fd_tmo_clamp_mov) + str_len(fd_tmo_clamp))
+    let fd_tmo_head = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + clk_guard(41) + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(rdx, rt_slot(rt_timer_n)) + mov_rm(rdx, rdx, 0) + mov_ri64(r11, 9223372036854775807) + mov_ri64(r8, rt_slot(TIMER_BASE)) + test_rr(rdx, rdx) + je_rel32(str_len(fd_tmo_calc) + str_len(fd_tmo_clamp_mov) + str_len(fd_tmo_clamp))
     let fd_tmo = fd_tmo_zero + fd_tmo_head + fd_tmo_scan_body + fd_tmo_scan_upd + fd_tmo_scan_skip_pre + fd_tmo_scan_check + fd_tmo_scan_done + fd_tmo_calc + fd_tmo_clamp
     let fd_none = mov_ri64(rdx, -1) + jmp_rel32(str_len(fd_tmo))
     let fd_head = mov_ri64(r9, rt_slot(rt_waitset_n)) + mov_rm(r9, r9, 0) + sub_ri32(r9, 1) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(fd_none))

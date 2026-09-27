@@ -883,7 +883,7 @@ jobs:
       # TEMP §18 v8 采样步（抓到 guard dump 或修复落地后即删）：单轮 corpus 复现率
       # ~36% 两个都不崩就全绿；此处对两个 flake 例各连跑 20 轮，任何非零退出都打印
       # stderr 的 96B guard dump hex + 原文，不 gate（永远 exit 0）。
-      - name: "TEMP: section-18 v8 sample loop (20x flaky exec cases)"
+      - name: "TEMP: section-18 v9 sample loop (20x flaky exec cases)"
         run: |
           set +e
           for n in examples_io_exec testdata_regression_exec_large; do
@@ -898,9 +898,9 @@ jobs:
               if [ "$rc" -ne 0 ]; then
                 hits=$((hits + 1))
                 echo "SAMPLE $n run=$i rc=$rc"
-                if [ "$rc" -eq 38 ] || [ "$rc" -eq 39 ]; then
-                  echo "-- guard dump (96B, 38=fd path 39=service pass):"
-                  od -An -tx1 -N96 "s-$n.err"
+                if [ "$rc" -eq 38 ] || [ "$rc" -eq 39 ] || [ "$rc" -eq 40 ] || [ "$rc" -eq 41 ] || [ "$rc" -eq 42 ] || [ "$rc" -eq 43 ]; then
+                  echo "-- guard dump (128B read-side 38=fd 39=sw; 24B write-side 40=td_now 41=fd_tmo_head 42=timer_park 43=clock_native):"
+                  od -An -tx1 -N128 "s-$n.err"
                 fi
                 head -c 120 "s-$n.err" | od -An -c
               fi
@@ -926,6 +926,14 @@ jobs:
       # the nonblocking service-pass staging (exit 39; fd path stays 38) — v5's
       # Windows exec_large 0xC0000005 is consistent with an unguarded
       # service-pass corruption.
+      # v9 (2026-09-27): write-side tripwires at all four clock_gettime sites —
+      # the kernel writes the timespec into the [rsp] scratch, so a corrupted
+      # stack pointer lets tv_sec (~uptime seconds) land in neighbouring runtime
+      # slots (matches v8's 540/541 counts). Each site checks rsp's high 32 bits
+      # right after the syscall and dumps {rsp, tv_sec, tv_nsec} (24B) with its
+      # own exit code (40 td_now, 41 fd_tmo_head, 42 timer_park, 43
+      # clock_native). The read-side dump grew to 128B: neighbours [rt+112],
+      # [rt+120] plus end-of-dump re-reads of both counters.
 
   runtime:
     needs: []
