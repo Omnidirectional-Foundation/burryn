@@ -826,8 +826,8 @@ jobs:
               fail=$((fail + 1))
               echo "FAIL $n: rc $rc (want $want)"
               diff "macho-out/corpus/$n.expected" "act-$n.txt" | head -6
-              # §18 v6 插桩现场：exec 语料若因 waitset 计数腐化触发 dump（exit 38），
-              # stderr 前 64B 即现场块；一并打印原始 stderr 尾部供核对。
+              # §18 v8 插桩现场：exec 语料若因 waitset 计数腐化触发 dump（exit 38/39），
+              # stderr 前 96B 即现场块；一并打印原始 stderr 尾部供核对。
               [ -s "act-$n.err" ] && { echo "-- $n stderr head:"; od -An -tx1 -N80 "act-$n.err"; }
             fi
           done <macho-out/corpus/CASES
@@ -880,10 +880,10 @@ jobs:
           echo "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           [ "$fail" -eq 0 ]
 
-      # TEMP §18 v6 采样步（抓到 guard dump 或修复落地后即删）：单轮 corpus 复现率
+      # TEMP §18 v8 采样步（抓到 guard dump 或修复落地后即删）：单轮 corpus 复现率
       # ~36% 两个都不崩就全绿；此处对两个 flake 例各连跑 20 轮，任何非零退出都打印
-      # stderr 的 64B guard dump hex + 原文，不 gate（永远 exit 0）。
-      - name: "TEMP: section-18 v6 sample loop (20x flaky exec cases)"
+      # stderr 的 96B guard dump hex + 原文，不 gate（永远 exit 0）。
+      - name: "TEMP: section-18 v8 sample loop (20x flaky exec cases)"
         run: |
           set +e
           for n in examples_io_exec testdata_regression_exec_large; do
@@ -898,9 +898,9 @@ jobs:
               if [ "$rc" -ne 0 ]; then
                 hits=$((hits + 1))
                 echo "SAMPLE $n run=$i rc=$rc"
-                if [ "$rc" -eq 38 ]; then
-                  echo "-- guard dump (64B):"
-                  od -An -tx1 -N64 "s-$n.err"
+                if [ "$rc" -eq 38 ] || [ "$rc" -eq 39 ]; then
+                  echo "-- guard dump (96B, 38=fd path 39=service pass):"
+                  od -An -tx1 -N96 "s-$n.err"
                 fi
                 head -c 120 "s-$n.err" | od -An -c
               fi
@@ -921,6 +921,11 @@ jobs:
       # instead gates inside the scheduler itself (runtime.bur dbg_guard: on n>CAP dump
       # a 64B scene block to stderr and exit(38)); the corpus step above prints the dump.
       # The probe step is retired; the scene arrives via the FAIL branch output.
+      # v8 (2026-09-27): dump widened to 96B with rsp first (FB_RSP-hijack
+      # discriminator) plus rbp/r14/r15/r12 context; the same guard now also covers
+      # the nonblocking service-pass staging (exit 39; fd path stays 38) — v5's
+      # Windows exec_large 0xC0000005 is consistent with an unguarded
+      # service-pass corruption.
 
   runtime:
     needs: []

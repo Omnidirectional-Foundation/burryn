@@ -328,19 +328,29 @@ fn x86gen_sched_block() {
     // zeroed) before polling; afterwards write revents back to entry+6, where fd_loop_rev
     // keeps reading readiness ----
     let st_init = mov_ri64(rsi, rt_slot(rt_waitset_n)) + mov_rm(rsi, rsi, 0) + xor_rr(rdi, rdi) + mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_ri64(r11, rt_slot(POLLFD_BASE))
-    // TEMP §18 v6 插桩（取到腐化源后整体回退）：waitset 计数超过槽容量意味着
+    // TEMP §18 v8 插桩（取到腐化源后整体回退）：waitset 计数超过槽容量意味着
     // [rt_waitset_n] 已被腐化——在 staging 把 pollfd[64]==thunk 槽覆写之前，把
-    // 64B 现场块写 stderr 并 exit(38)，让 corpus 硬闸在该例失败、err 落盘可读；
-    // 健康路径永不触发（guard 不跳），输出零影响。
-    // TEMP §18 v6 probe (revert once the corrupter is known): a waitset count above the
-    // capacity means [rt_waitset_n] is corrupted — before staging clobbers
-    // pollfd[64]==thunk, dump a 64B scene block to stderr and exit(38). Healthy runs
-    // never take the guard.
-    let dbg_fields = mov_mr(rsp, 0, rsi) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 8, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 16, rax) + mov_ri64(rax, rt_slot(TIMER_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 24, rdx) + mov_rm(rdx, rax, 8) + mov_mr(rsp, 32, rdx) + mov_ri64(rax, rt_slot(WAITSET_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 40, rdx) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 48, rax) + mov_mr(rsp, 56, rbx)
-    let dbg_out = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 64) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 38) + sys_mov_rax(60) + syscall()
-    let dbg_seq = sub_ri32(rsp, 64) + dbg_fields + dbg_out
+    // 96B 现场块写 stderr 并退出（fd 阻塞路径 exit 38、非阻塞服务趟 exit 39），
+    // 让 corpus 硬闸在该例失败、err 落盘可读。首字段=rsp：若落在 __DATA 槽区
+    // 即实锤「调度器栈指针被腐化的 FB_RSP 劫持」（v6b dump 读回矛盾的唯一自洽
+    // 解释）；rbp/r14/r15/r12/rbx 同列以定位污染寄存器。健康路径永不触发。
+    // TEMP §18 v8 probe (revert once the corrupter is known): a waitset count above
+    // the capacity means [rt_waitset_n] is corrupted — before staging clobbers
+    // pollfd[64]==thunk, dump a 96B scene block to stderr (blocking fd path exit 38,
+    // nonblocking service pass exit 39). Field 0 is rsp: landing inside the __DATA
+    // slot region confirms the "scheduler stack hijacked by a corrupt FB_RSP"
+    // hypothesis (the only self-consistent reading of the v6b dump); rbp/r14/r15/
+    // r12/rbx narrow down which register carries the pollution. Healthy runs never
+    // take the guard.
+    let dbg_fields = mov_mr(rsp, 0, rsp) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 8, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 16, rax) + mov_ri64(rax, rt_slot(TIMER_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 24, rdx) + mov_rm(rdx, rax, 8) + mov_mr(rsp, 32, rdx) + mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 40, rax) + mov_mr(rsp, 48, rbx) + mov_mr(rsp, 56, rbp) + mov_mr(rsp, 64, r14) + mov_mr(rsp, 72, r15) + mov_mr(rsp, 80, r12) + mov_mr(rsp, 88, rsi)
+    let dbg_out38 = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 96) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 38) + sys_mov_rax(60) + syscall()
+    let dbg_out39 = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 96) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, 39) + sys_mov_rax(60) + syscall()
+    let dbg_seq = sub_ri32(rsp, 96) + dbg_fields + dbg_out38
+    let dbg_seq_sw = sub_ri32(rsp, 96) + dbg_fields + dbg_out39
     let dbg_bypass = jmp_rel32(str_len(dbg_seq))
+    let dbg_bypass_sw = jmp_rel32(str_len(dbg_seq_sw))
     let dbg_guard = cmp_ri32(rsi, WAITSET_CAP) + ja_rel32(5) + dbg_bypass + dbg_seq
+    let dbg_guard_sw = cmp_ri32(rsi, WAITSET_CAP) + ja_rel32(5) + dbg_bypass_sw + dbg_seq_sw
     let st_body = mov_rm(rcx, r10, 0) + mov_mr32(r11, 0, rcx) + mov_rm(rcx, r10, 4) + mov_mr32(r11, 4, rcx) + xor_rr(rcx, rcx) + mov_mr16(r11, 6, rcx) + add_ri32(r10, 16) + add_ri32(r11, 8) + add_ri32(rdi, 1)
     let st_top = cmp_rr(rdi, rsi) + jge_rel32(str_len(st_body) + 5)
     let st_back = jmp_rel32(0 - (str_len(st_top) + str_len(st_body) + 5))
@@ -391,7 +401,7 @@ fn x86gen_sched_block() {
     let main_check = mov_ri64(rax, rt_slot(rt_main_fiber)) + mov_rm(rax, rax, 0) + mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, FB_DONE) + cmp_rr(rcx, rdx) + je_rel32(str_len(sw_gate) + str_len(pop_head) + str_len(pop_body) + str_len(tail_clean) + str_len(resume))
     let sw_due = pw_timer_due
     let sw_tmo0 = mov_ri64(rdx, 0)
-    let sw_stage = st_init + st_top + st_body + st_back
+    let sw_stage = st_init + dbg_guard_sw + st_top + st_body + st_back
     let sw_poll = fd_poll_pre + fd_poll_test
     let sw_cb = cb_init + cb_top + cb_step + cb_back
     let sw_cursor = fd_cursor
