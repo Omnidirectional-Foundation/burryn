@@ -254,29 +254,36 @@ fn gc_rec(ptr_reg, size) {
 }
 
 // TEMP §18 v9 写侧布防（取到腐化源后整体回退）：clock_gettime 的 timespec 由内核
-// 写进 [rsp] 刮痕区；若进站点时栈指针已腐化指向 __DATA，内核就把 tv_sec（≈开机
-// 秒数）直接砸进相邻槽位。v8 判读已证腐化值≈uptime 秒、但读侧 dump 无法看到"谁
-// 写的"——本布防在每个 clock 站点 syscall 返回后立刻校验 rsp 高 32 位：活栈应为
-// 0x7ff7…量级，≤0x100 即视为已指向镜像数据区，把 {命中时 rsp, tv_sec, tv_nsec}
-// 共 24B 写 stderr 并以站点码退出（40 td_now / 41 fd_tmo_head / 42 timer_park /
-// 43 clock_native，natives.bur 内有同构副本，两处需同步改）。校验只经 r11 且
-// push/pop 包裹，健康路径零副作用；guard 触发时 dump 首字段=rsp+8（push 之后
-// 的 rsp），decode 时注意加回 8。
+// 写进 [rsp] 刮痕区；若进站点时栈指针已腐化指向镜像/堆区，内核就把 tv_sec（≈开机
+// 秒数）砸进被指向的内存。首跑已实锤 macOS net_nb：rsp=堆地址、sec=uptime——
+// 腐化在 fiber 上下文（v8 读侧 dump 的调度器 rsp 才是正常值）。判别用「窗口」：
+// rsp 落在 [data_origin-64KB, data_origin+32MB) 即视为镜像/堆区（darwin/Linux 栈在
+// 0x7ff… 高位、Windows PE 主栈在低位 0x0B…，都不落窗；PE data_origin=0x1400000，
+// 主栈 0xBFxxxx 距窗口下缘 >1MB）。窗口判定经 r10/r11，两个寄存器都 push/pop 包裹，
+// 健康路径零副作用。命中时 dump {scratch rsp, tv_sec, tv_nsec} 共 24B（两个 pop
+// 之后 rsp=scratch 本尊，无需补偿）并以站点码退出（40 td_now / 41 fd_tmo_head /
+// 42 timer_park / 43 clock_native）。
 // TEMP §18 v9 write-side tripwires (revert once the corrupter is known):
-// clock_gettime's timespec is written BY THE KERNEL into the [rsp] scratch; if
-// the stack pointer is already corrupted into __DATA on entry, tv_sec (~uptime
-// seconds) lands straight in neighbouring slots. v8 showed the corrupt value is
-// uptime-like seconds but the read-side dump cannot see the writer — so right
-// after the syscall at every clock site, check rsp's high 32 bits: a live stack
-// reads 0x7ff7…; ≤0x100 means the pointer sits in the image data region — dump
-// {rsp at hit, tv_sec, tv_nsec} (24B) to stderr and exit with the site code
-// (40 td_now, 41 fd_tmo_head, 42 timer_park, 43 clock_native; natives.bur keeps
-// an isomorphic copy, change both together). Only r11 is touched, wrapped in
-// push/pop; healthy paths are unaffected. Note the dump's first field is rsp+8
-// (captured after the push) — add 8 back when decoding.
+// clock_gettime's timespec is written BY THE KERNEL into the [rsp] scratch; a
+// stack pointer already corrupted into the image/heap region lets tv_sec
+// (~uptime seconds) land in whatever the pointer names. First run caught
+// macOS net_nb red-handed: rsp was a heap address, sec=uptime — the corruption
+// lives in fiber context (v8's read-side dump showed a healthy scheduler rsp
+// because the scheduler is a different context). The check is a WINDOW: rsp in
+// [data_origin-64KB, data_origin+32MB) counts as image/heap (darwin/Linux
+// stacks sit high at 0x7ff…, the Windows PE main stack sits low at 0x0B…;
+// PE data_origin=0x1400000 leaves >1MB below the window). Both r10 and r11 are
+// wrapped in push/pop; healthy paths are unaffected. On a hit the dump is
+// {scratch rsp, tv_sec, tv_nsec} (24B — taken after both pops, rsp IS the
+// scratch pointer) and the process exits with the site code (40 td_now, 41
+// fd_tmo_head, 42 timer_park, 43 clock_native).
 fn clk_guard(code) {
     let d = mov_mr(rsp, 0, rsp) + mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 24) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, code) + sys_mov_rax(60) + syscall()
-    push_r(r11) + mov_rr(r11, rsp) + shr_ri(r11, 32) + cmp_ri32(r11, 256) + ja_rel32(str_len(d)) + d + pop_r(r11)
+    let bad = pop_r(r10) + pop_r(r11) + d
+    let good = pop_r(r10) + pop_r(r11) + jmp_rel32(str_len(bad))
+    let hi_chk = mov_ri64(r10, data_origin() + 33554432) + cmp_rr(r11, r10) + jb_rel32(str_len(good))
+    let lo_chk = mov_rr(r11, rsp) + mov_ri64(r10, data_origin() - 65536) + cmp_rr(r11, r10) + jb_rel32(str_len(hi_chk))
+    push_r(r11) + push_r(r10) + lo_chk + hi_chk + good + bad
 }
 
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
