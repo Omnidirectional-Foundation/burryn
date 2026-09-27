@@ -278,32 +278,31 @@ fn gc_rec(ptr_reg, size) {
 // (40 td_now, 41 fd_tmo_head, 42 timer_park, 43 clock_native).
 // TEMP §18 v9 写侧布防（取到腐化源后整体回退）：clock_gettime 的 timespec 由内核
 // 写进 [rsp] 刮痕区；腐化签名（v8 实锤）是 scratch 落在 runtime 数据页上（rt+0x80），
-// 内核把 tv_sec（≈开机秒数）砸进 waitset_n。判别窗口因此收紧到数据页邻域
-// [data_origin-8KB, data_origin+8KB]：Linux 值栈增长区被内核 mmap 在 data 段正后方
-// （实测滑动 data_origin+1MB～2MB），调度器寄生其上属设计常态，宽窗口会误杀；
-// 收紧后 net 例完整跑完、真凶（scratch 落 rt 邻域）照抓。窗口判定经 r10/r11，
-// 两个寄存器都 push/pop 包裹，健康路径零副作用。命中时 dump {scratch rsp, tv_sec,
+// 内核把 tv_sec（≈开机秒数）砸进 waitset_n。判别=精确数据段窗口
+// [data_origin, data_origin+4096)：该区间是固定映射，mmap 永不与之重叠，健康栈
+// （主栈/值栈增长区）不可能落进去——增长区即使被内核紧贴 data 段后放置也从下一页
+// 开始（±8KB 窗败于 GH runner 的紧贴布局：增长页落 data+4KB 恰在窗内）。窗口判定
+// 经 r10/r11，push/pop 包裹，健康路径零副作用。命中时 dump {scratch rsp, tv_sec,
 // tv_nsec} 共 24B（两个 pop 之后 rsp=scratch 本尊）并以站点码退出（40 td_now /
 // 41 fd_tmo_head / 42 timer_park / 43 clock_native）。
 // TEMP §18 v9 write-side tripwires (revert once the corrupter is known):
 // clock_gettime's timespec is written BY THE KERNEL into the [rsp] scratch; the
 // v8-proven corruption signature is the scratch landing ON the runtime data page
 // (rt+0x80), letting tv_sec (~uptime seconds) smash waitset_n. The check window
-// is therefore the data-page neighbourhood [data_origin-8KB, data_origin+8KB]:
-// Linux grows value stacks by mmapping right behind the data segment (observed
-// at +1MB..+2MB) and the scheduler legitimately parasitises those stacks, so a
-// wide window would murder healthy runs; the tight window lets net examples run
-// to completion while still catching the killer. Both r10 and r11 are wrapped
-// in push/pop; healthy paths are unaffected. On a hit the dump is {scratch rsp,
-// tv_sec, tv_nsec} (24B — taken after both pops, rsp IS the scratch pointer)
-// and the process exits with the site code (40 td_now, 41 fd_tmo_head, 42
-// timer_park, 43 clock_native).
+// is the EXACT data segment [data_origin, data_origin+4096): a fixed mapping no
+// mmap ever overlaps, so no healthy stack can land inside it — growth regions,
+// even when the kernel packs them right behind the data segment, start at the
+// NEXT page (the ±8KB window died on GH runners for exactly that reason).
+// Only r10/r11 are touched, wrapped in push/pop; healthy paths are unaffected.
+// On a hit the dump is {scratch rsp, tv_sec, tv_nsec} (24B — taken after both
+// pops, rsp IS the scratch pointer) and the process exits with the site code
+// (40 td_now, 41 fd_tmo_head, 42 timer_park, 43 clock_native).
 fn clk_guard(code) {
     let d = mov_mr(rsp, 0, rsp) + mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 24) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, code) + sys_mov_rax(60) + syscall()
     let bad = pop_r(r10) + pop_r(r11) + d
     let good = pop_r(r10) + pop_r(r11) + jmp_rel32(str_len(bad))
-    let hi_chk = mov_ri64(r10, data_origin() + 8192) + cmp_rr(r11, r10) + jb_rel32(str_len(good))
-    let lo_chk = mov_rr(r11, rsp) + mov_ri64(r10, data_origin() - 8192) + cmp_rr(r11, r10) + jb_rel32(str_len(hi_chk))
+    let hi_chk = mov_ri64(r10, data_origin() + 4096) + cmp_rr(r11, r10) + jb_rel32(str_len(good))
+    let lo_chk = mov_rr(r11, rsp) + mov_ri64(r10, data_origin()) + cmp_rr(r11, r10) + jb_rel32(str_len(hi_chk))
     push_r(r11) + push_r(r10) + lo_chk + hi_chk + good + bad
 }
 
