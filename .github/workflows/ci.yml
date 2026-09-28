@@ -631,21 +631,43 @@ jobs:
               if (Test-Path "err-$n.txt") { Get-Content "err-$n.txt" -TotalCount 6 }
             }
           }
-          $p = Start-Process -FilePath "pe-out/corpus/examples_basics_args.exe" -ArgumentList 'one "two words" 三' -RedirectStandardOutput "act-argv.txt" -PassThru -NoNewWindow
+          $p = Start-Process -FilePath "pe-out/corpus/examples_basics_args.exe" -ArgumentList 'one "two words" 三' -RedirectStandardOutput "act-argv.txt" -RedirectStandardError "err-argv.txt" -PassThru -NoNewWindow
           $null = $p.Handle
-          $p.WaitForExit(20000) | Out-Null
-          if ((Get-FileHash "act-argv.txt").Hash -eq (Get-FileHash "pe-out/corpus/ARGV.expected").Hash) { $pass++ } else {
-            $fail++
-            Write-Output "FAIL args with arguments"
-            git diff --no-index --text "pe-out/corpus/ARGV.expected" "act-argv.txt" | Select-Object -Skip 4 -First 6
+          if (-not $p.WaitForExit(20000)) { taskkill /F /T /PID $p.Id | Out-Null; $rc = 124 } else { $rc = $p.ExitCode }
+          $h = $null
+          for ($try = 0; $try -lt 10 -and $null -eq $h; $try++) {
+            try { $h = (Get-FileHash "act-argv.txt" -ErrorAction Stop).Hash } catch { Start-Sleep -Milliseconds 500 }
           }
-          $p = Start-Process -FilePath "pe-out/corpus/examples_io_stdin.exe" -RedirectStandardInput "pe-out/corpus/STDIN.in" -RedirectStandardOutput "act-stdin.txt" -PassThru -NoNewWindow
-          $null = $p.Handle
-          $p.WaitForExit(20000) | Out-Null
-          if ((Get-FileHash "act-stdin.txt").Hash -eq (Get-FileHash "pe-out/corpus/STDIN.expected").Hash) { $pass++ } else {
+          $same = $h -eq (Get-FileHash "pe-out/corpus/ARGV.expected").Hash
+          if ($same -and $rc -eq 0) { $pass++ } else {
             $fail++
-            Write-Output "FAIL stdin from a file"
+            Write-Output ("FAIL args with arguments: rc {0} hash-read={1}" -f $rc, ($null -ne $h))
+            git diff --no-index --text "pe-out/corpus/ARGV.expected" "act-argv.txt" | Select-Object -Skip 4 -First 6
+            # §18 v9 探针在 clock 站点命中时以 40-43 退场，24B 现场写在 stderr
+            # §18 v9 probe exits 40-43 from a clock site; the 24B scene is on stderr
+            if ($rc -ge 40 -and $rc -le 43) {
+              $probe++
+              Write-Output ("PROBE-HIT args: rc {0} (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):" -f $rc)
+              od -An -tx1 -N24 "err-argv.txt"
+            } elseif (Test-Path "err-argv.txt") { Get-Content "err-argv.txt" -TotalCount 6 }
+          }
+          $p = Start-Process -FilePath "pe-out/corpus/examples_io_stdin.exe" -RedirectStandardInput "pe-out/corpus/STDIN.in" -RedirectStandardOutput "act-stdin.txt" -RedirectStandardError "err-stdin.txt" -PassThru -NoNewWindow
+          $null = $p.Handle
+          if (-not $p.WaitForExit(20000)) { taskkill /F /T /PID $p.Id | Out-Null; $rc = 124 } else { $rc = $p.ExitCode }
+          $h = $null
+          for ($try = 0; $try -lt 10 -and $null -eq $h; $try++) {
+            try { $h = (Get-FileHash "act-stdin.txt" -ErrorAction Stop).Hash } catch { Start-Sleep -Milliseconds 500 }
+          }
+          $same = $h -eq (Get-FileHash "pe-out/corpus/STDIN.expected").Hash
+          if ($same -and $rc -eq 0) { $pass++ } else {
+            $fail++
+            Write-Output ("FAIL stdin from a file: rc {0} hash-read={1}" -f $rc, ($null -ne $h))
             git diff --no-index --text "pe-out/corpus/STDIN.expected" "act-stdin.txt" | Select-Object -Skip 4 -First 6
+            if ($rc -ge 40 -and $rc -le 43) {
+              $probe++
+              Write-Output ("PROBE-HIT stdin: rc {0} (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):" -f $rc)
+              od -An -tx1 -N24 "err-stdin.txt"
+            } elseif (Test-Path "err-stdin.txt") { Get-Content "err-stdin.txt" -TotalCount 6 }
           }
           Write-Output "=== corpus: $pass pass, $fail fail, $probe probe-hits ==="
           if ($fail -ne 0) { exit 1 }
@@ -856,23 +878,39 @@ jobs:
               [ -s "act-$n.err" ] && { echo "-- $n stderr head:"; od -An -tx1 -N80 "act-$n.err"; }
             fi
           done <macho-out/corpus/CASES
-          macho-out/corpus/examples_basics_args-mac one "two words" 三 >act-argv.txt
-          if cmp -s act-argv.txt macho-out/corpus/ARGV.expected; then
+          perl -e 'alarm 20; exec @ARGV' macho-out/corpus/examples_basics_args-mac one "two words" 三 >act-argv.txt 2>probe-argv.err
+          rc=$?
+          [ "$rc" -eq 142 ] && rc=124
+          if cmp -s act-argv.txt macho-out/corpus/ARGV.expected && [ "$rc" -eq 0 ]; then
             pass=$((pass + 1))
           else
             fail=$((fail + 1))
-            echo "FAIL args with arguments"
+            echo "FAIL args with arguments rc=$rc"
             diff macho-out/corpus/ARGV.expected act-argv.txt | head -6
+            # §18 v9 探针命中（40-43）时 24B 现场在 stderr / a v9 probe hit
+            # (40-43) leaves the 24B scene on stderr
+            if [ "$rc" -ge 40 ] && [ "$rc" -le 43 ]; then
+              probe=$((probe + 1))
+              echo "PROBE-HIT args rc=$rc (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):"
+              od -An -tx1 -N24 probe-argv.err
+            fi
           fi
           codesign -f -s - macho-out/corpus/examples_io_stdin-mac 2>/dev/null
           chmod +x macho-out/corpus/examples_io_stdin-mac
-          perl -e 'alarm 20; exec @ARGV' macho-out/corpus/examples_io_stdin-mac <macho-out/corpus/STDIN.in >act-stdin.txt
-          if cmp -s act-stdin.txt macho-out/corpus/STDIN.expected; then
+          perl -e 'alarm 20; exec @ARGV' macho-out/corpus/examples_io_stdin-mac <macho-out/corpus/STDIN.in >act-stdin.txt 2>probe-stdin.err
+          rc=$?
+          [ "$rc" -eq 142 ] && rc=124
+          if cmp -s act-stdin.txt macho-out/corpus/STDIN.expected && [ "$rc" -eq 0 ]; then
             pass=$((pass + 1))
           else
             fail=$((fail + 1))
-            echo "FAIL stdin from a file"
+            echo "FAIL stdin from a file rc=$rc"
             diff macho-out/corpus/STDIN.expected act-stdin.txt | head -6
+            if [ "$rc" -ge 40 ] && [ "$rc" -le 43 ]; then
+              probe=$((probe + 1))
+              echo "PROBE-HIT stdin rc=$rc (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):"
+              od -An -tx1 -N24 probe-stdin.err
+            fi
           fi
           echo "=== corpus: $pass pass, $fail fail, $probe probe-hits ==="
           [ "$fail" -eq 0 ]
