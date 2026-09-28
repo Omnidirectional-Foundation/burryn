@@ -418,15 +418,19 @@ fn pe_spawn_case(iat) {
     let cmdline = mov_rm(r8, rsp, 112) + lea(rdi, r12, 176) + xor_rr(r9, r9) + arg_head + arg_body + jmp_rel32(0 - (str_len(arg_head) + str_len(arg_body) + 5)) + put(0)
     // CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)
     let create = xor_rr(rcx, rcx) + lea(rdx, r12, 176) + xor_rr(r8, r8) + xor_rr(r9, r9) + mov_ri64(rax, 1) + mov_mr(rsp, 32, rax) + mov_ri64(rax, 134217728) + mov_mr(rsp, 40, rax) + xor_rr(rax, rax) + mov_mr(rsp, 48, rax) + mov_mr(rsp, 56, rax) + lea(rax, r12, 32) + mov_mr(rsp, 64, rax) + lea(rax, r12, 144) + mov_mr(rsp, 72, rax) + pe_call(iat, "CreateProcessA") + mov_mr(rsp, 112, rax) + close_at(88) + close_at(104)
-    let fail = mov_ri64(rax, 0 - 1)
+    // 两个失败尾返回不同值供消费端定串：-1 = 建管失败，-2 = CreateProcess 失败
+    // two failure tails return distinct values for the consumer's fixed texts:
+    // -1 = pipe creation, -2 = CreateProcess
+    let fail_proc = mov_ri64(rax, 0 - 2)
+    let fail = mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(fail_proc))
     let p2_fail = close_at(80) + close_at(88)
-    let cp_fail = close_at(80) + close_at(96) + jmp_rel32(str_len(p2_fail))
-    let ok = mov_rm(rcx, r12, 152) + pe_call(iat, "CloseHandle") + mov_rm(rcx, rsp, 120) + mov_rm(rax, rsp, 80) + mov_mr(rcx, 0, rax) + mov_rm(rax, rsp, 96) + mov_mr(rcx, 8, rax) + mov_rm(rax, r12, 144) + jmp_rel32(str_len(cp_fail) + str_len(p2_fail) + str_len(fail))
+    let cp_fail = close_at(80) + close_at(96) + jmp_rel32(str_len(p2_fail) + str_len(fail))
+    let ok = mov_rm(rcx, r12, 152) + pe_call(iat, "CloseHandle") + mov_rm(rcx, rsp, 120) + mov_rm(rax, rsp, 80) + mov_mr(rcx, 0, rax) + mov_rm(rax, rsp, 96) + mov_mr(rcx, 8, rax) + mov_rm(rax, r12, 144) + jmp_rel32(str_len(cp_fail) + str_len(p2_fail) + str_len(fail) + str_len(fail_proc))
     let cp_chk = mov_rm32(rax, rsp, 112) + test_rr(rax, rax) + je_rel32(str_len(ok))
     let after_p2 = no_inherit(80) + no_inherit(96) + si + cmdline + create + cp_chk + ok + cp_fail
     let p2 = pipe_at(96) + e1(133) + e1(192) + je_rel32(str_len(after_p2))
     let p1 = pipe_at(80) + e1(133) + e1(192) + je_rel32(str_len(p2) + str_len(after_p2) + str_len(p2_fail))
-    mov_mr(rsp, 112, rdi) + mov_mr(rsp, 120, rsi) + sa + p1 + p2 + after_p2 + p2_fail + fail
+    mov_mr(rsp, 112, rdi) + mov_mr(rsp, 120, rsi) + sa + p1 + p2 + after_p2 + p2_fail + fail + fail_proc
 }
 
 pub fn pe_build_dispatcher(iat) {

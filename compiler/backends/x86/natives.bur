@@ -213,9 +213,12 @@ fn x86gen_defer_loop() {
     loop_head + body + back
 }
 
-// x86gen_err_inst 构造 Err("os error") 实例（rax 返回）
-// x86gen_err_inst builds an Err("os error") instance (returned in rax)
-fn x86gen_err_inst() {
+// _x86gen_err_inst 构造 Err("os error") 实例（rax 返回）；exec 族已改报
+// strerror/平台定串，现无调用方（保留备用）
+// _x86gen_err_inst builds an Err("os error") instance (returned in rax); the
+// exec family now reports strerror/platform fixed texts, so it has no callers
+// (kept for reference)
+fn _x86gen_err_inst() {
     let err_str = mov_rr(r8, r12) + mov_ri64(r10, 8) + mov_mr(r8, 0, r10) + mov_ri64(rdx, 8245935278387131247) + mov_mr(r8, 8, rdx) + add_ri32(r12, 16)
     let err_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r8) + add_ri32(r12, 24) + mov_rr(rax, rcx)
     err_str + err_inst
@@ -247,7 +250,17 @@ fn x86gen_exec_native(sched_addr, timer_add_addr) {
     let spawn_seq = x86gen_exec_spawn_native()
     let pump = x86gen_proc_pump()
     let result = x86gen_proc_result_inst()
-    let err = x86gen_err_inst()
+    // spawn 同步失败文本对齐 C：POSIX 报 strerror(真 errno)（rax = -errno），
+    // Windows 报分派器两尾对应的固定串
+    // spawn sync-failure text matches C: POSIX reports strerror of the real
+    // errno (rax = -errno), Windows reports the dispatcher tails' fixed strings
+    let lit_pipe = x86gen_err_lit("cannot create pipe")
+    let lit_proc = x86gen_err_lit("cannot start process")
+    let err = if target_os == "windows" {
+        mov_ri64(rdx, 0 - 2) + cmp_rr(rax, rdx) + jne_rel32(str_len(lit_proc) + 5) + lit_proc + jmp_rel32(str_len(lit_pipe)) + lit_pipe
+    } else {
+        x86gen_err_from_errno()
+    }
     let store = mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let err_tail = err + store
     let done_seq = result + jmp_rel32(str_len(err))
@@ -270,7 +283,16 @@ fn x86gen_exec_native(sched_addr, timer_add_addr) {
 // exec_start inline: spawn, return Ok(handle)
 fn x86gen_exec_start_native() {
     let spawn_seq = x86gen_exec_spawn_native()
-    let err = x86gen_err_inst()
+    // 同 exec：spawn 同步失败报 strerror(真 errno) / Windows 定串（对齐 C）
+    // as exec: spawn sync failure reports strerror of the real errno / the
+    // windows fixed strings (matching C)
+    let lit_pipe = x86gen_err_lit("cannot create pipe")
+    let lit_proc = x86gen_err_lit("cannot start process")
+    let err = if target_os == "windows" {
+        mov_ri64(rdx, 0 - 2) + cmp_rr(rax, rdx) + jne_rel32(str_len(lit_proc) + 5) + lit_proc + jmp_rel32(str_len(lit_pipe)) + lit_pipe
+    } else {
+        x86gen_err_from_errno()
+    }
     let store = mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let err_tail = err + store
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + add_ri32(r12, 24) + mov_rr(rax, rcx)
@@ -1569,7 +1591,11 @@ fn x86gen_exec_spawn_native() {
     let init_err = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_err_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_err_cap, rax)
     let proc_rest = init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
     let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + proc_rest
-    let fork_fail = c1(0) + c1(8) + c1(16) + mov_ri64(rax, 0 - 1)
+    // fork 失败：先存 -errno 进 [rsp+72] 再关读端（close 会覆写 rax），错误值
+    // 一路带到 spawn 返回值
+    // fork failure: stash -errno at [rsp+72] before closing the read ends (the
+    // closes clobber rax) so the error value survives to the spawn return
+    let fork_fail = mov_mr(rsp, 72, rax) + c1(0) + c1(8) + c1(16)
     let parent_seq = mov_mr(rsp, 24, rax) + c1(4) + c1(12) + c1(20) + test_rr(rax, rax) + jl_rel32(str_len(parent_ok) + 5) + parent_ok + jmp_rel32(str_len(fork_fail)) + fork_fail
     let done_seq = add_ri32(rsp, 80)
     let fork_seq = sys_mov_rax(57) + syscall() + test_rr(rax, rax) + jne_rel32(str_len(child_seq)) + child_seq + parent_seq + done_seq
@@ -1578,13 +1604,19 @@ fn x86gen_exec_spawn_native() {
     // Pipe failure chain falls through by level: a pipe3 failure lands on close_p2 (pipe2
     // then pipe1), a pipe2 failure on close_p1, a pipe1 failure straight on fail_tail, which
     // skips the whole fork and restores the stack. Only already-created pipe ends are closed.
-    let fail_tail = mov_ri64(rax, 0 - 1) + jmp_rel32(str_len(fork_seq) - str_len(done_seq))
+    // fail_tail 把 [rsp+72] 的 -errno 装回 rax 再收栈返回（close 链已覆写 rax，
+    // 不装回会以 rax=0 伪装成功句柄返回——实测 SIGSEGV 教训）
+    // fail_tail reloads the stashed -errno into rax before restoring the stack
+    // (the close chain clobbers rax; without the reload a zero return masquerades
+    // as a success handle — the measured SIGSEGV lesson)
+    let fail_tail = mov_rm(rax, rsp, 72) + jmp_rel32(str_len(fork_seq) - str_len(done_seq))
     let close_p1 = c1(0) + c1(4)
     let close_p2 = c1(8) + c1(12)
     let skip_fail = jmp_rel32(str_len(close_p2) + str_len(close_p1) + str_len(fail_tail))
-    let p3_fail = test_rr(rax, rax) + jl_rel32(5)
-    let p2_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(close_p2))
-    let p1_fail = test_rr(rax, rax) + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5 + str_len(close_p2) + str_len(close_p1))
+    let save = mov_mr(rsp, 72, rax)
+    let p3_fail = test_rr(rax, rax) + save + jl_rel32(5)
+    let p2_fail = test_rr(rax, rax) + save + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(close_p2))
+    let p1_fail = test_rr(rax, rax) + save + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5 + str_len(close_p2) + str_len(close_p1))
     let pipes = pipe1 + p1_fail + pipe2 + p2_fail + pipe3 + p3_fail + skip_fail + close_p2 + close_p1 + fail_tail
     if target_os == "windows" {
         // windows：无 fork，分派器 1004 号一步 CreatePipe×2 + CreateProcessA，
@@ -1601,7 +1633,12 @@ fn x86gen_exec_spawn_native() {
             mov_rm(rax, rsp, off) + x86gen_fdtable_alloc() + x86gen_fdtable_mark_kind(2) + mov_mr(rsp, off, rax)
         }
         let win_ok = mov_mr(rsp, 24, rax) + reg(0) + reg(8) + mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_ri64(rax, 0 - 1) + mov_mr(r9, proc_failfd, rax) + proc_rest
-        let win_fail = mov_ri64(rax, 0 - 1)
+        // Windows 失败值：-1 = 建管失败，-2 = CreateProcess 失败（分派器 1004 臂
+        // 分两尾返回）；win_fail 保持 rax 原样传给消费端定串
+        // windows failure values: -1 = pipe creation, -2 = CreateProcess (the
+        // dispatcher's 1004 arm returns them from two tails); win_fail passes
+        // rax through for the consumer to pick the fixed text
+        let win_fail = ""
         let win_spawn = mov_rm(rdi, rsp, 32) + mov_rr(rsi, rsp) + sys_mov_rax(1004) + syscall() + test_rr(rax, rax) + jl_rel32(str_len(win_ok) + 5) + win_ok + jmp_rel32(str_len(win_fail)) + win_fail
         return sub_ri32(rsp, 80) + defb + argv_alloc + cmd_copy + argv_loop + null_tail + win_spawn + done_seq
     }
