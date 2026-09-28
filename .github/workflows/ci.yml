@@ -628,7 +628,15 @@ jobs:
               $fail++
               Write-Output ("FAIL {0}: rc {1} (want {2}) hash-read={3}" -f $n, $rc, $want, ($null -ne $h))
               git diff --no-index --text "pe-out/corpus/$n.expected" "act-$n.txt" | Select-Object -Skip 4 -First 6
-              if (Test-Path "err-$n.txt") { Get-Content "err-$n.txt" -TotalCount 6 }
+              # §18 v9 探针在 clock 站点命中时以 40-43 退场，24B 现场写在 stderr；
+              # 读侧 guard 38/39 的 128B 现场同样在 stderr（二进制，须 od）
+              # §18 v9 probe exits 40-43 from a clock site; the 24B scene is on stderr;
+              # read-side guard 38/39 leaves a 128B scene there too (binary, od it)
+              if ($rc -ge 38 -and $rc -le 43 -and (Test-Path "err-$n.txt")) {
+                $probe++
+                Write-Output ("PROBE-HIT {0}: rc {1} (section-18 v9 tripwire; dump):" -f $n, $rc)
+                od -An -tx1 -N128 "err-$n.txt"
+              } elseif (Test-Path "err-$n.txt") { Get-Content "err-$n.txt" -TotalCount 6 }
             }
           }
           $p = Start-Process -FilePath "pe-out/corpus/examples_basics_args.exe" -ArgumentList 'one "two words" 三' -RedirectStandardOutput "act-argv.txt" -RedirectStandardError "err-argv.txt" -PassThru -NoNewWindow
@@ -875,7 +883,7 @@ jobs:
               diff "macho-out/corpus/$n.expected" "act-$n.txt" | head -6
               # §18 v8 插桩现场：exec 语料若因 waitset 计数腐化触发 dump（exit 38/39），
               # stderr 前 96B 即现场块；一并打印原始 stderr 尾部供核对。
-              [ -s "act-$n.err" ] && { echo "-- $n stderr head:"; od -An -tx1 -N80 "act-$n.err"; }
+              [ -s "act-$n.err" ] && { echo "-- $n stderr head:"; od -An -tx1 -N128 "act-$n.err"; }
             fi
           done <macho-out/corpus/CASES
           perl -e 'alarm 20; exec @ARGV' macho-out/corpus/examples_basics_args-mac one "two words" 三 >act-argv.txt 2>probe-argv.err
