@@ -967,7 +967,11 @@ fn x86gen_net_read_native(sched_addr, waitset_add_addr) {
 fn x86gen_net_write_native(sched_addr, waitset_add_addr) {
     let ok_inst = mov_rr(rcx, r12) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 16, rdx) + add_ri32(r12, 24) + mov_mr(r15, 0 - 24, rcx) + vs_pop_n(2)
     let fail = mov_rr(rdi, rax) + x86gen_err_op_errno("net_write") + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
-    let done = ok_inst + jmp_rel32(str_len(fail))
+    // n == 0 尾：C 同文定串 Err（send 对 len>0 实际不回 0，此为防御路径）
+    // n == 0 tail: the C-verbatim fixed-text Err (send never really returns 0
+    // for len>0; this is the defensive path)
+    let zero_tail = x86gen_err_lit("net_write: write returned zero bytes") + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
+    let done = ok_inst + jmp_rel32(str_len(zero_tail) + str_len(fail))
     let fd_park = x86gen_fd_park_at(sched_addr, waitset_add_addr, r15, 0 - 16, 4)
     // w_adv：off += n；随后的 w_adv_jmp 跳回 loop_check（两处 5 = 各自 jmp_rel32 长度）
     // w_adv: off += n; the following w_adv_jmp jumps back to loop_check (the two 5s are the
@@ -980,18 +984,24 @@ fn x86gen_net_write_native(sched_addr, waitset_add_addr) {
     // for jmp_rel32
     let w_err_len = str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0))
     let w1 = mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, r9, 0) + mov_rm(rcx, r15, 0 - 24) + sub_rr(rdx, rcx) + mov_rm(rdi, r15, 0 - 16) + mov_rr(rsi, r9) + add_rr(rsi, rcx) + add_ri32(rsi, 8) + sys_mov_rax(1) + syscall() + test_rr(rax, rax)
-    // w2：n > 0 → w_adv；n == 0 → fail（VM 语义：write returned zero bytes）
-    // w2: n > 0 goes to w_adv; n == 0 fails (VM semantics: write returned zero bytes)
-    let w2 = jg_rel32(6 + w_err_len) + je_rel32(w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done) + str_len(fail))
+    // w2：n > 0 → w_adv；n == 0 → zero_tail（VM 语义：write returned zero bytes，
+    // 与 C 同文）。旧 je 位移多计了一段 str_len(fail)、落点越过整个 native 尾部
+    //（流式 socket len>0 实际不回 0，故从未现形）；zero_tail 补上后 fail 前移一位
+    // w2: n > 0 goes to w_adv; n == 0 fails via zero_tail (VM semantics: write
+    // returned zero bytes, verbatim as C). The old je displacement counted one
+    // str_len(fail) too many and landed past the whole native tail (stream
+    // sockets never return 0 for len>0, so it never surfaced); with zero_tail
+    // in place fail shifts one fragment later
+    let w2 = jg_rel32(6 + w_err_len) + je_rel32(w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done))
     let loop_check = mov_rm(r9, r15, 0 - 8) + mov_rm(rax, r9, 0) + mov_rm(rcx, r15, 0 - 24) + cmp_rr(rcx, rax) + jae_rel32(str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5)
-    let w_err = neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(w_adv) + 5) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + 6 + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(w1) + str_len(w2) + str_len(loop_check))) + jmp_rel32(str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done))
+    let w_err = neg_r(rax) + mov_ri64(rdx, 11) + cmp_rr(rax, rdx) + je_rel32(str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(je_rel32(0)) + str_len(jmp_rel32(0)) + str_len(w_adv) + 5) + mov_ri64(rdx, 4) + cmp_rr(rax, rdx) + je_rel32(0 - (6 + str_len(neg_r(rax)) + str_len(mov_ri64(rdx, 11)) + str_len(cmp_rr(rax, rdx)) + 6 + str_len(mov_ri64(rdx, 4)) + str_len(cmp_rr(rax, rdx)) + str_len(w1) + str_len(w2) + str_len(loop_check))) + jmp_rel32(str_len(w_adv) + 5 + str_len(fd_park) + 5 + str_len(done) + str_len(zero_tail))
     let w_adv_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5))
     let fd_park_jmp = jmp_rel32(0 - (str_len(loop_check) + str_len(w1) + str_len(w2) + w_err_len + str_len(w_adv) + 5 + str_len(fd_park) + 5))
     // head：off 清零存 [r15-24]，jmp 进 loop_check（同 net_loopback 的 off 槽用法）
     // head: zeroes off into [r15-24] and jumps into loop_check (same off-slot usage as
     // net_loopback)
     let head = xor_rr(rcx, rcx) + mov_mr(r15, 0 - 24, rcx) + jmp_rel32(0)
-    head + loop_check + w1 + w2 + w_err + w_adv + w_adv_jmp + fd_park + fd_park_jmp + done + fail
+    head + loop_check + w1 + w2 + w_err + w_adv + w_adv_jmp + fd_park + fd_park_jmp + done + zero_tail + fail
 }
 
 // x86gen_ord_native 内联 ord：解码首码点（1-4 字节 UTF-8）
