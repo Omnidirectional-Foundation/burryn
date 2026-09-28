@@ -1,0 +1,1595 @@
+// llgen.bur — LLVM 后端：把字节码逐条翻译为 LLVM IR（忠实镜像 C 后端 cgen.bur）。
+// The LLVM backend: translates bytecode opcode by opcode into LLVM IR (a
+// faithful mirror of the C backend, cgen.bur).
+// 值模型 = 16B tagged Value（与 C runtime 一致），链接 burrt.c 免费获得全部
+// natives 与 GC；每个编译函数是 void @bur_fn_N()，类型布局逐字段对齐 burrt.h
+// 的 x86-64 形状。指针语法双模式：clang >= 15 发射不透明 ptr，clang <= 14
+// 发射 typed pointer（clang 14 的解析器硬拒裸 ptr，实测）。
+// The value model is the 16-byte tagged Value shared with the C runtime;
+// linking burrt.c buys all natives and the GC for free. Each compiled function
+// is a void @bur_fn_N() with types matching burrt.h's x86-64 layout field by
+// field. Pointer syntax is dual-mode: clang >= 15 gets opaque ptr, clang <= 14
+// gets typed pointers (clang 14's parser rejects a bare ptr, tested).
+
+import "burryn.dev/compiler/lib"
+import "burryn.dev/compiler/frontend"
+
+pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, ls_files, ls_names, ls_tables, use_ptr) {
+    let mut out = []
+    let mut glue = []
+    fn w(s) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        push(out, s)
+    }
+    fn wg(s) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        push(glue, s)
+    }
+    // PT(t)/PB(t)：指向 t 的指针类型 / 其基址操作数；FNPT()：函数指针类型。
+    // PT(t)/PB(t): pointer-to-t type / its base operand; FNPT(): fn-pointer type.
+    fn PT(t) capture(ref use_ptr) {
+        if use_ptr {
+            "ptr"
+        } else {
+            t + "*"
+        }
+    }
+    fn PB(t) capture(ref use_ptr) {
+        if use_ptr {
+            "ptr "
+        } else {
+            t + "* "
+        }
+    }
+    fn FNPT() capture(ref use_ptr) {
+        if use_ptr {
+            "ptr"
+        } else {
+            "void ()*"
+        }
+    }
+
+    let mut o_kind = []
+    let mut o_str = []
+    let mut o_a = []
+    let mut o_b = []
+    let mut ids = map()
+    let mut sids = map()
+    let mut sn = 0
+    let mut fconst_ids = []
+    for _f in f_name {
+        push(fconst_ids, [])
+    }
+
+    fn alloc_obj(kind, s, a, b) capture(ref o_kind, ref o_str, ref o_a, ref o_b) {
+        push(o_kind, kind)
+        push(o_str, s)
+        push(o_a, a)
+        push(o_b, b)
+        len(o_kind) - 1
+    }
+
+    fn register(cv) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let key = ll_reg_key(cv)
+        if key != "" {
+            match get(ids, key) {
+                Some(id) => {
+                    return id
+                },
+                None => {},
+            }
+        }
+        let id = match cv {
+            lib::CVal::CStr(s) => alloc_obj(0, s, 0, 0),
+            lib::CVal::CFn(fh) => alloc_obj(1, "", fh, 0),
+            lib::CVal::CEnumType(eh) => alloc_obj(2, "", eh, 0),
+            lib::CVal::CCtor(eh, i) => alloc_obj(3, "", eh, i),
+            lib::CVal::CSingleton(eh, i) => alloc_obj(4, "", eh, i),
+            _ => -1,
+        }
+        if key != "" {
+            put(ids, key, id)
+        }
+        match cv {
+            lib::CVal::CFn(fh) => {
+                let mut slot_ids = []
+                for c in f_consts[fh] {
+                    let is_obj = match c {
+                        lib::CVal::CInt(_) => false,
+                        lib::CVal::CFloat(_) => false,
+                        _ => true,
+                    }
+                    push(slot_ids, if is_obj {
+                        register(c)
+                    } else {
+                        -1
+                    })
+                }
+                fconst_ids[fh] = slot_ids
+            },
+            lib::CVal::CCtor(eh, _) => {
+                let _ = register(lib::CVal::CEnumType(eh))
+            },
+            lib::CVal::CSingleton(eh, _) => {
+                let _ = register(lib::CVal::CEnumType(eh))
+            },
+            _ => {},
+        }
+        id
+    }
+
+    // sref 内联字符串常量（按内容去重，NUL 结尾）/ sref interns a string
+    fn sref(s) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref sn, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let n = str_len(s)
+        let key = "s:" + str(n) + ":" + s
+        match get(sids, key) {
+            Some(nm) => nm,
+            None => {
+                let nid = sn
+                sn = sn + 1
+                let nm = "@.str." + str(nid)
+                put(sids, key, nm)
+                wg(nm + " = private constant [" + str(n + 1) + " x i8] c\"" + ll_esc(s) + "\\00\"\n")
+                nm
+            },
+        }
+    }
+
+    // srefp 字符串常量作为 i8* 操作数：ptr 模式直接用 @.str.N；typed 模式
+    // 全局是 [L x i8]* 不能直接当 i8*，改发常量 GEP 表达式（可作实参/store 值）
+    // srefp yields the string as an i8* operand: opaque mode uses @.str.N;
+    // typed mode emits a constant GEP (legal as an argument or store value)
+    fn srefp(s) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref sn, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        if use_ptr {
+            "ptr " + sref(s)
+        } else {
+            let g = sref(s)
+            let l = str_len(s) + 1
+            "i8* getelementptr inbounds ([" + str(l) + " x i8], [" + str(l) + " x i8]* " + g + ", i64 0, i64 0)"
+        }
+    }
+
+    let opt_id = register(lib::CVal::CEnumType(0))
+    let res_id = register(lib::CVal::CEnumType(1))
+    let out_id = register(lib::CVal::CEnumType(2))
+    let entry = register(lib::CVal::CFn(0))
+
+    w("; Generated by the Burryn LLVM backend. Do not edit.\n")
+    // 字符串里的 { 是插值起始符（E1004），左花括号一律 chr(123) 拼接；
+    // } 无此待遇，可直写（与 cgen 同款纪律）。
+    // { inside a string starts interpolation (E1004); open braces always go
+    // through chr(123). A lone } is fine literal (same rule cgen follows).
+    let OB = chr(123)
+    w("%Value = type " + OB + " i32, i64 }\n")
+    w("%Obj = type " + OB + " i32, i8, " + PT("%Obj") + " }\n")
+    w("%OString = type " + OB + " %Obj, " + PT("i8") + ", i64 }\n")
+    w("%OList = type " + OB + " %Obj, " + PT("%Value") + ", i64, i64 }\n")
+    w("%VariantInfo = type " + OB + " " + PT("i8") + ", i32 }\n")
+    w("%OFunc = type " + OB + " %Obj, " + PT("i8") + ", " + PT("i8") + ", i32, i32, " + FNPT() + ", " + PT("%Value") + ", i32 }\n")
+    w("%OUpvalue = type " + OB + " %Obj, " + PT("%Fiber") + ", i32, i8, %Value }\n")
+    w("%OClosure = type " + OB + " %Obj, " + PT("%OFunc") + ", " + PT(PT("%OUpvalue")) + ", i32 }\n")
+    w("%OEnumType = type " + OB + " %Obj, " + PT("i8") + ", " + PT("%VariantInfo") + ", i32 }\n")
+    w("%OVariantCtor = type " + OB + " %Obj, " + PT("%OEnumType") + ", i32 }\n")
+    w("%OEnumInst = type " + OB + " %Obj, " + PT("%OEnumType") + ", i32, " + PT("%Value") + ", i32 }\n")
+    w("%Buf = type " + OB + " " + PT("i8") + ", i64, i64 }\n")
+    w("%Fiber = type " + OB + " " + PT("%Value") + ", i32, i32, " + PT(PT("%OUpvalue")) + ", i32, i32, i32, i32, %Value, " + PT("%OClosure") + ", i32, " + PT(PT("%OFunc")) + ", " + PT("i32") + ", i32, i32, i64, i64, i64, i16, i8, " + PT("%Value") + ", i32, i32 }\n")
+
+    w("@bur_K = global [" + str(len(o_kind)) + " x " + PT("%Obj") + "] zeroinitializer\n")
+    let mut fun_ids = []
+    let mut fun_fhs = []
+    let mut oi = 0
+    while oi < len(o_kind) {
+        if o_kind[oi] == 1 {
+            push(fun_ids, oi)
+            push(fun_fhs, o_a[oi])
+        }
+        oi = oi + 1
+    }
+    let mut fi = 0
+    while fi < len(fun_ids) {
+        if len(f_consts[fun_fhs[fi]]) > 0 {
+            w("@bur_consts_" + str(fun_ids[fi]) + " = global [" + str(len(f_consts[fun_fhs[fi]])) + " x %Value] zeroinitializer\n")
+        }
+        fi = fi + 1
+    }
+    w("@bur_cur = external global " + PT("%Fiber") + "\n")
+    w("@bur_cur_closure = external global " + PT("%OClosure") + "\n")
+    w("@bur_gc_ready = external global i8\n")
+    w("@bur_main_fiber = external global " + PT("%Fiber") + "\n")
+    w("@bur_opt_enum = external global " + PT("%OEnumType") + "\n")
+    w("@bur_res_enum = external global " + PT("%OEnumType") + "\n")
+    w("@bur_out_enum = external global " + PT("%OEnumType") + "\n")
+    w("@stdout = external global " + PT("i8") + "\n")
+
+    w("declare void @bur_push(%Value)\n")
+    w("declare %Value @bur_pop()\n")
+    w("declare %Value @bur_peek(i32)\n")
+    w("declare i8 @bur_eq(%Value, %Value)\n")
+    w("declare %Value @bur_add(%Value, %Value)\n")
+    w("declare %Value @bur_compare(%Value, %Value, i32)\n")
+    w("declare %Value @bur_arith(%Value, %Value, i8)\n")
+    w("declare %Value @bur_neg(%Value)\n")
+    w("declare %Value @bur_not(%Value)\n")
+    w("declare " + PT("i8") + " @bur_typename(%Value)\n")
+    w("declare %Value @bur_index_get(%Value, %Value)\n")
+    w("declare void @bur_index_set(%Value, %Value, %Value)\n")
+    w("declare i64 @bur_len(%Value)\n")
+    w("declare %Value @upvalue_get(" + PT("%OUpvalue") + ")\n")
+    w("declare void @upvalue_set(" + PT("%OUpvalue") + ", %Value)\n")
+    w("declare " + PT("%OUpvalue") + " @bur_capture_upvalue(i32)\n")
+    w("declare " + PT("%OUpvalue") + " @bur_new_closed_cell(%Value)\n")
+    w("declare " + PT("%OUpvalue") + " @bur_capture_value(i32)\n")
+    w("declare void @bur_close_upvalues(i32)\n")
+    w("declare void @bur_call(i32)\n")
+    w("declare void @bur_defer_push(%Value)\n")
+    w("declare void @bur_run_defers(i32)\n")
+    w("declare void @bur_globals_put(" + PT("i8") + ", i64, %Value)\n")
+    w("declare %Value @bur_get_global(" + PT("i8") + ", i64)\n")
+    w("declare void @bur_set_global(" + PT("i8") + ", i64, %Value)\n")
+    w("declare " + PT("%OClosure") + " @bur_new_closure(" + PT("%OFunc") + ")\n")
+    w("declare " + PT("%OList") + " @bur_new_list(" + PT("%Value") + ", i64)\n")
+    w("declare void @bur_format(" + PT("%Buf") + ", %Value, i8)\n")
+    w("declare void @buf_char(" + PT("%Buf") + ", i8)\n")
+    w("declare void @bur_trap(" + PT("i8") + ", ...)\n")
+    w("declare " + PT("%Obj") + " @bur_alloc(i64, i32)\n")
+    w("declare void @bur_add_root(" + PT("%Obj") + ")\n")
+    w("declare i32 @bur_select(" + PT("i8") + ", i32, i8)\n")
+    w("declare void @bur_tuple_make(i32)\n")
+    w("declare void @bur_record_make(i32, " + PT("i8") + ")\n")
+    w("declare void @bur_record_get(" + PT("i8") + ")\n")
+    w("declare void @bur_record_update(i32, " + PT("i8") + ")\n")
+    w("declare void @bur_spawn(i32)\n")
+    w("declare void @bur_send(%Value, %Value)\n")
+    w("declare %Value @bur_recv(%Value)\n")
+    w("declare i8 @bur_chan_next(%Value, " + PT("%Value") + ")\n")
+    w("declare void @bur_boot(i32, " + PT("i8") + ")\n")
+    w("declare void @bur_register_natives()\n")
+    w("declare " + PT("%Fiber") + " @bur_new_fiber(" + PT("%OClosure") + ", " + PT("%Value") + ", i32, i64)\n")
+    w("declare void @bur_schedule(" + PT("%Fiber") + ")\n")
+    w("declare void @bur_scheduler()\n")
+    w("declare void @bur_preempt()\n")
+    w("declare " + PT("i8") + " @malloc(i64)\n")
+    w("declare " + PT("i8") + " @memcpy(" + PT("i8") + ", " + PT("i8") + ", i64)\n")
+    w("declare void @fflush(" + PT("i8") + ")\n")
+
+    // 逐函数发射状态（emit_inst 共享；每函数在主循环重置）
+    let mut tn = 0
+    let mut cur_term = true
+    let mut _init_n = 0
+    let mut _init_parts = 0
+
+    // nt() 新临时寄存器（%tN 命名空间）/ fresh temp register
+    fn nt() capture(ref tn) {
+        let r = "%t" + str(tn)
+        tn = tn + 1
+        r
+    }
+    // nl() 新块标签（x 命名空间，与寄存器隔离）/ fresh block label
+    fn nl() capture(ref tn) {
+        let r = "x" + str(tn)
+        tn = tn + 1
+        r
+    }
+    fn load_cur() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let r = nt()
+        w("  " + r + " = load " + PT("%Fiber") + ", " + PB(PT("%Fiber")) + "@bur_cur\n")
+        r
+    }
+    fn load_base() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let r = nt()
+        w("  " + r + " = load i32, " + PB("i32") + "%base\n")
+        r
+    }
+    fn stack_slot(off) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let cur = load_cur()
+        let sp = nt()
+        w("  " + sp + " = getelementptr %Fiber, " + PB("%Fiber") + cur + ", i32 0, i32 0\n")
+        let sv = nt()
+        w("  " + sv + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + sp + "\n")
+        let b = load_base()
+        let idx = nt()
+        w("  " + idx + " = add i32 " + b + ", " + str(off) + "\n")
+        let i64i = nt()
+        w("  " + i64i + " = sext i32 " + idx + " to i64\n")
+        let slot = nt()
+        w("  " + slot + " = getelementptr %Value, " + PB("%Value") + sv + ", i64 " + i64i + "\n")
+        slot
+    }
+    fn top_reg() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let cur = load_cur()
+        let tp = nt()
+        w("  " + tp + " = getelementptr %Fiber, " + PB("%Fiber") + cur + ", i32 0, i32 1\n")
+        tp
+    }
+    fn push_val(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        w("  call void @bur_push(%Value " + v + ")\n")
+    }
+    fn pop_val() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let r = nt()
+        w("  " + r + " = call %Value @bur_pop()\n")
+        r
+    }
+    fn peek_val(n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let r = nt()
+        w("  " + r + " = call %Value @bur_peek(i32 " + str(n) + ")\n")
+        r
+    }
+    fn top_adj(n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let tp = top_reg()
+        let tv = nt()
+        w("  " + tv + " = load i32, " + PB("i32") + tp + "\n")
+        let t2 = nt()
+        w("  " + t2 + " = sub i32 " + tv + ", " + str(n) + "\n")
+        w("  store i32 " + t2 + ", " + PB("i32") + tp + "\n")
+    }
+    fn v_bool(b1) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let a = nt()
+        w("  " + a + " = insertvalue %Value undef, i32 1, 0\n")
+        let z = nt()
+        w("  " + z + " = zext i1 " + b1 + " to i64\n")
+        let b = nt()
+        w("  " + b + " = insertvalue %Value " + a + ", i64 " + z + ", 1\n")
+        b
+    }
+    fn v_int(n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let a = nt()
+        w("  " + a + " = insertvalue %Value undef, i32 2, 0\n")
+        let b = nt()
+        w("  " + b + " = insertvalue %Value " + a + ", i64 " + n + ", 1\n")
+        b
+    }
+    fn v_obj(p, t) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let a = nt()
+        w("  " + a + " = insertvalue %Value undef, i32 4, 0\n")
+        let i = nt()
+        w("  " + i + " = ptrtoint " + PT(t) + " " + p + " to i64\n")
+        let b = nt()
+        w("  " + b + " = insertvalue %Value " + a + ", i64 " + i + ", 1\n")
+        b
+    }
+    // obj_val 装载 bur_K[i] / obj_val loads bur_K[i]
+    fn obj_val(i) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let kp = nt()
+        w("  " + kp + " = getelementptr [" + str(len(o_kind)) + " x " + PT("%Obj") + "], " + PB("[" + str(len(o_kind)) + " x " + PT("%Obj") + "]") + "@bur_K, i64 0, i64 " + str(i) + "\n")
+        let o = nt()
+        w("  " + o + " = load " + PT("%Obj") + ", " + PB(PT("%Obj")) + kp + "\n")
+        o
+    }
+    // bc typed 模式下的指针位宽转换（ptr 模式恒等）/ bitcast in typed mode
+    fn bc(r, from, to) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        if use_ptr {
+            r
+        } else {
+            let x = nt()
+            w("  " + x + " = bitcast " + PT(from) + " " + r + " to " + PT(to) + "\n")
+            x
+        }
+    }
+    // gdec 字符串常量首元素地址（数组→指针退化）/ gdec decays a string global
+    fn gdec(g, l) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let r = nt()
+        w("  " + r + " = getelementptr [" + str(l) + " x i8], " + PB("[" + str(l) + " x i8]") + g + ", i64 0, i64 0\n")
+        r
+    }
+    fn ret_seq(hd) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        if hd {
+            let db = nt()
+            w("  " + db + " = load i32, " + PB("i32") + "%dbase\n")
+            w("  call void @bur_run_defers(i32 " + db + ")\n")
+        }
+        let r = pop_val()
+        let b = load_base()
+        w("  call void @bur_close_upvalues(i32 " + b + ")\n")
+        let tp = top_reg()
+        w("  store i32 " + b + ", " + PB("i32") + tp + "\n")
+        push_val(r)
+        cur_term = true
+        w("  ret void\n")
+    }
+    fn upval_cell(i) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let sp = nt()
+        w("  " + sp + " = load " + PT("%OClosure") + ", " + PB(PT("%OClosure")) + "%self\n")
+        let up = nt()
+        w("  " + up + " = getelementptr %OClosure, " + PB("%OClosure") + sp + ", i32 0, i32 2\n")
+        let upa = nt()
+        w("  " + upa + " = load " + PT(PT("%OUpvalue")) + ", " + PT(PT(PT("%OUpvalue"))) + " " + up + "\n")
+        let uslot = nt()
+        w("  " + uslot + " = getelementptr " + PT("%OUpvalue") + ", " + PB(PT("%OUpvalue")) + upa + ", i64 " + str(i) + "\n")
+        let cell = nt()
+        w("  " + cell + " = load " + PT("%OUpvalue") + ", " + PB(PT("%OUpvalue")) + uslot + "\n")
+        cell
+    }
+    fn cond_trap(v, t, fmt) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let tag = nt()
+        w("  " + tag + " = extractvalue %Value " + v + ", 0\n")
+        let bad = nt()
+        w("  " + bad + " = icmp ne i32 " + tag + ", " + str(t) + "\n")
+        cur_term = true
+        let lab = nl()
+        w("  br i1 " + bad + ", label %" + lab + "tp, label %" + lab + "ok\n")
+        w(lab + "tp:\n")
+        let tnreg = nt()
+        w("  " + tnreg + " = call " + PT("i8") + " @bur_typename(%Value " + v + ")\n")
+        w("  call void (" + PT("i8") + ", ...) @bur_trap(" + srefp(fmt) + ", " + PT("i8") + " " + tnreg + ")\n")
+        w("  br label %" + lab + "ok\n")
+        w(lab + "ok:\n")
+        cur_term = false
+    }
+
+    // emit_inst 按 opcode 发射 IR（与 cgen 的 C 语义逐条对应）
+    fn emit_inst(id, fh, code, ip, hd) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
+        let op = code[ip]
+        if op == lib::op_const {
+            let n = len(f_consts[fh])
+            let slot = nt()
+            w("  " + slot + " = getelementptr [" + str(n) + " x %Value], " + PB("[" + str(n) + " x %Value]") + "@bur_consts_" + str(id) + ", i64 0, i64 " + str(ll_read_u16(code, ip + 1)) + "\n")
+            let v = nt()
+            w("  " + v + " = load %Value, " + PB("%Value") + slot + "\n")
+            push_val(v)
+            ip + 3
+        } else if op == lib::op_unit {
+            let a = nt()
+            w("  " + a + " = insertvalue %Value undef, i32 0, 0\n")
+            let b = nt()
+            w("  " + b + " = insertvalue %Value " + a + ", i64 0, 1\n")
+            push_val(b)
+            ip + 1
+        } else if op == lib::op_true {
+            let r = v_bool("1")
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_false {
+            let r = v_bool("0")
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_pop {
+            let _r = pop_val()
+            ip + 1
+        } else if op == lib::op_pop_n {
+            top_adj(code[ip + 1])
+            ip + 2
+        } else if op == lib::op_close_upvalue {
+            let tp = top_reg()
+            let tv = nt()
+            w("  " + tv + " = load i32, " + PB("i32") + tp + "\n")
+            let t2 = nt()
+            w("  " + t2 + " = sub i32 " + tv + ", 1\n")
+            w("  call void @bur_close_upvalues(i32 " + t2 + ")\n")
+            let _r = pop_val()
+            ip + 1
+        } else if op == lib::op_end_block {
+            let n = code[ip + 1]
+            let v = pop_val()
+            let tp = top_reg()
+            let tv = nt()
+            w("  " + tv + " = load i32, " + PB("i32") + tp + "\n")
+            let fr = nt()
+            w("  " + fr + " = sub i32 " + tv + ", " + str(n) + "\n")
+            w("  call void @bur_close_upvalues(i32 " + fr + ")\n")
+            top_adj(n)
+            push_val(v)
+            ip + 2
+        } else if op == lib::op_get_local {
+            let slot = stack_slot(ll_read_u16(code, ip + 1))
+            let v = nt()
+            w("  " + v + " = load %Value, " + PB("%Value") + slot + "\n")
+            push_val(v)
+            ip + 3
+        } else if op == lib::op_set_local {
+            let pv = peek_val(0)
+            let slot = stack_slot(ll_read_u16(code, ip + 1))
+            w("  store %Value " + pv + ", " + PB("%Value") + slot + "\n")
+            ip + 3
+        } else if op == lib::op_get_global {
+            let n = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
+            let r = nt()
+            w("  " + r + " = call %Value @bur_get_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ")\n")
+            push_val(r)
+            ip + 3
+        } else if op == lib::op_def_global {
+            let n = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
+            let v = pop_val()
+            w("  call void @bur_globals_put(" + srefp(n) + ", i64 " + str(str_len(n)) + ", %Value " + v + ")\n")
+            ip + 3
+        } else if op == lib::op_set_global {
+            let n = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
+            let v = peek_val(0)
+            w("  call void @bur_set_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ", %Value " + v + ")\n")
+            ip + 3
+        } else if op == lib::op_get_upval {
+            let cell = upval_cell(ll_read_u16(code, ip + 1))
+            let r = nt()
+            w("  " + r + " = call %Value @upvalue_get(" + PT("%OUpvalue") + " " + cell + ")\n")
+            push_val(r)
+            ip + 3
+        } else if op == lib::op_set_upval {
+            let pv = peek_val(0)
+            let cell = upval_cell(ll_read_u16(code, ip + 1))
+            w("  call void @upvalue_set(" + PT("%OUpvalue") + " " + cell + ", %Value " + pv + ")\n")
+            ip + 3
+        } else if op == lib::op_eq || op == lib::op_neq {
+            let a = peek_val(1)
+            let b = peek_val(0)
+            let r8 = nt()
+            w("  " + r8 + " = call i8 @bur_eq(%Value " + a + ", %Value " + b + ")\n")
+            let r8b = if op == lib::op_neq {
+                let x = nt()
+                w("  " + x + " = xor i8 " + r8 + ", 1\n")
+                x
+            } else {
+                r8
+            }
+            let b1 = nt()
+            w("  " + b1 + " = icmp ne i8 " + r8b + ", 0\n")
+            let r = v_bool(b1)
+            top_adj(2)
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_gt || op == lib::op_gt_eq || op == lib::op_lt || op == lib::op_lt_eq {
+            let kind = if op == lib::op_gt {
+                0
+            } else if op == lib::op_gt_eq {
+                1
+            } else if op == lib::op_lt {
+                2
+            } else {
+                3
+            }
+            let a = peek_val(1)
+            let b = peek_val(0)
+            let r = nt()
+            w("  " + r + " = call %Value @bur_compare(%Value " + a + ", %Value " + b + ", i32 " + str(kind) + ")\n")
+            top_adj(2)
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_add {
+            let a = peek_val(1)
+            let b = peek_val(0)
+            let r = nt()
+            w("  " + r + " = call %Value @bur_add(%Value " + a + ", %Value " + b + ")\n")
+            top_adj(2)
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_sub || op == lib::op_mul || op == lib::op_div || op == lib::op_mod {
+            let c = if op == lib::op_sub {
+                45
+            } else if op == lib::op_mul {
+                42
+            } else if op == lib::op_div {
+                47
+            } else {
+                37
+            }
+            let a = peek_val(1)
+            let b = peek_val(0)
+            let r = nt()
+            w("  " + r + " = call %Value @bur_arith(%Value " + a + ", %Value " + b + ", i8 " + str(c) + ")\n")
+            top_adj(2)
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_neg || op == lib::op_not {
+            let f = if op == lib::op_neg {
+                "@bur_neg"
+            } else {
+                "@bur_not"
+            }
+            let v = pop_val()
+            let r = nt()
+            w("  " + r + " = call %Value " + f + "(%Value " + v + ")\n")
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_jump {
+            cur_term = true
+            w("  br label %L" + str(ip + 3 + ll_read_u16(code, ip + 1)) + "\n")
+            ip + 3
+        } else if op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop {
+            let c = peek_val(0)
+            cond_trap(c, 1, "condition must be a bool, got %s")
+            let b64 = nt()
+            w("  " + b64 + " = extractvalue %Value " + c + ", 1\n")
+            let b8 = nt()
+            w("  " + b8 + " = trunc i64 " + b64 + " to i8\n")
+            let want = if op == lib::op_jump_if_true {
+                "ne"
+            } else {
+                "eq"
+            }
+            let b1 = nt()
+            w("  " + b1 + " = icmp " + want + " i8 " + b8 + ", 0\n")
+            if op == lib::op_jump_if_false_pop {
+                let _p = pop_val()
+            }
+            cur_term = true
+            w("  br i1 " + b1 + ", label %L" + str(ip + 3 + ll_read_u16(code, ip + 1)) + ", label %L" + str(ip + 3) + "\n")
+            ip + 3
+        } else if op == lib::op_loop {
+            let cur = load_cur()
+            let bp = nt()
+            w("  " + bp + " = getelementptr %Fiber, " + PB("%Fiber") + cur + ", i32 0, i32 14\n")
+            let bv = nt()
+            w("  " + bv + " = load i32, " + PB("i32") + bp + "\n")
+            let bv1 = nt()
+            w("  " + bv1 + " = sub i32 " + bv + ", 1\n")
+            w("  store i32 " + bv1 + ", " + PB("i32") + bp + "\n")
+            let nb = nt()
+            w("  " + nb + " = icmp sle i32 " + bv1 + ", 0\n")
+            cur_term = true
+            let tgt = "L" + str(ip + 3 - ll_read_u16(code, ip + 1))
+            let lab = nl()
+            w("  br i1 " + nb + ", label %" + lab + "pp, label %" + tgt + "\n")
+            w(lab + "pp:\n")
+            w("  call void @bur_preempt()\n")
+            w("  br label %" + tgt + "\n")
+            ip + 3
+        } else if op == lib::op_call {
+            w("  call void @bur_call(i32 " + str(code[ip + 1]) + ")\n")
+            ip + 2
+        } else if op == lib::op_closure {
+            let fn_c = ll_read_u16(code, ip + 1)
+            let sub = ll_fn_const(fh, fn_c, f_consts)
+            let mut p = ip + 3
+            let n = len(f_consts[fh])
+            let cslot = nt()
+            w("  " + cslot + " = getelementptr [" + str(n) + " x %Value], " + PB("[" + str(n) + " x %Value]") + "@bur_consts_" + str(id) + ", i64 0, i64 " + str(fn_c) + "\n")
+            let fv = nt()
+            w("  " + fv + " = load %Value, " + PB("%Value") + cslot + "\n")
+            let fo = nt()
+            w("  " + fo + " = extractvalue %Value " + fv + ", 1\n")
+            let fop = nt()
+            w("  " + fop + " = inttoptr i64 " + fo + " to " + PT("%OFunc") + "\n")
+            let cl = nt()
+            w("  " + cl + " = call " + PT("%OClosure") + " @bur_new_closure(" + PT("%OFunc") + " " + fop + ")\n")
+            let clv = v_obj(cl, "%OClosure")
+            push_val(clv)
+            let mut i = 0
+            while i < f_nupvals[sub] {
+                let flag = code[p]
+                p = p + 1
+                let uidx = ll_read_u16(code, p)
+                p = p + 2
+                let up = nt()
+                w("  " + up + " = getelementptr %OClosure, " + PB("%OClosure") + cl + ", i32 0, i32 2\n")
+                let upa = nt()
+                w("  " + upa + " = load " + PT(PT("%OUpvalue")) + ", " + PT(PT(PT("%OUpvalue"))) + " " + up + "\n")
+                let uslot = nt()
+                w("  " + uslot + " = getelementptr " + PT("%OUpvalue") + ", " + PB(PT("%OUpvalue")) + upa + ", i64 " + str(i) + "\n")
+                if flag % 2 == 1 {
+                    if flag >= 2 {
+                        let b = load_base()
+                        let idx = nt()
+                        w("  " + idx + " = add i32 " + b + ", " + str(uidx) + "\n")
+                        let cc = nt()
+                        w("  " + cc + " = call " + PT("%OUpvalue") + " @bur_capture_upvalue(i32 " + idx + ")\n")
+                        w("  store " + PT("%OUpvalue") + " " + cc + ", " + PB(PT("%OUpvalue")) + uslot + "\n")
+                    } else {
+                        let b = load_base()
+                        let idx = nt()
+                        w("  " + idx + " = add i32 " + b + ", " + str(uidx) + "\n")
+                        let cc = nt()
+                        w("  " + cc + " = call " + PT("%OUpvalue") + " @bur_capture_value(i32 " + idx + ")\n")
+                        w("  store " + PT("%OUpvalue") + " " + cc + ", " + PB(PT("%OUpvalue")) + uslot + "\n")
+                    }
+                } else {
+                    let cell = upval_cell(uidx)
+                    let opn = nt()
+                    w("  " + opn + " = getelementptr %OUpvalue, " + PB("%OUpvalue") + cell + ", i32 0, i32 3\n")
+                    let ov = nt()
+                    w("  " + ov + " = load i8, " + PB("i8") + opn + "\n")
+                    let isop = nt()
+                    w("  " + isop + " = icmp ne i8 " + ov + ", 0\n")
+                    cur_term = true
+                    let lab = nl()
+                    w("  br i1 " + isop + ", label %" + lab + "use, label %" + lab + "new\n")
+                    w(lab + "use:\n")
+                    w("  store " + PT("%OUpvalue") + " " + cell + ", " + PB(PT("%OUpvalue")) + "%cell\n")
+                    w("  br label %" + lab + "st\n")
+                    w(lab + "new:\n")
+                    let pv = nt()
+                    w("  " + pv + " = call %Value @upvalue_get(" + PT("%OUpvalue") + " " + cell + ")\n")
+                    let nc = nt()
+                    w("  " + nc + " = call " + PT("%OUpvalue") + " @bur_new_closed_cell(%Value " + pv + ")\n")
+                    w("  store " + PT("%OUpvalue") + " " + nc + ", " + PB(PT("%OUpvalue")) + "%cell\n")
+                    w("  br label %" + lab + "st\n")
+                    w(lab + "st:\n")
+                    cur_term = false
+                    let cc = nt()
+                    w("  " + cc + " = load " + PT("%OUpvalue") + ", " + PB(PT("%OUpvalue")) + "%cell\n")
+                    w("  store " + PT("%OUpvalue") + " " + cc + ", " + PB(PT("%OUpvalue")) + uslot + "\n")
+                }
+                i = i + 1
+            }
+            p
+        } else if op == lib::op_return {
+            ret_seq(hd)
+            ip + 1
+        } else if op == lib::op_list {
+            let n2 = ll_read_u16(code, ip + 1)
+            let cur = load_cur()
+            let sp = nt()
+            w("  " + sp + " = getelementptr %Fiber, " + PB("%Fiber") + cur + ", i32 0, i32 0\n")
+            let sv = nt()
+            w("  " + sv + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + sp + "\n")
+            let tp = nt()
+            w("  " + tp + " = getelementptr %Fiber, " + PB("%Fiber") + cur + ", i32 0, i32 1\n")
+            let tv = nt()
+            w("  " + tv + " = load i32, " + PB("i32") + tp + "\n")
+            let start = nt()
+            w("  " + start + " = sub i32 " + tv + ", " + str(n2) + "\n")
+            let s64 = nt()
+            w("  " + s64 + " = sext i32 " + start + " to i64\n")
+            let sptr = nt()
+            w("  " + sptr + " = getelementptr %Value, " + PB("%Value") + sv + ", i64 " + s64 + "\n")
+            let l = nt()
+            w("  " + l + " = call " + PT("%OList") + " @bur_new_list(" + PT("%Value") + " " + sptr + ", i64 " + str(n2) + ")\n")
+            top_adj(n2)
+            let lv = v_obj(l, "%OList")
+            push_val(lv)
+            ip + 3
+        } else if op == lib::op_index_get {
+            let a = peek_val(1)
+            let b = peek_val(0)
+            let r = nt()
+            w("  " + r + " = call %Value @bur_index_get(%Value " + a + ", %Value " + b + ")\n")
+            top_adj(2)
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_index_set {
+            let val = pop_val()
+            let idx = pop_val()
+            let tgt = pop_val()
+            w("  call void @bur_index_set(%Value " + tgt + ", %Value " + idx + ", %Value " + val + ")\n")
+            ip + 1
+        } else if op == lib::op_len {
+            let v = pop_val()
+            let l = nt()
+            w("  " + l + " = call i64 @bur_len(%Value " + v + ")\n")
+            let r = v_int(l)
+            push_val(r)
+            ip + 1
+        } else if op == lib::op_test_variant {
+            let vi = code[ip + 1]
+            let et = pop_val()
+            let cand = pop_val()
+            let tag = nt()
+            w("  " + tag + " = extractvalue %Value " + cand + ", 0\n")
+            let isobj = nt()
+            w("  " + isobj + " = icmp eq i32 " + tag + ", 4\n")
+            cur_term = true
+            let lab = nl()
+            w("  br i1 " + isobj + ", label %" + lab + "dr, label %" + lab + "no\n")
+            w(lab + "dr:\n")
+            let o64 = nt()
+            w("  " + o64 + " = extractvalue %Value " + cand + ", 1\n")
+            let op = nt()
+            w("  " + op + " = inttoptr i64 " + o64 + " to " + PT("%Obj") + "\n")
+            let typ = nt()
+            let tp0 = nt()
+            w("  " + tp0 + " = getelementptr %Obj, " + PB("%Obj") + op + ", i32 0, i32 0\n")
+            w("  " + typ + " = load i32, " + PB("i32") + tp0 + "\n")
+            let isei = nt()
+            w("  " + isei + " = icmp eq i32 " + typ + ", 8\n")
+            w("  br i1 " + isei + ", label %" + lab + "ck, label %" + lab + "no\n")
+            w(lab + "ck:\n")
+            let ei = bc(op, "%Obj", "%OEnumInst")
+            let e64 = nt()
+            w("  " + e64 + " = extractvalue %Value " + et + ", 1\n")
+            let etp = nt()
+            w("  " + etp + " = inttoptr i64 " + e64 + " to " + PT("%OEnumType") + "\n")
+            let enmp = nt()
+            w("  " + enmp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + ei + ", i32 0, i32 1\n")
+            let enm = nt()
+            w("  " + enm + " = load " + PT("%OEnumType") + ", " + PB(PT("%OEnumType")) + enmp + "\n")
+            let same = nt()
+            w("  " + same + " = icmp eq " + PT("%OEnumType") + " " + enm + ", " + etp + "\n")
+            w("  br i1 " + same + ", label %" + lab + "vr, label %" + lab + "no\n")
+            w(lab + "vr:\n")
+            let vrp = nt()
+            w("  " + vrp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + ei + ", i32 0, i32 2\n")
+            let vr = nt()
+            w("  " + vr + " = load i32, " + PB("i32") + vrp + "\n")
+            let ok = nt()
+            w("  " + ok + " = icmp eq i32 " + vr + ", " + str(vi) + "\n")
+            let o1 = nt()
+            w("  " + o1 + " = zext i1 " + ok + " to i8\n")
+            w("  store i8 " + o1 + ", " + PB("i8") + "%tvi\n")
+            w("  br label %" + lab + "mg\n")
+            w(lab + "no:\n")
+            w("  store i8 0, " + PB("i8") + "%tvi\n")
+            w("  br label %" + lab + "mg\n")
+            w(lab + "mg:\n")
+            cur_term = false
+            let m8 = nt()
+            w("  " + m8 + " = load i8, " + PB("i8") + "%tvi\n")
+            let mb = nt()
+            w("  " + mb + " = icmp ne i8 " + m8 + ", 0\n")
+            let r = v_bool(mb)
+            push_val(r)
+            ip + 2
+        } else if op == lib::op_get_field {
+            let v = pop_val()
+            let o64 = nt()
+            w("  " + o64 + " = extractvalue %Value " + v + ", 1\n")
+            let op = nt()
+            w("  " + op + " = inttoptr i64 " + o64 + " to " + PT("%OEnumInst") + "\n")
+            let fp = nt()
+            w("  " + fp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + op + ", i32 0, i32 3\n")
+            let fa = nt()
+            w("  " + fa + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + fp + "\n")
+            let slot = nt()
+            w("  " + slot + " = getelementptr %Value, " + PB("%Value") + fa + ", i64 " + str(code[ip + 1]) + "\n")
+            let fld = nt()
+            w("  " + fld + " = load %Value, " + PB("%Value") + slot + "\n")
+            push_val(fld)
+            ip + 2
+        } else if op == lib::op_no_match {
+            let d0 = nt()
+            w("  " + d0 + " = getelementptr %Buf, " + PB("%Buf") + "%nmb, i32 0, i32 0\n")
+            w("  store " + PT("i8") + " null, " + PB(PT("i8")) + d0 + "\n")
+            let d1 = nt()
+            w("  " + d1 + " = getelementptr %Buf, " + PB("%Buf") + "%nmb, i32 0, i32 1\n")
+            w("  store i64 0, " + PB("i64") + d1 + "\n")
+            let d2 = nt()
+            w("  " + d2 + " = getelementptr %Buf, " + PB("%Buf") + "%nmb, i32 0, i32 2\n")
+            w("  store i64 0, " + PB("i64") + d2 + "\n")
+            let v = peek_val(0)
+            w("  call void @bur_format(" + PT("%Buf") + " %nmb, %Value " + v + ", i8 1)\n")
+            w("  call void @buf_char(" + PT("%Buf") + " %nmb, i8 0)\n")
+            let dd = nt()
+            w("  " + dd + " = load " + PT("i8") + ", " + PB(PT("i8")) + d0 + "\n")
+            w("  call void (" + PT("i8") + ", ...) @bur_trap(" + srefp("no pattern matched value %s") + ", " + PT("i8") + " " + dd + ")\n")
+            ip + 1
+        } else if op == lib::op_try {
+            let v = peek_val(0)
+            let tag = nt()
+            w("  " + tag + " = extractvalue %Value " + v + ", 0\n")
+            let isobj = nt()
+            w("  " + isobj + " = icmp eq i32 " + tag + ", 4\n")
+            cur_term = true
+            let lab = nl()
+            w("  br i1 " + isobj + ", label %" + lab + "dr, label %" + lab + "tq\n")
+            w(lab + "tq:\n")
+            let tn2 = nt()
+            w("  " + tn2 + " = call " + PT("i8") + " @bur_typename(%Value " + v + ")\n")
+            w("  call void (" + PT("i8") + ", ...) @bur_trap(" + srefp("'?' needs an Option or Result, got %s") + ", " + PT("i8") + " " + tn2 + ")\n")
+            w("  br label %" + lab + "dr\n")
+            w(lab + "dr:\n")
+            let o64 = nt()
+            w("  " + o64 + " = extractvalue %Value " + v + ", 1\n")
+            let op = nt()
+            w("  " + op + " = inttoptr i64 " + o64 + " to " + PT("%OEnumInst") + "\n")
+            let enmp = nt()
+            w("  " + enmp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + op + ", i32 0, i32 1\n")
+            let enm = nt()
+            w("  " + enm + " = load " + PT("%OEnumType") + ", " + PB(PT("%OEnumType")) + enmp + "\n")
+            let optp = nt()
+            w("  " + optp + " = load " + PT("%OEnumType") + ", " + PB(PT("%OEnumType")) + "@bur_opt_enum\n")
+            let resp = nt()
+            w("  " + resp + " = load " + PT("%OEnumType") + ", " + PB(PT("%OEnumType")) + "@bur_res_enum\n")
+            let iso = nt()
+            w("  " + iso + " = icmp eq " + PT("%OEnumType") + " " + enm + ", " + optp + "\n")
+            let isr = nt()
+            w("  " + isr + " = icmp eq " + PT("%OEnumType") + " " + enm + ", " + resp + "\n")
+            let ok = nt()
+            w("  " + ok + " = or i1 " + iso + ", " + isr + "\n")
+            w("  br i1 " + ok + ", label %" + lab + "ck, label %" + lab + "r1\n")
+            w(lab + "r1:\n")
+            ret_seq(hd)
+            w(lab + "ck:\n")
+            let vrp = nt()
+            w("  " + vrp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + op + ", i32 0, i32 2\n")
+            let vr = nt()
+            w("  " + vr + " = load i32, " + PB("i32") + vrp + "\n")
+            let is0 = nt()
+            w("  " + is0 + " = icmp eq i32 " + vr + ", 0\n")
+            w("  br i1 " + is0 + ", label %" + lab + "uw, label %" + lab + "r2\n")
+            w(lab + "r2:\n")
+            ret_seq(hd)
+            w(lab + "uw:\n")
+            cur_term = false
+            let fp = nt()
+            w("  " + fp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + op + ", i32 0, i32 3\n")
+            let fa = nt()
+            w("  " + fa + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + fp + "\n")
+            let f0 = nt()
+            w("  " + f0 + " = getelementptr %Value, " + PB("%Value") + fa + ", i64 0\n")
+            let inner = nt()
+            w("  " + inner + " = load %Value, " + PB("%Value") + f0 + "\n")
+            let _p = pop_val()
+            push_val(inner)
+            ip + 1
+        } else if op == lib::op_defer {
+            let cl = pop_val()
+            w("  call void @bur_defer_push(%Value " + cl + ")\n")
+            ip + 1
+        } else if op == lib::op_spawn {
+            w("  call void @bur_spawn(i32 " + str(code[ip + 1]) + ")\n")
+            ip + 2
+        } else if op == lib::op_send {
+            let val = pop_val()
+            let ch = pop_val()
+            w("  call void @bur_send(%Value " + ch + ", %Value " + val + ")\n")
+            ip + 1
+        } else if op == lib::op_recv {
+            let p = peek_val(0)
+            let v = nt()
+            w("  " + v + " = call %Value @bur_recv(%Value " + p + ")\n")
+            let _d = pop_val()
+            push_val(v)
+            ip + 1
+        } else if op == lib::op_chan_next {
+            let p = peek_val(0)
+            let c = nt()
+            w("  " + c + " = call i8 @bur_chan_next(%Value " + p + ", " + PT("%Value") + " %vslot)\n")
+            let b1 = nt()
+            w("  " + b1 + " = icmp ne i8 " + c + ", 0\n")
+            cur_term = true
+            let lab = nl()
+            w("  br i1 " + b1 + ", label %" + lab + "th, label %" + lab + "el\n")
+            w(lab + "th:\n")
+            let _d = pop_val()
+            let v = nt()
+            w("  " + v + " = load %Value, " + PB("%Value") + "%vslot\n")
+            push_val(v)
+            w("  br label %L" + str(ip + 3) + "\n")
+            w(lab + "el:\n")
+            let _p = pop_val()
+            w("  br label %L" + str(ip + 3 + ll_read_u16(code, ip + 1)) + "\n")
+            ip + 3
+        } else if op == lib::op_select {
+            let mut p = ip + 1
+            let n_arms = code[p]
+            let has_default = code[p + 1] != 0
+            p = p + 2
+            let mut kinds = []
+            let mut tgts = []
+            let mut i = 0
+            while i < n_arms {
+                push(kinds, code[p])
+                p = p + 1
+                push(tgts, p + 2 + ll_read_u16(code, p))
+                p = p + 2
+                i = i + 1
+            }
+            let mut default_target = -1
+            if has_default {
+                default_target = p + 2 + ll_read_u16(code, p)
+                p = p + 2
+            }
+            let arr = "@selk." + str(id) + "." + str(ip)
+            wg(arr + " = private constant [" + str(n_arms) + " x i8] c\"" + ll_esc_bytes(kinds) + "\"\n")
+            let hdi = if has_default {
+                1
+            } else {
+                0
+            }
+            let selref = if use_ptr {
+                "ptr " + arr
+            } else {
+                "i8* getelementptr inbounds ([" + str(n_arms) + " x i8], [" + str(n_arms) + " x i8]* " + arr + ", i64 0, i64 0)"
+            }
+            let r = nt()
+            w("  " + r + " = call i32 @bur_select(" + selref + ", i32 " + str(n_arms) + ", i8 " + str(hdi) + ")\n")
+            cur_term = true
+            let mut cases = ""
+            i = 0
+            while i < n_arms {
+                cases = cases + "    i32 " + str(i) + ", label %L" + str(tgts[i]) + "\n"
+                i = i + 1
+            }
+            let dfl = if has_default {
+                str(default_target)
+            } else {
+                str(tgts[0])
+            }
+            w("  switch i32 " + r + ", label %L" + dfl + " [\n" + cases + "  ]\n")
+            p
+        } else if op == lib::op_tuple {
+            w("  call void @bur_tuple_make(i32 " + str(code[ip + 1]) + ")\n")
+            ip + 2
+        } else if op == lib::op_record {
+            let n2 = code[ip + 1]
+            let cidx = ll_read_u16(code, ip + 2)
+            let nm = ll_const_str(fh, cidx, f_consts)
+            w("  call void @bur_record_make(i32 " + str(n2) + ", " + srefp(nm) + ")\n")
+            ip + 4
+        } else if op == lib::op_get_field_name {
+            let nm = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
+            w("  call void @bur_record_get(" + srefp(nm) + ")\n")
+            ip + 3
+        } else if op == lib::op_record_update {
+            let n2 = code[ip + 1]
+            let cidx = ll_read_u16(code, ip + 2)
+            let nm = ll_const_str(fh, cidx, f_consts)
+            w("  call void @bur_record_update(i32 " + str(n2) + ", " + srefp(nm) + ")\n")
+            ip + 4
+        } else {
+            ip + 1
+        }
+    }
+
+    // ---- 函数体 ----
+    // ---- Function bodies ----
+    let mut bi = 0
+    while bi < len(fun_ids) {
+        let id = fun_ids[bi]
+        let fh = fun_fhs[bi]
+        let code = f_code[fh]
+        let targets = ll_jump_targets(fh, f_code, f_nupvals, f_consts)
+        let hd = ll_fn_has_defer(fh, f_code, f_nupvals, f_consts)
+        tn = 0
+        cur_term = true
+        w("define void @bur_fn_" + str(id) + "() " + OB + " ; " + f_name[fh] + "\n")
+        w("pro:\n")
+        w("  %base = alloca i32\n")
+        w("  %self = alloca " + PT("%OClosure") + "\n")
+        if hd {
+            w("  %dbase = alloca i32\n")
+        }
+        w("  %cell = alloca " + PT("%OUpvalue") + "\n")
+        w("  %tvi = alloca i8\n")
+        w("  %nmb = alloca %Buf\n")
+        w("  %vslot = alloca %Value\n")
+        let b0 = nt()
+        w("  " + b0 + " = load " + PT("%Fiber") + ", " + PB(PT("%Fiber")) + "@bur_cur\n")
+        let t0 = nt()
+        w("  " + t0 + " = getelementptr %Fiber, " + PB("%Fiber") + b0 + ", i32 0, i32 1\n")
+        let tv0 = nt()
+        w("  " + tv0 + " = load i32, " + PB("i32") + t0 + "\n")
+        let bs = nt()
+        w("  " + bs + " = sub i32 " + tv0 + ", " + str(f_arity[fh] + 1) + "\n")
+        w("  store i32 " + bs + ", " + PB("i32") + "%base\n")
+        let s0 = nt()
+        w("  " + s0 + " = load " + PT("%OClosure") + ", " + PB(PT("%OClosure")) + "@bur_cur_closure\n")
+        w("  store " + PT("%OClosure") + " " + s0 + ", " + PB(PT("%OClosure")) + "%self\n")
+        if hd {
+            let d0 = nt()
+            w("  " + d0 + " = getelementptr %Fiber, " + PB("%Fiber") + b0 + ", i32 0, i32 21\n")
+            let dv = nt()
+            w("  " + dv + " = load i32, " + PB("i32") + d0 + "\n")
+            w("  store i32 " + dv + ", " + PB("i32") + "%dbase\n")
+        }
+        let c1 = nt()
+        w("  " + c1 + " = getelementptr %Fiber, " + PB("%Fiber") + b0 + ", i32 0, i32 14\n")
+        let c2 = nt()
+        w("  " + c2 + " = load i32, " + PB("i32") + c1 + "\n")
+        let c3 = nt()
+        w("  " + c3 + " = sub i32 " + c2 + ", 1\n")
+        w("  store i32 " + c3 + ", " + PB("i32") + c1 + "\n")
+        let c4 = nt()
+        w("  " + c4 + " = icmp sle i32 " + c3 + ", 0\n")
+        cur_term = true
+        w("  br i1 " + c4 + ", label %pre, label %L0\n")
+        w("pre:\n")
+        w("  call void @bur_preempt()\n")
+        w("  br label %L0\n")
+        w("L0:\n")
+        cur_term = false
+        let li = ll_ls_index(f_file[fh], ls_files)
+        let mut ip = 0
+        while ip < len(code) {
+            if ll_is_target(targets, ip) {
+                if !cur_term {
+                    w("  br label %L" + str(ip) + "\n")
+                }
+                w("L" + str(ip) + ":\n")
+                cur_term = false
+            } else if cur_term {
+                w("L" + str(ip) + ":\n")
+                cur_term = false
+            }
+            if li >= 0 && ip < len(f_spans[fh]) {
+                match f_spans[fh][ip] {
+                    frontend::SpanT::Sp(s0, _) => {
+                        let ln = ll_line_of_off(ls_tables[li], s0)
+                        let q0 = nt()
+                        w("  " + q0 + " = load " + PT("%Fiber") + ", " + PB(PT("%Fiber")) + "@bur_cur\n")
+                        let q1 = nt()
+                        w("  " + q1 + " = getelementptr %Fiber, " + PB("%Fiber") + q0 + ", i32 0, i32 10\n")
+                        let q2 = nt()
+                        w("  " + q2 + " = load i32, " + PB("i32") + q1 + "\n")
+                        let q3 = nt()
+                        w("  " + q3 + " = getelementptr %Fiber, " + PB("%Fiber") + q0 + ", i32 0, i32 12\n")
+                        let q4 = nt()
+                        w("  " + q4 + " = load " + PT("i32") + ", " + PB(PT("i32")) + q3 + "\n")
+                        let q5 = nt()
+                        w("  " + q5 + " = getelementptr i32, " + PB("i32") + q4 + ", i32 " + q2 + "\n")
+                        w("  store i32 " + str(ln) + ", " + PB("i32") + q5 + "\n")
+                    },
+                }
+            }
+            ip = emit_inst(id, fh, code, ip, hd)
+        }
+        if !cur_term {
+            w("  ret void\n")
+        }
+        w("}\n\n")
+        bi = bi + 1
+    }
+
+    // ---- 对象初始化：单个 @bur_init_objs（C 后端的 256 条分片是给 cc1 的
+    // 编译提速优化；clang 吃 .ll 不需要）----
+    // ---- Object initializers: one @bur_init_objs (the C backend's 256-item
+    // chunks were a cc1 compile-time optimization; clang on .ll needs none) ----
+    w("define void @bur_init_objs() " + OB + "\n")
+    let mut ip2 = 0
+    while ip2 < len(o_kind) {
+        let sz = if o_kind[ip2] == 0 {
+            32
+        } else if o_kind[ip2] == 1 {
+            64
+        } else if o_kind[ip2] == 2 {
+            40
+        } else if o_kind[ip2] == 3 {
+            32
+        } else {
+            48
+        }
+        let ty = if o_kind[ip2] == 0 {
+            0
+        } else if o_kind[ip2] == 1 {
+            3
+        } else if o_kind[ip2] == 2 {
+            6
+        } else if o_kind[ip2] == 3 {
+            7
+        } else {
+            8
+        }
+        let kp = nt()
+        w("  " + kp + " = getelementptr [" + str(len(o_kind)) + " x " + PT("%Obj") + "], " + PB("[" + str(len(o_kind)) + " x " + PT("%Obj") + "]") + "@bur_K, i64 0, i64 " + str(ip2) + "\n")
+        let o = nt()
+        w("  " + o + " = call " + PT("%Obj") + " @bur_alloc(i64 " + str(sz) + ", i32 " + str(ty) + ")\n")
+        w("  store " + PT("%Obj") + " " + o + ", " + PB(PT("%Obj")) + kp + "\n")
+        ip2 = ip2 + 1
+    }
+    ip2 = 0
+    while ip2 < len(o_kind) {
+        let o = obj_val(ip2)
+        w("  call void @bur_add_root(" + PT("%Obj") + " " + o + ")\n")
+        ip2 = ip2 + 1
+    }
+    ip2 = 0
+    while ip2 < len(o_kind) {
+        if o_kind[ip2] == 0 {
+            let s = o_str[ip2]
+            let n = str_len(s)
+            let sp = bc(obj_val(ip2), "%Obj", "%OString")
+            let srefn = sref(s)
+            let dp = nt()
+            w("  " + dp + " = getelementptr %OString, " + PB("%OString") + sp + ", i32 0, i32 1\n")
+            let m = nt()
+            w("  " + m + " = call " + PT("i8") + " @malloc(i64 " + str(n + 1) + ")\n")
+            w("  store " + PT("i8") + " " + m + ", " + PB(PT("i8")) + dp + "\n")
+            let srcp = gdec(srefn, n + 1)
+            w("  call " + PT("i8") + " @memcpy(" + PT("i8") + " " + m + ", " + PT("i8") + " " + srcp + ", i64 " + str(n) + ")\n")
+            let zp = nt()
+            w("  " + zp + " = getelementptr i8, " + PB("i8") + m + ", i64 " + str(n) + "\n")
+            w("  store i8 0, " + PB("i8") + zp + "\n")
+            let lp = nt()
+            w("  " + lp + " = getelementptr %OString, " + PB("%OString") + sp + ", i32 0, i32 2\n")
+            w("  store i64 " + str(n) + ", " + PB("i64") + lp + "\n")
+        } else if o_kind[ip2] == 2 {
+            let eh = o_a[ip2]
+            let mut elems = []
+            let mut i = 0
+            while i < len(en_vnames[eh]) {
+                let nm = srefp(en_vnames[eh][i])
+                push(elems, "%VariantInfo " + OB + " " + nm + ", i32 " + str(en_varities[eh][i]) + " }")
+                i = i + 1
+            }
+            wg("@vs." + str(ip2) + " = private constant [" + str(len(en_vnames[eh])) + " x %VariantInfo] [" + join(elems, ", ") + "]\n")
+            let en = bc(obj_val(ip2), "%Obj", "%OEnumType")
+            let np = nt()
+            w("  " + np + " = getelementptr %OEnumType, " + PB("%OEnumType") + en + ", i32 0, i32 1\n")
+            w("  store " + srefp(en_qual[eh]) + ", " + PB(PT("i8")) + np + "\n")
+            let vp = nt()
+            w("  " + vp + " = getelementptr %OEnumType, " + PB("%OEnumType") + en + ", i32 0, i32 2\n")
+            let vref = bc("@vs." + str(ip2), "[" + str(len(en_vnames[eh])) + " x %VariantInfo]", "%VariantInfo")
+            w("  store " + PT("%VariantInfo") + " " + vref + ", " + PB(PT("%VariantInfo")) + vp + "\n")
+            let nvp = nt()
+            w("  " + nvp + " = getelementptr %OEnumType, " + PB("%OEnumType") + en + ", i32 0, i32 3\n")
+            w("  store i32 " + str(len(en_vnames[eh])) + ", " + PB("i32") + nvp + "\n")
+        } else if o_kind[ip2] == 3 {
+            let ekey = "e:" + str(o_a[ip2])
+            let eid = match get(ids, ekey) {
+                Some(x) => x,
+                None => 0,
+            }
+            let cp = bc(obj_val(ip2), "%Obj", "%OVariantCtor")
+            let em = bc(obj_val(eid), "%Obj", "%OEnumType")
+            let ep = nt()
+            w("  " + ep + " = getelementptr %OVariantCtor, " + PB("%OVariantCtor") + cp + ", i32 0, i32 1\n")
+            w("  store " + PT("%OEnumType") + " " + em + ", " + PB(PT("%OEnumType")) + ep + "\n")
+            let xp = nt()
+            w("  " + xp + " = getelementptr %OVariantCtor, " + PB("%OVariantCtor") + cp + ", i32 0, i32 2\n")
+            w("  store i32 " + str(o_b[ip2]) + ", " + PB("i32") + xp + "\n")
+        } else if o_kind[ip2] == 4 {
+            let ekey = "e:" + str(o_a[ip2])
+            let eid = match get(ids, ekey) {
+                Some(x) => x,
+                None => 0,
+            }
+            let inr = bc(obj_val(ip2), "%Obj", "%OEnumInst")
+            let em = bc(obj_val(eid), "%Obj", "%OEnumType")
+            let ep = nt()
+            w("  " + ep + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + inr + ", i32 0, i32 1\n")
+            w("  store " + PT("%OEnumType") + " " + em + ", " + PB(PT("%OEnumType")) + ep + "\n")
+            let xp = nt()
+            w("  " + xp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + inr + ", i32 0, i32 2\n")
+            w("  store i32 " + str(o_b[ip2]) + ", " + PB("i32") + xp + "\n")
+            let np2 = nt()
+            w("  " + np2 + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + inr + ", i32 0, i32 4\n")
+            w("  store i32 0, " + PB("i32") + np2 + "\n")
+        } else {
+            let fh = o_a[ip2]
+            let nconsts = len(f_consts[fh])
+            let fnr = bc(obj_val(ip2), "%Obj", "%OFunc")
+            let p1 = nt()
+            w("  " + p1 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 1\n")
+            w("  store " + srefp(f_name[fh]) + ", " + PB(PT("i8")) + p1 + "\n")
+            let fli = ll_ls_index(f_file[fh], ls_files)
+            if fli >= 0 {
+                let p2 = nt()
+                w("  " + p2 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 2\n")
+                w("  store " + srefp(ls_names[fli]) + ", " + PB(PT("i8")) + p2 + "\n")
+            } else if f_file[fh] != "" {
+                let p2 = nt()
+                w("  " + p2 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 2\n")
+                w("  store " + srefp(f_file[fh]) + ", " + PB(PT("i8")) + p2 + "\n")
+            } else {
+                let p2 = nt()
+                w("  " + p2 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 2\n")
+                w("  store " + PT("i8") + " null, " + PB(PT("i8")) + p2 + "\n")
+            }
+            let p3 = nt()
+            w("  " + p3 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 3\n")
+            w("  store i32 " + str(f_arity[fh]) + ", " + PB("i32") + p3 + "\n")
+            let p4 = nt()
+            w("  " + p4 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 4\n")
+            w("  store i32 " + str(f_nupvals[fh]) + ", " + PB("i32") + p4 + "\n")
+            let p5 = nt()
+            w("  " + p5 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 5\n")
+            w("  store " + FNPT() + " @bur_fn_" + str(ip2) + ", " + PB(FNPT()) + p5 + "\n")
+            let p6 = nt()
+            w("  " + p6 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 6\n")
+            if nconsts > 0 {
+                let cref = bc("@bur_consts_" + str(ip2), "[" + str(nconsts) + " x %Value]", "%Value")
+                w("  store " + PT("%Value") + " " + cref + ", " + PB(PT("%Value")) + p6 + "\n")
+            } else {
+                w("  store " + PT("%Value") + " null, " + PB(PT("%Value")) + p6 + "\n")
+            }
+            let p7 = nt()
+            w("  " + p7 + " = getelementptr %OFunc, " + PB("%OFunc") + fnr + ", i32 0, i32 7\n")
+            w("  store i32 " + str(nconsts) + ", " + PB("i32") + p7 + "\n")
+            let mut i = 0
+            while i < nconsts {
+                let cslot = nt()
+                w("  " + cslot + " = getelementptr [" + str(nconsts) + " x %Value], " + PB("[" + str(nconsts) + " x %Value]") + "@bur_consts_" + str(ip2) + ", i64 0, i64 " + str(i) + "\n")
+                match f_consts[fh][i] {
+                    lib::CVal::CInt(n) => {
+                        let v = v_int(dec_uint64(n))
+                        w("  store %Value " + v + ", " + PB("%Value") + cslot + "\n")
+                    },
+                    lib::CVal::CFloat(fl) => {
+                        let fb = nt()
+                        w("  " + fb + " = bitcast double " + ll_float(fl) + " to i64\n")
+                        let a = nt()
+                        w("  " + a + " = insertvalue %Value undef, i32 3, 0\n")
+                        let v = nt()
+                        w("  " + v + " = insertvalue %Value " + a + ", i64 " + fb + ", 1\n")
+                        w("  store %Value " + v + ", " + PB("%Value") + cslot + "\n")
+                    },
+                    _ => {
+                        let ov = obj_val(fconst_ids[fh][i])
+                        let v = v_obj(ov, "%Obj")
+                        w("  store %Value " + v + ", " + PB("%Value") + cslot + "\n")
+                    },
+                }
+                i = i + 1
+            }
+        }
+        ip2 = ip2 + 1
+    }
+    let eo = obj_val(opt_id)
+    let e1 = bc(eo, "%Obj", "%OEnumType")
+    w("  store " + PT("%OEnumType") + " " + e1 + ", " + PB(PT("%OEnumType")) + "@bur_opt_enum\n")
+    let ro = obj_val(res_id)
+    let r1 = bc(ro, "%Obj", "%OEnumType")
+    w("  store " + PT("%OEnumType") + " " + r1 + ", " + PB(PT("%OEnumType")) + "@bur_res_enum\n")
+    let oo = obj_val(out_id)
+    let o1 = bc(oo, "%Obj", "%OEnumType")
+    w("  store " + PT("%OEnumType") + " " + o1 + ", " + PB(PT("%OEnumType")) + "@bur_out_enum\n")
+    w("  ret void\n")
+    w("}\n\n")
+
+    w("define i32 @main(i32 %argc, " + PT("i8") + " %argv) " + OB + "\n")
+    w("  call void @bur_boot(i32 %argc, " + PT("i8") + " %argv)\n")
+    w("  call void @bur_init_objs()\n")
+    w("  call void @bur_register_natives()\n")
+    w("  store i8 1, " + PB("i8") + "@bur_gc_ready\n")
+    let ef = bc(obj_val(entry), "%Obj", "%OFunc")
+    let ecl = nt()
+    w("  " + ecl + " = call " + PT("%OClosure") + " @bur_new_closure(" + PT("%OFunc") + " " + ef + ")\n")
+    let emf = nt()
+    w("  " + emf + " = call " + PT("%Fiber") + " @bur_new_fiber(" + PT("%OClosure") + " " + ecl + ", " + PT("%Value") + " null, i32 0, i64 8388608)\n")
+    w("  store " + PT("%Fiber") + " " + emf + ", " + PB(PT("%Fiber")) + "@bur_main_fiber\n")
+    w("  call void @bur_schedule(" + PT("%Fiber") + " " + emf + ")\n")
+    w("  call void @bur_scheduler()\n")
+    let eso = nt()
+    w("  " + eso + " = load " + PT("i8") + ", " + PB(PT("i8")) + "@stdout\n")
+    w("  call void @fflush(" + PT("i8") + " " + eso + ")\n")
+    w("  ret i32 0\n")
+    w("}\n")
+
+    // glue（@.str/@selk/@vs）必须落在函数体之前：typed 模式下全局的首次前向
+    // 引用会固定其类型，定义在后会撞型（实测 clang 14）。
+    // glue globals must precede the function bodies: in typed mode the first
+    // forward reference fixes a global's type and a later definition clashes
+    let mut split = -1
+    let mut si = 0
+    while si < len(out) {
+        if split < 0 && str_len(out[si]) >= 6 && substr(out[si], 0, 6) == "define" {
+            split = si
+        }
+        si = si + 1
+    }
+    let mut files = []
+    if split < 0 {
+        push(files, ["program.ll", join(out, "") + join(glue, "")])
+        files
+    } else {
+        let mut head = []
+        let mut tail = []
+        let mut gi = 0
+        while gi < len(out) {
+            if gi < split {
+                push(head, out[gi])
+            } else {
+                push(tail, out[gi])
+            }
+            gi = gi + 1
+        }
+        push(files, ["program.ll", join(head, "") + join(glue, "") + join(tail, "")])
+        files
+    }
+}
+
+fn ll_read_u16(code, at) {
+    code[at] * 256 + code[at + 1]
+}
+
+fn ll_line_of_off(table, off) {
+    let mut lo = 0
+    let mut hi = len(table) - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if table[mid] <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo + 1
+}
+
+fn ll_inst_len(fh, code, ip, f_nupvals, f_consts) {
+    let op = code[ip]
+    if op == lib::op_const || op == lib::op_get_local || op == lib::op_set_local || op == lib::op_get_global || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_get_upval || op == lib::op_set_upval || op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop || op == lib::op_loop || op == lib::op_list || op == lib::op_chan_next || op == lib::op_get_field_name {
+        3
+    } else if op == lib::op_pop_n || op == lib::op_call || op == lib::op_spawn || op == lib::op_end_block || op == lib::op_test_variant || op == lib::op_get_field {
+        2
+    } else if op == lib::op_record || op == lib::op_record_update {
+        4
+    } else if op == lib::op_closure {
+        let idx = ll_read_u16(code, ip + 1)
+        let sub = match f_consts[fh][idx] {
+            lib::CVal::CFn(s) => s,
+            _ => 0,
+        }
+        3 + f_nupvals[sub] * 3
+    } else if op == lib::op_select {
+        let n_arms = code[ip + 1]
+        let has_default = code[ip + 2] != 0
+        3 + n_arms * 3 + (if has_default {
+            2
+        } else {
+            0
+        })
+    } else {
+        1
+    }
+}
+
+fn ll_jump_targets(fh, f_code, f_nupvals, f_consts) {
+    let code = f_code[fh]
+    let mut targets = map()
+    let mut ip = 0
+    while ip < len(code) {
+        let op = code[ip]
+        if op == lib::op_jump || op == lib::op_jump_if_false || op == lib::op_jump_if_true || op == lib::op_jump_if_false_pop {
+            put(targets, ip + 3 + ll_read_u16(code, ip + 1), true)
+            ip = ip + 3
+        } else if op == lib::op_loop {
+            put(targets, ip + 3 - ll_read_u16(code, ip + 1), true)
+            ip = ip + 3
+        } else if op == lib::op_chan_next {
+            put(targets, ip + 3 + ll_read_u16(code, ip + 1), true)
+            ip = ip + 3
+        } else if op == lib::op_select {
+            let mut p = ip + 1
+            let n_arms = code[p]
+            let has_default = code[p + 1] != 0
+            p = p + 2
+            let mut i = 0
+            while i < n_arms {
+                p = p + 1
+                put(targets, p + 2 + ll_read_u16(code, p), true)
+                p = p + 2
+                i = i + 1
+            }
+            if has_default {
+                put(targets, p + 2 + ll_read_u16(code, p), true)
+                p = p + 2
+            }
+            ip = p
+        } else {
+            ip = ip + ll_inst_len(fh, code, ip, f_nupvals, f_consts)
+        }
+    }
+    targets
+}
+
+fn ll_is_target(targets, ip) {
+    match get(targets, ip) {
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn ll_fn_has_defer(fh, f_code, f_nupvals, f_consts) {
+    let code = f_code[fh]
+    let mut ip = 0
+    while ip < len(code) {
+        if code[ip] == lib::op_defer {
+            return true
+        }
+        ip = ip + ll_inst_len(fh, code, ip, f_nupvals, f_consts)
+    }
+    false
+}
+
+fn ll_ls_index(file, ls_files) {
+    let mut i = 0
+    while i < len(ls_files) {
+        if ls_files[i] == file {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn ll_reg_key(cv) {
+    match cv {
+        lib::CVal::CFn(fh) => "f:" + str(fh),
+        lib::CVal::CEnumType(eh) => "e:" + str(eh),
+        lib::CVal::CSingleton(eh, i) => "s:" + str(eh) + ":" + str(i),
+        lib::CVal::CCtor(eh, i) => "c:" + str(eh) + ":" + str(i),
+        _ => "",
+    }
+}
+
+fn ll_const_str(fh, idx, f_consts) {
+    match f_consts[fh][idx] {
+        lib::CVal::CStr(s) => s,
+        _ => "",
+    }
+}
+
+fn ll_fn_const(fh, idx, f_consts) {
+    match f_consts[fh][idx] {
+        lib::CVal::CFn(sub) => sub,
+        _ => 0,
+    }
+}
+
+// ll_esc 转义 LLVM c"..." 字符串 / ll_esc escapes an LLVM c"..." string
+fn ll_esc(s) {
+    let mut parts = []
+    let mut i = 0
+    while i < str_len(s) {
+        let o = byte_at(s, i)
+        if o == 34 || o == 92 || o < 32 || o >= 127 {
+            push(parts, "\\" + hex2(o))
+        } else {
+            push(parts, substr(s, i, 1))
+        }
+        i = i + 1
+    }
+    join(parts, "")
+}
+
+// ll_esc_bytes 转义字节列表（select kinds 表）/ ll_esc_bytes escapes bytes
+fn ll_esc_bytes(bs) {
+    let mut parts = []
+    for o in bs {
+        if o == 34 || o == 92 || o < 32 || o >= 127 {
+            push(parts, "\\" + hex2(o))
+        } else {
+            push(parts, chr(o))
+        }
+    }
+    join(parts, "")
+}
+
+fn hex2(o) {
+    let hi = o / 16
+    let lo = o % 16
+    lib::hex_digit(hi) + lib::hex_digit(lo)
+}
+
+// ll_float 渲染 LLVM 十六进制 double 字面量（16 位十六进制位型）
+// ll_float renders an LLVM hex double literal (16 hex digits of the bit pattern)
+fn ll_float(f) {
+    let bits = float_bits(f)
+    let neg = bits < 0
+    let low63 = if neg {
+        bits + 9223372036854775807 + 1
+    } else {
+        bits
+    }
+    let mut nib = []
+    let mut m = low63
+    let mut i = 0
+    while i < 15 {
+        push(nib, m % 16)
+        m = m / 16
+        i = i + 1
+    }
+    let top = (if neg {
+        8
+    } else {
+        0
+    }) + m % 8
+    let digits = lib::hex_digit(top) + lib::hex_digit(nib[14]) + lib::hex_digit(nib[13]) + lib::hex_digit(nib[12]) + lib::hex_digit(nib[11]) + lib::hex_digit(nib[10]) + lib::hex_digit(nib[9]) + lib::hex_digit(nib[8]) + lib::hex_digit(nib[7]) + lib::hex_digit(nib[6]) + lib::hex_digit(nib[5]) + lib::hex_digit(nib[4]) + lib::hex_digit(nib[3]) + lib::hex_digit(nib[2]) + lib::hex_digit(nib[1]) + lib::hex_digit(nib[0])
+    "0x" + digits
+}
+
+// dec_add 逐位十进制字符串加法（常量折叠用，避免浮点误差）
+fn dec_add(a, b) {
+    let mut out = []
+    let mut i = str_len(a) - 1
+    let mut j = str_len(b) - 1
+    let mut carry = 0
+    while i >= 0 || j >= 0 || carry > 0 {
+        let da = if i >= 0 {
+            ord(char_at(a, i)) - 48
+        } else {
+            0
+        }
+        let db = if j >= 0 {
+            ord(char_at(b, j)) - 48
+        } else {
+            0
+        }
+        let s = da + db + carry
+        push(out, chr(48 + s % 10))
+        carry = s / 10
+        i = i - 1
+        j = j - 1
+    }
+    let mut rev = []
+    let mut k = len(out) - 1
+    while k >= 0 {
+        push(rev, out[k])
+        k = k - 1
+    }
+    join(rev, "")
+}
+
+// dec_uint64 把 u64 转十进制字符串 / dec_uint64 renders a u64 as decimal
+fn dec_uint64(v) {
+    if v >= 0 {
+        str(v)
+    } else {
+        dec_add("9223372036854775808", str(v + 9223372036854775807 + 1))
+    }
+}

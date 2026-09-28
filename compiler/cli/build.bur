@@ -4,6 +4,7 @@
 // then drives cc over the units and links a native binary.
 
 import "burryn.dev/compiler/backends/x86"
+import "burryn.dev/compiler/backends/llvm"
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/backends/c"
 import "burryn.dev/compiler/tooling"
@@ -17,6 +18,7 @@ import "burryn.dev/compiler/module"
 pub fn build_cmd(rest) {
     let mut out = ""
     let mut emit_c = false
+    let mut emit_llvm = false
     let mut backend = "c"
     let mut target_os_flag = "linux"
     let mut input = ""
@@ -31,11 +33,18 @@ pub fn build_cmd(rest) {
             out = rest[i + 1]
             i = i + 2
         } else if arg == "--emit" {
-            if i + 1 >= len(rest) || rest[i + 1] != "c" {
+            if i + 1 >= len(rest) {
                 usage()
                 exit(exit_usage)
             }
-            emit_c = true
+            if rest[i + 1] == "c" {
+                emit_c = true
+            } else if rest[i + 1] == "llvm" {
+                emit_llvm = true
+            } else {
+                usage()
+                exit(exit_usage)
+            }
             i = i + 2
         } else if arg == "--backend" {
             if i + 1 >= len(rest) {
@@ -74,11 +83,15 @@ pub fn build_cmd(rest) {
     if backend == "x86" {
         x86::set_target_os(target_os_flag)
     }
-    build_input(input, emit_c, out, backend)
+    if backend == "llvm" && target_os_flag != "linux" {
+        eprintln("error: --os is not supported by the LLVM backend yet")
+        exit(exit_usage)
+    }
+    build_input(input, emit_c, emit_llvm, out, backend)
 }
 
 // build_input 解析 build 输入（文件/目录/backend） / build_input resolves the build input (file/dir/backend)
-fn build_input(input, emit_c, out, backend) {
+fn build_input(input, emit_c, emit_llvm, out, backend) {
     if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
         eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
         exit(exit_usage)
@@ -137,6 +150,46 @@ fn build_input(input, emit_c, out, backend) {
                 eprintln("error: " + msg)
                 exit(exit_no_input)
             },
+        }
+    } else if backend == "llvm" {
+        let cc = find_clang()
+        if cc == "" {
+            eprintln("error: no clang found (the LLVM backend requires clang)")
+            eprintln("hint: run without a toolchain using `bur run`")
+            exit(exit_static)
+        }
+        let major = clang_major(cc)
+        if major < 14 {
+            eprintln("error: clang 14 or newer is required for the LLVM backend (found major " + str(major) + ")")
+            exit(exit_static)
+        }
+        // clang >= 15 parses opaque ptr; clang 14 only parses typed pointers
+        // (a bare ptr is rejected by its parser outright)
+        let use_ptr = major >= 15
+        let llsr = compile_to_llvm(input, use_ptr)
+        let dst = if out == "" {
+            default_out_name(input)
+        } else {
+            out
+        }
+        if emit_llvm {
+            let mut s = ""
+            for f in llsr {
+                s = s + f[1]
+            }
+            if out == "" || out == "-" {
+                print(s)
+            } else {
+                match write_file(out, s) {
+                    Ok(_) => {},
+                    Err(msg) => {
+                        eprintln("error: " + msg)
+                        exit(exit_no_input)
+                    },
+                }
+            }
+        } else {
+            build_native_llvm(cc, llsr, dst)
         }
     } else {
         eprintln("error: backend '" + backend + "' is not yet implemented")
@@ -428,6 +481,187 @@ fn compile_file_to_x86(path) {
             }
         },
     }
+}
+
+// compile_to_llvm 编译为 LLVM IR / compile_to_llvm compiles to LLVM IR
+fn compile_to_llvm(input, use_ptr) {
+    if is_dir(input) {
+        compile_module_to_llvm(lib::strip_trailing_slash(input), use_ptr)
+    } else {
+        compile_file_to_llvm(input, use_ptr)
+    }
+}
+
+// compile_file_to_llvm 单文件转 LLVM IR / compile_file_to_llvm compiles a
+// single file to LLVM IR (the C pipeline verbatim; the C runtime carries
+// float formatting, so no float_rt/dns_rt injection)
+fn compile_file_to_llvm(path, use_ptr) {
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln("error: " + msg)
+            exit(exit_no_input)
+        },
+    }
+    match frontend::lex(src) {
+        lib::LexOut::Lexed(toks, ldiags, _) => {
+            if emit_errors(ldiags, path, false) {
+                exit(exit_static)
+            }
+            match frontend::parse(toks) {
+                frontend::ParseOut::Parsed(stmts, pdiags) => {
+                    if emit_errors(pdiags, path, false) {
+                        exit(exit_static)
+                    }
+                    let checked_stmts = fold_script_or_exit(stmts, path)
+                    match frontend::typecheck_script(checked_stmts) {
+                        lib::CheckOut::Checked(cdiags, _, _, chan_fors, _) => {
+                            if emit_errors(cdiags, path, true) {
+                                exit(exit_static)
+                            }
+                            match bytecode::compile_script(checked_stmts, chan_fors) {
+                                bytecode::CompileOut::CompileFailed(d, _) => {
+                                    eprintln(tooling::render_diag(d, path))
+                                    exit(exit_static)
+                                },
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => llvm::llgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)], use_ptr),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// compile_module_to_llvm 模块转 LLVM IR / compile_module_to_llvm compiles a
+// module to LLVM IR (mirrors compile_module_to_c)
+fn compile_module_to_llvm(dir, use_ptr) {
+    if !file_exists(dir + "/bur.mod") {
+        eprintln("error: bur.mod not found in " + dir)
+        exit(exit_no_input)
+    }
+    match module::load_module(dir) {
+        module::ModOut::ModFailed(diags, dfiles) => {
+            emit_errors_f(diags, dfiles, false)
+            exit(exit_static)
+        },
+        module::ModOut::ModLoaded(ldiags, lfiles, pkg_paths, pkgs_stmts, pkgs_fpaths, pkgs_imports, pkg_ids, pkgs_lstarts) => {
+            if emit_errors_f(ldiags, lfiles, false) {
+                exit(exit_static)
+            }
+            let checked_stmts = fold_packages_or_exit(pkgs_stmts, pkgs_fpaths, pkg_paths, pkgs_imports)
+            match module::typecheck_cached(checked_stmts, pkgs_fpaths, pkg_paths, pkgs_imports, pkg_ids) {
+                lib::CheckOut::Checked(cdiags, cfiles, _, chan_fors, _) => {
+                    if emit_errors_f(cdiags, cfiles, true) {
+                        exit(exit_static)
+                    }
+                    let ls_files = concat_lists(pkgs_fpaths)
+                    let ls_tables = concat_lists(pkgs_lstarts)
+                    match bytecode::compile_program(checked_stmts, pkgs_fpaths, true, pkg_paths, pkgs_imports, chan_fors) {
+                        bytecode::CompileOut::CompileFailed(d, f) => {
+                            eprintln(tooling::render_diag(d, f))
+                            exit(exit_static)
+                        },
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => llvm::llgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables, use_ptr),
+                    }
+                },
+            }
+        },
+    }
+}
+
+// build_native_llvm 一次 clang 调用吃下 .ll + burrt 两个 .c 并链接
+// build_native_llvm feeds the .ll plus the two burrt .c files to a single
+// clang invocation and links
+fn build_native_llvm(cc, files, out) {
+    for f in files {
+        match write_file(f[0], f[1]) {
+            Ok(_) => {},
+            Err(msg) => {
+                cleanup_native(files, [], [])
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+    }
+    let mut ok = false
+    let args = [cc_opt, "-g1", files[0][0], "runtime/burrt_impl.c", "runtime/burrt_natives.c", "-Iruntime", "-o", out, "-lm"]
+    match exec(cc, args) {
+        Ok(o) => match o {
+            Output(code, _, err) => {
+                if code != 0 {
+                    eprint_raw(err)
+                    eprintln("error: clang failed")
+                } else {
+                    ok = true
+                }
+            },
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+        },
+    }
+    cleanup_native(files, [], [])
+    if !ok {
+        exit(exit_static)
+    }
+}
+
+// find_clang 探测 clang（LLVM 后端硬依赖，cc/gcc 不吃 .ll）
+// find_clang probes for clang (the LLVM backend hard-depends on it; cc/gcc
+// cannot ingest .ll)
+fn find_clang() {
+    if cc_works("clang") {
+        "clang"
+    } else {
+        ""
+    }
+}
+
+// clang_major 解析 clang 主版本号（探测不到返回 0）
+// clang_major parses clang's major version (0 when undetectable)
+fn clang_major(cc) {
+    let outv = match exec(cc, ["--version"]) {
+        Ok(o) => match o {
+            Output(code, so, _) => {
+                if code == 0 {
+                    so
+                } else {
+                    ""
+                }
+            },
+        },
+        Err(_) => "",
+    }
+    if outv == "" {
+        return 0
+    }
+    let n = str_len(outv)
+    let mut i = 0
+    while i + 8 <= n {
+        if substr(outv, i, 8) == "version " {
+            let mut j = i + 8
+            let mut maj = 0
+            let mut got = false
+            while j < n {
+                let d = ord(char_at(outv, j))
+                if d >= 48 && d <= 57 {
+                    maj = maj * 10 + (d - 48)
+                    got = true
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if got {
+                return maj
+            }
+            return 0
+        }
+        i = i + 1
+    }
+    0
 }
 
 // cc_opt C 优化等级：-O1 是内存上限决定的，不是性能选择。
