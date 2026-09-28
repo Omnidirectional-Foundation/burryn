@@ -1591,11 +1591,13 @@ fn x86gen_exec_spawn_native() {
     let init_err = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_err_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_err_cap, rax)
     let proc_rest = init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
     let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + proc_rest
-    // fork 失败：先存 -errno 进 [rsp+72] 再关读端（close 会覆写 rax），错误值
-    // 一路带到 spawn 返回值
+    // fork 失败：先存 -errno 进 [rsp+72] 再关读端（close 会覆写 rax），收栈前
+    // 必须装回——漏掉装回会以 rax=0 伪装成功句柄返回（与管道链同一教训）
     // fork failure: stash -errno at [rsp+72] before closing the read ends (the
-    // closes clobber rax) so the error value survives to the spawn return
-    let fork_fail = mov_mr(rsp, 72, rax) + c1(0) + c1(8) + c1(16)
+    // closes clobber rax) and reload it before popping the stack — without the
+    // reload a zero return masquerades as a success handle (same lesson as the
+    // pipe chain)
+    let fork_fail = mov_mr(rsp, 72, rax) + c1(0) + c1(8) + c1(16) + mov_rm(rax, rsp, 72)
     let parent_seq = mov_mr(rsp, 24, rax) + c1(4) + c1(12) + c1(20) + test_rr(rax, rax) + jl_rel32(str_len(parent_ok) + 5) + parent_ok + jmp_rel32(str_len(fork_fail)) + fork_fail
     let done_seq = add_ri32(rsp, 80)
     let fork_seq = sys_mov_rax(57) + syscall() + test_rr(rax, rax) + jne_rel32(str_len(child_seq)) + child_seq + parent_seq + done_seq
@@ -1613,10 +1615,17 @@ fn x86gen_exec_spawn_native() {
     let close_p1 = c1(0) + c1(4)
     let close_p2 = c1(8) + c1(12)
     let skip_fail = jmp_rel32(str_len(close_p2) + str_len(close_p1) + str_len(fail_tail))
+    // 位移必须把下游失败臂整段计入（各自含 save 的 5 字节）——曾按 test+jl=9
+    // 硬编码，p1/p2 各短 5/10 字节落进 close 链中段执行垃圾字节，ulimit -n 4/5
+    // 即 SIGSEGV；一律 str_len(片段)，不写魔数
+    // each displacement must count the whole downstream fail arms (including
+    // their 5-byte saves) — hardcoding test+jl as 9 left p1/p2 5/10 bytes short,
+    // landing mid-close-chain on garbage bytes (SIGSEGV under ulimit -n 4/5);
+    // always str_len(fragments), never magic numbers
     let save = mov_mr(rsp, 72, rax)
     let p3_fail = test_rr(rax, rax) + save + jl_rel32(5)
-    let p2_fail = test_rr(rax, rax) + save + jl_rel32(str_len(pipe3) + 9 + 5 + str_len(close_p2))
-    let p1_fail = test_rr(rax, rax) + save + jl_rel32(str_len(pipe2) + 9 + str_len(pipe3) + 9 + 5 + str_len(close_p2) + str_len(close_p1))
+    let p2_fail = test_rr(rax, rax) + save + jl_rel32(str_len(pipe3) + str_len(p3_fail) + 5 + str_len(close_p2))
+    let p1_fail = test_rr(rax, rax) + save + jl_rel32(str_len(pipe2) + str_len(p2_fail) + str_len(pipe3) + str_len(p3_fail) + 5 + str_len(close_p2) + str_len(close_p1))
     let pipes = pipe1 + p1_fail + pipe2 + p2_fail + pipe3 + p3_fail + skip_fail + close_p2 + close_p1 + fail_tail
     if target_os == "windows" {
         // windows：无 fork，分派器 1004 号一步 CreatePipe×2 + CreateProcessA，
