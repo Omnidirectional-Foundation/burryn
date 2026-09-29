@@ -1660,8 +1660,31 @@ fn x86gen_exec_spawn_native() {
     // ends (keep failp[1]), PATH-resolve then execve
     let dup1 = mov_rm32(rdi, rsp, 4) + mov_ri64(rsi, 1) + sys_mov_rax(33) + syscall()
     let dup2 = mov_rm32(rdi, rsp, 12) + mov_ri64(rsi, 2) + sys_mov_rax(33) + syscall()
+    // §25：pipe2 全程 O_NONBLOCK（父侧排空要非阻塞读），但 dup 后的 1/2 号 fd 与
+    // 写端共享 open file description flags——子进程及其全部后代拿到非阻塞
+    // stdout，管道一满（恰为 64KB 容量）write 返 EAGAIN，head 等常规工具视为
+    // 写错误直接夭折（输出截断、exit 1、"Resource temporarily unavailable"；
+    // C 后端普通 pipe() 阻塞故免疫，实测 65537 即炸）。子侧 dup2 后对 1/2 清
+    // O_NONBLOCK：description 级一次清除，execve 后全部后代继承阻塞语义；父侧
+    // 读端独立 description 不受影响，排空照旧。失败不分支——fcntl 在此不可能
+    // 败，真败了行为也只是退回旧状。
+    // §25: pipe2 is created O_NONBLOCK throughout (the parent's drain needs
+    // non-blocking reads), but the dup'd fds 1/2 share the write ends' open
+    // file description flags — the child and every descendant inherit a
+    // NON-BLOCKING stdout; once the pipe fills (exactly the 64KB capacity) a
+    // write returns EAGAIN and plain tools like head treat that as a fatal
+    // write error (output truncated, exit 1, "Resource temporarily
+    // unavailable"; the C backend's plain blocking pipe() is immune, measured
+    // at 65537). The child clears O_NONBLOCK on fds 1/2 after the dup2s: one
+    // clear on the description, inherited blocking by every descendant after
+    // execve; the parent's read ends are separate descriptions and keep their
+    // non-blocking drain. No failure branch — fcntl cannot fail here, and a
+    // failure would only fall back to the old behavior.
+    let unblock_fd = fn(fd) {
+        mov_ri64(rdi, fd) + mov_ri64(rsi, 3) + sys_mov_rax(72) + syscall() + mov_ri64(r10, 0 - 2049) + and_rr(rax, r10) + mov_rr(rdx, rax) + mov_ri64(rdi, fd) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
+    }
     let child_closes = c1(0) + c1(4) + c1(8) + c1(12) + c1(16)
-    let child_seq = dup1 + dup2 + child_closes + slash_head + slash_body + slash_back + direct + walk + fail_write
+    let child_seq = dup1 + dup2 + unblock_fd(1) + unblock_fd(2) + child_closes + slash_head + slash_body + slash_back + direct + walk + fail_write
     // 父进程：关写端，建 proc 结构（失败关读端）/ parent: close write ends, build the proc struct (on failure close
     // read ends)
     let init_out = x86gen_drain_fl_take(8192, rax, rdi) + mov_mr(r9, proc_out_ptr, rax) + mov_mr(r9, proc_out_cap, rdi)
