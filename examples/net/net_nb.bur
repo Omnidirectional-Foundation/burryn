@@ -1,46 +1,67 @@
 // net_nb.bur — 非阻塞 accept/read/write 与 __eagain
 // net_nb: non-blocking accept/read/write with __eagain
 fn server(lh) {
-    match net_nb(0, lh, "", 0) {
-        Ok(conn_str) => {
-            match parse_int(conn_str) {
-                Some(conn) => {
-                    // 读到数据前一直让出：限定轮数会在回环投递稍慢时放弃，
-                    // 客户端随即永远阻塞在 net_read 上
-                    // keep yielding until data arrives: a bounded retry count gives
-                    // up when loopback delivery lags, leaving the client blocked in
-                    // net_read forever
-                    let mut said_block = false
-                    while true {
-                        match net_nb(1, conn, "", 64) {
-                            Ok(data) => {
-                                println("server read:", data)
-                                match net_nb(2, conn, "reply:" + data, 0) {
-                                    Ok(n) => println("server wrote", n, "bytes"),
-                                    Err(e) => println("server write: " + e),
-                                }
-                                net_close(conn)
-                                return
-                            },
-                            Err(e) => {
-                                if e == "__eagain" {
-                                    if !said_block {
-                                        println("server read: would block")
-                                        said_block = true
-                                    }
-                                } else {
-                                    println("server read: " + e)
-                                    return
-                                }
-                            },
+    // accept 也要让出重试：macOS 回环的握手落地可能晚于 connect 返回，accept
+    // 会拿到 __eagain，放弃就会让客户端永远阻塞在 net_read 上（§16 darwin
+    // 挂起）。Linux 回环同步落队，此处零重试，输出与 golden 一致。
+    // accept must yield-and-retry too: the macOS loopback handshake can land
+    // after connect() returns, so accept sees __eagain, and giving up leaves
+    // the client blocked in net_read forever (the section-16 darwin hang).
+    // Linux loopback queues synchronously: zero retries there, golden output
+    // unchanged.
+    let mut conn_str = ""
+    let mut accepted = false
+    while !accepted {
+        match net_nb(0, lh, "", 0) {
+            Ok(s) => {
+                conn_str = s
+                accepted = true
+            },
+            Err(e) => {
+                if e == "__eagain" {
+                    yield()
+                } else {
+                    println("server accept: " + e)
+                    return
+                }
+            },
+        }
+    }
+    match parse_int(conn_str) {
+        Some(conn) => {
+            // 读到数据前一直让出：限定轮数会在回环投递稍慢时放弃，
+            // 客户端随即永远阻塞在 net_read 上
+            // keep yielding until data arrives: a bounded retry count gives
+            // up when loopback delivery lags, leaving the client blocked in
+            // net_read forever
+            let mut said_block = false
+            while true {
+                match net_nb(1, conn, "", 64) {
+                    Ok(data) => {
+                        println("server read:", data)
+                        match net_nb(2, conn, "reply:" + data, 0) {
+                            Ok(n) => println("server wrote", n, "bytes"),
+                            Err(e) => println("server write: " + e),
                         }
-                        yield()
-                    }
-                },
-                None => println("server accept: bad handle"),
+                        net_close(conn)
+                        return
+                    },
+                    Err(e) => {
+                        if e == "__eagain" {
+                            if !said_block {
+                                println("server read: would block")
+                                said_block = true
+                            }
+                        } else {
+                            println("server read: " + e)
+                            return
+                        }
+                    },
+                }
+                yield()
             }
         },
-        Err(e) => println("server accept: " + e),
+        None => println("server accept: bad handle"),
     }
 }
 
