@@ -649,12 +649,12 @@ jobs:
           $pass = 0; $fail = 0; $probe = 0
           foreach ($n in Get-Content pe-out/corpus/CASES) {
             $want = [int](Get-Content "pe-out/corpus/$n.rc")
-            # §18 v9 探针：Linux 参照自身被 tripwire 打成 40-43 时该例不可比，
-            # 响亮记录后跳过比对（临时措施，腐化根因落地后整体回退）
-            # §18 v9 probe: when the Linux reference itself trips the wire
-            # (rc 40-43) the case is uncomparable — log loudly and skip
-            # (temporary until the root cause lands)
-            if ($want -ge 40 -and $want -le 43) {
+            # §18 v9/v10 探针：Linux 参照自身被 tripwire（40-43）或站点（44-49）
+            # 打中时该例不可比，响亮记录后跳过比对（临时措施，根因落地后整体回退）
+            # §18 v9/v10 probe: when the Linux reference itself trips the wire
+            # (rc 40-43) or a station (rc 44-49) the case is uncomparable —
+            # log loudly and skip (temporary until the root cause lands)
+            if ($want -ge 40 -and $want -le 49) {
               $probe++
               Write-Output ("PROBE-HIT {0}: Linux x86 reference rc {1} (section-18 v9 tripwire; comparison skipped)" -f $n, $want)
               continue
@@ -674,13 +674,13 @@ jobs:
               $fail++
               Write-Output ("FAIL {0}: rc {1} (want {2}) hash-read={3}" -f $n, $rc, $want, ($null -ne $h))
               git diff --no-index --text "pe-out/corpus/$n.expected" "act-$n.txt" | Select-Object -Skip 4 -First 6
-              # §18 v9 探针在 clock 站点命中时以 40-43 退场，24B 现场写在 stderr；
-              # 读侧 guard 38/39 的 128B 现场同样在 stderr（二进制，须 od）
-              # §18 v9 probe exits 40-43 from a clock site; the 24B scene is on stderr;
+              # §18 v9/v10 探针以 40-49 退场：24B/48B 现场写在 stderr；读侧
+              # guard 38/39 的 128B 现场同样在 stderr（二进制，须 od）
+              # §18 v9/v10 probes exit 40-49; the 24B/48B scenes are on stderr;
               # read-side guard 38/39 leaves a 128B scene there too (binary, od it)
-              if ($rc -ge 38 -and $rc -le 43 -and (Test-Path "err-$n.txt")) {
+              if ($rc -ge 38 -and $rc -le 49 -and (Test-Path "err-$n.txt")) {
                 $probe++
-                Write-Output ("PROBE-HIT {0}: rc {1} (section-18 v9 tripwire; dump):" -f $n, $rc)
+                Write-Output ("PROBE-HIT {0}: rc {1} (section-18 v9/v10 tripwire; dump):" -f $n, $rc)
                 od -An -tx1 -N128 "err-$n.txt"
               } elseif (Test-Path "err-$n.txt") { Get-Content "err-$n.txt" -TotalCount 6 }
             }
@@ -697,12 +697,12 @@ jobs:
             $fail++
             Write-Output ("FAIL args with arguments: rc {0} hash-read={1}" -f $rc, ($null -ne $h))
             git diff --no-index --text "pe-out/corpus/ARGV.expected" "act-argv.txt" | Select-Object -Skip 4 -First 6
-            # §18 v9 探针在 clock 站点命中时以 40-43 退场，24B 现场写在 stderr
-            # §18 v9 probe exits 40-43 from a clock site; the 24B scene is on stderr
-            if ($rc -ge 40 -and $rc -le 43) {
+            # §18 v9/v10 探针命中（40-49）时现场在 stderr
+            # §18 v9/v10 probe hits (40-49) leave the scene on stderr
+            if ($rc -ge 38 -and $rc -le 49) {
               $probe++
-              Write-Output ("PROBE-HIT args: rc {0} (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):" -f $rc)
-              od -An -tx1 -N24 "err-argv.txt"
+              Write-Output ("PROBE-HIT args: rc {0} (section-18 v9/v10 tripwire; 24B v9 dump or 48B v10 station dump):" -f $rc)
+              od -An -tx1 -N64 "err-argv.txt"
             } elseif (Test-Path "err-argv.txt") { Get-Content "err-argv.txt" -TotalCount 6 }
           }
           $p = Start-Process -FilePath "pe-out/corpus/examples_io_stdin.exe" -RedirectStandardInput "pe-out/corpus/STDIN.in" -RedirectStandardOutput "act-stdin.txt" -RedirectStandardError "err-stdin.txt" -PassThru -NoNewWindow
@@ -717,10 +717,10 @@ jobs:
             $fail++
             Write-Output ("FAIL stdin from a file: rc {0} hash-read={1}" -f $rc, ($null -ne $h))
             git diff --no-index --text "pe-out/corpus/STDIN.expected" "act-stdin.txt" | Select-Object -Skip 4 -First 6
-            if ($rc -ge 40 -and $rc -le 43) {
+            if ($rc -ge 38 -and $rc -le 49) {
               $probe++
-              Write-Output ("PROBE-HIT stdin: rc {0} (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):" -f $rc)
-              od -An -tx1 -N24 "err-stdin.txt"
+              Write-Output ("PROBE-HIT stdin: rc {0} (section-18 v9/v10 tripwire; 24B v9 dump or 48B v10 station dump):" -f $rc)
+              od -An -tx1 -N64 "err-stdin.txt"
             } elseif (Test-Path "err-stdin.txt") { Get-Content "err-stdin.txt" -TotalCount 6 }
           }
           Write-Output "=== corpus: $pass pass, $fail fail, $probe probe-hits ==="
@@ -760,7 +760,7 @@ jobs:
               Write-Output ("FAIL {0}: x86 rc {1}, C rc {2}" -f $n, $rc1, $rc2)
               git diff --no-index --text "x-out.txt" "c-out.txt" | Select-Object -First 6
               git diff --no-index --text "x-err.txt" "c-err.txt" | Select-Object -First 6
-              if ($rc1 -ge 38 -and $rc1 -le 43) {
+              if ($rc1 -ge 38 -and $rc1 -le 49) {
                 Write-Output ("-- section-18 scene (rc {0}) x86 stderr:" -f $rc1)
                 od -An -tx1 -N128 "x-err.txt"
               }
@@ -768,6 +768,37 @@ jobs:
           }
           Write-Output "=== x86-vs-C: $pass pass, $fail fail, $skip no-c ==="
           if ($fail -ne 0) { exit 1 }
+
+      # TEMP §18 v10 采样步（抓到 guard dump 或修复落地后即删）：macho 侧同款，
+      # 两个 flake exec 例各连跑 100 轮；任何非零退出打印 stderr hex，
+      # 不 gate（永远 exit 0）。
+      - name: "TEMP: section-18 v10 sample loop (100x flaky exec cases)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $total = 0
+          foreach ($n in @("examples_io_exec", "testdata_regression_exec_large")) {
+            $bin = "pe-out/corpus/$n.exe"
+            if (-not (Test-Path $bin)) { Write-Output "missing $n"; continue }
+            $h = 0
+            for ($i = 1; $i -le 100; $i++) {
+              $p = Start-Process -FilePath $bin -RedirectStandardOutput "s-out.txt" -RedirectStandardError "s-$n.err" -PassThru -NoNewWindow
+              $null = $p.Handle
+              if (-not $p.WaitForExit(20000)) { taskkill /F /T /PID $p.Id | Out-Null; $rc = 124 } else { $rc = $p.ExitCode }
+              if ($rc -ne 0) {
+                $h++
+                Write-Output ("SAMPLE {0} run={1} rc={2}" -f $n, $i, $rc)
+                if ($rc -ge 38 -and $rc -le 49) {
+                  Write-Output "-- guard/station dump (48B v10 stations: 44=td_now 45=fd_tmo_head 46=clock_native 47=timer_park 48=waitset_add 49=timer_add; 128B read-side 38=fd 39=sw; 24B write-side 40-43):"
+                  od -An -tx1 -N128 "s-$n.err"
+                } elseif (Test-Path "s-$n.err") { Get-Content "s-$n.err" -TotalCount 4 }
+              }
+            }
+            Write-Output "SAMPLE $n hits=$h/100"
+            $total += $h
+          }
+          Write-Output "=== sample loop total hits: $total ==="
+          exit 0
 
   x86-macho-build:
     needs: gen1
@@ -864,9 +895,9 @@ jobs:
             perl -e 'alarm 30; exec @ARGV' "macho-out/$1" > "actual-$1.txt" 2>"probe-$1.err"
             rc=$?
             set -e
-            if [ "$rc" -ge 40 ] && [ "$rc" -le 43 ]; then
-              echo "PROBE-HIT $1 rc=$rc (section-18 v9 tripwire caught a clock call on a corrupted stack; 24B dump = rsp, tv_sec, tv_nsec):"
-              od -An -tx1 -N24 "probe-$1.err"
+            if [ "$rc" -ge 38 ] && [ "$rc" -le 49 ]; then
+              echo "PROBE-HIT $1 rc=$rc (section-18 v9/v10: write-side 40-43, read-side 38/39, station 44-49; scene on stderr):"
+              od -An -tx1 -N64 "probe-$1.err"
               return 0
             fi
             diff "$2" "actual-$1.txt"
@@ -918,11 +949,12 @@ jobs:
             rc=$?
             [ "$rc" -eq 142 ] && rc=124
             want=$(cat "macho-out/corpus/$n.rc")
-            # §18 v9 probe: Linux reference tripped the wire (rc 40-43) —
-            # uncomparable, log loudly and skip (temporary until root cause)
-            if [ "$want" -ge 40 ] && [ "$want" -le 43 ]; then
+            # §18 v9/v10 probe: Linux reference tripped the wire (40-43) or a
+            # station (44-49) — uncomparable, log loudly and skip (temporary
+            # until root cause)
+            if [ "$want" -ge 40 ] && [ "$want" -le 49 ]; then
               probe=$((probe + 1))
-              echo "PROBE-HIT $n: Linux x86 reference rc $want (section-18 v9 tripwire; comparison skipped)"
+              echo "PROBE-HIT $n: Linux x86 reference rc $want (section-18 v9/v10 tripwire; comparison skipped)"
               continue
             fi
             if cmp -s "act-$n.txt" "macho-out/corpus/$n.expected" && [ "$rc" -eq "$want" ]; then
@@ -945,12 +977,12 @@ jobs:
             fail=$((fail + 1))
             echo "FAIL args with arguments rc=$rc"
             diff macho-out/corpus/ARGV.expected act-argv.txt | head -6
-            # §18 v9 探针命中（40-43）时 24B 现场在 stderr / a v9 probe hit
-            # (40-43) leaves the 24B scene on stderr
-            if [ "$rc" -ge 40 ] && [ "$rc" -le 43 ]; then
+            # §18 v9/v10 探针命中（40-49）时现场在 stderr / v9/v10 probe hits
+            # (40-49) leave the scene on stderr
+            if [ "$rc" -ge 38 ] && [ "$rc" -le 49 ]; then
               probe=$((probe + 1))
-              echo "PROBE-HIT args rc=$rc (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):"
-              od -An -tx1 -N24 probe-argv.err
+              echo "PROBE-HIT args rc=$rc (section-18 v9/v10 tripwire; 24B v9 dump or 48B v10 station dump):"
+              od -An -tx1 -N64 probe-argv.err
             fi
           fi
           codesign -f -s - macho-out/corpus/examples_io_stdin-mac 2>/dev/null
@@ -964,10 +996,10 @@ jobs:
             fail=$((fail + 1))
             echo "FAIL stdin from a file rc=$rc"
             diff macho-out/corpus/STDIN.expected act-stdin.txt | head -6
-            if [ "$rc" -ge 40 ] && [ "$rc" -le 43 ]; then
+            if [ "$rc" -ge 38 ] && [ "$rc" -le 49 ]; then
               probe=$((probe + 1))
-              echo "PROBE-HIT stdin rc=$rc (section-18 v9 tripwire; 24B dump = rsp, tv_sec, tv_nsec):"
-              od -An -tx1 -N24 probe-stdin.err
+              echo "PROBE-HIT stdin rc=$rc (section-18 v9/v10 tripwire; 24B v9 dump or 48B v10 station dump):"
+              od -An -tx1 -N64 probe-stdin.err
             fi
           fi
           echo "=== corpus: $pass pass, $fail fail, $probe probe-hits ==="
@@ -1013,7 +1045,7 @@ jobs:
               echo "FAIL $n: x86 rc $rc1, C rc $rc2"
               diff x-out.txt c-out.txt | head -6
               diff x-err.txt c-err.txt | head -6
-              if [ "$rc1" -ge 38 ] && [ "$rc1" -le 43 ]; then
+              if [ "$rc1" -ge 38 ] && [ "$rc1" -le 49 ]; then
                 echo "-- section-18 scene (rc $rc1) x86 stderr:"
                 od -An -tx1 -N128 x-err.txt
               fi
@@ -1040,8 +1072,8 @@ jobs:
               if [ "$rc" -ne 0 ]; then
                 hits=$((hits + 1))
                 echo "SAMPLE $n run=$i rc=$rc"
-                if [ "$rc" -eq 38 ] || [ "$rc" -eq 39 ] || [ "$rc" -eq 40 ] || [ "$rc" -eq 41 ] || [ "$rc" -eq 42 ] || [ "$rc" -eq 43 ]; then
-                  echo "-- guard dump (128B read-side 38=fd 39=sw; 24B write-side 40=td_now 41=fd_tmo_head 42=timer_park 43=clock_native):"
+                if [ "$rc" -ge 38 ] && [ "$rc" -le 49 ]; then
+                  echo "-- guard/station dump (48B v10 stations: 44=td_now 45=fd_tmo_head 46=clock_native 47=timer_park 48=waitset_add 49=timer_add; 128B read-side 38=fd 39=sw; 24B write-side 40=td_now 41=fd_tmo_head 42=timer_park 43=clock_native):"
                   od -An -tx1 -N128 "s-$n.err"
                 fi
                 head -c 120 "s-$n.err" | od -An -c

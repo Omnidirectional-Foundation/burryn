@@ -306,6 +306,48 @@ fn clk_guard(code) {
     push_r(r11) + push_r(r10) + lo_chk + hi_chk + good + bad
 }
 
+// TEMP §18 v10 读侧站点（取到腐化源后与 clk_guard/dbg_guard 一起整体回退）：
+// 写侧 clk_guard(40-43) 全程静默 + 读侧 dbg_guard(38/39) 命中 ⇒ 腐化不是
+// clock_gettime 刮痕写的，但发生时刻未知。v10 在六个点位采样 [rt_waitset_n]：
+// 44 td_now（调度器 timer 趟开头）/ 45 fd_tmo_head（fd 趟超时计算，紧邻 staging
+// 的 dbg_guard）/ 46 clock_native / 47 timer_park（两个内联 clock 站点）/
+// 48 waitset_add 入口 / 49 timer_add 入口。健康路径仅 push/pop r11，零副作用；
+// n > WAITSET_CAP 时（与 dbg_guard 同判据：合法上限恰为 CAP，健康运行永不触发）
+// 落 48B 现场块 {站点码, waitset_n, timer_n, timer[0].deadline, now_sec,
+// now_nsec} 到 stderr 并按站点码退出。首现中招的站点与其前一个干净站点夹出
+// 腐化窗口：44 净 → 45 中招 ⇒ 腐化在 timer 到期趟内部（td_copy 紧缩拷贝是
+// 头号嫌疑——timer[last] 的 deadline 落到失控游标上，形状恰是「waitset_n 值
+// = deadline 秒数」）；45 净 → 38 中招 ⇒ 腐化在 staging/poll/回收段内部。
+// 注意 48/49 站点的 now_sec/now_nsec 两个字段没有 clock 刮痕可读，内容是
+// 调用帧残渣（48 站点是返回地址），解码时按站点码区分。
+// TEMP §18 v10 read-side stations (revert together with clk_guard/dbg_guard
+// once the corrupter is known): the write-side tripwires (40-43) stayed silent
+// while the read-side dbg_guard (38/39) fired — the corruption is not a
+// clock_gettime scratch write, and its moment is unknown. v10 samples
+// [rt_waitset_n] at six points: 44 td_now (start of the scheduler timer pass),
+// 45 fd_tmo_head (fd-pass timeout calc, right before staging's dbg_guard), 46
+// clock_native, 47 timer_park (the two inlined clock sites), 48 waitset_add
+// entry, 49 timer_add entry. The healthy path only pushes/pops r11; when
+// n > WAITSET_CAP (the same predicate as dbg_guard — the legal maximum is
+// exactly CAP, so healthy runs never trip it) a 48B scene block {station code,
+// waitset_n, timer_n, timer[0].deadline, now_sec, now_nsec} goes to stderr and
+// the process exits with the station code. The first station to see the
+// corruption brackets the window with its clean predecessor: 44 clean → 45 hit
+// means the timer-due pass itself (td_copy's compaction copy is suspect #1 —
+// timer[last]'s deadline landing on a runaway cursor is exactly the observed
+// "waitset_n == deadline seconds" shape); 45 clean → 38 hit means it happened
+// inside staging/poll/reclaim. Stations 48/49 have no clock scratch to read,
+// so their now_sec/now_nsec fields hold caller-frame residue (the return
+// address for 48); decode by station code.
+fn ws_guard(code) {
+    let d_fill = sub_ri32(rsp, 48) + mov_ri64(rax, code) + mov_mr(rsp, 0, rax) + mov_ri64(rax, rt_slot(rt_waitset_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 8, rax) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 16, rax) + mov_ri64(rax, rt_slot(TIMER_BASE)) + mov_rm(rdx, rax, 0) + mov_mr(rsp, 24, rdx) + mov_rm(rax, rsp, 48) + mov_mr(rsp, 32, rax) + mov_rm(rax, rsp, 56) + mov_mr(rsp, 40, rax)
+    let d_out = mov_ri64(rdi, 2) + mov_rr(rsi, rsp) + mov_ri64(rdx, 48) + sys_mov_rax(1) + syscall() + mov_ri64(rdi, code) + sys_mov_rax(60) + syscall()
+    let bad = pop_r(r11) + d_fill + d_out
+    let good = pop_r(r11) + jmp_rel32(str_len(bad))
+    let chk = mov_ri64(r11, rt_slot(rt_waitset_n)) + mov_rm(r11, r11, 0) + cmp_ri32(r11, WAITSET_CAP) + ja_rel32(str_len(good))
+    push_r(r11) + chk + good + bad
+}
+
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
 // 空队时先等 waitset（poll）与 timer（nanosleep），两者皆空才扫描死锁
 // x86gen_sched_block emits the scheduler loop: pop ready, restore ctx, ret; exit when the
@@ -350,7 +392,7 @@ fn x86gen_sched_block() {
     let td_loop_check_pre = test_rr(r8, r8)
     let td_loop_back = jne_rel32(0 - (str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check_pre) + 6))
     let td_loop_check = td_loop_check_pre + td_loop_back
-    let td_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + clk_guard(40) + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(r9, rt_slot(rt_timer_n)) + mov_rm(r9, r9, 0) + mov_rr(r8, r9) + mov_ri64(r11, rt_slot(TIMER_BASE)) + test_rr(r8, r8) + je_rel32(str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check))
+    let td_now = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + clk_guard(40) + ws_guard(44) + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(r9, rt_slot(rt_timer_n)) + mov_rm(r9, r9, 0) + mov_rr(r8, r9) + mov_ri64(r11, rt_slot(TIMER_BASE)) + test_rr(r8, r8) + je_rel32(str_len(td_body) + str_len(td_drop) + str_len(td_next) + str_len(td_loop_check))
     let pw_timer_due = td_now + td_body + td_drop + td_next + td_loop_check + td_done
     // ---- fd_path：timeout 计算（有 timer 则按最短 deadline）+ poll + 就绪清理
     // （反向遍历，就绪者 schedule + 末项压缩）+ timer 到期检查 ----
@@ -426,7 +468,7 @@ fn x86gen_sched_block() {
     let fd_tmo_scan_back = jne_rel32(0 - (str_len(fd_tmo_scan_body) + str_len(fd_tmo_scan_upd) + str_len(fd_tmo_scan_skip_pre) + str_len(fd_tmo_scan_check_pre) + 6))
     let fd_tmo_scan_check = fd_tmo_scan_check_pre + fd_tmo_scan_back
     let fd_tmo_scan_done = mov_rr(rcx, r11) + sub_rr(rcx, r10) + test_rr(rcx, rcx) + jle_rel32(str_len(fd_tmo_calc) + str_len(fd_tmo_clamp_mov) + str_len(fd_tmo_clamp))
-    let fd_tmo_head = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + clk_guard(41) + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(rdx, rt_slot(rt_timer_n)) + mov_rm(rdx, rdx, 0) + mov_ri64(r11, 9223372036854775807) + mov_ri64(r8, rt_slot(TIMER_BASE)) + test_rr(rdx, rdx) + je_rel32(str_len(fd_tmo_calc) + str_len(fd_tmo_clamp_mov) + str_len(fd_tmo_clamp))
+    let fd_tmo_head = sub_ri32(rsp, 16) + mov_ri64(rdi, 1) + mov_rr(rsi, rsp) + sys_mov_rax(228) + syscall() + clk_guard(41) + ws_guard(45) + mov_rm(rax, rsp, 0) + mov_ri64(rcx, 1000000000) + imul_rr(rax, rcx) + mov_rm(rcx, rsp, 8) + add_rr(rax, rcx) + mov_rr(r10, rax) + add_ri32(rsp, 16) + mov_ri64(rdx, rt_slot(rt_timer_n)) + mov_rm(rdx, rdx, 0) + mov_ri64(r11, 9223372036854775807) + mov_ri64(r8, rt_slot(TIMER_BASE)) + test_rr(rdx, rdx) + je_rel32(str_len(fd_tmo_calc) + str_len(fd_tmo_clamp_mov) + str_len(fd_tmo_clamp))
     let fd_tmo = fd_tmo_zero + fd_tmo_head + fd_tmo_scan_body + fd_tmo_scan_upd + fd_tmo_scan_skip_pre + fd_tmo_scan_check + fd_tmo_scan_done + fd_tmo_calc + fd_tmo_clamp
     let fd_none = mov_ri64(rdx, -1) + jmp_rel32(str_len(fd_tmo))
     let fd_head = mov_ri64(r9, rt_slot(rt_waitset_n)) + mov_rm(r9, r9, 0) + sub_ri32(r9, 1) + mov_ri64(rax, rt_slot(rt_timer_n)) + mov_rm(rax, rax, 0) + test_rr(rax, rax) + jne_rel32(str_len(fd_none))
@@ -534,7 +576,7 @@ fn x86gen_waitset_add_block() {
     let add_addr = mov_ri64(r10, rt_slot(WAITSET_BASE)) + mov_rr(r11, r9) + mov_rr(rdx, rcx) + mov_ri32(rcx, 4) + shl_rcl(r11) + add_rr(r11, r10) + add_store
     let add_trap = x86gen_trap_exit("waitset capacity exceeded")
     let add_check = mov_ri64(r8, rt_slot(rt_waitset_n)) + mov_rm(r9, r8, 0) + mov_ri64(r10, WAITSET_CAP) + cmp_rr(r9, r10) + jae_rel32(str_len(add_addr) + str_len(add_set))
-    add_check + add_addr + add_set + add_trap
+    ws_guard(48) + add_check + add_addr + add_set + add_trap
 }
 
 // x86gen_timer_add_block 生成 timer 表追加子程序（rax=deadline_ns、rdi=fiber → 写
@@ -548,5 +590,5 @@ fn x86gen_timer_add_block() {
     let add_addr = mov_ri64(r10, rt_slot(TIMER_BASE)) + mov_rr(r11, r9) + mov_ri32(rcx, 4) + shl_rcl(r11) + add_rr(r11, r10) + add_store
     let add_trap = x86gen_trap_exit("timer capacity exceeded")
     let add_check = mov_ri64(r8, rt_slot(rt_timer_n)) + mov_rm(r9, r8, 0) + mov_ri64(r10, TIMER_CAP) + cmp_rr(r9, r10) + jae_rel32(str_len(add_addr) + str_len(add_set))
-    add_check + add_addr + add_set + add_trap
+    ws_guard(49) + add_check + add_addr + add_set + add_trap
 }
