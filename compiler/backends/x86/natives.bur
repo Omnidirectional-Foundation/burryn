@@ -1092,6 +1092,68 @@ let proc_consumed = 112
 let proc_size = 120
 let pipe2_nonblock_cloexec = 526336
 
+// §17 内部自由链：exec 排空缓冲（spawn 初始两块 + grow 倍增块）在 proc 消费完
+// 毕时显式归还，下一轮 exec 原样取回。这些缓冲从不逃逸进用户值（用户拿到的
+// ob_str/eb_str 是拷贝），所有权转移点唯一（cons 一次性置 consumed），故回收
+// 不经 GC、也不可能误收活块——这是 §17「字节不复用」里可证明安全的那一块。
+// 块形状 [next:8][cap:8]；链头停在 gray 区尾预留的 8B 零值空隙
+// （[rt_gray]+GC_GRAY_CAP*8+8：mmap/VirtualAlloc 匿名页保零 = 天然空链）。
+// §17 internal free list: the exec drain buffers (the two spawn-init blocks
+// plus grow's doubled blocks) are handed back explicitly when the proc is
+// consumed, and the next exec takes them back unchanged. These buffers never
+// escape into user values (the user gets the ob_str/eb_str copies) and the
+// ownership transfer point is unique (cons sets consumed exactly once), so
+// reclamation bypasses the GC and can never free a live block — the provably
+// safe slice of §17's "bytes are never reused". Block shape [next:8][cap:8];
+// the head parks in the 8B zero slack after the gray region
+// ([rt_gray]+GC_GRAY_CAP*8+8: anonymous mmap/VirtualAlloc pages stay zero, so
+// the list starts empty).
+
+// x86gen_fl_head_seq 把链头槽地址装入 rsi / x86gen_fl_head_seq loads the head-slot
+// address into rsi
+fn x86gen_fl_head_seq() {
+    mov_ri64(rsi, rt_slot(rt_gray)) + mov_rm(rsi, rsi, 0) + add_ri32(rsi, GC_GRAY_CAP * 8 + 8)
+}
+
+// x86gen_drain_fl_take 从自由链取一块 cap ≥ need 的缓冲：out_reg 回块（命中或
+// bump），cap_reg 回真实容量（命中读 [块+8]，未命中 = need）。need_imm ≥ 0 表
+// 立即数需求，否则需求取自 r10（grow 形态：r10 = 倍增后的新容量）。毁
+// rax/rcx/rdi/rsi，保留 rdx/r8/r9 与其余现场寄存器。
+// x86gen_drain_fl_take takes a cap>=need buffer off the free list: out_reg
+// receives the block (hit or fresh bump), cap_reg its real capacity (read from
+// [block+8] on a hit, `need` on a bump). need_imm >= 0 is an immediate need;
+// otherwise the need comes from r10 (the grow form: r10 = the doubled new
+// capacity). Clobbers rax/rcx/rdi/rsi; preserves rdx/r8/r9 and every other
+// live register.
+fn x86gen_drain_fl_take(need_imm, out_reg, cap_reg) {
+    let need_seq = if need_imm >= 0 {
+        mov_ri64(rdi, need_imm)
+    } else {
+        mov_rr(rdi, r10)
+    }
+    let bump = mov_rr(out_reg, r12) + add_rr(r12, rdi) + mov_rr(cap_reg, rdi)
+    let found = mov_rm(cap_reg, rcx, 8) + mov_rm(rax, rcx, 0) + mov_mr(rsi, 0, rax) + mov_rr(out_reg, rcx) + jmp_rel32(str_len(bump))
+    let adv = mov_rr(rsi, rcx)
+    let tail = mov_rm(rax, rcx, 8) + cmp_rr(rax, rdi)
+    let body = mov_rm(rcx, rsi, 0) + test_rr(rcx, rcx) + je_rel32(str_len(tail) + str_len(jae_rel32(0)) + str_len(adv) + str_len(jmp_rel32(0)) + str_len(found)) + tail + jae_rel32(str_len(adv) + str_len(jmp_rel32(0))) + adv
+    let back = jmp_rel32(0 - (str_len(body) + 5))
+    x86gen_fl_head_seq() + need_seq + body + back + found + bump
+}
+
+// x86gen_drain_fl_give 把 proc 的 (ptr_off, cap_off) 缓冲还入自由链；ptr 为 0
+// （spawn 同步失败臂）直接跳过，还完把 ptr 槽清零防二次归还。毁 rdx/rcx/rdi/rsi，
+// 保留 rax（cons 点 rax 是待返回的 Result）。
+// x86gen_drain_fl_give returns the proc's (ptr_off, cap_off) buffer to the free
+// list; a zero ptr (the spawn sync-failure arm) skips everything, and the ptr
+// slot is cleared after handing back so a second give is impossible. Clobbers
+// rdx/rcx/rdi/rsi; preserves rax (at the cons point rax holds the Result about
+// to be returned).
+fn x86gen_drain_fl_give(ptr_off, cap_off) {
+    let clear = mov_ri64(rdx, 0) + mov_mr(r9, ptr_off, rdx)
+    let thread = mov_rm(rcx, r9, cap_off) + x86gen_fl_head_seq() + mov_rm(rdi, rsi, 0) + mov_mr(rdx, 0, rdi) + mov_mr(rdx, 8, rcx) + mov_mr(rsi, 0, rdx)
+    mov_rm(rdx, r9, ptr_off) + test_rr(rdx, rdx) + je_rel32(str_len(thread)) + thread + clear
+}
+
 // x86gen_proc_pump 内联排空：failfd/outfd/errfd 非阻塞读，双管 EOF 后 wait4 收尸
 // x86gen_proc_pump inlines draining: non-blocking reads of failfd/outfd/errfd, wait4 once both
 // pipes hit EOF
@@ -1101,7 +1163,7 @@ fn x86gen_proc_pump() {
     // drain one pipe: read until EAGAIN or EOF; on a full buffer, double it and keep collecting
     fn drain_fd(fd_off, len_off, ptr_off, cap_off) capture(ref store, ref exited, ref signaled, ref code_seq, ref hav, ref failfd_close, ref wait_block, ref out_drain, ref err_drain, ref err_check, ref out_check, ref failfd_read, ref failfd_drain, ref failfd_head) {
         let cap = mov_rm(r10, r9, cap_off) + mov_rm(rdx, r9, len_off) + sub_rr(r10, rdx)
-        let grow = mov_rm(r10, r9, cap_off) + add_rr(r10, r10) + mov_rr(r11, r12) + add_rr(r12, r10) + mov_rm(rsi, r9, ptr_off) + mov_rr(rdi, r11) + mov_rm(rcx, r9, len_off) + rep_movsb() + mov_mr(r9, ptr_off, r11) + mov_mr(r9, cap_off, r10) + sub_rr(r10, rdx)
+        let grow = mov_rm(r10, r9, cap_off) + add_rr(r10, r10) + x86gen_drain_fl_take(-1, r11, r10) + mov_rm(rsi, r9, ptr_off) + mov_rr(rdi, r11) + mov_rm(rcx, r9, len_off) + rep_movsb() + mov_mr(r9, ptr_off, r11) + mov_mr(r9, cap_off, r10) + sub_rr(r10, rdx)
         let append = mov_rm(rsi, r9, ptr_off) + add_rr(rsi, rdx) + mov_rr(rdx, r10)
         let cap_branch = test_rr(r10, r10) + jg_rel32(str_len(grow))
         let read = mov_rr(rdi, r8) + xor_rr(rax, rax) + syscall()
@@ -1152,7 +1214,7 @@ fn x86gen_proc_result_inst() {
     // the child's exec failed: child_err holds a positive errno, reported as its
     // strerror text like C; errtext clobbers r9, so save it
     let err_path = push_r(r9) + mov_rm(rax, r9, proc_child_err) + neg_r(rax) + x86gen_err_from_errno() + pop_r(r9)
-    let cons = mov_ri64(rdx, 1) + mov_mr(r9, proc_consumed, rdx)
+    let cons = x86gen_drain_fl_give(proc_out_ptr, proc_out_cap) + x86gen_drain_fl_give(proc_err_ptr, proc_err_cap) + mov_ri64(rdx, 1) + mov_mr(r9, proc_consumed, rdx)
     let branch = mov_rm(r8, r9, proc_have_err) + test_rr(r8, r8) + je_rel32(str_len(err_path) + 5) + err_path + jmp_rel32(str_len(ok_path)) + ok_path + cons
     branch
 }
@@ -1602,8 +1664,8 @@ fn x86gen_exec_spawn_native() {
     let child_seq = dup1 + dup2 + child_closes + slash_head + slash_body + slash_back + direct + walk + fail_write
     // 父进程：关写端，建 proc 结构（失败关读端）/ parent: close write ends, build the proc struct (on failure close
     // read ends)
-    let init_out = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_out_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_out_cap, rax)
-    let init_err = mov_rr(rax, r12) + add_ri32(r12, 8192) + mov_mr(r9, proc_err_ptr, rax) + mov_ri64(rax, 8192) + mov_mr(r9, proc_err_cap, rax)
+    let init_out = x86gen_drain_fl_take(8192, rax, rdi) + mov_mr(r9, proc_out_ptr, rax) + mov_mr(r9, proc_out_cap, rdi)
+    let init_err = x86gen_drain_fl_take(8192, rax, rdi) + mov_mr(r9, proc_err_ptr, rax) + mov_mr(r9, proc_err_cap, rdi)
     let proc_rest = init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
     let parent_ok = mov_rr(r9, r12) + add_ri32(r12, proc_size) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + proc_rest
     // fork 失败：先存 -errno 进 [rsp+72] 再关读端（close 会覆写 rax），收栈前
