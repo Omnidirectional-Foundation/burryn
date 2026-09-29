@@ -504,6 +504,20 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     let gc_rec_bytes = x86gen_gc_record()
     let gc_col = x86gen_gc_collect(n_globals, code_origin() + const_data_len)
     let gc_mark = x86gen_mark_addr()
+    // P0：OOM die 与 PE 提交两个 stub；地址先于 funcs 拼接定值，站点序列经
+    // x86gen_oom_check 间接调用（同 die_addr_g 的发射期全局模式）
+    // P0: the OOM die and PE commit stubs; addresses are fixed before funcs is
+    // assembled and site sequences reach them indirectly through x86gen_oom_check
+    // (the same emission-time-global pattern as die_addr_g)
+    // stub 先以当前 die_addr_g 量长（mov imm64 定长，长度与地址值无关），
+    // 定址后（die_addr_g 定值处）再重建字节——两遍各自持有本遍地址，
+    // PIC 改写按探针位移成立
+    // stub lengths are measured with the current die_addr_g first (mov imm64 is
+    // fixed-size, so length is address-independent) and the bytes are rebuilt
+    // after die_addr_g is fixed — each pass then carries its own address and the
+    // PIC rewrite holds by the probe shift
+    let oom_die_len = str_len(x86gen_oom_die_stub())
+    oom_die_g = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
     // 调度器块（sched/yield/done）与 channel 子程序（schedule/wake_waiters/push_queue）在
     // funcs 头部、GC 子程序之后；地址编译期确定，供 _start / prologue 插桩 / spawn 的
     // fake frame / channel opcode 引用
@@ -512,7 +526,7 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // with 0 first, then rebuild once the address is known
     die_addr_g = 0
     let sched_bytes = x86gen_sched_block()
-    let sched_addr = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
+    let sched_addr = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark) + oom_die_len
     let yield_bytes = x86gen_yield_block(sched_addr)
     let yield_addr = sched_addr + str_len(sched_bytes)
     let done_bytes = x86gen_fiber_done_block(sched_addr)
@@ -536,13 +550,17 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     let die_addr = timer_add_addr + str_len(timer_add_bytes)
     die_undef_g = die_addr
     die_addr_g = die_addr + die_entry_off()
+    // die_addr_g 定值后重建两个 stub：内部对 die 的引用此刻为本遍真实地址
+    // rebuild both stubs once die_addr_g is fixed: their die references now carry
+    // this pass's real address
+    let oom_die_bytes = x86gen_oom_die_stub()
     let die_len = str_len(x86gen_die_block(0, 0, 0, 0))
     let die_off = die_addr - (code_origin() + const_data_len)
     // 字符串构建器子程序紧跟 die（格式化用，见 fmt.bur） / the string-builder
     // subroutines follow die (used by formatting, see fmt.bur)
     sb_set_addrs(die_addr + die_len)
     errtext_g = die_addr + die_len + str_len(la_link(x86gen_sb_items()))
-    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items())
+    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + oom_die_bytes + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items())
     // fn 名表：每函数一项 8B 偏移（自表基址起算），指向 [len:8][bytes] 名字串；
     // 空名记为 anonymous（对齐 C 的 bur_format）。放在用户代码之前，其绝对地址在此
     // 处即已最终确定（与 sb_set_addrs 同基准），fmt 子程序经 mov_ri64 取基址。

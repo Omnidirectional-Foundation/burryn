@@ -49,7 +49,7 @@ fn x86gen_chan_push_queue_block(off) {
     let store_n = mov_rm(r8, rax, off + 8) + add_ri32(r8, 1) + mov_mr(rax, off + 8, r8) + ret()
     let no_grow = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rdx, rax, off) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(rcx, 0, rdi)
     // grow_alloc 记录新块但先不写回指针，grow_copy 从 [rax+off] 读旧数组拷贝 n 元素后再写回
-    let grow_alloc = mov_rr(r11, r12) + mov_rr(rsi, r8) + add_rr(r12, rsi) + gc_rec(r11, mov_rr(rsi, rsi)) + mov_rm(rcx, rax, off + 16) + add_rr(rcx, rcx) + add_ri32(rcx, QUEUE_GROW_ADD) + mov_mr(rax, off + 16, rcx)
+    let grow_alloc = mov_rr(r11, r12) + mov_rr(rsi, r8) + add_rr(r12, rsi) + gc_rec(r11, mov_rr(rsi, rsi)) + x86gen_oom_check() + mov_rm(rcx, rax, off + 16) + add_rr(rcx, rcx) + add_ri32(rcx, QUEUE_GROW_ADD) + mov_mr(rax, off + 16, rcx)
     let grow_copy = mov_rm(rsi, rax, off) + mov_rr(rdi, r11) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(rax, off, r11)
     let grow_size = mov_rr(r8, rcx) + add_rr(r8, r8) + add_ri32(r8, QUEUE_GROW_ADD) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r8)
     let grow = mov_rm(rdx, rax, off) + mov_rm(rcx, rax, off + 16) + mov_rm(r9, rax, off + 8) + grow_size + grow_alloc + grow_copy
@@ -253,6 +253,40 @@ fn gc_rec(ptr_reg, size) {
     push_r(rdi) + push_r(rsi) + push_r(r8) + mov_rr(rdi, ptr_reg) + size + call + pop_r(r8) + pop_r(rsi) + pop_r(rdi)
 }
 
+// oom_die / commit 两个 stub 的发射期地址（x86gen_image 每遍装配前设定）
+// the two stubs' emission-time addresses (set by x86gen_image before each pass)
+pub let mut oom_die_g = 0
+pub let mut gc_commit_stub_g = 0
+
+// x86gen_oom_check 生成站点尾部的堆越界检查（r12 推进后调用；push/pop rcx 保护现场）。
+// Linux：r12 超 rt_heap_limit 即进 oom_die stub（funcs 头部，永不返回）；PE：r12 超
+// rt_commit_top 先进 commit stub 续提一片并复查 limit，仍不够才 die。
+// x86gen_oom_check emits the per-site heap-bound check (call it right after an r12
+// advance; push/pop rcx preserves the surroundings). Linux: r12 past rt_heap_limit
+// enters the oom_die stub (in funcs' head, never returning); PE: r12 past
+// rt_commit_top first enters the commit stub to top up a chunk and re-checks the
+// limit, dying only when that still fails.
+fn x86gen_oom_check() {
+    if target_os == "windows" {
+        let die_call = push_r(rax) + mov_ri64(rax, oom_die_g) + call_r(rax) + pop_r(rax)
+        push_r(rcx) + mov_ri64(rcx, rt_slot(rt_heap_limit)) + mov_rm(rcx, rcx, 0) + cmp_rr(rcx, r12) + pop_r(rcx) + ja_rel32(str_len(die_call)) + die_call
+    } else {
+        let die_call = push_r(rax) + mov_ri64(rax, oom_die_g) + call_r(rax) + pop_r(rax)
+        push_r(rcx) + mov_ri64(rcx, rt_slot(rt_heap_limit)) + mov_rm(rcx, rcx, 0) + cmp_rr(rcx, r12) + pop_r(rcx) + ja_rel32(str_len(die_call)) + die_call
+    }
+}
+
+// x86gen_oom_die_stub 生成 OOM die stub 本体：全保存现场后经 die 报错退出
+// x86gen_oom_die_stub emits the OOM die stub: save everything, report through die
+fn x86gen_oom_die_stub() {
+    push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rsi) + push_r(rdi) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + x86gen_trap_exit("out of memory: x86 heap limit")
+}
+
+// x86gen_commit_stub 生成 PE 提交 stub 本体：按水位循环续提 4MB，commit 失败或
+// 复查 limit 仍越界即 OOM die；成功恢复现场返回
+// x86gen_commit_stub emits the PE commit stub: top up 4MB in a loop by the
+// watermark; a commit failure or a limit re-check still past the cap dies with
+// OOM; success restores the registers and returns
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
 // 空队时先等 waitset（poll）与 timer（nanosleep），两者皆空才扫描死锁
 // x86gen_sched_block emits the scheduler loop: pop ready, restore ctx, ret; exit when the
@@ -433,7 +467,7 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // resume 后第一次 ret 弹 main 入口，main 返回时 ret 弹 done 块
     let fake_frame = sub_ri32(rsp, 16) + mov_ri64(rax, done_addr) + mov_mr(rsp, 8, rax) + jt_load(rax, 0) + mov_mr(rsp, 0, rax)
     // fb 建设：r11 = fb（gc_rec 保护 r11），bump r12；status 清零为 READY
-    let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + gc_rec(r11, mov_ri32(rsi, FB_SIZE)) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx) + lea(rcx, rsp, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx)
+    let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + gc_rec(r11, mov_ri32(rsi, FB_SIZE)) + x86gen_oom_check() + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx) + lea(rcx, rsp, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx)
     // ctx 保存：saved_rsp = fake frame 后（含两槽），rsp 下方的 prologue 由 resume 后函数自身建立
     let ctx_save = mov_rr(rcx, rsp) + mov_mr(r11, FB_RSP, rcx) + mov_rr(rcx, rbp) + mov_mr(r11, FB_RBP, rcx) + mov_rr(rcx, r14) + mov_mr(r11, FB_R14, rcx) + mov_rr(rcx, r15) + mov_mr(r11, FB_R15, rcx) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx)
     let ready_join = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + branch + empty_head + to_set + nonempty + set_tail
@@ -461,6 +495,17 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     } else {
         mov_rr(r11, rsp)
     }
+    // P0 堆预留：Linux 一次性 mmap 1GB（MAP_NORESERVE）；PE 先 MEM_RESERVE 1GB 再按
+    // 4MB 粒度 MEM_COMMIT（guard 子程序按水位续提）。rt_heap_limit 两平台同为预留上限。
+    // P0 heap reserve: Linux mmaps 1GB at once (MAP_NORESERVE); PE MEM_RESERVEs 1GB
+    // first, then MEM_COMMITs in 4MB granularity (the guard stub keeps topping up by
+    // the watermark). rt_heap_limit is the reserve cap on both targets.
+    let heap_mmap = if target_os == "windows" {
+        mov_ri64(rdi, 0) + mov_ri64(rsi, X86GC_RESERVE) + mov_ri64(rdx, 12288) + mov_ri64(r8, 4) + sys_mov_rax(1005) + syscall()
+    } else {
+        mov_ri64(rdi, 0) + mov_ri64(rsi, X86GC_RESERVE) + mov_ri64(rdx, 3) + mov_ri64(r10, X86GC_MMAP_FLAGS) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall()
+    }
+    let heap_limit = mov_ri64(r11, rt_slot(rt_heap_limit)) + lea(rcx, rax, X86GC_RESERVE) + mov_mr(r11, 0, rcx)
     // 主纤程栈下探：Windows 只在距 rsp 一页内自动扩展栈，直接写 1MB 下方
     // 会踩未提交的 guard 页；逐页触碰（每页 4096B，共 256 页）强制按序提交，
     // 结束时 r15 = r14 = rsp - 1048576，与直减路径终态一致。
@@ -478,7 +523,7 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // result strings (~0.85MB per large-output exec); 64MB puts the 60x840KB
     // stress (stress_s4) inside the budget. Anonymous mappings commit on
     // demand; VA is cheap.
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + mov_ri64(rdi, 0) + mov_ri64(rsi, 67108864) + mov_ri64(rdx, 3) + mov_ri64(r10, 34) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall() + mov_rr(r12, rax) + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, global_flag_disp(n_globals, (n_globals + 7) / 8 * 8)) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + heap_mmap + mov_rr(r12, rax) + heap_limit + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, global_flag_disp(n_globals, (n_globals + 7) / 8 * 8)) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
 }
 
 // x86gen_waitset_add_block 生成 waitset 追加子程序（rax=fd 低 32 位、rcx=events 低 16 位、
