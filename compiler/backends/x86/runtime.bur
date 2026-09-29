@@ -291,7 +291,16 @@ fn x86gen_sched_block() {
     let td_sched_enq_empty = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
     let td_sched_enq_branch = test_rr(rcx, rcx) + jne_rel32(str_len(td_sched_enq_empty) + str_len(td_sched_enq_to_set))
     let td_sched_ready = mov_ri64(rcx, FB_READY) + mov_mr(rax, FB_STATUS, rcx) + xor_rr(rcx, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
-    let td_sched = mov_rm(rax, r11, 8) + td_sched_ready + mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0) + td_sched_enq_branch + td_sched_enq_empty + td_sched_enq_to_set + td_sched_enq_nonempty + td_sched_enq_set
+    let td_sched_enq_load = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0)
+    // 状态门：只唤醒仍阻塞在 timer 上的 fiber（对齐 C bur_wake_due_timers 的
+    // FBLOCKED_TIMER 检查）；陈旧条目照常摘除但不重复入队——fiber 被其他路径
+    // 先唤醒时，双重入队会把同一 fiber 塞进 ready 队两次、弄脏调度器。
+    // Status gate: wake only fibers still blocked on the timer (mirrors C's
+    // FBLOCKED_TIMER check in bur_wake_due_timers); stale entries are still
+    // removed but not re-enqueued — a fiber woken by another path must never
+    // enter the ready queue twice.
+    let td_sched_gate = mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, FB_BLOCKED_TIMER) + cmp_rr(rcx, rdx) + jne_rel32(str_len(td_sched_ready) + str_len(td_sched_enq_load) + str_len(td_sched_enq_branch) + str_len(td_sched_enq_empty) + str_len(td_sched_enq_to_set) + str_len(td_sched_enq_nonempty) + str_len(td_sched_enq_set))
+    let td_sched = mov_rm(rax, r11, 8) + td_sched_gate + td_sched_ready + td_sched_enq_load + td_sched_enq_branch + td_sched_enq_empty + td_sched_enq_to_set + td_sched_enq_nonempty + td_sched_enq_set
     let td_check = mov_rm(rax, r11, 0) + cmp_rr(rax, r10) + jg_rel32(str_len(td_sched) + str_len(td_remove) + str_len(td_copy) + str_len(td_drop))
     let td_body = td_check + td_sched + td_remove + td_copy
     let td_loop_check_pre = test_rr(r8, r8)
@@ -312,7 +321,14 @@ fn x86gen_sched_block() {
     let fd_loop_sched_enq_empty = mov_ri64(rcx, rt_slot(rt_ready_head)) + mov_mr(rcx, 0, rax)
     let fd_loop_sched_enq_branch = test_rr(rcx, rcx) + jne_rel32(str_len(fd_loop_sched_enq_empty) + str_len(fd_loop_sched_enq_to_set))
     let fd_loop_sched_ready = mov_ri64(rcx, FB_READY) + mov_mr(rax, FB_STATUS, rcx) + xor_rr(rcx, rcx) + mov_mr(rax, FB_READY_NEXT, rcx)
-    let fd_loop_sched = mov_rm(rax, r10, 8) + fd_loop_sched_ready + mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0) + fd_loop_sched_enq_branch + fd_loop_sched_enq_empty + fd_loop_sched_enq_to_set + fd_loop_sched_enq_nonempty + fd_loop_sched_enq_set
+    let fd_loop_sched_enq_load = mov_ri64(rcx, rt_slot(rt_ready_tail)) + mov_rm(rcx, rcx, 0)
+    // 状态门：只唤醒仍阻塞在 fd 上的 fiber（对齐 C bur_fiber_fd_ready/唤醒循环的
+    // FBLOCKED_IO 检查）；条目照常摘除但不重复入队。
+    // Status gate: wake only fibers still blocked on the fd (mirrors C's
+    // FBLOCKED_IO checks in bur_fiber_fd_ready and the wake loop); the entry
+    // is still removed but the fiber is not re-enqueued.
+    let fd_loop_sched_gate = mov_rm(rcx, rax, FB_STATUS) + mov_ri64(rdx, FB_BLOCKED_FD) + cmp_rr(rcx, rdx) + jne_rel32(str_len(fd_loop_sched_ready) + str_len(fd_loop_sched_enq_load) + str_len(fd_loop_sched_enq_branch) + str_len(fd_loop_sched_enq_empty) + str_len(fd_loop_sched_enq_to_set) + str_len(fd_loop_sched_enq_nonempty) + str_len(fd_loop_sched_enq_set))
+    let fd_loop_sched = mov_rm(rax, r10, 8) + fd_loop_sched_gate + fd_loop_sched_ready + fd_loop_sched_enq_load + fd_loop_sched_enq_branch + fd_loop_sched_enq_empty + fd_loop_sched_enq_to_set + fd_loop_sched_enq_nonempty + fd_loop_sched_enq_set
     let fd_loop_rev = mov_rm32(rcx, r10, 4) + mov_rr(rdx, rcx) + mov_ri32(rcx, 16) + shr_rcl(rdx) + test_rr(rdx, rdx) + je_rel32(str_len(fd_loop_sched) + str_len(fd_loop_remove) + str_len(fd_loop_copy) + str_len(fd_drop))
     let fd_loop_addr = mov_ri64(r8, rt_slot(WAITSET_BASE)) + mov_rr(r10, r9) + mov_ri32(rcx, 4) + shl_rcl(r10) + add_rr(r10, r8)
     let fd_loop_body = fd_loop_addr + fd_loop_rev + fd_loop_sched + fd_loop_remove + fd_loop_copy
