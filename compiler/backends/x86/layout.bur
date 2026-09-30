@@ -48,6 +48,14 @@ pub let rt_heap_limit = 144
 // reuses the retired rt_commit_top position).
 pub let rt_desc_table = 152
 pub let rt_start_bitmap = 160
+// P2：主 fiber 影子 kind 区基址、影子游标（= 影子基址 + (r15-stack_lo)/8 的
+// 字节地址，恒与 r15 同步推进）、全局 kind 表基址（发射期静态字节，rt_init 写槽）。
+// P2: the main fiber's shadow-kind region base, the shadow cursor (byte address
+// = shadow base + (r15-stack_lo)/8, always advanced in lockstep with r15), and
+// the global kind table base (static bytes known at emission; rt_init stores it).
+pub let rt_main_shadow = 2736
+pub let rt_shadow_top = 2744
+pub let rt_global_kinds = 2752
 // waitset 每项 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]；poll(2) 只认连续 8B 记录，
 // 故 poll 前把各条目前 8B 拷入 POLLFD_BASE 暂存区，返回后把 revents 回写条目 +6
 // waitset entries are 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]; poll(2) consumes
@@ -67,7 +75,12 @@ pub let WAITSET_BASE = 176
 // TIMER_BASE = 144 + 64*16 = 1168, POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2192;
 pub let TIMER_BASE = 1200
 pub let POLLFD_BASE = 2224
-pub let RUNTIME_SIZE = 2736
+// P2：RUNTIME_SIZE 2736 → 2760，尾部追加三个 GC 槽（rt_main_shadow/rt_shadow_top/
+// rt_global_kinds，见上）；thunk 槽与 fd/WSA 区随符号位移，无硬编码依赖。
+// P2: RUNTIME_SIZE 2736 -> 2760, three GC slots appended at the tail
+// (rt_main_shadow/rt_shadow_top/rt_global_kinds, above); the thunk slot and the
+// fd/WSA areas shift along symbolically, nothing hardcodes them.
+pub let RUNTIME_SIZE = 2760
 // P1：rec 表与 gray 栈的容量常量（rec 项 24B）随 rec 表删除退役，仅留字面量占位。
 // P1: the rec table's/gray stack's capacity constants (24B per rec entry) are
 // retired along with the rec table; kept as literals only.
@@ -105,7 +118,19 @@ pub let FB_LIST_NEXT = 64
 // FB_LIMIT: the prologue's rsp floor; going below it means the call depth
 // exceeds DEPTH_MAX (see x86gen_prologue)
 pub let FB_LIMIT = 72
-pub let FB_SIZE = 80
+// P2：FB_SHADOW = 该 fiber 影子 kind 区基址（1 字节/8B 槽，与值栈同索引）；FB_SIZE
+// 80 → 88。主 fiber 由 _start 填（独立 mmap），spawn fiber 由 emit 的 fb_build 填
+// （栈 mmap 尾段）。
+// P2: FB_SHADOW = the fiber's shadow-kind region base (one byte per 8B slot,
+// indexed with the value stack); FB_SIZE 80 -> 88. The main fiber's is filled by
+// _start (a standalone mmap), a spawned fiber's by emit's fb_build (the tail of
+// the stack mmap).
+pub let FB_SHADOW = 80
+pub let FB_SIZE = 88
+// P2：影子区容量——值栈 1MiB = 128Ki 槽，取 256KiB 留裕量（spawn 与主 fiber 同规格）。
+// P2: shadow capacity — a 1MiB value stack is 128Ki slots; 256KiB leaves headroom
+// (same size for spawned and main fibers).
+pub let X86GC_SHADOW_SIZE = 262144
 // DEPTH_MAX 是每 fiber 的函数调用深度上限（与 C/VM 同为 2048，fiber 入口帧不计）；
 // 用户函数帧恒占 24B 原生栈（返回地址 + 保存的 rbp + defer 槽）
 // DEPTH_MAX is the per-fiber call-depth cap (2048, as in C/VM; the fiber's

@@ -31,30 +31,160 @@
 // rounded up to 8).
 
 // desc kind：NOSCAN 无指针 / ALL_PTR 全词皆指针 / ALL_MAYBE 全词 MAYBE 扫描 /
-// BITMAP 位图描述。P1 全站占位 ALL_MAYBE，P2 逐类精化。
+// BITMAP 位图描述 / PREFIX 头部标量词跳过 + 尾部按单一 kind 扫。P2 批 4 逐类精化。
 // desc kinds: NOSCAN no pointers / ALL_PTR every word a pointer / ALL_MAYBE
-// speculative whole-word scan / BITMAP per-field bitmap. P1 stamps every site
-// with the ALL_MAYBE placeholder; P2 refines per type.
+// speculative whole-word scan / BITMAP per-field bitmap / PREFIX skip head
+// scalar words then scan the tail at a single kind. P2 batch 4 refines per type.
 pub let GC_KIND_NOSCAN = 0
 pub let GC_KIND_ALL_PTR = 1
 pub let GC_KIND_ALL_MAYBE = 2
 pub let GC_KIND_BITMAP = 3
-// P1 全站共用 desc_id = 0（表内唯一条目的字节偏移）。
-// P1's single desc_id = 0 (the byte offset of the table's only entry).
+pub let GC_KIND_PREFIX = 4
+// P1 全站占位 desc_id = 0 = ALL_MAYBE 条目（表内字节偏移，注册表首条目）。
+// P1's placeholder desc_id = 0 = the ALL_MAYBE entry (the registry's first).
 pub let GC_DESC_ALL = 0
-// desc 表字节数：单条目 8B = [kind:1][保留:7]。
-// desc table size: one 8B entry = [kind:1][reserved:7].
-pub let GC_DESC_TABLE_LEN = 8
+// desc 表 = 静态/按需条目 + GC_DESC_POOL 零垫，总长发射期定值（GC_DESC_TABLE_LEN，
+// desc_reset 定值）。定长的原因：表挂 const_data，而条目在装配遍中才注册齐——
+// x86gen_image 逐遍把最新表字节拼接回 const_data 尾段，probe/real 两遍拼到同一份
+// 最终字节（预热遍后注册即收敛），pic_data 逐字节必等；垫底零字节 = NOSCAN，
+// 野读安全；位图容量公式（表长 - desc_id）也随之有界。
+// the desc table = registered entries + a GC_DESC_POOL zero pad, its total
+// length fixed at emission (GC_DESC_TABLE_LEN, set by desc_reset). Fixed length
+// because the table rides const_data while entries only finish registering
+// during the assembly passes — x86gen_image splices the latest table bytes back
+// into const_data's tail every pass, so probe and real splice the same final
+// bytes (registration converges after the warmup pass) and pic_data matches
+// byte for byte; the zero pad reads as NOSCAN, safe for stray reads, and the
+// bitmap-capacity formula (table length - desc_id) stays bounded.
+pub let GC_DESC_POOL = 4096
+pub let mut GC_DESC_TABLE_LEN = 8
 // 2^40：hdr 内 desc 字段的位权 / 2^40: the desc field's bit weight in the hdr
 pub let GC_DESC_SHIFT = 1099511627776
+// hdr desc 字段宽 22 位（2^22−1）：hdr = [size:40][desc:22][flags:2]，verify 读
+// desc 前先掩掉 flags 位，位 63 起的标志置位时 desc 不得误报越界
+// the hdr desc field is 22 bits wide (2^22-1): hdr = [size:40][desc:22]
+// [flags:2]; verify masks the flag bits before reading desc so set flags never
+// misreport an out-of-table desc id
+pub let GC_DESC_MASK = 4194303
 
-// x86gen_desc_table 生成 desc 表镜像字节：条目 0 = ALL_MAYBE 占位，P2 逐类精化
-// 后在此追加条目（desc_id = 追加偏移）。
-// x86gen_desc_table emits the desc table's image bytes: entry 0 is the
-// ALL_MAYBE placeholder; P2 appends entries here as types are refined
-// (desc_id = the append offset).
-fn x86gen_desc_table() {
-    e8(GC_KIND_ALL_MAYBE)
+// desc 注册表：keys/ids 平行 list（包级 let 只许字面量，map() 进不来；异构对
+// [str,int] 过不了同型检查；条目量 ~30 线性查无碍）。desc_pool 持全部条目字节
+// （静态条目也入池），每程序 desc_reset 清零后按确定序重注册 → 两遍装配的 id
+// 完全一致。
+// the desc registry: parallel keys/ids lists (package-level lets only take
+// literals so map() is out, and a heterogeneous [str,int] pair fails the
+// same-type check; ~30 entries make linear scans fine). desc_pool holds every
+// entry's bytes (static ones included); desc_reset clears per program and
+// re-registers in a deterministic order, so both assembly passes see identical
+// ids.
+pub let mut desc_keys = []
+pub let mut desc_ids = []
+pub let mut desc_pool = []
+pub let mut desc_noscan = 0
+pub let mut desc_allptr = 0
+pub let mut desc_cell = 0
+pub let mut desc_lenptrs = 0
+pub let mut desc_caplenptrs = 0
+pub let mut desc_list_scalar = 0
+pub let mut desc_list_ptr = 0
+pub let mut desc_list_maybe = 0
+pub let mut desc_chan = 0
+pub let mut desc_map = 0
+pub let mut desc_fb = 0
+pub let mut desc_sb = 0
+pub let mut desc_box_ptr = 0
+
+fn desc_register(key: str, bytes: [int]) -> int {
+    let mut found = 0 - 1
+    let mut i = 0
+    while i < len(desc_keys) {
+        if desc_keys[i] == key {
+            found = desc_ids[i]
+        }
+        i = i + 1
+    }
+    if found >= 0 {
+        found
+    } else {
+        let id = len(desc_pool)
+        let mut k = 0
+        while k < len(bytes) {
+            push(desc_pool, bytes[k])
+            k = k + 1
+        }
+        push(desc_keys, key)
+        push(desc_ids, id)
+        id
+    }
+}
+
+// desc_reset 每程序清注册表并按确定序预注册全部静态形：
+// NOSCAN / ALL_PTR / cell·closure=PREFIX(0,PTR) / [len][ptrs]=PREFIX(1,PTR) /
+// [cap][len][ptrs]=PREFIX(2,PTR) / list=PREFIX(3,SCALAR|PTR|MAYBE)（头 3 词
+// len/cap/衍生 data 指针不扫，尾元素区按元素 kind）/ chan=BITMAP 位 1/4/7/10
+// （buf/sendq/recvq/waiters）/ map=BITMAP 位 2/3（keys/vals）/ fb=BITMAP 位 7/8
+// （READY_NEXT/LIST_NEXT）/ sb builder=BITMAP 位 2 / [tag][x][ptr]=BITMAP 位 2
+//（Result/Option 盒，载荷为指针时）。
+// desc_reset clears the registry per program and pre-registers every static
+// shape in a deterministic order (see the Chinese comment for the shapes).
+pub fn desc_reset() {
+    desc_keys = []
+    desc_ids = []
+    desc_pool = []
+    desc_noscan = desc_register("noscan", [0])
+    desc_allptr = desc_register("allptr", [1])
+    desc_cell = desc_register("cell", [4, 0, 1])
+    desc_lenptrs = desc_register("lenptrs", [4, 1, 1])
+    desc_caplenptrs = desc_register("caplenptrs", [4, 2, 1])
+    desc_list_scalar = desc_register("list-s", [4, 3, 0])
+    desc_list_ptr = desc_register("list-p", [4, 3, 1])
+    desc_list_maybe = desc_register("list-m", [4, 3, 2])
+    // chan 14 词，位 1/4/7/10 = buf/sendq/recvq/waiters
+    // chan is 14 words; bits 1/4/7/10 = buf/sendq/recvq/waiters
+    desc_chan = desc_register("chan", [3, 2, 144, 4])
+    // map 4 词，位 2/3 = keys/vals
+    // map is 4 words; bits 2/3 = keys/vals
+    desc_map = desc_register("map", [3, 12])
+    // fb 11 词，位 7/8 = READY_NEXT/LIST_NEXT
+    // fb is 11 words; bits 7/8 = READY_NEXT/LIST_NEXT
+    desc_fb = desc_register("fb", [3, 128, 64])
+    // sb builder 88B，位 2 = buf 指针
+    // the sb builder is 88B; bit 2 = the buf pointer
+    desc_sb = desc_register("sb", [3, 4])
+    // Result/Option 盒 [tag][x][payload]，载荷为指针时位 2 可扫
+    // a Result/Option box [tag][x][payload]; bit 2 scannable when the payload
+    // is a pointer
+    desc_box_ptr = desc_register("box-p", [3, 4])
+    GC_DESC_TABLE_LEN = len(desc_pool) + GC_DESC_POOL
+}
+
+// desc_list 按元素影子 kind 选 list 的 PREFIX 尾 kind。
+// desc_list picks the list PREFIX tail kind from the element's shadow kind.
+pub fn desc_list(k) {
+    if k == GC_SHADOW_PTR {
+        desc_list_ptr
+    } else if k == GC_SHADOW_SCALAR {
+        desc_list_scalar
+    } else {
+        desc_list_maybe
+    }
+}
+
+// gc_desc_image 拼当前注册态的表镜像：条目字节 + 零垫到 GC_DESC_POOL。
+// gc_desc_image assembles the table image for the current registration state:
+// entry bytes plus zero padding up to GC_DESC_POOL.
+pub fn gc_desc_image() {
+    let mut out = ""
+    let mut i = 0
+    while i < len(desc_pool) {
+        out = out + e8(desc_pool[i])
+        i = i + 1
+    }
+    while i < GC_DESC_POOL {
+        out = out + e8(0)
+        i = i + 1
+    }
+    out
 }
 
 // gc_scratch1/gc_scratch2 选分配序列的两枚 scratch 寄存器：默认 rcx/rdx，
@@ -125,7 +255,15 @@ fn x86gen_alloc(dst, size, desc) {
     let die = gc_oom_die()
     let hdr = mov_ri64(s1, sz + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1)
     let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
-    push_r(s1) + push_r(s2) + lea(dst, r12, 8) + add_ri32(r12, sz + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die + hdr + bits + pop_r(s2) + pop_r(s1)
+    // --gc-stress：切块前先同步 collect（收集器全寄存器自保，rax 再 push/pop 双保险）
+    // --gc-stress: collect right before every bump (the collector saves all
+    // registers itself; the rax push/pop is belt and suspenders)
+    let hook = if gc_stress_g {
+        push_r(rax) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
+    } else {
+        ""
+    }
+    hook + push_r(s1) + push_r(s2) + lea(dst, r12, 8) + add_ri32(r12, sz + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die + hdr + bits + pop_r(s2) + pop_r(s1)
 }
 
 // x86gen_alloc_r 寄存器尺寸分配（size_reg 承载 payload 字节数，运行期圆整）：
@@ -148,7 +286,13 @@ fn x86gen_alloc_r(dst, size_reg, desc) {
         ""
     }
     let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
-    push_r(s1) + push_r(s2) + lea(dst, r12, 8) + mov_rr(s1, size_reg) + add_ri32(s1, 7) + and_ri32(s1, 0 - 8) + add_rr(r12, s1) + add_ri32(r12, 8) + mov_ri64(s2, rt_slot(rt_heap_limit)) + mov_rm(s2, s2, 0) + cmp_rr(s2, r12) + ja_rel32(str_len(die)) + die + hdr_or + mov_mr(dst, 0 - 8, s1) + bits + pop_r(s2) + pop_r(s1)
+    // --gc-stress：同 x86gen_alloc / --gc-stress: same as x86gen_alloc
+    let hook = if gc_stress_g {
+        push_r(rax) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
+    } else {
+        ""
+    }
+    hook + push_r(s1) + push_r(s2) + lea(dst, r12, 8) + mov_rr(s1, size_reg) + add_ri32(s1, 7) + and_ri32(s1, 0 - 8) + add_rr(r12, s1) + add_ri32(r12, 8) + mov_ri64(s2, rt_slot(rt_heap_limit)) + mov_rm(s2, s2, 0) + cmp_rr(s2, r12) + ja_rel32(str_len(die)) + die + hdr_or + mov_mr(dst, 0 - 8, s1) + bits + pop_r(s2) + pop_r(s1)
 }
 
 // x86gen_gc_verify_seq 生成堆走查校验序列（--gc-debug 时内联在调度器 exit0 前）：
@@ -180,8 +324,9 @@ fn x86gen_gc_verify_seq() {
     push(it, la_jcc(CC_E, "gv_fail_size"))
     push(it, la_b(mov_ri64(rdx, 7) + and_rr(rdx, rcx)))
     push(it, la_jcc(CC_NE, "gv_fail_size"))
-    // desc_id = hdr >> 40：必须落在 desc 表内（P1 表 8B，仅条目 0）
-    push(it, la_b(mov_rr(rcx, rax) + shr_ri(rcx, 40) + cmp_ri32(rcx, GC_DESC_TABLE_LEN)))
+    // desc_id = (hdr >> 40) & GC_DESC_MASK：必须落在 desc 表内（P1 表 8B，仅条目 0）
+    // desc_id = (hdr >> 40) & GC_DESC_MASK: must land inside the desc table
+    push(it, la_b(mov_rr(rcx, rax) + shr_ri(rcx, 40) + mov_ri64(rdx, GC_DESC_MASK) + and_rr(rcx, rdx) + cmp_ri32(rcx, GC_DESC_TABLE_LEN)))
     push(it, la_jcc(CC_AE, "gv_fail_desc"))
     // start bit：bitmap[(hdr - heap_start) >> 3] 的 bit0 必须为 1
     //（cmp byte [rcx + rdx], 0 —— base+index 形式 mem_operand 不覆盖，手写编码）
@@ -204,5 +349,277 @@ fn x86gen_gc_verify_seq() {
     push(it, la_jcc(CC_E, "gv_ok"))
     push(it, la_b(x86gen_die_call("gc verify: heap top mismatch", 0)))
     push(it, la_l("gv_ok"))
+    la_link(it)
+}
+
+// P2 收集器：mark 子程序 + collect 主块。调用点仅 mov_ri64(gc_collect_g)+call——
+// 块自身入口固定序 push 14 个 GPR（rax..r15 除 rsp/r12），既做寄存器保存区根，
+// 也让收集器对调用方零破坏（出口按逆序 pop，rax 一并还原；仅 FLAGS 出栈非恒）。
+// r12（堆顶）、rbx（全局基）、rbp 只读不写。汇编期地址 gc_collect_g/gc_mark_g
+// 双遍量测定值（mov imm64 定长，先以 0 量长再重建），PIC 改写按位移成立。
+// P2 collector: the mark subroutine + the collect main block. Call sites are a
+// bare mov_ri64(gc_collect_g)+call — the block pushes the 14 GPRs (rax..r15
+// minus rsp/r12) in a fixed order at entry, which doubles as the register
+// save-area root and makes the collector zero-damage for its caller (the exit
+// pops in reverse, rax included; only FLAGS escape). r12 (heap top), rbx
+// (globals base), rbp are read-only. Assembly-time addresses gc_collect_g /
+// gc_mark_g go through the two-pass measure-then-fix pattern (mov imm64 is
+// fixed-size: measure with 0, rebuild once known), so the PIC rewrite holds.
+pub let mut gc_collect_g = 0
+pub let mut gc_mark_g = 0
+// 发射期三开关（build.bur 解析 --gc-stress/--gc-poison/--gc-debug 后置位）：
+// stress = 每次 alloc 前同步 collect；poison = sweep 死块 payload 填 0xAB；
+// debug = verify（P1 已接）。
+// emission-time switches (build.bur sets them from --gc-stress/--gc-poison/
+// --gc-debug): stress = collect before every alloc; poison = sweep fills dead
+// payloads with 0xAB; debug = verify (wired since P1).
+pub let mut gc_stress_g = false
+pub let mut gc_poison_g = false
+
+pub fn set_gc_stress(v: bool) {
+    gc_stress_g = v
+}
+
+pub fn set_gc_poison(v: bool) {
+    gc_poison_g = v
+}
+// hdr 标志位：位 62 = MARK（本轮可达），位 63 = FREE（已死，P3 复用时读）。
+// hdr flag bits: bit 62 = MARK (reachable this cycle), bit 63 = FREE (dead,
+// read back by P3's reuse).
+pub let GC_MARK_BIT = 4611686018427387904
+pub let GC_FREE_BIT = 0 - 9223372036854775807 - 1
+pub let GC_SIZE_MASK = 1099511627775
+
+// x86gen_gc_mark_block：mark(rdi) 子程序——对齐过滤 + [heap_start, r12) 界内 +
+// start-bit 命中三者全过才认指针：置 hdr 位 62、rt_gc_cnt++。已 MARK 直退。
+// 保存 rax/rcx/rdx/rsi（push/pop），其余不碰；毁 FLAGS。
+// x86gen_gc_mark_block: the mark(rdi) subroutine — an aligned candidate inside
+// [heap_start, r12) whose start-bit is set counts as a pointer: set hdr bit 62
+// and rt_gc_cnt++. Already-MARKed exits early. Saves rax/rcx/rdx/rsi
+// (push/pop), touches nothing else; clobbers FLAGS.
+fn x86gen_gc_mark_block() {
+    let mut it = []
+    push(it, la_b(push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rsi)))
+    // 未对齐候选直接弃（值栈里的 int/bool 位样式一概过滤）
+    // misaligned candidates are rejected outright (int/bool bit patterns in
+    // stack slots all filter out here)
+    push(it, la_b(mov_rr(rax, rdi) + and_ri32(rax, 7)))
+    push(it, la_jcc(CC_NE, "gm_done"))
+    push(it, la_b(mov_ri64(rsi, rt_slot(rt_heap_start)) + mov_rm(rsi, rsi, 0)))
+    push(it, la_b(cmp_rr(rdi, rsi)))
+    push(it, la_jcc(CC_B, "gm_done"))
+    push(it, la_b(cmp_rr(rdi, r12)))
+    push(it, la_jcc(CC_AE, "gm_done"))
+    push(it, la_b(mov_rr(rax, rdi) + sub_rr(rax, rsi) + shr_ri(rax, 3)))
+    push(it, la_b(mov_ri64(rcx, rt_slot(rt_start_bitmap)) + mov_rm(rcx, rcx, 0)))
+    // cmp byte [rcx+rax], 0（base+index 手写编码，同 verify_seq）
+    // cmp byte [rcx+rax], 0 (handwritten base+index encoding, same as verify_seq)
+    push(it, la_b(e1(128) + e1(60) + e1(rax * 8 + rcx) + e1(0)))
+    push(it, la_jcc(CC_E, "gm_done"))
+    push(it, la_b(mov_rm(rax, rdi, 0 - 8) + mov_ri64(rdx, GC_MARK_BIT)))
+    push(it, la_b(test_rr(rdx, rax)))
+    push(it, la_jcc(CC_NE, "gm_done"))
+    push(it, la_b(or_rr(rax, rdx) + mov_mr(rdi, 0 - 8, rax)))
+    // rt_gc_cnt++（inc qword [rcx]，REX.W FF /0 mod=00）
+    // rt_gc_cnt++ (inc qword [rcx], REX.W FF /0 mod=00)
+    push(it, la_b(mov_ri64(rcx, rt_slot(rt_gc_cnt)) + e1(72) + e1(255) + modrm(0, 0, rcx)))
+    push(it, la_l("gm_done"))
+    push(it, la_b(pop_r(rsi) + pop_r(rdx) + pop_r(rcx) + pop_r(rax) + ret()))
+    la_link(it)
+}
+
+// x86gen_gc_collect_block：完整回收一轮。fixpoint 线性趟——每趟扫根（①保存区
+// 14 词 MAYBE、②全局 kind 表非 SCALAR 槽、③各 fiber 值栈影子（当前 fiber 用
+// 保存区里的活 r15）、④fb 结构自身、⑤exec 排水自由链 rt_gray）再沿 hdr 链扫
+// 全部 MARK 块 payload 按 desc 试 mark；cnt 相邻两趟不变即收敛。sweep：MARK 清
+// 位保活，否则置 FREE 并（poison 开时）payload 填 0xAB；rt_gc_cycles++、
+// rt_gc_last_freed=死块字节和。栈布局：入口 sub rsp,16 后 [rsp+112]=cnt 快照、
+// [rsp+120]=cur_fiber，再 push 14 个 GPR。毁 FLAGS，其余全保。
+// x86gen_gc_collect_block: one full collection round. Fixpoint linear passes —
+// each pass scans the roots (1. the 14-word save area as MAYBE, 2. non-SCALAR
+// global-kind slots, 3. every fiber's value-stack shadow, the current fiber
+// using the live r15 from the save area, 4. the fb structs themselves, 5.
+// exec's drain free chain at rt_gray), then walks the hdr chain marking every
+// MARKed block's payload per its desc; convergence when cnt stops changing
+// between passes. Sweep: MARKed blocks get the bit cleared (kept), the rest
+// get FREE set plus a 0xAB payload fill when poison is on; rt_gc_cycles++
+// and rt_gc_last_freed = the dead byte total. Stack layout: entry sub rsp,16
+// puts [rsp+112]=cnt snapshot and [rsp+120]=cur_fiber, then the 14 pushes.
+// Clobbers FLAGS, preserves everything else.
+fn x86gen_gc_collect_block(n_globals) {
+    let mark_call = mov_ri64(rax, gc_mark_g) + call_r(rax)
+    let mut it = []
+    // 入口：快照区 + cur_fiber 暂存，再固定序存 14 个 GPR（r15 最后进 [rsp]）
+    // entry: scratch slots + cur_fiber stash, then the 14 GPRs in fixed order
+    // (r15 lands at [rsp])
+    push(it, la_b(sub_ri32(rsp, 16) + push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rbx) + push_r(rbp) + push_r(rsi) + push_r(rdi) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + push_r(r13) + push_r(r14) + push_r(r15)))
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cnt)) + xor_rr(rcx, rcx) + mov_mr(rax, 0, rcx)))
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 120, rax)))
+    push(it, la_l("gc_outer"))
+    // 本趟基线快照 / this pass's baseline
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 112, rax)))
+    // ①保存区：14 词全 MAYBE / save area: all 14 words MAYBE
+    push(it, la_b(mov_rr(r10, rsp) + mov_ri64(rcx, 14)))
+    push(it, la_l("gc_sv"))
+    push(it, la_b(mov_rm(rdi, r10, 0) + mark_call + add_ri32(r10, 8) + sub_ri32(rcx, 1)))
+    push(it, la_jcc(CC_NE, "gc_sv"))
+    // ②全局：kind 表字节非 SCALAR 的槽 / globals: non-SCALAR kind slots
+    push(it, la_b(mov_ri64(r10, rt_slot(rt_global_kinds)) + mov_rm(r10, r10, 0) + mov_rr(r11, rbx) + mov_ri64(rcx, n_globals)))
+    push(it, la_l("gc_gl"))
+    push(it, la_b(test_rr(rcx, rcx)))
+    push(it, la_jcc(CC_E, "gc_gl_done"))
+    push(it, la_b(movzx_rm8(rdi, r10, 0) + test_rr(rdi, rdi)))
+    push(it, la_jcc(CC_E, "gc_gl_next"))
+    push(it, la_b(mov_rm(rdi, r11, 0) + mark_call))
+    push(it, la_l("gc_gl_next"))
+    push(it, la_b(add_ri32(r10, 1) + add_ri32(r11, 8) + sub_ri32(rcx, 1)))
+    push(it, la_jmp("gc_gl"))
+    push(it, la_l("gc_gl_done"))
+    // ③④⑤fibers：链上每个 fb——mark(fb)、值栈影子扫、native 栈 [LIMIT, RSP+16] 扫
+    // fibers: for each fb on the chain — mark(fb), the shadow stack scan, and
+    // the native-stack [LIMIT, RSP+16] scan
+    push(it, la_b(mov_ri64(r9, rt_slot(rt_fiber_list)) + mov_rm(r9, r9, 0)))
+    push(it, la_l("gc_fb"))
+    push(it, la_b(test_rr(r9, r9)))
+    push(it, la_jcc(CC_E, "gc_fb_done"))
+    push(it, la_b(mov_rr(rdi, r9) + mark_call))
+    // 活 r15：当前 fiber 取保存区 [rsp]，其余取 [fb+FB_R15]
+    // live r15: the current fiber reads [rsp] (save area), others [fb+FB_R15]
+    push(it, la_b(mov_rm(rax, rsp, 120) + cmp_rr(r9, rax)))
+    push(it, la_jcc(CC_E, "gc_fb_cur"))
+    push(it, la_b(mov_rm(rdx, r9, FB_R15)))
+    push(it, la_jmp("gc_fb_r15"))
+    push(it, la_l("gc_fb_cur"))
+    push(it, la_b(mov_rm(rdx, rsp, 0)))
+    push(it, la_l("gc_fb_r15"))
+    push(it, la_b(mov_rm(r10, r9, FB_STACK_LO) + mov_rm(r11, r9, FB_SHADOW) + sub_rr(rdx, r10) + shr_ri(rdx, 3) + xor_rr(rcx, rcx)))
+    push(it, la_l("gc_vs"))
+    push(it, la_b(cmp_rr(rcx, rdx)))
+    push(it, la_jcc(CC_AE, "gc_vs_done"))
+    push(it, la_b(mov_rr(rax, r11) + add_rr(rax, rcx) + movzx_rm8(rdi, rax, 0) + test_rr(rdi, rdi)))
+    push(it, la_jcc(CC_E, "gc_vs_next"))
+    push(it, la_b(mov_rr(r8, rcx) + shl_ri(r8, 3) + add_rr(r8, r10) + mov_rm(rdi, r8, 0) + mark_call))
+    push(it, la_l("gc_vs_next"))
+    push(it, la_b(add_ri32(rcx, 1)))
+    push(it, la_jmp("gc_vs"))
+    push(it, la_l("gc_vs_done"))
+    push(it, la_b(mov_rm(r10, r9, FB_LIMIT) + mov_rm(r11, r9, FB_RSP) + add_ri32(r11, 16)))
+    push(it, la_l("gc_ns"))
+    push(it, la_b(cmp_rr(r10, r11)))
+    push(it, la_jcc(CC_AE, "gc_ns_done"))
+    push(it, la_b(mov_rm(rdi, r10, 0) + mark_call + add_ri32(r10, 8)))
+    push(it, la_jmp("gc_ns"))
+    push(it, la_l("gc_ns_done"))
+    push(it, la_b(mov_rm(r9, r9, FB_LIST_NEXT)))
+    push(it, la_jmp("gc_fb"))
+    push(it, la_l("gc_fb_done"))
+    // ⑤exec 排水自由链（POISON 下不保活会被拆链）/ exec's drain free chain
+    push(it, la_b(mov_ri64(r9, rt_slot(rt_gray)) + mov_rm(r9, r9, 0)))
+    push(it, la_l("gc_ch"))
+    push(it, la_b(test_rr(r9, r9)))
+    push(it, la_jcc(CC_E, "gc_ch_done"))
+    push(it, la_b(mov_rr(rdi, r9) + mark_call + mov_rm(r9, r9, 0)))
+    push(it, la_jmp("gc_ch"))
+    push(it, la_l("gc_ch_done"))
+    // MARK 块 payload 按 desc 扫 / MARKed payloads per desc
+    push(it, la_b(mov_ri64(r9, rt_slot(rt_heap_start)) + mov_rm(r9, r9, 0)))
+    push(it, la_l("gc_pw"))
+    push(it, la_b(cmp_rr(r9, r12)))
+    push(it, la_jcc(CC_AE, "gc_pw_done"))
+    push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rdx, GC_MARK_BIT) + test_rr(rdx, rax)))
+    push(it, la_jcc(CC_E, "gc_pw_next"))
+    push(it, la_b(mov_rr(rdx, rax) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rdx, rcx)))
+    // desc_id = (hdr>>40) & GC_DESC_MASK；r8 = desc 表基址 + desc_id（条目首字节）
+    // desc_id = (hdr>>40) & GC_DESC_MASK; r8 = desc table base + desc_id (the
+    // entry's first byte)
+    push(it, la_b(mov_rr(rcx, rax) + shr_ri(rcx, 40) + mov_ri64(rdi, GC_DESC_MASK) + and_rr(rcx, rdi)))
+    push(it, la_b(mov_ri64(r8, rt_slot(rt_desc_table)) + mov_rm(r8, r8, 0) + add_rr(r8, rcx)))
+    push(it, la_b(movzx_rm8(rdi, r8, 0) + cmp_ri32(rdi, 1)))
+    push(it, la_jcc(CC_E, "gc_sw_words"))
+    push(it, la_b(cmp_ri32(rdi, 2)))
+    push(it, la_jcc(CC_E, "gc_sw_words"))
+    push(it, la_b(cmp_ri32(rdi, 3)))
+    push(it, la_jcc(CC_E, "gc_sw_bitmap"))
+    push(it, la_b(cmp_ri32(rdi, 4)))
+    push(it, la_jcc(CC_E, "gc_sw_prefix"))
+    push(it, la_jmp("gc_pw_next"))
+    // words：全词扫 / all words scanned
+    push(it, la_l("gc_sw_words"))
+    push(it, la_b(shr_ri(rdx, 3) + xor_rr(rcx, rcx) + lea(r10, r9, 8)))
+    push(it, la_jmp("gc_scan"))
+    // prefix：跳过头标量词，尾按 kind / prefix: skip head scalars, tail per kind
+    push(it, la_l("gc_sw_prefix"))
+    push(it, la_b(movzx_rm8(rcx, r8, 1) + movzx_rm8(rdi, r8, 2) + cmp_ri32(rdi, 1)))
+    push(it, la_jcc(CC_E, "gc_pw_next"))
+    push(it, la_b(cmp_ri32(rdi, 2)))
+    push(it, la_jcc(CC_E, "gc_pw_next"))
+    push(it, la_b(shr_ri(rdx, 3) + lea(r10, r9, 8)))
+    push(it, la_jmp("gc_scan"))
+    // bitmap：位图逐词（容量 = 表尾余量×8）/ bitmap: per-bit, capped by the
+    // table's tail margin ×8
+    push(it, la_l("gc_sw_bitmap"))
+    push(it, la_b(shr_ri(rdx, 3) + mov_ri64(rax, GC_DESC_TABLE_LEN) + sub_rr(rax, rcx) + sub_ri32(rax, 1) + shl_ri(rax, 3)))
+    push(it, la_b(cmp_rr(rdx, rax)))
+    push(it, la_jcc(CC_BE, "gc_bm_cap"))
+    push(it, la_b(mov_rr(rdx, rax)))
+    push(it, la_l("gc_bm_cap"))
+    // 字节指针走 r11：rax 跨 mark_call 会被调用序列覆写（mov_ri64 进 rax）
+    // the byte pointer lives in r11: rax is overwritten across mark_call (the
+    // call sequence mov_ri64's into rax)
+    push(it, la_b(lea(r10, r9, 8) + mov_rr(r11, r8) + add_ri32(r11, 1) + xor_rr(rcx, rcx) + mov_ri64(rsi, 1)))
+    push(it, la_l("gc_bm"))
+    push(it, la_b(cmp_rr(rcx, rdx)))
+    push(it, la_jcc(CC_AE, "gc_pw_next"))
+    push(it, la_b(movzx_rm8(rdi, r11, 0) + test_rr(rdi, rsi)))
+    push(it, la_jcc(CC_E, "gc_bm_skip"))
+    push(it, la_b(mov_rr(rdi, rcx) + shl_ri(rdi, 3) + add_rr(rdi, r10) + mov_rm(rdi, rdi, 0) + mark_call))
+    push(it, la_l("gc_bm_skip"))
+    push(it, la_b(shl_ri(rsi, 1) + cmp_ri32(rsi, 256)))
+    push(it, la_jcc(CC_NE, "gc_bm_noroll"))
+    push(it, la_b(mov_ri64(rsi, 1) + add_ri32(r11, 1)))
+    push(it, la_l("gc_bm_noroll"))
+    push(it, la_b(add_ri32(rcx, 1)))
+    push(it, la_jmp("gc_bm"))
+    // 共享词扫尾：[r10+8i] for i in [rcx, rdx) / shared word-scan tail
+    push(it, la_l("gc_scan"))
+    push(it, la_b(cmp_rr(rcx, rdx)))
+    push(it, la_jcc(CC_AE, "gc_pw_next"))
+    push(it, la_b(mov_rr(r8, rcx) + shl_ri(r8, 3) + add_rr(r8, r10) + mov_rm(rdi, r8, 0) + mark_call + add_ri32(rcx, 1)))
+    push(it, la_jmp("gc_scan"))
+    push(it, la_l("gc_pw_next"))
+    push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rax, rcx) + lea(r9, r9, 8) + add_rr(r9, rax)))
+    push(it, la_jmp("gc_pw"))
+    push(it, la_l("gc_pw_done"))
+    // 收敛判定：cnt 与快照同 → sweep / convergence: cnt unchanged -> sweep
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rcx, rax, 0) + mov_rm(rdx, rsp, 112) + cmp_rr(rcx, rdx)))
+    push(it, la_jcc(CC_NE, "gc_outer"))
+    // sweep：MARK 清位保活；其余置 FREE（poison 开时 payload 填 0xAB）
+    push(it, la_b(mov_ri64(r9, rt_slot(rt_heap_start)) + mov_rm(r9, r9, 0) + xor_rr(r10, r10)))
+    push(it, la_l("gc_sw"))
+    push(it, la_b(cmp_rr(r9, r12)))
+    push(it, la_jcc(CC_AE, "gc_sw_done"))
+    push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_MARK_BIT) + test_rr(rcx, rax)))
+    push(it, la_jcc(CC_NE, "gc_sw_live"))
+    push(it, la_b(mov_rr(rdx, rax) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rdx, rcx)))
+    // FREE 位 63 = 1<<63：imm64 字面量经 e8s 的 0−x 折算会在 i64 下溢，改移位合成
+    // the FREE bit 63 = 1<<63: an imm64 literal would overflow i64 inside e8s's
+    // 0-x fold, so synthesize it by shifting
+    push(it, la_b(mov_ri64(rcx, 1) + shl_ri(rcx, 63) + or_rr(rax, rcx) + mov_mr(r9, 0, rax) + add_rr(r10, rdx)))
+    if gc_poison_g {
+        // rep stosb：rdi=payload、rcx=size、AL=0xAB（imm64 任意值低字节即可）
+        // rep stosb: rdi=payload, rcx=size, AL=0xAB (any imm64 whose low byte is 0xAB)
+        push(it, la_b(mov_rr(rdi, r9) + add_ri32(rdi, 8) + mov_rr(rcx, rdx) + mov_ri64(rax, 171) + e1(243) + e1(170)))
+    }
+    push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rax, rcx) + lea(r9, r9, 8) + add_rr(r9, rax)))
+    push(it, la_jmp("gc_sw"))
+    push(it, la_l("gc_sw_live"))
+    push(it, la_b(and_rr(rax, rcx) + mov_mr(r9, 0, rax)))
+    push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rax, rcx) + lea(r9, r9, 8) + add_rr(r9, rax)))
+    push(it, la_jmp("gc_sw"))
+    push(it, la_l("gc_sw_done"))
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cycles)) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx)))
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_mr(rax, 0, r10)))
+    // 出口：逆序弹 14 个 GPR，还快照区，ret
+    push(it, la_b(pop_r(r15) + pop_r(r14) + pop_r(r13) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rdi) + pop_r(rsi) + pop_r(rbp) + pop_r(rbx) + pop_r(rdx) + pop_r(rcx) + pop_r(rax) + add_ri32(rsp, 16) + ret()))
     la_link(it)
 }

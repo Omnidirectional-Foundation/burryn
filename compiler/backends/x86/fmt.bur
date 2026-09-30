@@ -56,7 +56,7 @@ fn x86gen_sb_items() {
     let mut it = []
     // sb_new：rax = 新构建器（初始 64B 缓冲） / sb_new: rax = a new builder (64B initial buffer)
     push(it, la_l("sb_new"))
-    push(it, la_b(x86gen_alloc(rax, 24 + 64, GC_DESC_ALL) + xor_rr(rcx, rcx) + mov_mr(rax, 0, rcx) + mov_ri64(rcx, 64) + mov_mr(rax, 8, rcx) + lea(rcx, rax, 24) + mov_mr(rax, 16, rcx) + ret()))
+    push(it, la_b(x86gen_alloc(rax, 24 + 64, desc_sb) + xor_rr(rcx, rcx) + mov_mr(rax, 0, rcx) + mov_ri64(rcx, 64) + mov_mr(rax, 8, rcx) + lea(rcx, rax, 24) + mov_mr(rax, 16, rcx) + ret()))
     // reserve：rdi = 构建器，rdx = 需追加字节数；保留 rdi/rsi/rdx
     // reserve: rdi = builder, rdx = bytes to add; preserves rdi/rsi/rdx
     push(it, la_l("reserve"))
@@ -66,7 +66,7 @@ fn x86gen_sb_items() {
     push(it, la_jcc(CC_AE, "reserve_cap"))
     push(it, la_b(mov_rr(rcx, rax)))
     push(it, la_l("reserve_cap"))
-    push(it, la_b(add_ri32(rcx, 7) + and_ri32(rcx, 0 - 8) + x86gen_alloc_r(r8, rcx, GC_DESC_ALL) + mov_mr(rdi, 8, rcx) + mov_rr(r9, rsi) + mov_rr(r10, rdi) + mov_rm(rsi, rdi, 16) + mov_rr(rdi, r8) + mov_rm(rcx, r10, 0) + rep_movsb() + mov_mr(r10, 16, r8) + mov_rr(rdi, r10) + mov_rr(rsi, r9)))
+    push(it, la_b(add_ri32(rcx, 7) + and_ri32(rcx, 0 - 8) + x86gen_alloc_r(r8, rcx, desc_noscan) + mov_mr(rdi, 8, rcx) + mov_rr(r9, rsi) + mov_rr(r10, rdi) + mov_rm(rsi, rdi, 16) + mov_rr(rdi, r8) + mov_rm(rcx, r10, 0) + rep_movsb() + mov_mr(r10, 16, r8) + mov_rr(rdi, r10) + mov_rr(rsi, r9)))
     push(it, la_l("reserve_ok"))
     push(it, la_b(ret()))
     // sb_app：rdi = 构建器，rsi = 源，rdx = 字节数 / sb_app: rdi = builder, rsi = source, rdx = byte count
@@ -140,7 +140,7 @@ fn x86gen_sb_items() {
     // sb_fin：rdi = 构建器 → rax = 新字符串对象 [len][bytes]（登记 GC）
     // sb_fin: rdi = builder -> rax = a new string object [len][bytes] (GC-recorded)
     push(it, la_l("sb_fin"))
-    push(it, la_b(mov_rm(rcx, rdi, 0) + lea(rdx, rcx, 8) + x86gen_alloc_r(r11, rdx, GC_DESC_ALL) + mov_mr(r11, 0, rcx) + mov_rm(rsi, rdi, 16) + lea(rdi, r11, 8) + rep_movsb() + mov_rm(rcx, r11, 0) + mov_rr(rax, r11) + ret()))
+    push(it, la_b(mov_rm(rcx, rdi, 0) + lea(rdx, rcx, 8) + x86gen_alloc_r(r11, rdx, desc_noscan) + mov_mr(r11, 0, rcx) + mov_rm(rsi, rdi, 16) + lea(rdi, r11, 8) + rep_movsb() + mov_rm(rcx, r11, 0) + mov_rr(rax, r11) + ret()))
     it
 }
 
@@ -221,7 +221,7 @@ fn fmt_b_lit(boff, s) {
 // sub-value, call the subroutine, pop the copy
 fn fmt_nested(ctx: X86Ctx, mut g: FmtGen, mut it, boff, load, t) {
     let lbl = fmt_label(ctx, g, t, true)
-    push(it, la_b(mov_rm(rax, r15, boff) + vs_push(rax) + load + vs_push(rax)))
+    push(it, la_b(mov_rm(rax, r15, boff) + vs_push(rax, GC_SHADOW_PTR) + load + vs_push(rax, gc_kind_of(t))))
     push(it, la_call(lbl))
     push(it, la_b(vs_pop_n(1)))
 }
@@ -267,12 +267,12 @@ fn fmt_body(ctx: X86Ctx, mut g: FmtGen, t, quote, lbl) {
     } else if t == "float" {
         // 注入的 format_float(bits) 返回字符串；值栈 [B][v][s] / the injected
         // format_float(bits) returns a string; value stack [B][v][s]
-        push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + vs_push_zero() + vs_push(rax) + jt_load(rax, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rdi, r15, 0 - 24) + mov_rm(rax, r15, 0 - 8) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + sb_call(sb_app_g) + vs_pop_n(1)))
+        push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 0) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push(rax, GC_SHADOW_SCALAR) + jt_load(rax, 8 * ctx.f2s_h) + call_r(rax) + mov_rm(rdi, r15, 0 - 24) + mov_rm(rax, r15, 0 - 8) + mov_rm(rdx, rax, 0) + lea(rsi, rax, 8) + sb_call(sb_app_g) + vs_pop_n(1)))
     } else if is_list_type(t) {
         // 值栈 [B][L][i] / value stack [B][L][i]
         let et = list_elem_type(t)
         push(it, fmt_b_lit(0 - 16, "["))
-        push(it, la_b(vs_push_zero()))
+        push(it, la_b(vs_push_zero(GC_SHADOW_SCALAR)))
         push(it, la_l("l_loop"))
         push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + cmp_rr(rax, rcx)))
         push(it, la_jcc(CC_GE, "l_end"))
@@ -304,7 +304,7 @@ fn fmt_body(ctx: X86Ctx, mut g: FmtGen, t, quote, lbl) {
         let kt = map_key_type(t)
         let vt = map_val_type(t)
         push(it, fmt_b_lit(0 - 16, chr(123)))
-        push(it, la_b(vs_push_zero()))
+        push(it, la_b(vs_push_zero(GC_SHADOW_SCALAR)))
         push(it, la_l("m_loop"))
         push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, r15, 0 - 16) + mov_rm(rcx, rcx, 0) + cmp_rr(rax, rcx)))
         push(it, la_jcc(CC_GE, "m_end"))
@@ -433,10 +433,10 @@ fn fmt_scope(items, pre) {
 // [r15+off] onto the stack with a fresh builder inserted beneath it; the
 // caller then calls the subroutine, and fmt_top_post stores the resulting
 // string back into [r15+off]
-fn fmt_top_pre(off) {
-    mov_rm(rax, r15, off) + vs_push(rax) + sb_call(sb_new_g) + mov_rm(rcx, r15, 0 - 8) + mov_mr(r15, 0 - 8, rax) + vs_push(rcx)
+fn fmt_top_pre(off, t) {
+    mov_rm(rax, r15, off) + vs_push(rax, gc_kind_of(t)) + sb_call(sb_new_g) + mov_rm(rcx, r15, 0 - 8) + mov_mr(r15, 0 - 8, rax) + shadow_set(1, GC_SHADOW_PTR) + vs_push(rcx, gc_kind_of(t))
 }
 
 fn fmt_top_post(off) {
-    mov_rm(rdi, r15, 0 - 8) + sb_call(sb_fin_g) + mov_mr(r15, off - 8, rax) + vs_pop_n(1)
+    mov_rm(rdi, r15, 0 - 8) + sb_call(sb_fin_g) + mov_mr(r15, off - 8, rax) + vs_pop_n(1) + shadow_set(0 - off / 8, GC_SHADOW_PTR)
 }

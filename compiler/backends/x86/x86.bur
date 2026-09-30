@@ -182,14 +182,18 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
         rf = rf + 1
     }
 
-    // P1：desc 表紧随常量区尾部（当前单条目 ALL_MAYBE 占位）。挂进 const_data
-    // 尾部，code_origin()+const_data_len 的全部下游地址公式自动吸收这 8 字节，
-    // 表址 = 常量区尾 - GC_DESC_TABLE_LEN。
-    // P1: the desc table rides right after the constant area's tail (a single
-    // ALL_MAYBE placeholder entry for now). Appending it to const_data lets
-    // every downstream code_origin()+const_data_len address formula absorb the
-    // 8 bytes automatically; the table address = consts' end - GC_DESC_TABLE_LEN.
-    const_data = const_data + x86gen_desc_table()
+    // P2 批 4：desc 表挂 const_data 尾部（先 reset 注册表再挂占位镜像——定长
+    // 静态+池，真实条目字节由 x86gen_image 逐遍拼接回这段区间）。下游
+    // code_origin()+const_data_len 的地址公式自动吸收表长，表址 = 常量区尾 -
+    // n_globals（全局 kind 表）- GC_DESC_TABLE_LEN。
+    // P2 batch 4: the desc table rides the const_data tail (reset the registry
+    // first, then append the fixed-length placeholder image — static + pool;
+    // x86gen_image splices the real entry bytes back into this region per
+    // pass). Downstream code_origin()+const_data_len address formulas absorb
+    // the table length automatically; the table address = consts' end -
+    // n_globals (the global kind table) - GC_DESC_TABLE_LEN.
+    desc_reset()
+    const_data = const_data + gc_desc_image()
 
     let mut globals_map = map()
     let mut n_globals = 0
@@ -221,6 +225,40 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
     n_globals = n_globals + 1
     net_reg_g = n_globals
     n_globals = n_globals + 1
+    // P2：全局 kind 表（1 字节/槽）——预发射 global_type 经 gc_kind_of 折叠（未知词
+    // 落 MAYBE 保守兜底），exec 进程表 / net 登记表两个隐藏槽强制 PTR。挂进
+    // const_data 后，desc 表址公式相应再减 n_globals（见 rt_init）。
+    // P2: the global kind table (one byte per slot) — gc_kind_of over the
+    // pre-emission global_type (unknown words fold to MAYBE, the conservative
+    // fallback); the two hidden slots (exec's proc table / net's registry) are
+    // forced to PTR. Riding const_data, the desc-table address formula
+    // correspondingly subtracts n_globals (see rt_init).
+    let mut gk_bytes = ""
+    let mut gk_i = 0
+    while gk_i < n_globals {
+        gk_bytes = gk_bytes + e8(0)
+        gk_i = gk_i + 1
+    }
+    let gk_names = keys(global_type)
+    let mut gk_n = 0
+    while gk_n < len(gk_names) {
+        let gk_name = gk_names[gk_n]
+        match get(globals_map, gk_name) {
+            Some(gk_slot) => {
+                match get(global_type, gk_name) {
+                    Some(gk_t) => {
+                        gk_bytes = substr(gk_bytes, 0, gk_slot) + e8(gc_kind_of(gk_t)) + substr(gk_bytes, gk_slot + 1, n_globals - gk_slot - 1)
+                    },
+                    None => {},
+                }
+            },
+            None => {},
+        }
+        gk_n = gk_n + 1
+    }
+    gk_bytes = substr(gk_bytes, 0, proc_reg_g) + e8(GC_SHADOW_PTR) + substr(gk_bytes, proc_reg_g + 1, n_globals - proc_reg_g - 1)
+    gk_bytes = substr(gk_bytes, 0, net_reg_g) + e8(GC_SHADOW_PTR) + substr(gk_bytes, net_reg_g + 1, n_globals - net_reg_g - 1)
+    const_data = const_data + gk_bytes
     // 方法全名映射：CLOSURE + DEF_GLOBAL 配对记录「全局名 → fn handle」
     // map from fully-qualified method names to fn handles (CLOSURE + DEF_GLOBAL pairs)
     // 被 SET_GLOBAL 重赋值的全局不是稳定函数定义（如闭包变量），不注册——否则调用
@@ -468,12 +506,27 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
 
     // 位置无关（PIE）：同一镜像按两个基址各装配一遍——先以 PIC_PROBE_SHIFT 平移的
     // 探针基址，再以真实基址；pic_image 比对两遍的代码/数据字节，把随基址变化的
-    // mov imm64 地址改写成 RIP 相对 lea，见 pic.bur 与 architecture.md §5.22
+    // mov imm64 地址改写成 RIP 相对 lea，见 pic.bur 与 architecture.md §5.22。
+    // P2：发射会经 ctx 字段变更共享类型态（global_type/record/enum 登记与
+    // pt_target_shadow 的 psim 快照），P1 类型不影响字节所以无感；P2 起 kind 字节
+    // 直接落码，两遍类型态不同步即 PIC 差分报非 movimm64 差异。先跑一遭「预热」
+    // 遍把共享态推到收敛（产物弃），probe/real 两遍即从同一状态出发——各遍在相同
+    // 程序点做相同写入，任一读取点可见的条目集 = 预热遍同点写入集，对两遍一致。
     // Position independence (PIE): the same image is assembled at two bases —
     // first at the probe base shifted by PIC_PROBE_SHIFT, then at the real
     // base; pic_image diffs the two passes' code/data bytes and rewrites every
     // base-dependent mov imm64 address into a RIP-relative lea, see pic.bur and
-    // architecture.md §5.22
+    // architecture.md §5.22. P2: emission mutates the shared type state through
+    // ctx fields (global_type/record/enum registrations and pt_target_shadow's
+    // psim snapshots); P1 was immune because types never reached the bytes, but
+    // from P2 on kind bytes land in code directly, so desynced type states show
+    // up as non-movimm64 PIC diffs. A throwaway warmup pass first pushes the
+    // shared state to convergence; probe and real then start from the same
+    // state — every pass writes the same entries at the same program points, so
+    // the entry set visible at any read point (the warmup pass's writes below
+    // that point) is identical for both.
+    set_pic_pass(true)
+    x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
     set_pic_pass(true)
     x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
     set_pic_pass(false)
@@ -509,6 +562,19 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     let res_int_enc = ctx.res_int_enc
     let opt_res_enc = ctx.opt_res_enc
     let fn_variants = ctx.fn_variants
+    // P2 批 4：desc 表字节以本遍注册态重拼回 const_data 尾段——表定长
+    // （GC_DESC_TABLE_LEN），垫底零字节 = NOSCAN；预热遍后注册即收敛，probe/real
+    // 两遍拼到同一份最终字节，pic_data 逐字节必等。表区在 const_data 末尾：
+    // [desc 表 n_globals 前移的定长区][全局 kind 表 n_globals 字节]。
+    // P2 batch 4: splice the desc table's bytes for this pass's registration
+    // state back into the const_data tail — the table is fixed-length
+    // (GC_DESC_TABLE_LEN) with the zero pad reading as NOSCAN; registration
+    // converges after the warmup pass, so probe and real splice the same final
+    // bytes and pic_data matches byte for byte. The table region sits at the
+    // end of const_data: [desc table, fixed length, ahead of the n_globals
+    // bytes][the n_globals global-kind bytes].
+    let desc_off = str_len(const_data) - n_globals - GC_DESC_TABLE_LEN
+    let const_data = substr(const_data, 0, desc_off) + gc_desc_image() + substr(const_data, desc_off + GC_DESC_TABLE_LEN, n_globals)
     let const_data_len = str_len(const_data)
     // P0：OOM die stub；地址先于 funcs 拼接定值，站点序列经 x86gen_oom_check /
     // x86gen_alloc 间接调用（同 die_addr_g 的发射期全局模式）。P1 起 funcs 头部
@@ -569,7 +635,23 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // subroutines follow die (used by formatting, see fmt.bur)
     sb_set_addrs(die_addr + die_len)
     errtext_g = die_addr + die_len + str_len(la_link(x86gen_sb_items()))
-    let mut funcs_bytes = oom_die_bytes + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items())
+    // P2 收集器定址必须先于 funcs_bytes 的块重建：sched/chan 队列/waitset/timer 等
+    // 内部块含 alloc 的 --gc-stress 钩子（movimm64 嵌 gc_collect_g）——若在重建之后
+    // 才定值，这些块嵌的是上一遍的陈旧地址（探针基址值进真实镜像，且两遍字节相同
+    // →PIC 不改写→运行期跳飞）。各块长度与地址值无关（movimm64 定长），先前量出
+    // 的长度在此直接复用。
+    // the P2 collector's addressing MUST happen before the funcs_bytes block
+    // rebuild: the sched/chan-queue/waitset/timer internal blocks embed the
+    // alloc --gc-stress hook (a movimm64 of gc_collect_g) — assigning after the
+    // rebuild would bake the previous pass's stale address into them (a
+    // probe-base value in the real image, identical bytes in both passes, so
+    // PIC never rewrites it and the program jumps into the void at run time).
+    // Block lengths are address-independent (fixed-size mov imm64), so the
+    // measured lengths above are reused directly.
+    let gc_collect_len = str_len(x86gen_gc_collect_block(n_globals))
+    gc_collect_g = code_origin() + const_data_len + str_len(oom_die_bytes) + str_len(x86gen_sched_block()) + str_len(yield_bytes) + str_len(done_bytes) + str_len(chan_sched_bytes) + str_len(chan_wake_bytes) + str_len(chan_push_sendq_bytes) + str_len(chan_push_recvq_bytes) + str_len(chan_push_waiters_bytes) + str_len(chan_remove_waiter_bytes) + str_len(x86gen_waitset_add_block()) + str_len(x86gen_timer_add_block()) + die_len + str_len(la_link(x86gen_sb_items())) + str_len(la_link(x86gen_errtext_items()))
+    gc_mark_g = gc_collect_g + gc_collect_len
+    let mut funcs_bytes = oom_die_bytes + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items()) + x86gen_gc_collect_block(n_globals) + x86gen_gc_mark_block()
     // fn 名表：每函数一项 8B 偏移（自表基址起算），指向 [len:8][bytes] 名字串；
     // 空名记为 anonymous（对齐 C 的 bur_format）。放在用户代码之前，其绝对地址在此
     // 处即已最终确定（与 sb_set_addrs 同基准），fmt 子程序经 mov_ri64 取基址。
@@ -746,12 +828,12 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     }
     let runtime_bytes = e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + rt_zero
     let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
-    // P1：rt_init 只写 desc 表槽（发射期表址 = 常量区尾 - GC_DESC_TABLE_LEN）；
-    // rec/collect/mark 三个 GC 子程序槽随 P1 批 2 删除。
-    // P1: rt_init stores only the desc-table slot (emission-time table address =
-    // consts' end - GC_DESC_TABLE_LEN); the three GC subroutine slots went with
-    // batch 2 of P1.
-    let rt_init = mov_ri64(rax, code_origin() + const_data_len - GC_DESC_TABLE_LEN) + mov_ri64(r11, rt_slot(rt_desc_table)) + mov_mr(r11, 0, rax)
+    // P2：rt_init 写 desc 表槽与全局 kind 表槽——desc 表址 = 常量区尾 -
+    // GC_DESC_TABLE_LEN - n_globals（全局 kind 表 n_globals 字节垫在 desc 表后）。
+    // P2: rt_init stores the desc-table slot and the global-kind-table slot —
+    // the desc table address = consts' end - GC_DESC_TABLE_LEN - n_globals
+    // (the n_globals kind bytes ride right behind the desc table).
+    let rt_init = mov_ri64(rax, code_origin() + const_data_len - GC_DESC_TABLE_LEN - n_globals) + mov_ri64(r11, rt_slot(rt_desc_table)) + mov_mr(r11, 0, rax) + mov_ri64(rax, code_origin() + const_data_len - n_globals) + mov_ri64(r11, rt_slot(rt_global_kinds)) + mov_mr(r11, 0, rax)
     // 分派器（windows/darwin）紧跟 _start；_start 长度与写入值无关，先以 0 量长再定址
     // The dispatcher (windows/darwin) follows _start; _start's length does not
     // depend on the stored value, so measure it with 0 first, then address it

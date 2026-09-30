@@ -469,19 +469,97 @@ pub fn jt_load(dst, disp) {
     mov_rm(dst, r13, disp) + add_rr(dst, r13)
 }
 
-// vs_push 把值压入值栈（r15 为栈顶）/ vs_push pushes a value onto the value stack (r15 is the top)
-pub fn vs_push(reg) {
-    mov_mr(r15, 0, reg) + add_ri32(r15, 8)
+// P2 影子 kind 编码（影子区每 8B 槽一字节；与 desc 的 MAYBE 语义一致）
+// P2 shadow kind encoding (one byte per 8B slot in the shadow region; MAYBE
+// semantics match the desc kinds)
+pub let GC_SHADOW_SCALAR = 0
+pub let GC_SHADOW_PTR = 1
+pub let GC_SHADOW_MAYBE = 2
+
+// 影子游标：rt_shadow_top 槽持有「影子基址 + (r15-stack_lo)/8」的字节地址，与 r15
+// 同步推进；任意槽的影子字节 = 游标 - 静态位移（帧高发射期全静态，无运行期索引
+// 运算）。rt_* 槽在 data 段镜像，访问一律走 rt_slot 绝对地址（movabs+间取），
+// 与 prologue 预算读 rt_cur_fiber 同款；rbx 只覆盖堆前导区的全局数组/旗标。
+// The shadow cursor: the rt_shadow_top slot holds the byte address "shadow base
+// + (r15-stack_lo)/8", advanced in lockstep with r15; any slot's shadow byte is
+// cursor - a static displacement (frame heights are fully static at emission —
+// no run-time index math). The rt_* slots mirror into the data segment and are
+// ALWAYS addressed absolutely via rt_slot (movabs + indirect), same as the
+// prologue's rt_cur_fiber budget read; rbx only covers the heap-preamble
+// globals array and its flag bytes.
+fn shadow_cursor_load() {
+    push_r(rax) + mov_ri64(rax, rt_slot(rt_shadow_top)) + mov_rm(rax, rax, 0)
 }
 
-// vs_push_zero 把 0 压入值栈 / vs_push_zero pushes zero onto the value stack
-pub fn vs_push_zero() {
-    e1(73) + e1(199) + modrm(0, 0, r15) + e4(0) + add_ri32(r15, 8)
+// shadow_set(disp, k)：在「游标 - disp」槽写 kind 字节（push 后新顶 disp=0；
+// 值栈内既有槽如 set_local/TOS 置换用正位移向下寻）。编码 C6 /0 imm8：|0-disp|
+// ≤127 走 disp8（mod=01），否则 disp32（mod=10）——set_local 的帧高位移可远超
+// 127，disp8 恒定截断会写错槽。
+// shadow_set(disp, k): store the kind byte at "cursor - disp" (disp=0 for the
+// freshly pushed top; positive displacements reach existing in-stack slots like
+// set_local/TOS replacements). C6 /0 imm8: |0-disp| <= 127 uses disp8 (mod=01),
+// else disp32 (mod=10) — set_local frame-height displacements can exceed 127
+// and a constant disp8 truncation would write the wrong slot.
+fn shadow_set(disp, k) {
+    let d = 0 - disp
+    if d < -128 || d > 127 {
+        shadow_cursor_load() + e1(198) + modrm(2, 0, rax) + e4s(d) + sb(k) + pop_r(rax)
+    } else {
+        shadow_cursor_load() + e1(198) + modrm(1, 0, rax) + sb(d) + sb(k) + pop_r(rax)
+    }
 }
 
-// vs_pop_n 从值栈弹出 n 个槽 / vs_pop_n pops n slots from the value stack
+// shadow_bump(n)：游标槽 += n（n 槽，正进负退）。rt 槽在 data 段镜像，无「绝对
+// 地址 + 位移」直访编码——先 movabs 槽址进 rax（push/pop 保护），再 81 /0（ADD）
+// 或 /5（SUB）带 mod=00 rm=rax 的 [rax] 间访 + imm32。
+// shadow_bump(n): cursor slot += n (n slots, forward or back). The rt slots
+// mirror into the data segment and no "absolute address + displacement" direct
+// addressing exists — movabs the slot address into rax first (push/pop saved),
+// then 81 /0 (ADD) or /5 (SUB) with mod=00 rm=rax indirect [rax] plus imm32.
+fn shadow_bump(n) {
+    if n == 0 {
+        ""
+    } else if n > 0 {
+        push_r(rax) + mov_ri64(rax, rt_slot(rt_shadow_top)) + rex(1, 0, 0, 0) + e1(129) + modrm(0, 0, rax) + e4s(n) + pop_r(rax)
+    } else {
+        push_r(rax) + mov_ri64(rax, rt_slot(rt_shadow_top)) + rex(1, 0, 0, 0) + e1(129) + modrm(0, 5, rax) + e4s(0 - n) + pop_r(rax)
+    }
+}
+
+// gc_kind_of 把静态类型词折成影子 kind：""（未知）→ MAYBE 兜底；
+// int/bool/unit/ctor → SCALAR；其余（str/float/enum:*/record:*/tup:*/list:*/
+// chan:*/closure:*、native: 与一切未知词）→ PTR —— 未知词宁可 PTR：
+// 多扫一个标量无害，漏扫一个指针在 GC_POISON 下即悬垂。
+// gc_kind_of folds a static type word into a shadow kind: "" (unknown) -> MAYBE
+// fallback; int/bool/unit/ctor -> SCALAR; everything else (str/float/enum:*/
+// record:*/tup:*/list:*/chan:*/closure:*, native:, any unknown word) -> PTR —
+// unknown words prefer PTR: scanning a scalar as a pointer is harmless, while
+// missing a pointer turns into a dangling block under GC_POISON.
+pub fn gc_kind_of(t) {
+    if t == "" {
+        GC_SHADOW_MAYBE
+    } else if t == "int" || t == "bool" || t == "unit" || t == "ctor" {
+        GC_SHADOW_SCALAR
+    } else {
+        GC_SHADOW_PTR
+    }
+}
+
+// vs_push(reg, k) 把值压入值栈并同步写影子 kind（r15 为栈顶）
+// vs_push(reg, k) pushes a value onto the value stack (r15 is the top) and
+// records its shadow kind in lockstep
+pub fn vs_push(reg, k) {
+    mov_mr(r15, 0, reg) + add_ri32(r15, 8) + shadow_set(0, k) + shadow_bump(1)
+}
+
+// vs_push_zero(k) 把 0 压入值栈并同步写影子 kind / vs_push_zero(k) pushes zero and records the shadow kind
+pub fn vs_push_zero(k) {
+    e1(73) + e1(199) + modrm(0, 0, r15) + e4(0) + add_ri32(r15, 8) + shadow_set(0, k) + shadow_bump(1)
+}
+
+// vs_pop_n 从值栈弹出 n 个槽（影子游标同步回退）/ vs_pop_n pops n slots (the shadow cursor retreats in step)
 pub fn vs_pop_n(n) {
-    sub_ri32(r15, 8 * n)
+    sub_ri32(r15, 8 * n) + shadow_bump(0 - n)
 }
 
 // ---- SSE 编码 helper（装箱 float 用；内存一律走 GPR，避免对齐要求）----
