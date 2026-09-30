@@ -1,0 +1,208 @@
+// gc.bur — P1 精确 GC 的分配前端：块头 / descriptor 表 / start bitmap 的发射期生成器。
+// gc.bur — the P1 precise-GC allocation front end: emission-time generators for the
+// block header, the descriptor table and the start bitmap.
+
+// 块布局：[hdr:8][payload]。用户拿到的指针恒为 payload 起点（hdr 落在 ptr-8），
+// 因此全部既有字段偏移（串 [len][bytes]、record [tag][x][fields]、fiber/channel
+// 结构体……）零改动；hdr 属于块本身，precise 扫描按 ptr-8 回溯块头。
+// Block layout: [hdr:8][payload]. The pointer handed to users is always the
+// payload start (the hdr sits at ptr-8), so every existing field offset (str
+// [len][bytes], record [tag][x][fields], fiber/channel structs, ...) is
+// untouched; the hdr belongs to the block itself and precise scans back up a
+// pointer through ptr-8.
+// hdr 64 位 = payload 字节数（8 的倍数，低 40 位）| desc_id（desc 表内字节偏移，
+// 40..61）| MARK 位 62 | FREE 位 63。P1 分配恒 MARK/FREE 清零；P1 不回收，
+// payload 无需清零（bump 区原生零页）。
+// The 64-bit hdr = payload byte count (a multiple of 8, low 40 bits) |
+// desc_id (byte offset into the desc table, bits 40..61) | MARK bit 62 |
+// FREE bit 63. P1 always allocates with MARK/FREE clear and never collects,
+// so payloads need no zeroing (the bump region is fresh zero pages).
+// start bitmap：每 8B granule 一**字节**（bit0 = 块起点；对任务书「每 8B 一位」
+// 的空间换指令偏离——1B/granule 让站点置位只需一条 or byte [base+idx]，
+// 128MB NORESERVE 映射不值钱，且 P3 sweep 可按字节快速跳过零段）。
+// Start bitmap: one BYTE per 8-byte granule (bit0 = block start; a
+// space-for-instructions deviation from the brief's one-bit-per-8B — 1B per
+// granule makes the per-site set a single "or byte [base+idx]", the 128MB
+// NORESERVE mapping is cheap, and P3's sweep can skip zero runs byte-wise).
+// 块起点恒 8 对齐：r12 起点 8 对齐（heap_start 由 _start 在 globals 前导区后
+// 盖章），每个块 bump = 8 + payload（payload 圆整到 8）。
+// Block starts stay 8-aligned: r12 starts aligned (heap_start is stamped by
+// _start after the globals preamble) and every bump = 8 + payload (payload
+// rounded up to 8).
+
+// desc kind：NOSCAN 无指针 / ALL_PTR 全词皆指针 / ALL_MAYBE 全词 MAYBE 扫描 /
+// BITMAP 位图描述。P1 全站占位 ALL_MAYBE，P2 逐类精化。
+// desc kinds: NOSCAN no pointers / ALL_PTR every word a pointer / ALL_MAYBE
+// speculative whole-word scan / BITMAP per-field bitmap. P1 stamps every site
+// with the ALL_MAYBE placeholder; P2 refines per type.
+pub let GC_KIND_NOSCAN = 0
+pub let GC_KIND_ALL_PTR = 1
+pub let GC_KIND_ALL_MAYBE = 2
+pub let GC_KIND_BITMAP = 3
+// P1 全站共用 desc_id = 0（表内唯一条目的字节偏移）。
+// P1's single desc_id = 0 (the byte offset of the table's only entry).
+pub let GC_DESC_ALL = 0
+// desc 表字节数：单条目 8B = [kind:1][保留:7]。
+// desc table size: one 8B entry = [kind:1][reserved:7].
+pub let GC_DESC_TABLE_LEN = 8
+// 2^40：hdr 内 desc 字段的位权 / 2^40: the desc field's bit weight in the hdr
+pub let GC_DESC_SHIFT = 1099511627776
+
+// x86gen_desc_table 生成 desc 表镜像字节：条目 0 = ALL_MAYBE 占位，P2 逐类精化
+// 后在此追加条目（desc_id = 追加偏移）。
+// x86gen_desc_table emits the desc table's image bytes: entry 0 is the
+// ALL_MAYBE placeholder; P2 appends entries here as types are refined
+// (desc_id = the append offset).
+fn x86gen_desc_table() {
+    e8(GC_KIND_ALL_MAYBE)
+}
+
+// gc_scratch1/gc_scratch2 选分配序列的两枚 scratch 寄存器：默认 rcx/rdx，
+// 与 dst 冲突时换 rsi（push/pop 全保护，选谁都不破坏现场）。
+// gc_scratch1/gc_scratch2 pick the alloc sequence's two scratch registers:
+// rcx/rdx by default, rsi on a dst collision (everything is push/pop saved, so
+// any choice preserves the surroundings).
+fn gc_scratch1(dst) {
+    if dst == rcx {
+        rdx
+    } else if dst == rdx {
+        rcx
+    } else {
+        rcx
+    }
+}
+
+fn gc_scratch2(dst) {
+    if dst == rcx {
+        rsi
+    } else if dst == rdx {
+        rsi
+    } else {
+        rdx
+    }
+}
+
+// gc_oom_die 生成越界 die 调用（push/pop rax 保护现场；oom_die_g 为发射期
+// 全局，funcs 头部定址——与 P0 x86gen_oom_check 同款）。
+// gc_oom_die emits the over-limit die call (push/pop rax preserves the
+// surroundings; oom_die_g is the emission-time global addressed at funcs' head
+// — same pattern as P0's x86gen_oom_check).
+fn gc_oom_die() {
+    push_r(rax) + mov_ri64(rax, oom_die_g) + call_r(rax) + pop_r(rax)
+}
+
+// gc_bitmap_set 生成 start-bit 置位：granule = (hdr_addr - rt_heap_start) >> 3，
+// 字节地址 = rt_start_bitmap + granule，or byte [base+idx], 1。
+// s1 = 基址寄存器（承载 bitmap 基址），s2 = 索引寄存器（承载 granule 号）；
+// ModRM=00 /1 100(SIB)，SIB = s2:8+s1，无 REX（两组寄存器均 <8 且非 rsp 系）。
+// gc_bitmap_set emits the start-bit set: granule = (hdr_addr - rt_heap_start)
+// >> 3, byte address = rt_start_bitmap + granule, "or byte [base+idx], 1".
+// s1 = the base register (bitmap base), s2 = the index register (granule
+// number); ModRM = 00 /1 100(SIB), SIB = s2:8+s1, no REX (both groups are <8
+// and outside the rsp encoding).
+fn gc_bitmap_set(s1, s2) {
+    e1(128) + e1(12) + e1(s2 * 8 + s1) + sb(1)
+}
+
+// x86gen_alloc 立即数尺寸分配（size = payload 字节数，发射期圆整到 8）：
+// dst = r12+8（payload 起点）→ r12 += size+8 → 限界检查（r12 越界进 oom_die）
+// → [dst-8] = payload|desc<<40 → bitmap 置 start 位。
+// 寄存器代价：毁 s1/s2（push/pop 保护）与 r12；写 dst；rax 仅 die 路径触碰
+//（亦保护）。FLAGS 被破坏——与旧内联 bump（add 亦毁 FLAGS）同级，站点内
+// test→je 相邻对不受影响（分配序列插在原 bump 位置）。
+// x86gen_alloc immediate-size allocation (size = payload bytes, rounded to 8
+// at emission): dst = r12+8 (payload start) -> r12 += size+8 -> bound check
+// (r12 past the limit enters oom_die) -> [dst-8] = payload|desc<<40 -> set the
+// start bit. Register cost: clobbers s1/s2 (push/pop saved) and r12; writes
+// dst; rax only touched on the die path (also saved). FLAGS are clobbered —
+// same class as the old inline bump (add clobbers FLAGS too); adjacent
+// test->je pairs inside sites are unaffected (the sequence goes where the
+// bump was).
+fn x86gen_alloc(dst, size, desc) {
+    let sz = (size + 7) / 8 * 8
+    let s1 = gc_scratch1(dst)
+    let s2 = gc_scratch2(dst)
+    let die = gc_oom_die()
+    let hdr = mov_ri64(s1, sz + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1)
+    let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
+    push_r(s1) + push_r(s2) + lea(dst, r12, 8) + add_ri32(r12, sz + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die + hdr + bits + pop_r(s2) + pop_r(s1)
+}
+
+// x86gen_alloc_r 寄存器尺寸分配（size_reg 承载 payload 字节数，运行期圆整）：
+// sz = (size_reg+7) & -8 先算进 s1，bump 与 hdr 共用它；desc≠0 时对 hdr 补
+// OR（P1 desc 恒 0，该分支零字节）。size_reg 自身不被改写；size_reg 不得等
+// 于 dst（dst 在读 size 前被覆写——站点审计保证）。
+// x86gen_alloc_r register-size allocation (size_reg carries the payload byte
+// count, rounded at run time): sz = (size_reg+7) & -8 lands in s1 first and is
+// shared by the bump and the hdr; desc != 0 ORs the hdr (P1's desc is always
+// 0, so that branch emits no bytes). size_reg itself is not written; size_reg
+// must not equal dst (dst is overwritten before the size is read — audited per
+// site).
+fn x86gen_alloc_r(dst, size_reg, desc) {
+    let s1 = gc_scratch1(dst)
+    let s2 = gc_scratch2(dst)
+    let die = gc_oom_die()
+    let hdr_or = if desc != 0 {
+        mov_ri64(s2, desc * GC_DESC_SHIFT) + or_rr(s1, s2)
+    } else {
+        ""
+    }
+    let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
+    push_r(s1) + push_r(s2) + lea(dst, r12, 8) + mov_rr(s1, size_reg) + add_ri32(s1, 7) + and_ri32(s1, 0 - 8) + add_rr(r12, s1) + add_ri32(r12, 8) + mov_ri64(s2, rt_slot(rt_heap_limit)) + mov_rm(s2, s2, 0) + cmp_rr(s2, r12) + ja_rel32(str_len(die)) + die + hdr_or + mov_mr(dst, 0 - 8, s1) + bits + pop_r(s2) + pop_r(s1)
+}
+
+// x86gen_gc_verify_seq 生成堆走查校验序列（--gc-debug 时内联在调度器 exit0 前）：
+// 从 rt_heap_start 沿 hdr 链走到 r12，逐块校验 size 非零且 8 对齐、desc_id 落在
+// desc 表内、start-bit 置位；收口要求游标恰好等于 r12（最后一块越过堆顶也算腐
+// 化）。毁 rax/rcx/rdx/rdi/r9（退出路径无活值）。毁 FLAGS。失败信息区分四类检
+// 查（size/desc/bit/top），且经 die_call(flags=0) 无回溯退出——调度器上下文没
+// 有用户栈帧，flags=1 的回溯会踩空段错误。
+// x86gen_gc_verify_seq emits the heap-walk verification sequence (inlined before
+// the scheduler's exit0 under --gc-debug): walk the hdr chain from rt_heap_start
+// to r12, checking per block that size is nonzero and 8-aligned, desc_id lands
+// inside the desc table, and the start bit is set; the walk must land exactly on
+// r12 (the last block overshooting the top counts as corruption). Clobbers
+// rax/rcx/rdx/rdi/r9 (no live values on the exit path). Clobbers FLAGS. The four
+// failure classes report distinct messages, and the exit goes through
+// die_call(flags=0) — no backtrace: the scheduler context has no user frame, so
+// a flags=1 unwind would walk garbage and segfault.
+fn x86gen_gc_verify_seq() {
+    let mut it = []
+    // 游标 r9 = heap_start（当前块 hdr 地址）
+    push(it, la_b(mov_ri64(r9, rt_slot(rt_heap_start)) + mov_rm(r9, r9, 0)))
+    push(it, la_l("gv_loop"))
+    push(it, la_b(cmp_rr(r9, r12)))
+    push(it, la_jcc(CC_AE, "gv_done"))
+    push(it, la_b(mov_rm(rax, r9, 0)))
+    // size = hdr 低 40 位：非零且 8 对齐
+    push(it, la_b(mov_rr(rcx, rax) + mov_ri64(rdx, 1099511627775) + and_rr(rcx, rdx)))
+    push(it, la_b(test_rr(rcx, rcx)))
+    push(it, la_jcc(CC_E, "gv_fail_size"))
+    push(it, la_b(mov_ri64(rdx, 7) + and_rr(rdx, rcx)))
+    push(it, la_jcc(CC_NE, "gv_fail_size"))
+    // desc_id = hdr >> 40：必须落在 desc 表内（P1 表 8B，仅条目 0）
+    push(it, la_b(mov_rr(rcx, rax) + shr_ri(rcx, 40) + cmp_ri32(rcx, GC_DESC_TABLE_LEN)))
+    push(it, la_jcc(CC_AE, "gv_fail_desc"))
+    // start bit：bitmap[(hdr - heap_start) >> 3] 的 bit0 必须为 1
+    //（cmp byte [rcx + rdx], 0 —— base+index 形式 mem_operand 不覆盖，手写编码）
+    push(it, la_b(mov_ri64(rcx, rt_slot(rt_start_bitmap)) + mov_rm(rcx, rcx, 0)))
+    push(it, la_b(mov_rr(rdx, r9) + mov_ri64(rdi, rt_slot(rt_heap_start)) + mov_rm(rdi, rdi, 0) + sub_rr(rdx, rdi) + shr_ri(rdx, 3)))
+    push(it, la_b(e1(128) + e1(60) + e1(rdx * 8 + rcx) + e1(0)))
+    push(it, la_jcc(CC_E, "gv_fail_bit"))
+    // next = hdr + 8 + size
+    push(it, la_b(mov_rr(rcx, rax) + mov_ri64(rdx, 1099511627775) + and_rr(rcx, rdx) + lea(r9, r9, 8) + add_rr(r9, rcx)))
+    push(it, la_jmp("gv_loop"))
+    push(it, la_l("gv_fail_size"))
+    push(it, la_b(x86gen_die_call("gc verify: bad block size", 0)))
+    push(it, la_l("gv_fail_desc"))
+    push(it, la_b(x86gen_die_call("gc verify: desc id out of table", 0)))
+    push(it, la_l("gv_fail_bit"))
+    push(it, la_b(x86gen_die_call("gc verify: start bit missing", 0)))
+    push(it, la_l("gv_done"))
+    // 收口：游标必须恰好等于 r12；相等则跳过 die 落到序列尾（exit0 主流程）
+    push(it, la_b(cmp_rr(r9, r12)))
+    push(it, la_jcc(CC_E, "gv_ok"))
+    push(it, la_b(x86gen_die_call("gc verify: heap top mismatch", 0)))
+    push(it, la_l("gv_ok"))
+    la_link(it)
+}

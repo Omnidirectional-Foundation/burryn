@@ -42,14 +42,16 @@ fn x86gen_chan_wake_waiters_block(sched_addr) {
 fn x86gen_chan_push_queue_block(off) {
     // 布局 head + grow + no_grow + store_n：n==cap 落入 grow（倍增重分配后拷贝旧元素，
     // 写回新数组指针，落入 no_grow 写 fiber），n<cap 跳 no_grow；store_n 重读 n 自增后 ret。
-    // gc_rec 跨调用只保 rax/r11/r12/rsi/rdi（rdx/rcx/r8/r9/r10 全毁），
-    // 故 grow_copy/no_grow 一律从内存重读 array/n，且 [rax+off] 在拷贝完成前不写回；
+    // P1 前的 grow 经 gc_rec 跨调用登记（只保 rax/r11/r12/rsi/rdi，rdx/rcx/r8/r9/r10 全毁），
+    // 故 grow_copy/no_grow 一律从内存重读 array/n，且 [rax+off] 在拷贝完成前不写回——
+    // P1 的 x86gen_alloc_r push/pop 保护 scratch、只写 dst 与 r12，上述重读纪律保留不动。
     // grow_copy 把 rdi 覆写为新数组（rep movsb 还会推进），no_grow 在存储前从
     // rt_cur_fiber 重读 fiber——被 push 的恒是当前 fiber
     let store_n = mov_rm(r8, rax, off + 8) + add_ri32(r8, 1) + mov_mr(rax, off + 8, r8) + ret()
     let no_grow = mov_ri64(rdi, rt_slot(rt_cur_fiber)) + mov_rm(rdi, rdi, 0) + mov_rm(rdx, rax, off) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + mov_mr(rcx, 0, rdi)
-    // grow_alloc 记录新块但先不写回指针，grow_copy 从 [rax+off] 读旧数组拷贝 n 元素后再写回
-    let grow_alloc = mov_rr(r11, r12) + mov_rr(rsi, r8) + add_rr(r12, rsi) + gc_rec(r11, mov_rr(rsi, rsi)) + x86gen_oom_check() + mov_rm(rcx, rax, off + 16) + add_rr(rcx, rcx) + add_ri32(rcx, QUEUE_GROW_ADD) + mov_mr(rax, off + 16, rcx)
+    // grow_alloc 分配新数组（r8 = 倍增后字节数）但先不写回指针，grow_copy 从 [rax+off]
+    // 读旧数组拷贝 n 元素后再写回
+    let grow_alloc = x86gen_alloc_r(r11, r8, GC_DESC_ALL) + mov_rm(rcx, rax, off + 16) + add_rr(rcx, rcx) + add_ri32(rcx, QUEUE_GROW_ADD) + mov_mr(rax, off + 16, rcx)
     let grow_copy = mov_rm(rsi, rax, off) + mov_rr(rdi, r11) + mov_rm(r10, rax, off + 8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r10) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(rax, off, r11)
     let grow_size = mov_rr(r8, rcx) + add_rr(r8, r8) + add_ri32(r8, QUEUE_GROW_ADD) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r8)
     let grow = mov_rm(rdx, rax, off) + mov_rm(rcx, rax, off + 16) + mov_rm(r9, rax, off + 8) + grow_size + grow_alloc + grow_copy
@@ -127,154 +129,32 @@ fn x86gen_yield_block(sched_addr) {
     cur + save + set_ready + tail + branch + tail_link + to_join + first + join + mov_ri64(r8, sched_addr) + jmp_r(r8)
 }
 
-// gc_rec_imm 立即数版本 / gc_rec_imm is the immediate-size variant
-fn gc_rec_imm(ptr_reg, size) {
-    gc_rec(ptr_reg, mov_ri64(rsi, size))
+// P1：GC 调试开关（--gc-debug）；开启时生成的程序在正常退出前跑一次堆遍历校验。
+// P1: the GC debug switch (--gc-debug); when on, the generated program runs a
+// full heap-walk verification before normal exit.
+pub let mut gc_debug = false
+
+pub fn set_gc_debug(v: bool) {
+    gc_debug = v
 }
 
-// x86gen_gc_record 生成 gc_record 子程序（rdi=ptr, rsi=size，写入分配表，超阈值触发回收）
-// x86gen_gc_record emits the gc_record subroutine (rdi=ptr, rsi=size; appends to the alloc table,
-// collects past the threshold)
-fn x86gen_gc_record() {
-    // 保存 r10/r11：阈值触发的 gc_collect 会经 mark_addr 改写 r11（返回 size），分配点跨调用存活的
-    // 对象指针常驻 r11；保存全部被 collect 破坏的寄存器，调用方无需关心
-    let push3 = push_r(rdx) + push_r(rdi) + push_r(rsi) + push_r(rax) + push_r(rcx) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11)
-    let load_cnt = mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rax, rax, 0)
-    let recs_base = mov_ri64(rcx, rt_slot(rt_gc_recs)) + mov_rm(rcx, rcx, 0) + mov_rr(r9, rcx)
-    let rec_idx = mov_rr(r8, rax) + add_rr(r8, r8) + add_rr(r8, rax) + mov_ri32(rcx, 3) + shl_rcl(r8) + mov_rr(rcx, r9) + add_rr(rcx, r8)
-    let rec_write = mov_mr(rcx, 0, rdi) + mov_mr(rcx, 8, rsi) + xor_rr(r9, r9) + mov_mr(rcx, 16, r9)
-    let cnt_inc = add_ri32(rax, 1) + mov_ri64(rcx, rt_slot(rt_gc_cnt)) + mov_mr(rcx, 0, rax)
-    let rec_body = recs_base + rec_idx + rec_write + cnt_inc
-    let ret_path = pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rcx) + pop_r(rax) + pop_r(rsi) + pop_r(rdi) + pop_r(rdx) + ret()
-    let cc_load = mov_rm(rdi, rsp, 56) + mov_rm(rsi, rsp, 48)
-    let cc_call = mov_ri64(r8, rt_slot(rt_gc_collect_fn)) + mov_rm(r8, r8, 0) + call_r(r8)
-    let cc_mov2 = mov_rm(rdi, rsp, 56) + mov_rm(rsi, rsp, 48)
-    let thr_check = mov_ri64(rcx, rt_slot(rt_gc_threshold)) + mov_rm(r9, rcx, 0) + cmp_rr(rax, r9) + jg_rel32(str_len(ret_path))
-    let cap_check = mov_ri64(rcx, GC_RECS_CAP) + cmp_rr(rax, rcx) + jae_rel32(str_len(rec_body) + str_len(thr_check) + str_len(ret_path))
-    let cc_retry = cc_mov2 + jmp_rel32(0 - (str_len(load_cnt) + str_len(cap_check) + str_len(rec_body) + str_len(thr_check) + str_len(ret_path) + str_len(cc_load) + str_len(cc_call) + str_len(cc_mov2) + 5))
-    push3 + load_cnt + cap_check + rec_body + thr_check + ret_path + cc_load + cc_call + cc_retry
-}
-
-// x86gen_mark_addr 生成 mark_addr 子程序（rdx=val；线性扫描 rec 表，标记并压入 gray；
-// 返回 r11=size，未找到为 0；除 r11 外保留全部 caller 寄存器）
-// x86gen_mark_addr emits mark_addr (rdx=val; linear scan of the rec table, marks the object and
-// pushes gray; returns r11=size or 0; preserves every register except r11)
-fn x86gen_mark_addr() {
-    let pro = push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rdi) + push_r(r8) + push_r(r9) + push_r(r10)
-    let epi = pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rdi) + pop_r(rdx) + pop_r(rcx) + pop_r(rax)
-    let clean = epi + ret()
-    let notfound = xor_rr(r11, r11) + clean
-    // gray push：槽偏移 = count*8（3 次 add，避开 CL 依赖）
-    let gray_slot = mov_rr(rdi, r8) + add_rr(rdi, rdi) + add_rr(rdi, rdi) + add_rr(rdi, rdi) + add_rr(rdi, r10) + mov_mr(rdi, 8, rdx)
-    let gray_inc = add_ri32(r8, 1) + mov_mr(r10, 0, r8)
-    let gray_full = jae_rel32(str_len(gray_slot) + str_len(gray_inc))
-    let gray_push = mov_ri64(r10, rt_slot(rt_gray)) + mov_rm(r10, r10, 0) + mov_rm(r8, r10, 0) + mov_ri64(rdi, GC_GRAY_CAP) + cmp_rr(r8, rdi) + gray_full + gray_slot + gray_inc
-    // found：r9=rec 指针，r11 已是 size；未标记则置位并入 gray
-    let mark_set = mov_ri64(r10, 1) + mov_mr(r9, 16, r10)
-    let mark_chk = mov_rm(r10, r9, 16) + test_rr(r10, r10) + jne_rel32(str_len(mark_set) + str_len(gray_push))
-    let found_path = mark_chk + mark_set + gray_push
-    // 线性扫描：从表尾（最新分配）往回；r9=rec，r11=size
-    let notthis_off = str_len(found_path) + str_len(clean)
-    let scan_tail = add_rr(rdi, r11) + cmp_rr(rdx, rdi)
-    let scan_body = sub_ri32(r9, 24) + mov_rm(rdi, r9, 0) + mov_rm(r11, r9, 8) + cmp_rr(rdx, rdi) + jb_rel32(str_len(scan_tail) + str_len(jae_rel32(0)) + notthis_off) + scan_tail + jae_rel32(notthis_off)
-    let notthis_decr = sub_ri32(rax, 1)
-    let loop_head_len = str_len(test_rr(rax, rax)) + str_len(je_rel32(0))
-    let loop_back = jmp_rel32(0 - (loop_head_len + str_len(scan_body) + str_len(found_path) + str_len(clean) + str_len(notthis_decr) + 5))
-    let notthis = notthis_decr + loop_back
-    let loop_head = test_rr(rax, rax) + je_rel32(str_len(scan_body) + str_len(found_path) + str_len(clean) + str_len(notthis))
-    let init = mov_ri64(r8, rt_slot(rt_gc_recs)) + mov_rm(r8, r8, 0) + mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rax, rax, 0) + mov_rr(r9, rax) + add_rr(r9, r9) + add_rr(r9, rax) + mov_ri32(rcx, 3) + shl_rcl(r9) + add_rr(r9, r8)
-    let notfound_off = str_len(init) + str_len(loop_head) + str_len(scan_body) + str_len(found_path) + str_len(clean) + str_len(notthis)
-    let bound_hi = cmp_rr(rdx, r12) + jae_rel32(notfound_off)
-    let bound_lo = mov_ri64(r8, rt_slot(rt_heap_start)) + mov_rm(r8, r8, 0) + cmp_rr(rdx, r8) + jb_rel32(str_len(bound_hi) + notfound_off)
-    pro + bound_lo + bound_hi + init + loop_head + scan_body + found_path + clean + notthis + notfound
-}
-
-// x86gen_gc_collect 生成 gc_collect（mark 根 + gray 传播 + sweep 压缩）
-// x86gen_gc_collect emits gc_collect (mark roots, gray propagation, compacting sweep)
-fn x86gen_gc_collect(n_globals, gc_col_addr) {
-    let cyc = mov_ri64(rax, rt_slot(rt_gc_cycles)) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx)
-    let clear_body = xor_rr(rax, rax) + mov_mr(r8, 16, rax) + add_ri32(r8, 24) + sub_ri32(rcx, 1)
-    let clear_head = test_rr(rcx, rcx) + je_rel32(str_len(clear_body) + 5)
-    let clear_back = jmp_rel32(0 - (str_len(clear_head) + str_len(clear_body) + 5))
-    let clear_loop = clear_head + clear_body + clear_back
-    let mark_root = mov_ri64(r8, rt_slot(rt_mark_addr_fn)) + mov_rm(r8, r8, 0)
-    // mark 根：遍历 fiber 列表；每 fiber 扫值栈 [stack_lo, top)（top = 当前 fiber 取 r15，
-    // 其余取 [fb+FB_R15]）并 mark defer 链头（[fb+FB_RSP] 处 8B，非 0 才 mark）
-    let f_init = mov_ri64(r9, rt_slot(rt_fiber_list)) + mov_rm(r9, r9, 0)
-    // 循环体段序 f_init+f_head+f_top_pre+f_top+f_cur+f_other+f_scan+f_next；f_next 用
-    // 绝对跳回 f_head（块基址编译期传入），其余跳转均向后
-    let f_next_body = mov_rm(r9, r9, FB_LIST_NEXT)
-    let f_next = f_next_body + mov_ri64(r9, gc_col_addr + str_len(cyc) + str_len(clear_loop) + str_len(mark_root) + str_len(f_init)) + jmp_r(r9)
-    let v_done = mov_rm(rax, r9, FB_RSP) + mov_rm(rdx, rax, 0) + test_rr(rdx, rdx) + je_rel32(str_len(f_next)) + call_r(r8)
-    let v_body = mov_rm(rdx, rax, 0) + call_r(r8) + add_ri32(rax, 8)
-    let v_head = cmp_rr(rax, rcx) + jae_rel32(str_len(v_body) + str_len(v_done))
-    let f_scan = mov_rm(rax, r9, FB_STACK_LO) + v_head + v_body + v_done
-    let f_other = mov_rm(rcx, r9, FB_R15)
-    let f_cur = mov_rr(rcx, r15) + jmp_rel32(str_len(f_other))
-    let f_top = cmp_rr(rax, r9) + jne_rel32(str_len(f_cur))
-    let f_top_pre = mov_ri64(rax, rt_slot(rt_cur_fiber)) + mov_rm(rax, rax, 0)
-    let f_head = test_rr(r9, r9) + jne_rel32(str_len(f_top_pre) + str_len(f_top) + str_len(f_cur) + str_len(f_other) + str_len(f_scan) + str_len(f_next))
-    let fiber_loop = f_init + f_head + f_top_pre + f_top + f_cur + f_other + f_scan + f_next
-    let globals_set = mov_rr(rax, rbx) + mov_ri64(rcx, 8 * n_globals) + add_rr(rcx, rbx)
-    let g_body = mov_rm(rdx, rax, 0) + call_r(r8) + add_ri32(rax, 8)
-    let g_head = cmp_rr(rax, rcx) + jae_rel32(str_len(g_body) + 5)
-    let g_back = jmp_rel32(0 - (str_len(g_head) + str_len(g_body) + 5))
-    let g_loop = g_head + g_body + g_back
-    // gray 传播：弹出对象地址，扫描其全部子指针（r10=游标、rdi=终点，mark_addr 保留二者）
-    let gh_pre_len = str_len(mov_ri64(r9, rt_slot(rt_gray))) + str_len(mov_rm(r9, r9, 0)) + str_len(mov_rm(rax, r9, 0)) + str_len(test_rr(rax, rax)) + str_len(je_rel32(0))
-    let gh_post_len = str_len(sub_ri32(rax, 1)) + str_len(mov_mr(r9, 0, rax)) + str_len(mov_rr(r10, rax)) + str_len(mov_ri32(rcx, 3)) + str_len(shl_rcl(r10)) + str_len(add_rr(r10, r9)) + str_len(mov_rm(rdx, r10, 8)) + str_len(call_r(r8)) + str_len(add_rr(r11, rdx)) + str_len(mov_rr(rdi, r11)) + str_len(mov_rr(r10, rdx))
-    let gi_head_len = str_len(cmp_rr(r10, rdi)) + str_len(jae_rel32(0))
-    let gi_body_body = mov_rm(rdx, r10, 0) + call_r(r8) + add_ri32(r10, 8)
-    let gi_back = jmp_rel32(0 - (gi_head_len + str_len(gi_body_body) + 5))
-    let gi_body = gi_body_body + gi_back
-    let gi_head = cmp_rr(r10, rdi) + jae_rel32(0 - (gh_pre_len + gh_post_len + gi_head_len))
-    let gh_post = sub_ri32(rax, 1) + mov_mr(r9, 0, rax) + mov_rr(r10, rax) + mov_ri32(rcx, 3) + shl_rcl(r10) + add_rr(r10, r9) + mov_rm(rdx, r10, 8) + call_r(r8) + add_rr(r11, rdx) + mov_rr(rdi, r11) + mov_rr(r10, rdx)
-    let gh_pre = mov_ri64(r9, rt_slot(rt_gray)) + mov_rm(r9, r9, 0) + mov_rm(rax, r9, 0) + test_rr(rax, rax) + je_rel32(str_len(gh_post) + str_len(gi_head) + str_len(gi_body))
-    let gray_set = gh_pre + gh_post + gi_head + gi_body
-    // sweep：已标记（存活）对象复制到表头，未标记对象丢弃并计数 freed
-    let sweep_init = mov_ri64(r8, rt_slot(rt_gc_recs)) + mov_rm(r8, r8, 0) + mov_ri64(rcx, rt_slot(rt_gc_cnt)) + mov_rm(rcx, rcx, 0) + xor_rr(r9, r9) + xor_rr(r10, r10) + mov_rr(rsi, r8) + mov_rr(rdi, r8)
-    let sweep_done = mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_mr(rax, 0, r9) + mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_mr(rax, 0, r10) + ret()
-    let sweep_head_len = str_len(test_rr(rcx, rcx)) + str_len(je_rel32(0))
-    let sweep_dead_body = add_ri32(r10, 1) + add_ri32(rdi, 24) + add_ri32(rcx, -1)
-    let sweep_body = mov_rm(rax, rdi, 16) + test_rr(rax, rax) + jne_rel32(str_len(sweep_dead_body) + 5)
-    let sweep_dead = sweep_dead_body + jmp_rel32(0 - (sweep_head_len + str_len(sweep_body) + str_len(sweep_dead_body) + 5))
-    let sweep_live_body = mov_rm(rax, rdi, 0) + mov_mr(rsi, 0, rax) + mov_rm(rax, rdi, 8) + mov_mr(rsi, 8, rax) + mov_rm(rax, rdi, 16) + mov_mr(rsi, 16, rax) + add_ri32(rsi, 24) + add_ri32(rdi, 24) + add_ri32(r9, 1) + add_ri32(rcx, -1)
-    let sweep_live = sweep_live_body + jmp_rel32(0 - (sweep_head_len + str_len(sweep_body) + str_len(sweep_dead) + str_len(sweep_live_body) + 5))
-    let sweep_head = test_rr(rcx, rcx) + je_rel32(str_len(sweep_body) + str_len(sweep_dead) + str_len(sweep_live))
-    let sweep_loop = sweep_head + sweep_body + sweep_dead + sweep_live + sweep_done
-    cyc + mov_ri64(r8, rt_slot(rt_gc_recs)) + mov_rm(r8, r8, 0) + mov_ri64(rcx, rt_slot(rt_gc_cnt)) + mov_rm(rcx, rcx, 0) + clear_loop + mark_root + fiber_loop + globals_set + g_loop + gray_set + sweep_init + sweep_loop
-}
-
-// gc_rec 生成分配记录插桩（rdi=ptr 寄存器, size 立即数或寄存器；保存调用方 rdi/rsi）
-// gc_rec emits the alloc-recording stub (rdi=ptr register, size immediate
-// or register; preserves caller rdi/rsi)
-fn gc_rec(ptr_reg, size) {
-    let call = mov_ri64(r8, rt_slot(rt_gc_record_fn)) + mov_rm(r8, r8, 0) + call_r(r8)
-    push_r(rdi) + push_r(rsi) + push_r(r8) + mov_rr(rdi, ptr_reg) + size + call + pop_r(r8) + pop_r(rsi) + pop_r(rdi)
-}
-
-// oom_die / commit 两个 stub 的发射期地址（x86gen_image 每遍装配前设定）
-// the two stubs' emission-time addresses (set by x86gen_image before each pass)
+// oom_die stub 的发射期地址（x86gen_image 每遍装配前设定）
+// the oom_die stub's emission-time address (set by x86gen_image before each pass)
 pub let mut oom_die_g = 0
-pub let mut gc_commit_stub_g = 0
 
-// x86gen_oom_check 生成站点尾部的堆越界检查（r12 推进后调用；push/pop rcx 保护现场）。
-// Linux：r12 超 rt_heap_limit 即进 oom_die stub（funcs 头部，永不返回）；PE：r12 超
-// rt_commit_top 先进 commit stub 续提一片并复查 limit，仍不够才 die。
-// x86gen_oom_check emits the per-site heap-bound check (call it right after an r12
-// advance; push/pop rcx preserves the surroundings). Linux: r12 past rt_heap_limit
-// enters the oom_die stub (in funcs' head, never returning); PE: r12 past
-// rt_commit_top first enters the commit stub to top up a chunk and re-checks the
-// limit, dying only when that still fails.
-fn x86gen_oom_check() {
-    if target_os == "windows" {
-        let die_call = push_r(rax) + mov_ri64(rax, oom_die_g) + call_r(rax) + pop_r(rax)
-        push_r(rcx) + mov_ri64(rcx, rt_slot(rt_heap_limit)) + mov_rm(rcx, rcx, 0) + cmp_rr(rcx, r12) + pop_r(rcx) + ja_rel32(str_len(die_call)) + die_call
-    } else {
-        let die_call = push_r(rax) + mov_ri64(rax, oom_die_g) + call_r(rax) + pop_r(rax)
-        push_r(rcx) + mov_ri64(rcx, rt_slot(rt_heap_limit)) + mov_rm(rcx, rcx, 0) + cmp_rr(rcx, r12) + pop_r(rcx) + ja_rel32(str_len(die_call)) + die_call
-    }
-}
+// P0 偏离记录：PE 分步 commit stub 已废弃——VirtualAlloc 对 reserve 外地址自动
+// reserve+commit，按水位续提的循环永远成功、无法收敛，PE 与 Linux 统一一次成型
+// 映射（RESERVE|COMMIT），gc_commit_stub_g 随之退役。
+// P0 deviation note: the PE stepped-commit stub was abandoned — VirtualAlloc
+// auto-reserves+commits addresses outside any reserve, so the watermark-topping
+// loop always succeeds and never converges; PE and Linux now map in one shot
+// (RESERVE|COMMIT), retiring gc_commit_stub_g.
+
+// x86gen_oom_check 已删除：P1 批 2 全站转换为 x86gen_alloc / x86gen_alloc_r，
+// 限界检查内联进分配序列（见 gc.bur）。
+// x86gen_oom_check was removed: batch 2 of P1 converted every site to
+// x86gen_alloc / x86gen_alloc_r, whose sequences inline the bound check (see
+// gc.bur).
 
 // x86gen_oom_die_stub 生成 OOM die stub 本体：全保存现场后经 die 报错退出
 // x86gen_oom_die_stub emits the OOM die stub: save everything, report through die
@@ -282,11 +162,6 @@ fn x86gen_oom_die_stub() {
     push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rsi) + push_r(rdi) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + x86gen_trap_exit("out of memory: x86 heap limit")
 }
 
-// x86gen_commit_stub 生成 PE 提交 stub 本体：按水位循环续提 4MB，commit 失败或
-// 复查 limit 仍越界即 OOM die；成功恢复现场返回
-// x86gen_commit_stub emits the PE commit stub: top up 4MB in a loop by the
-// watermark; a commit failure or a limit re-check still past the cap dies with
-// OOM; success restores the registers and returns
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
 // 空队时先等 waitset（poll）与 timer（nanosleep），两者皆空才扫描死锁
 // x86gen_sched_block emits the scheduler loop: pop ready, restore ctx, ret; exit when the
@@ -296,7 +171,14 @@ fn x86gen_sched_block() {
     // 段序 main_check+pop_head+pop_body+tail_clean+resume+exit0+poll_wait+dl；poll_wait 内
     // 段按依赖序定义（回跳 jmp 引用已定义段），拼装按布局序
     let dl = x86gen_deadlock_seq()
-    let exit0 = xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
+    // --gc-debug：正常退出前跑一次堆走查校验（发射期条件，运行时零开销）
+    // --gc-debug: run one heap-walk verification before the normal exit
+    // (emission-time condition, zero run-time cost without the flag)
+    let exit0 = if gc_debug {
+        x86gen_gc_verify_seq() + xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
+    } else {
+        xor_rr(rdi, rdi) + sys_mov_rax(60) + syscall()
+    }
     let resume = mov_rm(rsp, rax, FB_RSP) + mov_rm(rbp, rax, FB_RBP) + mov_rm(r14, rax, FB_R14) + mov_rm(r15, rax, FB_R15) + ret()
     let tail_clean = mov_ri64(rdx, rt_slot(rt_ready_tail)) + xor_rr(rcx, rcx) + mov_mr(rdx, 0, rcx)
     let tail_done_jne = jne_rel32(str_len(tail_clean))
@@ -466,8 +348,8 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // fake frame：[rsp]=main 入口（jtable[0]），[rsp+8]=done 块；保存的 saved_rsp 含此两槽，
     // resume 后第一次 ret 弹 main 入口，main 返回时 ret 弹 done 块
     let fake_frame = sub_ri32(rsp, 16) + mov_ri64(rax, done_addr) + mov_mr(rsp, 8, rax) + jt_load(rax, 0) + mov_mr(rsp, 0, rax)
-    // fb 建设：r11 = fb（gc_rec 保护 r11），bump r12；status 清零为 READY
-    let fb_build = mov_rr(r11, r12) + add_ri32(r12, FB_SIZE) + gc_rec(r11, mov_ri32(rsi, FB_SIZE)) + x86gen_oom_check() + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx) + lea(rcx, rsp, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx)
+    // fb 建设：r11 = fb（payload 起点，hdr 在 r11-8），bump r12；status 清零为 READY
+    let fb_build = x86gen_alloc(r11, FB_SIZE, GC_DESC_ALL) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_STATUS, rcx) + mov_mr(r11, FB_STACK_LO, rcx) + lea(rcx, rsp, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx)
     // ctx 保存：saved_rsp = fake frame 后（含两槽），rsp 下方的 prologue 由 resume 后函数自身建立
     let ctx_save = mov_rr(rcx, rsp) + mov_mr(r11, FB_RSP, rcx) + mov_rr(rcx, rbp) + mov_mr(r11, FB_RBP, rcx) + mov_rr(rcx, r14) + mov_mr(r11, FB_R14, rcx) + mov_rr(rcx, r15) + mov_mr(r11, FB_R15, rcx) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx)
     let ready_join = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + branch + empty_head + to_set + nonempty + set_tail
@@ -495,17 +377,25 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     } else {
         mov_rr(r11, rsp)
     }
-    // P0 堆预留：Linux 一次性 mmap 1GB（MAP_NORESERVE）；PE 先 MEM_RESERVE 1GB 再按
-    // 4MB 粒度 MEM_COMMIT（guard 子程序按水位续提）。rt_heap_limit 两平台同为预留上限。
-    // P0 heap reserve: Linux mmaps 1GB at once (MAP_NORESERVE); PE MEM_RESERVEs 1GB
-    // first, then MEM_COMMITs in 4MB granularity (the guard stub keeps topping up by
-    // the watermark). rt_heap_limit is the reserve cap on both targets.
+    // P0 堆预留：Linux 一次性 mmap（MAP_NORESERVE）；PE 一次 VirtualAlloc
+    // RESERVE|COMMIT。总长 = BITMAP+RESERVE，两平台一致，rt_heap_limit 为上限。
+    // P0 heap reserve: Linux mmaps in one shot (MAP_NORESERVE); PE VirtualAllocs
+    // RESERVE|COMMIT once. The mapping spans BITMAP+RESERVE on both targets and
+    // rt_heap_limit is the cap.
     let heap_mmap = if target_os == "windows" {
-        mov_ri64(rdi, 0) + mov_ri64(rsi, X86GC_RESERVE) + mov_ri64(rdx, 12288) + mov_ri64(r8, 4) + sys_mov_rax(1005) + syscall()
+        mov_ri64(rdi, 0) + mov_ri64(rsi, X86GC_BITMAP_SIZE + X86GC_RESERVE) + mov_ri64(rdx, 12288) + mov_ri64(r8, 4) + sys_mov_rax(1005) + syscall()
     } else {
-        mov_ri64(rdi, 0) + mov_ri64(rsi, X86GC_RESERVE) + mov_ri64(rdx, 3) + mov_ri64(r10, X86GC_MMAP_FLAGS) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall()
+        mov_ri64(rdi, 0) + mov_ri64(rsi, X86GC_BITMAP_SIZE + X86GC_RESERVE) + mov_ri64(rdx, 3) + mov_ri64(r10, X86GC_MMAP_FLAGS) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall()
     }
-    let heap_limit = mov_ri64(r11, rt_slot(rt_heap_limit)) + lea(rcx, rax, X86GC_RESERVE) + mov_mr(r11, 0, rcx)
+    let heap_limit = mov_ri64(r11, rt_slot(rt_heap_limit)) + lea(rcx, rax, X86GC_BITMAP_SIZE + X86GC_RESERVE) + mov_mr(r11, 0, rcx)
+    // P1：bitmap 垫在堆区之前（rt_start_bitmap = 映射基址），用户堆起点随之
+    // 后移 BITMAP_SIZE；rt_desc_table 由 rt_init（x86gen_image 生成、_start 开头
+    // 执行）以发射期表址写入。
+    // P1: the bitmap pads in front of the heap (rt_start_bitmap = the mapping
+    // base), shifting the user-heap start by BITMAP_SIZE; rt_desc_table is
+    // written by rt_init (generated by x86gen_image, run first thing in _start)
+    // from the emission-time table address.
+    let bitmap_slots = mov_ri64(r11, rt_slot(rt_start_bitmap)) + mov_mr(r11, 0, rax) + mov_ri64(rcx, X86GC_BITMAP_SIZE) + add_rr(rax, rcx) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, rax) + mov_rr(r12, rax)
     // 主纤程栈下探：Windows 只在距 rsp 一页内自动扩展栈，直接写 1MB 下方
     // 会踩未提交的 guard 页；逐页触碰（每页 4096B，共 256 页）强制按序提交，
     // 结束时 r15 = r14 = rsp - 1048576，与直减路径终态一致。
@@ -523,7 +413,7 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     // result strings (~0.85MB per large-output exec); 64MB puts the 60x840KB
     // stress (stress_s4) inside the budget. Anonymous mappings commit on
     // demand; VA is cheap.
-    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + heap_mmap + mov_rr(r12, rax) + heap_limit + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, global_flag_disp(n_globals, (n_globals + 7) / 8 * 8)) + mov_ri64(r11, rt_slot(rt_gc_recs)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_RECS_CAP * 24) + mov_ri64(r11, rt_slot(rt_gray)) + mov_mr(r11, 0, r12) + add_ri32(r12, GC_GRAY_CAP * 8 + 8) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_ri64(r11, rt_slot(rt_gc_threshold)) + mov_ri64(r8, GC_INIT_THRESHOLD) + mov_mr(r11, 0, r8) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
+    lea_rip_rel32(r13, 0 - 8 * nfn - 7) + argv_capture + rt_init + heap_mmap + mov_rr(r12, rax) + heap_limit + bitmap_slots + startup_vec + mov_mr(r12, 0, r11) + add_ri32(r12, 8) + mov_rr(rbx, r12) + mov_ri64(rdi, 1) + lea(rsi, rbx, 8 * n_globals) + sys_mov_rax(228) + syscall() + add_ri32(r12, global_flag_disp(n_globals, (n_globals + 7) / 8 * 8)) + mov_ri64(r11, rt_slot(rt_heap_start)) + mov_mr(r11, 0, r12) + mov_rr(r15, rsp) + mov_rr(r14, rsp) + sub_ri32(r14, 1048576) + probe_body + mov_ri64(r11, rt_slot(rt_stack_base)) + mov_mr(r11, 0, r15) + vs_push_zero() + fake_frame + fb_build + ctx_save + ready_join + regs_set + mov_ri64(rdx, sched_addr) + jmp_r(rdx)
 }
 
 // x86gen_waitset_add_block 生成 waitset 追加子程序（rax=fd 低 32 位、rcx=events 低 16 位、

@@ -23,6 +23,11 @@ pub let rt_gc_cycles = 16
 pub let rt_gc_last_freed = 24
 pub let rt_stack_base = 32
 pub let rt_heap_start = 40
+// P1：rec 表/gray 栈删除后，rt_gc_recs、rt_gray 等槽退役留位（偏移稳定不重排）；
+// rt_gray 槽改挂 exec 排水空闲链头（0 = 空链，镜像零初始化天然成立）。
+// P1: with the rec table and gray stack gone, slots like rt_gc_recs/rt_gray are
+// retired in place (offsets stay stable); the rt_gray slot now parks exec's
+// drain free-list head (0 = empty, which the zero-initialized image provides).
 pub let rt_gc_recs = 48
 pub let rt_gc_record_fn = 56
 pub let rt_gc_collect_fn = 64
@@ -38,11 +43,11 @@ pub let rt_timer_n = 136
 // P0：堆上界与 PE 提交水位（P1 起供分配 stub 使用）
 // P0: the heap limit and the PE commit watermark (consumed by the alloc stub from P1 on)
 pub let rt_heap_limit = 144
-// rt_commit_top 槽位（152）随 P0 简化弃用：PE 与 Linux 统一一次成型映射，
-// 无需提交水位；空槽保留偏移稳定性。
-// slot 152 was rt_commit_top, retired by the P0 simplification: PE and Linux
-// now map in one shot, so no commit watermark is needed; the empty slot keeps
-// the offset layout stable.
+// P1：descriptor 表与 start bitmap 的运行时基址槽（152 复用原 rt_commit_top 位）。
+// P1: runtime base slots for the descriptor table and the start bitmap (152
+// reuses the retired rt_commit_top position).
+pub let rt_desc_table = 152
+pub let rt_start_bitmap = 160
 // waitset 每项 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]；poll(2) 只认连续 8B 记录，
 // 故 poll 前把各条目前 8B 拷入 POLLFD_BASE 暂存区，返回后把 revents 回写条目 +6
 // waitset entries are 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]; poll(2) consumes
@@ -52,19 +57,20 @@ pub let WAITSET_CAP = 64
 pub let TIMER_CAP = 64
 // timer 每项 16B = [deadline_ns:8][fiber:8]
 // timer entries are 16B = [deadline_ns:8][fiber:8]
-pub let WAITSET_BASE = 160
+pub let WAITSET_BASE = 176
 // POLLFD_BASE/TIMER_BASE/RUNTIME_SIZE 是包级字面量（编译器限制：包级 let 只允许字面量算术），
-// 依赖 WAITSET_CAP/TIMER_CAP=64：TIMER_BASE = 160 + 64*16 = 1184、
-// POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2208；
-// RUNTIME_SIZE = 128 + 16 + 16 + 64*16 + 64*16 + 64*8 = 2720
+// 依赖 WAITSET_CAP/TIMER_CAP=64：TIMER_BASE = 176 + 64*16 = 1200、
+// POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2224；
+// RUNTIME_SIZE = 128 + 16 + 32 + 64*16 + 64*16 + 64*8 = 2736
 // POLLFD_BASE/TIMER_BASE/RUNTIME_SIZE are package-level literals (the compiler restricts
 // package lets to literal arithmetic); they depend on WAITSET_CAP/TIMER_CAP=64:
 // TIMER_BASE = 144 + 64*16 = 1168, POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2192;
-pub let TIMER_BASE = 1184
-pub let POLLFD_BASE = 2208
-pub let RUNTIME_SIZE = 2720
-// gc_recs 每项 24B：[ptr][size][mark]；gray 区首 8B 为计数
-// gc_recs entries are 24B: [ptr][size][mark]; the gray area's first 8B holds its count
+pub let TIMER_BASE = 1200
+pub let POLLFD_BASE = 2224
+pub let RUNTIME_SIZE = 2736
+// P1：rec 表与 gray 栈的容量常量（rec 项 24B）随 rec 表删除退役，仅留字面量占位。
+// P1: the rec table's/gray stack's capacity constants (24B per rec entry) are
+// retired along with the rec table; kept as literals only.
 pub let GC_RECS_CAP = 65536
 pub let GC_GRAY_CAP = 65536
 pub let GC_INIT_THRESHOLD = 256
@@ -72,6 +78,17 @@ pub let GC_INIT_THRESHOLD = 256
 // P0: the x86 heap reserve (task brief §3.6) and the PE commit granularity; Linux's mmap
 // flags add MAP_NORESERVE
 pub let X86GC_RESERVE = 1073741824
+// P1：start bitmap 每 8B granule 一**字节**（bit0 = 块起点），垫在堆区之前。
+// 对任务书「每 8B 一位」的空间换指令偏离：1B/granule 让站点置位只发一条
+// or byte [base+idx]（1-bit 要拆位多两条且挤第三个寄存器），128MB 的
+// NORESERVE 映射不值钱，P3 sweep 还能按字节快跳零段。
+// P1: the start bitmap keeps one BYTE per 8-byte granule (bit0 = block start)
+// and pads in front of the heap. Space-for-instructions deviation from the
+// brief's one-bit-per-8B: 1B/granule turns the per-site set into a single
+// "or byte [base+idx]" (1-bit needs two extra split instructions and a third
+// register), the 128MB NORESERVE mapping is cheap, and P3's sweep can skip
+// zero runs byte-wise.
+pub let X86GC_BITMAP_SIZE = 134217728
 pub let X86GC_MMAP_FLAGS = 16418
 
 // fiber struct 堆布局（80B）/ fiber struct heap layout (80 bytes)

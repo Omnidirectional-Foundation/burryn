@@ -182,6 +182,15 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
         rf = rf + 1
     }
 
+    // P1：desc 表紧随常量区尾部（当前单条目 ALL_MAYBE 占位）。挂进 const_data
+    // 尾部，code_origin()+const_data_len 的全部下游地址公式自动吸收这 8 字节，
+    // 表址 = 常量区尾 - GC_DESC_TABLE_LEN。
+    // P1: the desc table rides right after the constant area's tail (a single
+    // ALL_MAYBE placeholder entry for now). Appending it to const_data lets
+    // every downstream code_origin()+const_data_len address formula absorb the
+    // 8 bytes automatically; the table address = consts' end - GC_DESC_TABLE_LEN.
+    const_data = const_data + x86gen_desc_table()
+
     let mut globals_map = map()
     let mut n_globals = 0
     let mut gf = 0
@@ -501,14 +510,14 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     let opt_res_enc = ctx.opt_res_enc
     let fn_variants = ctx.fn_variants
     let const_data_len = str_len(const_data)
-    let gc_rec_bytes = x86gen_gc_record()
-    let gc_col = x86gen_gc_collect(n_globals, code_origin() + const_data_len)
-    let gc_mark = x86gen_mark_addr()
-    // P0：OOM die 与 PE 提交两个 stub；地址先于 funcs 拼接定值，站点序列经
-    // x86gen_oom_check 间接调用（同 die_addr_g 的发射期全局模式）
-    // P0: the OOM die and PE commit stubs; addresses are fixed before funcs is
-    // assembled and site sequences reach them indirectly through x86gen_oom_check
-    // (the same emission-time-global pattern as die_addr_g)
+    // P0：OOM die stub；地址先于 funcs 拼接定值，站点序列经 x86gen_oom_check /
+    // x86gen_alloc 间接调用（同 die_addr_g 的发射期全局模式）。P1 起 funcs 头部
+    // 只剩 oom_die 一个内部子程序（rec 表/collect/mark 随 P1 批 2 删除）。
+    // P0: the OOM die stub; its address is fixed before funcs is assembled and
+    // site sequences reach it indirectly through x86gen_oom_check / x86gen_alloc
+    // (the same emission-time-global pattern as die_addr_g). From P1 on, oom_die
+    // is the only internal subroutine at funcs' head (the rec table, collect and
+    // mark went with batch 2 of P1).
     // stub 先以当前 die_addr_g 量长（mov imm64 定长，长度与地址值无关），
     // 定址后（die_addr_g 定值处）再重建字节——两遍各自持有本遍地址，
     // PIC 改写按探针位移成立
@@ -517,7 +526,7 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // after die_addr_g is fixed — each pass then carries its own address and the
     // PIC rewrite holds by the probe shift
     let oom_die_len = str_len(x86gen_oom_die_stub())
-    oom_die_g = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark)
+    oom_die_g = code_origin() + const_data_len
     // 调度器块（sched/yield/done）与 channel 子程序（schedule/wake_waiters/push_queue）在
     // funcs 头部、GC 子程序之后；地址编译期确定，供 _start / prologue 插桩 / spawn 的
     // fake frame / channel opcode 引用
@@ -526,7 +535,7 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // with 0 first, then rebuild once the address is known
     die_addr_g = 0
     let sched_bytes = x86gen_sched_block()
-    let sched_addr = code_origin() + const_data_len + str_len(gc_rec_bytes) + str_len(gc_col) + str_len(gc_mark) + oom_die_len
+    let sched_addr = code_origin() + const_data_len + oom_die_len
     let yield_bytes = x86gen_yield_block(sched_addr)
     let yield_addr = sched_addr + str_len(sched_bytes)
     let done_bytes = x86gen_fiber_done_block(sched_addr)
@@ -560,7 +569,7 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // subroutines follow die (used by formatting, see fmt.bur)
     sb_set_addrs(die_addr + die_len)
     errtext_g = die_addr + die_len + str_len(la_link(x86gen_sb_items()))
-    let mut funcs_bytes = gc_rec_bytes + gc_col + gc_mark + oom_die_bytes + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items())
+    let mut funcs_bytes = oom_die_bytes + x86gen_sched_block() + yield_bytes + done_bytes + chan_sched_bytes + chan_wake_bytes + chan_push_sendq_bytes + chan_push_recvq_bytes + chan_push_waiters_bytes + chan_remove_waiter_bytes + x86gen_waitset_add_block() + x86gen_timer_add_block() + x86gen_die_block(0, 0, 0, 0) + la_link(x86gen_sb_items()) + la_link(x86gen_errtext_items())
     // fn 名表：每函数一项 8B 偏移（自表基址起算），指向 [len:8][bytes] 名字串；
     // 空名记为 anonymous（对齐 C 的 bur_format）。放在用户代码之前，其绝对地址在此
     // 处即已最终确定（与 sb_set_addrs 同基准），fmt 子程序经 mov_ri64 取基址。
@@ -594,25 +603,24 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     }
     fn_names_g = code_origin() + const_data_len + str_len(funcs_bytes)
     funcs_bytes = funcs_bytes + fn_names_bytes
-    // 内部子程序 unwind 覆盖：gc_record（9-push）、mark_addr（7-push）与其余六个纯
-    // call/ret、零序言的子程序（gc_collect、chan 系四个、waitset_add、timer_add）——
-    // 序言形态逐个核对自 runtime.bur 源码（push_r 出现次数与顺序）。调度器三块
+    // 内部子程序 unwind 覆盖：oom_die（9-push）与其余八个纯 call/ret、零序言的
+    // 子程序（chan 系四个、waitset_add、timer_add）——序言形态逐个核对自
+    // runtime.bur 源码（push_r 出现次数与顺序）。调度器三块
     // （sched/yield/done）是纤程切换机制本身，边界与 PE/Mach-O 一致不覆盖（见
     // architecture.md §5.19/GOALS.md）。rt_unwind_* 三个并行数组供三个后端的
     // unwind-info 构建复用，push_regs 为空数组表示零序言。
-    // Internal-subroutine unwind coverage: gc_record (9-push), mark_addr
-    // (7-push), and six purely call/ret, zero-prologue subroutines
-    // (gc_collect, the four chan_* ones, waitset_add, timer_add) — prologue
-    // shapes were checked one by one against runtime.bur's source (push_r
-    // call count and order). The three scheduler blocks (sched/yield/done)
-    // are the fiber-switch mechanism itself, left uncovered to match the
-    // PE/Mach-O boundary (see architecture.md §5.19 / GOALS.md). The three
-    // rt_unwind_* parallel arrays feed all three backends' unwind-info
+    // Internal-subroutine unwind coverage: oom_die (9-push) and eight purely
+    // call/ret, zero-prologue subroutines (the four chan_* ones, waitset_add,
+    // timer_add) — prologue shapes were checked one by one against runtime.bur's
+    // source (push_r call count and order). The three scheduler blocks
+    // (sched/yield/done) are the fiber-switch mechanism itself, left uncovered
+    // to match the PE/Mach-O boundary (see architecture.md §5.19 / GOALS.md).
+    // The three rt_unwind_* parallel arrays feed all three backends' unwind-info
     // builders; an empty push_regs array means a zero prologue.
     let internal_base = code_origin() + const_data_len
-    let rt_unwind_offsets = [0, str_len(gc_rec_bytes), str_len(gc_rec_bytes) + str_len(gc_col), chan_sched_addr - internal_base, chan_wake_addr - internal_base, chan_push_sendq_addr - internal_base, chan_push_recvq_addr - internal_base, chan_push_waiters_addr - internal_base, chan_remove_waiter_addr - internal_base, waitset_add_addr - internal_base, timer_add_addr - internal_base]
-    let rt_unwind_lens = [str_len(gc_rec_bytes), str_len(gc_col), str_len(gc_mark), str_len(chan_sched_bytes), str_len(chan_wake_bytes), str_len(chan_push_sendq_bytes), str_len(chan_push_recvq_bytes), str_len(chan_push_waiters_bytes), str_len(chan_remove_waiter_bytes), str_len(waitset_add_bytes), str_len(timer_add_bytes)]
-    let rt_unwind_pushes = [[rdx, rdi, rsi, rax, rcx, r8, r9, r10, r11], [], [rax, rcx, rdx, rdi, r8, r9, r10], [], [], [], [], [], [], [], []]
+    let rt_unwind_offsets = [0, chan_sched_addr - internal_base, chan_wake_addr - internal_base, chan_push_sendq_addr - internal_base, chan_push_recvq_addr - internal_base, chan_push_waiters_addr - internal_base, chan_remove_waiter_addr - internal_base, waitset_add_addr - internal_base, timer_add_addr - internal_base]
+    let rt_unwind_lens = [str_len(oom_die_bytes), str_len(chan_sched_bytes), str_len(chan_wake_bytes), str_len(chan_push_sendq_bytes), str_len(chan_push_recvq_bytes), str_len(chan_push_waiters_bytes), str_len(chan_remove_waiter_bytes), str_len(waitset_add_bytes), str_len(timer_add_bytes)]
+    let rt_unwind_pushes = [[rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11], [], [], [], [], [], [], [], []]
     let mut func_offsets = []
     let mut variant_offsets = []
     // pdata_offsets/pdata_lens：每个变体的 (funcs_bytes 内偏移, 字节长度)，按发射顺序
@@ -724,22 +732,12 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     }
     let tr_bytes = trace_table_bytes(tr_ents, f_name, f_file, ls_files, ls_names, gnames)
     let fn_base = code_origin() + const_data_len
-    // 布局：常量区 + 函数体（GC 子程序在头部）+ 跳转表 + _start 构成代码域；
+    // 布局：常量区 + 函数体（内部子程序在头部）+ 跳转表 + _start 构成代码域；
     // runtime 区独立成数据段，不再挤进代码流
-    // Layout: constants + function bodies (GC subroutines at the head) + jump
-    // table + _start form the code domain; the runtime area becomes its own
+    // Layout: constants + function bodies (internal subroutines at the head) +
+    // jump table + _start form the code domain; the runtime area becomes its own
     // data segment instead of sitting in the code stream
-    let gc_rec_addr = code_origin() + const_data_len
-    let gc_col_addr = gc_rec_addr + str_len(gc_rec_bytes)
-    let gc_mark_addr = gc_col_addr + str_len(gc_col)
-    // runtime 槽初始值全零：waitset/timer 计数槽（16B）与数组零填充，使 runtime_bytes
-    // 恰好 RUNTIME_SIZE 长；三个 GC 子程序槽与分派器槽不在镜像里存绝对地址，由
-    // _start 开头按运行期地址写入（rt_init），其余由 _start 后续填充
-    // Runtime slots start zeroed: the waitset/timer count slots (16B) and arrays
-    // are zero-filled so runtime_bytes is exactly RUNTIME_SIZE long; the three GC
-    // subroutine slots and the dispatcher slot keep no absolute address in the
-    // image — _start stores their run-time addresses first thing (rt_init), and
-    // fills the rest later
+    let fn_base = code_origin() + const_data_len
     let mut rt_zero = ""
     let mut rzi = 0
     while rzi < 16 + WAITSET_CAP * 16 + TIMER_CAP * 16 + WAITSET_CAP * 8 {
@@ -748,7 +746,12 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     }
     let runtime_bytes = e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + e8(0) + rt_zero
     let start_off = const_data_len + str_len(funcs_bytes) + str_len(jt_bytes)
-    let rt_init = mov_ri64(rax, gc_rec_addr) + mov_ri64(r11, rt_slot(rt_gc_record_fn)) + mov_mr(r11, 0, rax) + mov_ri64(rax, gc_col_addr) + mov_ri64(r11, rt_slot(rt_gc_collect_fn)) + mov_mr(r11, 0, rax) + mov_ri64(rax, gc_mark_addr) + mov_ri64(r11, rt_slot(rt_mark_addr_fn)) + mov_mr(r11, 0, rax)
+    // P1：rt_init 只写 desc 表槽（发射期表址 = 常量区尾 - GC_DESC_TABLE_LEN）；
+    // rec/collect/mark 三个 GC 子程序槽随 P1 批 2 删除。
+    // P1: rt_init stores only the desc-table slot (emission-time table address =
+    // consts' end - GC_DESC_TABLE_LEN); the three GC subroutine slots went with
+    // batch 2 of P1.
+    let rt_init = mov_ri64(rax, code_origin() + const_data_len - GC_DESC_TABLE_LEN) + mov_ri64(r11, rt_slot(rt_desc_table)) + mov_mr(r11, 0, rax)
     // 分派器（windows/darwin）紧跟 _start；_start 长度与写入值无关，先以 0 量长再定址
     // The dispatcher (windows/darwin) follows _start; _start's length does not
     // depend on the stored value, so measure it with 0 first, then address it
@@ -845,27 +848,26 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
             pdata_pad = pdata_pad + byte_chr(0)
             ppi = ppi + 1
         }
-        // 内部子程序 unwind 覆盖：三份 UNWIND_INFO（零序言、gc_record 的 9-push、
-        // mark_addr 的 7-push）跟在用户函数共享的那份后面；.pdata 数组把内部子程序
-        // 的 11 项放在用户函数前面（内部子程序地址恒低于全部用户函数，符合
-        // RtlLookupFunctionEntry 要求的 BeginAddress 升序）。索引 0/2 对应
-        // rt_unwind_pushes 里 gc_record/mark_addr 的真实寄存器列表，其余 9 项零序言。
-        // Internal-subroutine unwind coverage: three UNWIND_INFO blobs (zero
-        // prologue, gc_record's 9-push, mark_addr's 7-push) follow the one
-        // shared by user functions; the .pdata array places the internal
-        // subroutines' 11 entries before the user functions (internal
-        // subroutines always sit at lower addresses than every user function,
-        // satisfying RtlLookupFunctionEntry's ascending-BeginAddress
-        // requirement). Indices 0/2 use rt_unwind_pushes' real register lists
-        // for gc_record/mark_addr; the other 9 entries are zero-prologue.
+        // 内部子程序 unwind 覆盖：两份 UNWIND_INFO（零序言、oom_die 的 9-push）跟在
+        // 用户函数共享的那份后面；.pdata 数组把内部子程序的 9 项放在用户函数前面
+        //（内部子程序地址恒低于全部用户函数，符合 RtlLookupFunctionEntry 要求的
+        // BeginAddress 升序）。索引 0 对应 rt_unwind_pushes 里 oom_die 的真实寄存器
+        // 列表，其余 8 项零序言。
+        // Internal-subroutine unwind coverage: two UNWIND_INFO blobs (zero
+        // prologue, oom_die's 9-push) follow the one shared by user functions;
+        // the .pdata array places the internal subroutines' 9 entries before
+        // the user functions (internal subroutines always sit at lower
+        // addresses than every user function, satisfying
+        // RtlLookupFunctionEntry's ascending-BeginAddress requirement). Index 0
+        // uses rt_unwind_pushes' real register list for oom_die; the other 8
+        // entries are zero-prologue.
         let unwind_off = pdata_off + 12 * (len(pdata_offsets) + len(rt_unwind_offsets))
         let zero_unwind_off = unwind_off + str_len(pe_unwind_info())
         let push9_unwind_off = zero_unwind_off + str_len(pe_unwind_info_zero())
-        let push7_unwind_off = push9_unwind_off + str_len(pe_unwind_info_pushes(rt_unwind_pushes[0]))
-        let internal_unwind_offs = [push9_unwind_off, zero_unwind_off, push7_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off]
+        let internal_unwind_offs = [push9_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off, zero_unwind_off]
         let internal_pdata = pe_build_pdata_multi(rt_unwind_offsets, rt_unwind_lens, code_base_off, internal_unwind_offs)
         let pdata_bytes = internal_pdata + pe_build_pdata(pdata_offsets, pdata_lens, code_base_off, unwind_off)
-        let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0]) + pe_unwind_info_pushes(rt_unwind_pushes[2])
+        let unwind_blobs = pe_unwind_info() + pe_unwind_info_zero() + pe_unwind_info_pushes(rt_unwind_pushes[0])
         let pe_tail = jt_bytes + start_bytes + dispatcher + pdata_pad + pdata_bytes + unwind_blobs
         emit_pe(pic_text(const_data + die_splice(funcs_bytes, die_off, die_len, fn_base + str_len(funcs_bytes) + str_len(pe_tail), fn_base, user_lo, done_addr) + pe_tail + tr_bytes, img_base()), start_off, idata_rva, str_len(imports), pdata_off, str_len(pdata_bytes), pic_data(runtime_with_fd + imports))
     } else if target_os == "darwin" {
