@@ -228,11 +228,11 @@ pub fn pe_import_dlls() {
 }
 
 pub fn pe_import_counts() {
-    [24, 14, 1]
+    [25, 14, 1]
 }
 
 pub fn pe_import_names() {
-    ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "GetCommandLineW", "WideCharToMultiByte", "CreatePipe", "SetHandleInformation", "CreateProcessA", "WaitForSingleObject", "GetExitCodeProcess", "PeekNamedPipe", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError", "CommandLineToArgvW"]
+    ["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc", "VirtualFree", "QueryPerformanceCounter", "QueryPerformanceFrequency", "Sleep", "VirtualProtect", "CloseHandle", "CreateFileA", "ReadFile", "GetFileAttributesA", "GetFileSizeEx", "FindFirstFileA", "FindNextFileA", "FindClose", "GetCommandLineW", "WideCharToMultiByte", "CreatePipe", "SetHandleInformation", "CreateProcessA", "WaitForSingleObject", "GetExitCodeProcess", "PeekNamedPipe", "WSAStartup", "socket", "bind", "listen", "accept", "connect", "setsockopt", "getsockopt", "ioctlsocket", "closesocket", "recv", "send", "WSAPoll", "WSAGetLastError", "CommandLineToArgvW"]
 }
 
 // pe_iat 按函数名取 IAT 槽绝对地址（iat 与 pe_import_names 平行）
@@ -559,6 +559,14 @@ pub fn pe_build_dispatcher(iat) {
     // RESERVE|COMMIT arm cannot express stepped committing)
     let valloc_case = mov_rr(r9, r8) + mov_rr(r8, rdx) + mov_rr(rcx, rdi) + mov_rr(rdx, rsi) + mov_ri64(r10, pe_iat(iat, "VirtualAlloc")) + e1(65) + e1(255) + e1(18)
 
+    // 11 munmap(addr=rdi, len=rsi)：VirtualFree(addr, 0, MEM_RELEASE=0x8000)——
+    // dwSize 必须 0；返 0 = 失败（当前无失败路径，调用方不查）。P4 批 4 done
+    // fiber 的栈 mmap 摘除专用。
+    // 11 munmap(addr=rdi, len=rsi): VirtualFree(addr, 0, MEM_RELEASE=0x8000) —
+    // dwSize must be 0; returns 0 on failure (no failure path today; callers
+    // don't check). Dedicated to the P4 batch-4 done-fiber stack-mmap reaping.
+    let munmap_case = mov_rr(rcx, rdi) + xor_rr(rdx, rdx) + mov_ri64(r8, 32768) + mov_ri64(r10, pe_iat(iat, "VirtualFree")) + e1(65) + e1(255) + e1(18)
+
     // socket(domain=rdi, type=rsi, proto=rdx)：WSAStartup 懒初始化一次
     // （wsa_once 置位，失败留待 socket 以 WSANOTINITIALISED 报错），再调 socket；
     // 返 SOCKET 原值（INVALID_SOCKET=-1 恰落入既有 jl 检查），由 native 登记进表。
@@ -856,7 +864,7 @@ pub fn pe_build_dispatcher(iat) {
     let wait_store = mov_mr(rsi, 0, rax)
     let wait4_case = mov_rr(rcx, rdi) + mov_ri32(rdx, 4294967295) + pe_call(iat, "WaitForSingleObject") + xor_rr(rax, rax) + mov_mr(rsp, 48, rax) + mov_rr(rcx, rdi) + lea(rdx, rsp, 48) + pe_call(iat, "GetExitCodeProcess") + mov_rr(rcx, rdi) + pe_call(iat, "CloseHandle") + mov_rm(rax, rsp, 48) + mov_ri32(rcx, 8) + shl_rcl(rax) + test_rr(rsi, rsi) + je_rel32(str_len(wait_store)) + wait_store + mov_rr(rax, rdi)
     let spawn_case = pe_spawn_case(iat)
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 3, 2, 0, 4, 5, 1000, 1001, 1002, 1003, 41, 49, 50, 42, 43, 54, 55, 72, 35, 61, 1004, 1005], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, argv_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case, nanosleep_case, wait4_case, spawn_case, valloc_case], epilogue)
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 11, 3, 2, 0, 4, 5, 1000, 1001, 1002, 1003, 41, 49, 50, 42, 43, 54, 55, 72, 35, 61, 1004, 1005], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, munmap_case, close_case, open_case, read_case, stat_case, fstat_case, findfirst_case, findnext_case, findclose_case, argv_case, socket_case, bind_case, listen_case, connect_case, accept_case, setsockopt_case, getsockopt_case, fcntl_case, nanosleep_case, wait4_case, spawn_case, valloc_case], epilogue)
 }
 
 // pe_emit_headers 生成 DOS 头 + COFF + PE32+ 可选头（240B 含 16 个数据目录）+ 三节表

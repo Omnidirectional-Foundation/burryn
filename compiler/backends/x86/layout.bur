@@ -70,6 +70,17 @@ pub let rt_free16 = 2760
 pub let rt_free32 = 2768
 pub let rt_free64 = 2776
 pub let rt_free_big = 2784
+// P4：done fiber 的栈 mmap 基址 LIFO（0 = 空，零镜像天然空链）。done 块把
+// [fb+FB_STACK_LO]-4096（spawn mmap 基址）压链：链 next 写进将死栈自己的
+// FB_STACK_LO 槽（rsp 已回顶，1MiB 之下的弃页，随意写）；摘除站点（op_spawn
+// 开头）弹链逐个 munmap/VirtualFree——不能在调度器里摘：它此刻还跑在将死栈上。
+// P4: a LIFO of done fibers' stack-mmap bases (0 = empty; the zero image is a
+// natural empty chain). The done block pushes [fb+FB_STACK_LO]-4096 (the spawn
+// mmap base): the chain next rides in the dying stack's own FB_STACK_LO slot
+// (rsp is back at the top, the abandoned page 1MiB below is free real estate).
+// The reap site (top of op_spawn) pops and munmaps/VirtualFrees one by one —
+// never reap in the scheduler: it is still running on the dying stack.
+pub let rt_reap_head = 2792
 // waitset 每项 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]；poll(2) 只认连续 8B 记录，
 // 故 poll 前把各条目前 8B 拷入 POLLFD_BASE 暂存区，返回后把 revents 回写条目 +6
 // waitset entries are 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]; poll(2) consumes
@@ -94,7 +105,9 @@ pub let POLLFD_BASE = 2224
 // P3: RUNTIME_SIZE 2760 -> 2792, the tail becomes the four size-class heads
 // (above); the thunk slot and the fd/WSA areas shift along symbolically,
 // nothing hardcodes them.
-pub let RUNTIME_SIZE = 2792
+// P4：2792 → 2800，尾部加 rt_reap_head（见上）。
+// P4: 2792 -> 2800, the tail gains rt_reap_head (above).
+pub let RUNTIME_SIZE = 2800
 // P3：阈值回收的步进——collect 尾把 rt_gc_threshold 抬到 r12 + GC_THRESH_SLACK，
 // _start 以同值初始化（r12 起点太小会一开场就连环回收）。
 // P3: the threshold-collection step — the collect tail raises rt_gc_threshold

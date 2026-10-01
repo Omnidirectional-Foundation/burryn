@@ -2099,7 +2099,26 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 seed_i = seed_i + 1
             }
             seed_code = seed_code + mov_mi8(rcx, 0, GC_SHADOW_PTR)
-            w(mmap + guard + copy_args + seed_code + fake_frame + fb_build + enqueue + lea(r15, r15, 0 - 8 * (n + 2)) + shadow_bump(0 - (n + 2)))
+            // P4：先排空 done 栈摘除链——done 块把每个已亡 fiber 的栈 mmap 基址压链
+            // （next 藏在将死栈自己的 FB_STACK_LO 槽，rsp 已回顶的弃页），此处逐个
+            // munmap（PE 走派发臂 11 → VirtualFree MEM_RELEASE）。绝不能在调度器里
+            // 摘——它此刻正跑在将死栈上；spawner 自己的栈也绝不在链上（活 fiber 不
+            // 会 done）。syscall 毁 rcx/r11/rax，链游标停 r10（槽址），next 先回写
+            // 槽再 munmap，循环从槽重读。
+            // P4: drain the done-stack reap chain first — the done block chained
+            // every finished fiber's stack-mmap base (the next pointer rides in
+            // the dying stack's own FB_STACK_LO slot, an abandoned page with rsp
+            // back at the top); munmap them one by one here (PE goes through
+            // dispatch arm 11 → VirtualFree MEM_RELEASE). Never reap in the
+            // scheduler — it is still running on the dying stack; the spawner's
+            // own stack is never on the chain either (a live fiber cannot be
+            // done). The syscall clobbers rcx/r11/rax, so the cursor stays in
+            // r10 (the slot address) and the next pointer is written back to the
+            // slot before the munmap, with the loop re-reading from the slot.
+            let reap_body = mov_rm(r11, rax, 4096) + mov_mr(r10, 0, r11) + mov_rr(rdi, rax) + mov_ri64(rsi, FIBER_STACK_SIZE + 4096 + X86GC_SHADOW_SIZE) + xor_rr(rdx, rdx) + sys_mov_rax(11) + syscall()
+            let reap_head = mov_ri64(r10, rt_slot(rt_reap_head)) + mov_rm(rax, r10, 0) + test_rr(rax, rax) + je_rel32(str_len(reap_body) + 5)
+            let reap = reap_head + reap_body + jmp_rel32(0 - (str_len(reap_head) + str_len(reap_body) + 5))
+            w(reap + mmap + guard + copy_args + seed_code + fake_frame + fb_build + enqueue + lea(r15, r15, 0 - 8 * (n + 2)) + shadow_bump(0 - (n + 2)))
             // 局部实参反查：被调参数 chan:X 回流升级局部槽 chan 类型（与 psim 同步，
             // 发射侧 pos_types 独立，需在 GET_LOCAL 前回填）
             // local arg back-lookup: a callee param chan:X promotes the local slot's

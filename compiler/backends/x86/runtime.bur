@@ -137,6 +137,17 @@ fn x86gen_fiber_done_block(sched_addr) {
     push(it, la_b(mark_done))
     push(it, la_b(mov_ri64(r10, rt_slot(rt_main_fiber)) + mov_rm(r10, r10, 0) + cmp_rr(rax, r10)))
     push(it, la_jcc(CC_E, "fd_sched"))
+    // P4：栈 mmap 基址入摘除链（main 除外——主栈非 mmap，误摘即灾难）。链 next
+    // 写进将死栈自己的 FB_STACK_LO 槽（rsp 已回顶，栈底弃页随便写），链头 = 基址
+    // （[FB_STACK_LO]-4096）。摘除点在 op_spawn 开头——调度器不能摘：它此刻正跑
+    // 在将死栈上。
+    // P4: park the stack mmap base on the reap chain (main excluded — the main
+    // stack is not an mmap, reaping it would be catastrophic). The chain next
+    // rides in the dying stack's own FB_STACK_LO slot (rsp back at the top, the
+    // abandoned bottom page is free real estate); the head becomes the mmap
+    // base ([FB_STACK_LO]-4096). The reap point is the top of op_spawn — never
+    // reap in the scheduler: it is still running on the dying stack.
+    push(it, la_b(mov_rm(rcx, rax, FB_STACK_LO) + sub_ri32(rcx, 4096) + mov_ri64(rdx, rt_slot(rt_reap_head)) + mov_rm(r11, rdx, 0) + mov_mr(rcx, 4096, r11) + mov_mr(rdx, 0, rcx)))
     push(it, la_b(mov_ri64(rcx, rt_slot(rt_fiber_list)) + mov_rm(rdx, rcx, 0)))
     push(it, la_l("fd_walk"))
     push(it, la_b(test_rr(rdx, rdx)))
