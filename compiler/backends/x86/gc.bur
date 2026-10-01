@@ -40,8 +40,19 @@ pub let GC_KIND_ALL_PTR = 1
 pub let GC_KIND_ALL_MAYBE = 2
 pub let GC_KIND_BITMAP = 3
 pub let GC_KIND_PREFIX = 4
-// P1 全站占位 desc_id = 0 = ALL_MAYBE 条目（表内字节偏移，注册表首条目）。
-// P1's placeholder desc_id = 0 = the ALL_MAYBE entry (the registry's first).
+// P1 的全站占位 desc_id = 0。注意：它实际是 **NOSCAN**——desc_reset 的首个注册
+// 条目是 noscan（P1 注释曾许诺 ALL_MAYBE，从未兑现，值栈影子掩盖到 P3）。GC_DESC_ALL
+// 因此只准用于**确保无指针载荷**的对象（str/float box/格式化缓冲等）；凡可能持指针
+// 的容器必须挂显式 desc（bitmap_desc 逐形 / desc_allptr / desc_list 家族），P3 批 3
+// 修过 record/enum 实例/提升 cell/map keys/vals 数组/chan 缓冲五处挂错。
+// P1's site-wide placeholder desc_id = 0. Note: it is really **NOSCAN** —
+// desc_reset's first registered entry is noscan (the P1 comment promised
+// ALL_MAYBE and never delivered; value-stack shadows masked that until P3).
+// GC_DESC_ALL is therefore only for payloads guaranteed pointer-free (str/float
+// boxes/format buffers); any container that may hold pointers needs an explicit
+// desc (bitmap_desc per shape / desc_allptr / the desc_list family). P3 batch 3
+// fixed five mis-users: record/enum instances, lift cells, map keys/vals arrays,
+// chan buffers.
 pub let GC_DESC_ALL = 0
 // desc 表 = 静态/按需条目 + GC_DESC_POOL 零垫，总长发射期定值（GC_DESC_TABLE_LEN，
 // desc_reset 定值）。定长的原因：表挂 const_data，而条目在装配遍中才注册齐——
@@ -174,6 +185,50 @@ pub fn desc_list(k) {
     } else {
         desc_list_maybe
     }
+}
+
+// bitmap_desc 按形态注册 BITMAP desc（key 去重，两遍发射同序注册 pic_data 必等）：
+// 前 skip 词标量不扫，其后每词静态类型折出非 SCALAR 即置位（未知词落 PTR 位，
+// 宁多勿漏）。P3 批 3 修 record/enum 实例挂 GC_DESC_ALL（=noscan）载荷从未被扫的洞。
+// bitmap_desc registers a per-shape BITMAP desc (deduped by key; both emission
+// passes register in the same order so pic_data matches byte for byte): the
+// leading `skip` words are scalars and stay unscanned, every later word sets its
+// bit unless its static type folds to SCALAR (unknown words land PTR — prefer
+// over-scan). P3 batch 2 fixes record/enum instances hanging off GC_DESC_ALL
+// (= noscan) whose payloads were never scanned.
+pub fn bitmap_desc(key, skip, types) {
+    let words = skip + len(types)
+    let mut bits = []
+    let mut bz = 0
+    while bz < (words + 7) / 8 {
+        push(bits, 0)
+        bz = bz + 1
+    }
+    let mut bi = 0
+    let mut byte_i = 0
+    let mut mask = 1
+    while bi < words {
+        if bi >= skip {
+            if gc_kind_of(types[bi - skip]) != GC_SHADOW_SCALAR {
+                bits[byte_i] = bits[byte_i] + mask
+            }
+        }
+        mask = mask + mask
+        if mask == 256 {
+            mask = 1
+            byte_i = byte_i + 1
+        }
+        bi = bi + 1
+    }
+    let mut entry = []
+    push(entry, 3)
+    let mut ez = 0
+    while ez < len(bits) {
+        push(entry, bits[ez])
+        ez = ez + 1
+    }
+    let rid = desc_register(key, entry)
+    rid
 }
 
 // gc_desc_image 拼当前注册态的表镜像：条目字节 + 零垫到 GC_DESC_TABLE_LEN。

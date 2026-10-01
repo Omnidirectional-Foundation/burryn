@@ -486,7 +486,10 @@ fn x86gen_prologue(arity, _locals, yield_addr, lifted) {
             // lift 覆写参数槽为 cell 指针：槽 [r14+8*pslot] 的影子深度是 arity+1-pslot
             // the lift overwrites the param slot with a cell pointer: slot
             // [r14+8*pslot] sits at shadow depth arity+1-pslot
-            lift_code = lift_code + x86gen_alloc(r11, 8, GC_DESC_ALL) + mov_rm(rax, r14, 8 * pslot) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * pslot, r11) + shadow_set(arity + 1 - pslot, GC_SHADOW_PTR)
+            // P3 批 3：cell 挂 allptr（见 emit GET 侧注释）——参数值可为任意指针。
+            // P3 batch 3: the cell hangs off allptr (see emit's GET-side note) —
+            // a param value can be any pointer.
+            lift_code = lift_code + x86gen_alloc(r11, 8, desc_allptr) + mov_rm(rax, r14, 8 * pslot) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * pslot, r11) + shadow_set(arity + 1 - pslot, GC_SHADOW_PTR)
         }
         pslot = pslot + 1
     }
@@ -731,8 +734,16 @@ fn x86gen_put_map_native(key_is_str) {
     let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
     let post_head = mov_rm(r10, rax, 0) + mov_rm(r8, rax, 16) + mov_rm(r9, rax, 24) + xor_rr(r11, r11)
     let g_min = add_ri32(r10, 4)
-    let g_keys = mov_rr(r8, r10) + add_rr(r8, r8) + add_rr(r8, r8) + add_rr(r8, r8) + x86gen_alloc_r(r11, r8, GC_DESC_ALL) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r11) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
-    let g_vals = mov_rm(rsi, rax, 24) + mov_rr(r8, r10) + add_rr(r8, r8) + add_rr(r8, r8) + add_rr(r8, r8) + x86gen_alloc_r(r9, r8, GC_DESC_ALL) + mov_rr(rdi, r9) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
+    // P3 批 3：map 内部 keys/vals 数组挂 allptr（desc_map 位 2/3 只到数组，元素值
+    // ——指针或标量——由数组自扫；GC_DESC_ALL=noscan 时代 map(str,str) 唯一持有的
+    // 键值在 collect 后悬垂）。标量键值由 mark 门安全拒绝。
+    // P3 batch 3: the map's internal keys/vals arrays hang off allptr (desc_map's
+    // bits 2/3 reach only the arrays; the element values — pointers or scalars —
+    // are scanned by the arrays themselves; under GC_DESC_ALL=noscan a
+    // map(str,str) as the sole holder dangled after a collect). Scalar keys and
+    // values are safely rejected by mark's gates.
+    let g_keys = mov_rr(r8, r10) + add_rr(r8, r8) + add_rr(r8, r8) + add_rr(r8, r8) + x86gen_alloc_r(r11, r8, desc_allptr) + mov_rm(rsi, rax, 16) + mov_rr(rdi, r11) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
+    let g_vals = mov_rm(rsi, rax, 24) + mov_rr(r8, r10) + add_rr(r8, r8) + add_rr(r8, r8) + add_rr(r8, r8) + x86gen_alloc_r(r9, r8, desc_allptr) + mov_rr(rdi, r9) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
     let g_hdr = mov_mr(rax, 8, r10) + mov_mr(rax, 16, r11) + mov_mr(rax, 24, r9)
     let growth = mov_rr(r10, rcx) + add_rr(r10, r10) + test_rr(r10, r10) + jne_rel32(str_len(g_min)) + g_min + g_keys + g_vals + g_hdr
     let head1 = mov_rm(rax, r15, 0 - 24) + mov_rm(rcx, rax, 0) + mov_rm(rdx, rax, 8) + cmp_rr(rcx, rdx) + jne_rel32(str_len(growth))
@@ -750,7 +761,15 @@ fn x86gen_map_native() {
 // (excluding argv[0])
 // args inline: read argv from the startup stack (excluding argv[0])
 fn x86gen_args_native() {
-    let head = mov_rm(rax, rbx, 0 - 8) + mov_rm(r8, rax, 0) + sub_ri32(r8, 1) + mov_rr(rcx, r8) + mov_ri64(rsi, 3) + shl_rcl(rcx) + add_ri32(rcx, 24) + x86gen_alloc_r(r11, rcx, GC_DESC_ALL) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, r8) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + xor_rr(rdx, rdx)
+    // P3 批 3：args 列表头挂 desc_list_ptr（[len][cap][data 内联 + n 串指针] 的
+    // prefix=3 布局恰走 list 专扫；GC_DESC_ALL=noscan 时代 args() 唯一持有的串在
+    // collect 后悬垂）。data 自指（块内 +24）被 mark 起点位门拒绝，无害。
+    // P3 batch 3: the args list header hangs off desc_list_ptr (the [len][cap]
+    // [inline data + n str pointers] prefix=3 layout takes exactly the list walk;
+    // under GC_DESC_ALL=noscan, strings held only by args() dangled after a
+    // collect). The self-referential data pointer (block+24) is rejected by
+    // mark's start-bit gate — harmless.
+    let head = mov_rm(rax, rbx, 0 - 8) + mov_rm(r8, rax, 0) + sub_ri32(r8, 1) + mov_rr(rcx, r8) + mov_ri64(rsi, 3) + shl_rcl(rcx) + add_ri32(rcx, 24) + x86gen_alloc_r(r11, rcx, desc_list_ptr) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, r8) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + xor_rr(rdx, rdx)
     let load = mov_rr(rsi, rdx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + add_rr(rsi, rax) + add_ri32(rsi, 16) + mov_rm(rsi, rsi, 0)
     let sl_test = e1(128) + e1(62) + e1(0)
     let sl_yes = add_ri32(rsi, 1) + add_ri32(r9, 1)

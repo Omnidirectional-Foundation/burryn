@@ -284,7 +284,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // fallback: let init has no SET_LOCAL (const lands in the slot),
                         // the slot holds a raw value; allocate a cell, move the value in,
                         // and write the cell pointer back
-                        w(mov_rm(rax, r14, 8 * slot) + x86gen_alloc(r11, 8, GC_DESC_ALL) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11) + mov_rm(rax, r11, 0) + vs_push(rax, gc_kind_of(stype)))
+                        // P3 批 3：cell 挂 allptr——8B 槽值可以是任意指针，noscan
+                        // （GC_DESC_ALL=id 0）让 cell 内容从未被扫，提升槽唯一持有时
+                        // 值即悬垂；标量值由 mark 三重过滤安全拒绝。
+                        // P3 batch 3: cells hang off allptr — the 8B slot value can be
+                        // any pointer; noscan (GC_DESC_ALL = id 0) meant the cell
+                        // content was never scanned, so a lifted slot as the sole
+                        // holder dangled; scalars are safely rejected by mark's gates.
+                        w(mov_rm(rax, r14, 8 * slot) + x86gen_alloc(r11, 8, desc_allptr) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11) + mov_rm(rax, r11, 0) + vs_push(rax, gc_kind_of(stype)))
                         while len(pos_auth) <= slot {
                             push(pos_auth, false)
                         }
@@ -341,7 +348,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // 首次写：分配 cell，槽存指针（P1 前经 gc_rec 在 r11 跨调用登记存活）
                     // first write: allocate the cell, the slot holds the pointer
                     // (pre-P1, gc_rec kept r11 alive across the call)
-                    w(x86gen_alloc(r11, 8, GC_DESC_ALL) + mov_rm(rax, r15, 0 - 8) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11))
+                    // P3 批 3：cell 挂 allptr（见 GET 侧注释）/ allptr cell (see the
+                    // GET-side note)
+                    w(x86gen_alloc(r11, 8, desc_allptr) + mov_rm(rax, r15, 0 - 8) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11))
                 }
             } else {
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
@@ -986,7 +995,13 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else if callee == "chan" {
                 // 分配 112B Channel 对象 + max(cap,1)*8 缓冲（cap=0 也要 1 槽：
                 // recvq 非空时 send 走 R1 push buf，队头 recv 恢复后从 buf 取）
-                let c_alloc_buf = mov_rr(rsi, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rr(r10, rsi) + x86gen_alloc_r(rdx, rsi, GC_DESC_ALL)
+                // chan 对象外的缓冲数组挂 allptr：排队值可为任意指针（chan(str) 唯一
+                // 持有时 noscan 即悬垂）；chan(int) 的标量由 mark 门安全拒绝。
+                // the buffer array outside the chan object hangs off allptr: queued
+                // values can be arbitrary pointers (chan(str) as the sole holder
+                // dangled under noscan); chan(int) scalars are rejected by mark's
+                // gates.
+                let c_alloc_buf = mov_rr(rsi, rcx) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rsi) + mov_rr(r10, rsi) + x86gen_alloc_r(rdx, rsi, desc_allptr)
                 let c_clamp = mov_ri64(rcx, 1)
                 let c_head = mov_rm(rcx, r15, 0 - 8) + mov_rr(rdi, rcx) + test_rr(rcx, rcx) + jne_rel32(str_len(c_clamp)) + c_clamp + c_alloc_buf
                 let c_obj = x86gen_alloc(r11, CH_CLOSED + 8, desc_chan) + mov_mr(r11, CH_CAP, rdi) + mov_mr(r11, CH_BUF, rdx) + xor_rr(rax, rax) + mov_mr(r11, CH_BUFLEN, rax) + mov_mr(r11, CH_BUFCAP, rdi) + mov_mr(r11, CH_SENDQ, rax) + mov_mr(r11, CH_NSENDQ, rax) + mov_mr(r11, CH_SENDQCAP, rax) + mov_mr(r11, CH_RECVQ, rax) + mov_mr(r11, CH_NRECVQ, rax) + mov_mr(r11, CH_RECVQCAP, rax) + mov_mr(r11, CH_WAITERS, rax) + mov_mr(r11, CH_NWAIT, rax) + mov_mr(r11, CH_CLOSED, rax)
@@ -1563,7 +1578,31 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     bmi = bmi + 1
                 }
             } else {
-                let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + x86gen_alloc(r9, 16 + 8 * n, GC_DESC_ALL) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + mov_mr(r15, 0 - 8 * (n + 1), r9) + shadow_set(n + 1, GC_SHADOW_PTR) + vs_pop_n(n)
+                // P3 批 3：enum 实例按变体注册 BITMAP desc（key "enu:eh:vi"）——
+                // GC_DESC_ALL=noscan 让 Text("hel"+"lo") 这类载荷指针只靠值栈影子。
+                // 位 0/1 = 模板词（常量区对象带来，非堆址）不扫；位 2+i = 实参 i。
+                // 非 ctor 调用此路径是死码，desc 随便合法即可（allptr 位图）。
+                // P3 batch 3: enum instances register a per-variant BITMAP desc (key
+                // "enu:eh:vi") — GC_DESC_ALL=noscan left payload pointers like
+                // Text("hel"+"lo") riding on value-stack shadows only. Bits 0/1 skip
+                // the two template words (from the const-area object, non-heap); bit
+                // 2+i = arg i. For non-ctor calls this path is dead code and any
+                // valid desc (the all-ptr bitmap) does.
+                let mut ctor_types = []
+                let mut cti = 0
+                while cti < n {
+                    if len(type_shadow) >= n - cti {
+                        push(ctor_types, type_shadow[len(type_shadow) - n + cti])
+                    } else {
+                        push(ctor_types, "")
+                    }
+                    cti = cti + 1
+                }
+                let mut ctor_desc = bitmap_desc("enu:x", 2, ctor_types)
+                if str_len(callee) > 5 && substr(callee, 0, 5) == "ctor:" {
+                    ctor_desc = bitmap_desc("enu:" + substr(callee, 5, str_len(callee) - 5), 2, ctor_types)
+                }
+                let ctor_path = mov_rm(r10, rax, 8) + mov_rm(r11, rax, 16) + x86gen_alloc(r9, 16 + 8 * n, ctor_desc) + mov_mr(r9, 0, r10) + mov_mr(r9, 8, r11) + lea(rdi, r9, 16) + lea(rsi, r15, 0 - 8 * n) + mov_ri64(rcx, 8 * n) + rep_movsb() + mov_mr(r15, 0 - 8 * (n + 1), r9) + shadow_set(n + 1, GC_SHADOW_PTR) + vs_pop_n(n)
                 // 闭包动态调用：若编译期知 closure:N 与实参类型，走多态变体槽；
                 // 否则仍按对象内 handle 调默认体。这样 map_first(str, …) 等
                 // native 实参能进 specialized body（静态 native: 分派），避免
@@ -1776,7 +1815,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // fallback: no SET_LOCAL for the let init; lift the raw value
                         // into a cell so the closure slot holds the cell pointer
                         // (r11 holds the closure base here, so the cell goes in r10)
-                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, GC_DESC_ALL) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10))
+                        // P3 批 3：cell 挂 allptr（见 GET 侧注释）/ allptr cell (see
+                        // the GET-side note)
+                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10))
                         while len(pos_auth) <= uidx {
                             push(pos_auth, false)
                         }
@@ -1857,13 +1898,29 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     ri = ri + 1
                 }
             }
-            w(x86gen_alloc(r11, 16 + 8 * n, GC_DESC_ALL) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_ri64(rax, rec_off) + mov_mr(r11, 8, rax) + lea(rsi, r15, 0 - 8 * n) + lea(rdi, r11, 16) + mov_ri64(rcx, 8 * n) + rep_movsb() + lea(r15, r15, 0 - 8 * n) + shadow_bump(0 - n) + vs_push(r11, GC_SHADOW_PTR))
+            // P3 批 3：record 按形态注册 BITMAP desc——GC_DESC_ALL 实为 noscan（id 0 =
+            // 首个注册条目），record 载荷从未被扫：字段指针只靠值栈影子兜着，churn 冲掉
+            // 影子后首轮 collect 字段即悬垂（pREC 实证：p.tags[0] 报 len 0——tags 列表
+            // 头被 sweep 链覆盖后又被空串复用）。位 0/1 = [n][rec_off] 标量不扫。
+            // P3 batch 3: records register a per-shape BITMAP desc — GC_DESC_ALL is
+            // really noscan (id 0 = the first registered entry), so record payloads
+            // were never scanned: field pointers survived only on value-stack
+            // shadows, and once churn overwrote them the first collect left
+            // dangling fields (pREC: p.tags[0] traps with len 0 — the tags list
+            // header was sweep-chained and then reused by an empty string). Bits
+            // 0/1 skip the [n][rec_off] scalars.
             let mut rec_ftypes = []
             let mut rfi = 0
             while rfi < n {
-                push(rec_ftypes, type_shadow[len(type_shadow) - n + rfi])
+                if len(type_shadow) >= n - rfi {
+                    push(rec_ftypes, type_shadow[len(type_shadow) - n + rfi])
+                } else {
+                    push(rec_ftypes, "")
+                }
                 rfi = rfi + 1
             }
+            let rec_desc = bitmap_desc("rec:" + enc, 2, rec_ftypes)
+            w(x86gen_alloc(r11, 16 + 8 * n, rec_desc) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_ri64(rax, rec_off) + mov_mr(r11, 8, rax) + lea(rsi, r15, 0 - 8 * n) + lea(rdi, r11, 16) + mov_ri64(rcx, 8 * n) + rep_movsb() + lea(r15, r15, 0 - 8 * n) + shadow_bump(0 - n) + vs_push(r11, GC_SHADOW_PTR))
             put(ctx.record_field_types, enc, rec_ftypes)
             shadow_pop(shadow, n)
             shadow_pop(type_shadow, n)
@@ -1948,8 +2005,22 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 upd_code = upd_code + mov_rm(rax, r15, 0 - 8 * (n + 1 - uj)) + push_r(rax)
                 uj = uj + 1
             }
+            // P3 批 3：update 的desc 与构造站点同 key（"rec:"+enc）去重共享；构造站点
+            // 尚未注册（他函数后置）时落 desc_allptr 兜底——全词扫，[n][rec_off] 标量
+            // 由 mark 三重过滤安全拒绝。
+            // P3 batch 3: the update site shares the constructor's desc via the same
+            // key ("rec:"+enc) dedup; when the constructor has not registered yet
+            // (emitted in a later function) this falls back to desc_allptr — the
+            // all-words scan safely rejects the [n][rec_off] scalars.
+            let mut upd_desc = desc_allptr
+            match get(ctx.record_field_types, enc) {
+                Some(ufts) => {
+                    upd_desc = bitmap_desc("rec:" + enc, 2, ufts)
+                },
+                None => {},
+            }
             let mut alloc_code = mov_rm(r9, rsp, 8 * n) + mov_rm(r8, r9, 0) + mov_rm(rdx, r9, 8)
-            alloc_code = alloc_code + mov_rr(r10, r8) + add_rr(r10, r10) + add_rr(r10, r10) + add_rr(r10, r10) + add_ri32(r10, 16) + x86gen_alloc_r(r11, r10, GC_DESC_ALL) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, rdx)
+            alloc_code = alloc_code + mov_rr(r10, r8) + add_rr(r10, r10) + add_rr(r10, r10) + add_rr(r10, r10) + add_ri32(r10, 16) + x86gen_alloc_r(r11, r10, upd_desc) + mov_mr(r11, 0, r8) + mov_mr(r11, 8, rdx)
             alloc_code = alloc_code + lea(rsi, r9, 16) + lea(rdi, r11, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + mov_rr(r10, rdx) + rep_movsb()
             let mut ovw_code = ""
             let mut ok = 0
@@ -1989,10 +2060,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             let enqueue = mov_ri64(rax, rt_slot(rt_ready_tail)) + mov_rm(rax, rax, 0) + enq_branch + enq_empty + enq_to_set + enq_nonempty + enq_set
             // 6. fb struct 字段（假 frame 在栈顶：FB_RSP 指向 entry 槽）。
             // P2：FB_SHADOW = 栈 mmap 尾段（guard 4096 + fiber 栈之后的影子区）。
+            // P3 批 3：FB_RBP 显式清零——resume 会把它载进 rbp；bump 区原生零曾掩盖
+            // 这一点，P3 复用上线后槽里是死 fiber 的陈旧值（或 poison 0xAB）。
             // fb struct fields (fake frame on the new stack top: FB_RSP points at
             // the entry slot). P2: FB_SHADOW = the mmap tail after the guard page
-            // and the fiber stack.
-            let fb_build = x86gen_alloc(r11, FB_SIZE, desc_fb) + mov_ri64(rax, FB_READY) + mov_mr(r11, FB_STATUS, rax) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + mov_rm(rax, r15, 0 - 8) + add_ri32(rax, 4096) + mov_mr(r11, FB_STACK_LO, rax) + mov_rr(rcx, rax) + add_ri32(rcx, FIBER_STACK_SIZE) + mov_mr(r11, FB_SHADOW, rcx) + add_ri32(rax, FIBER_STACK_SIZE - 4096 - 16) + mov_mr(r11, FB_RSP, rax) + lea(rcx, rax, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx) + mov_rr(rax, rdi) + mov_mr(r11, FB_R15, rax) + mov_mr(r11, FB_R14, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_READY_NEXT, rcx) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
+            // and the fiber stack. P3 batch 3: FB_RBP is zeroed explicitly —
+            // resume loads it into rbp; the bump region's native zeros used to
+            // mask this, but with P3 reuse the slot holds a dead fiber's stale
+            // value (or poison 0xAB).
+            let fb_build = x86gen_alloc(r11, FB_SIZE, desc_fb) + mov_ri64(rax, FB_READY) + mov_mr(r11, FB_STATUS, rax) + mov_ri64(rax, BUDGET_SLICE) + mov_mr(r11, FB_BUDGET, rax) + mov_rm(rax, r15, 0 - 8) + add_ri32(rax, 4096) + mov_mr(r11, FB_STACK_LO, rax) + mov_rr(rcx, rax) + add_ri32(rcx, FIBER_STACK_SIZE) + mov_mr(r11, FB_SHADOW, rcx) + add_ri32(rax, FIBER_STACK_SIZE - 4096 - 16) + mov_mr(r11, FB_RSP, rax) + lea(rcx, rax, 16 - FRAME_BYTES * (DEPTH_MAX + 1)) + mov_mr(r11, FB_LIMIT, rcx) + mov_rr(rax, rdi) + mov_mr(r11, FB_R15, rax) + mov_mr(r11, FB_R14, rax) + xor_rr(rcx, rcx) + mov_mr(r11, FB_RBP, rcx) + mov_mr(r11, FB_READY_NEXT, rcx) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_rm(rax, rax, 0) + mov_mr(r11, FB_LIST_NEXT, rax) + mov_ri64(rax, rt_slot(rt_fiber_list)) + mov_mr(rax, 0, r11)
             // 5. fake frame：栈顶 [stack_top-16]=entry、[stack_top-8]=done（stack_top = mmap 基址 + FIBER_STACK_SIZE）
             let fake_frame = mov_rm(rax, r15, 0 - 8 * (n + 2)) + mov_rm(rax, rax, 0) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_rr(rax, r13) + mov_rm(rax, rax, 0) + add_rr(rax, r13) + mov_rm(rcx, r15, 0 - 8) + add_ri32(rcx, FIBER_STACK_SIZE) + mov_mr(rcx, 0 - 16, rax) + mov_ri64(rax, done_addr) + mov_mr(rcx, 0 - 8, rax)
             // 3+4. 拷贝 [callee][args] 到新栈 + fake frame；mmap 基址占值栈顶，callee 在 8*(n+2) 之下
