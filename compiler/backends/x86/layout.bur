@@ -56,6 +56,20 @@ pub let rt_start_bitmap = 160
 pub let rt_main_shadow = 2736
 pub let rt_shadow_top = 2744
 pub let rt_global_kinds = 2752
+// P3：尺寸类自由链头×4（0 = 空链，镜像零初始化天然成立 + _start 显式清零）。
+// 节点 = 块 payload 的 [next:8][cap:8]；类界 16/32/64——alloc 按请求尺寸选类
+// （立即数版发射期即常量），sweep 按 cap 选类；同类内 cap ≥ sz 由分配端
+// 再校验兜底（cap=24 的块排在 L32 头上伺候 sz=32 请求时回落 bump）。
+// P3: four size-class free-list heads (0 = empty; the zero image plus an
+// explicit _start clear). A node = the block payload as [next:8][cap:8];
+// class bounds 16/32/64 — the alloc side picks by request size (a constant
+// at emission for immediate-size sites), the sweep picks by cap; cap >= sz
+// is re-checked at the alloc side as a backstop (a cap-24 block sitting at
+// the L32 head serving a sz=32 request just falls back to the bump).
+pub let rt_free16 = 2760
+pub let rt_free32 = 2768
+pub let rt_free64 = 2776
+pub let rt_free_big = 2784
 // waitset 每项 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]；poll(2) 只认连续 8B 记录，
 // 故 poll 前把各条目前 8B 拷入 POLLFD_BASE 暂存区，返回后把 revents 回写条目 +6
 // waitset entries are 16B = pollfd([fd:4][events:2][revents:2]) + [fiber:8]; poll(2) consumes
@@ -75,12 +89,18 @@ pub let WAITSET_BASE = 176
 // TIMER_BASE = 144 + 64*16 = 1168, POLLFD_BASE = TIMER_BASE + TIMER_CAP * 16 = 2192;
 pub let TIMER_BASE = 1200
 pub let POLLFD_BASE = 2224
-// P2：RUNTIME_SIZE 2736 → 2760，尾部追加三个 GC 槽（rt_main_shadow/rt_shadow_top/
-// rt_global_kinds，见上）；thunk 槽与 fd/WSA 区随符号位移，无硬编码依赖。
-// P2: RUNTIME_SIZE 2736 -> 2760, three GC slots appended at the tail
-// (rt_main_shadow/rt_shadow_top/rt_global_kinds, above); the thunk slot and the
-// fd/WSA areas shift along symbolically, nothing hardcodes them.
-pub let RUNTIME_SIZE = 2760
+// P3：RUNTIME_SIZE 2760 → 2792，尾部换成四个尺寸类链头（见上）；thunk 槽与
+// fd/WSA 区随符号位移，无硬编码依赖。
+// P3: RUNTIME_SIZE 2760 -> 2792, the tail becomes the four size-class heads
+// (above); the thunk slot and the fd/WSA areas shift along symbolically,
+// nothing hardcodes them.
+pub let RUNTIME_SIZE = 2792
+// P3：阈值回收的步进——collect 尾把 rt_gc_threshold 抬到 r12 + GC_THRESH_SLACK，
+// _start 以同值初始化（r12 起点太小会一开场就连环回收）。
+// P3: the threshold-collection step — the collect tail raises rt_gc_threshold
+// to r12 + GC_THRESH_SLACK, and _start initializes it with the same value (a
+// too-small start would collect in a loop right off the bat).
+pub let GC_THRESH_SLACK = 16777216
 // P1：rec 表与 gray 栈的容量常量（rec 项 24B）随 rec 表删除退役，仅留字面量占位。
 // P1: the rec table's/gray stack's capacity constants (24B per rec entry) are
 // retired along with the rec table; kept as literals only.

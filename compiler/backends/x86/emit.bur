@@ -874,7 +874,16 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // P2：epilogue 携带本函数返回 kind 与发射期帧高（塌缩后写影子字节）
             // P2: the epilogue carries this fn's return kind and the emission-time
             // frame height (the shadow byte is written after the collapse)
-            let epi = x86gen_defer_loop() + x86gen_epilogue(gc_kind_of(fn_ret_type[fh]), len(type_shadow))
+            // P3 批 2：与 op_return 同源——返回 kind 按变体 sig_ret，fn_ret_type 的
+            // 聚合收窄（num→int）不进 epilogue。
+            // P3 batch 2: same as op_return — the return kind comes from the
+            // per-signature sig_ret; fn_ret_type's aggregate narrowing (num→int)
+            // never reaches the epilogue.
+            let mut vret = psig_lookup(ctx, fh, vsigs[vi])
+            if vret == "" {
+                vret = fn_ret_type[fh]
+            }
+            let epi = x86gen_defer_loop() + x86gen_epilogue(gc_kind_of(vret), len(type_shadow))
             w(mov_rm(rax, r15, 0 - 8) + mov_rm(rcx, rax, 8) + test_rr(rcx, rcx) + jne_rel32(str_len(ok_path) + 5) + ok_path + jmp_rel32(str_len(epi)) + epi)
             shadow_pop(shadow, 1)
             shadow_pop(type_shadow, 1)
@@ -1707,7 +1716,23 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // run the defer chain (LIFO) before the epilogue
             // P2：epilogue 携带返回 kind 与帧高 / P2: the epilogue carries the return
             // kind and the frame height
-            w(x86gen_defer_loop() + x86gen_epilogue(gc_kind_of(fn_ret_type[fh]), len(type_shadow)))
+            // P3 批 2：返回 kind 先取按变体的 sig_ret——聚合 psim 写回的 fn_ret_type
+            // 会把 "num" 声明收窄成 "int" 默认值（num-add 模拟默认 int），float 变体的
+            // epilogue 随之把结果槽盖成 SCALAR，调用方的装箱 float 从此无根，collect+
+            // poison 下读回垃圾值（constraints/pM 实证：min_num(2.5,1.5) 打出
+            // -2.53e-98）。sig 未命中回退 fn_ret_type。
+            // P3 batch 2: the epilogue's return kind prefers the per-signature
+            // sig_ret — the aggregate psim's fn_ret_type writeback folds a "num"
+            // declaration down to the "int" default (the num-add sim defaults to
+            // int), so the float variant's epilogue would stamp the result slot
+            // SCALAR and the caller's boxed float goes unrooted — collected and,
+            // under poison, read back as garbage (constraints/pM: min_num(2.5,1.5)
+            // prints -2.53e-98). Fall back to fn_ret_type when the lookup misses.
+            let mut vret = psig_lookup(ctx, fh, vsigs[vi])
+            if vret == "" {
+                vret = fn_ret_type[fh]
+            }
+            w(x86gen_defer_loop() + x86gen_epilogue(gc_kind_of(vret), len(type_shadow)))
         } else if op == lib::op_defer {
             // 栈顶闭包压入 [rsp] 链头（[next][closure] 节点）
             // push the stack-top closure onto the [rsp] defer chain ([next][closure] nodes)

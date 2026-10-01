@@ -233,10 +233,42 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
     // fallback); the two hidden slots (exec's proc table / net's registry) are
     // forced to PTR. Riding const_data, the desc-table address formula
     // correspondingly subtracts n_globals (see rt_init).
+    // P3 批 2：全局 kind 表修复——一个函数里修掉两个 bug。
+    // ① 字宽：填充/盖章/强制三处原用 e8——那是 8 字节编码器（e4+e4），每槽
+    // 实写 8 字节，表长 8×n_globals；而 rt_init 的表址 = 常量区尾 - n_globals、
+    // desc 拼接的保留尾长也按 n_globals 算——运行时看到的「kind 表」一直是
+    // 8 倍表的最后 n_globals 字节（零垫），所有全局恒读 SCALAR，全局扫一个槽
+    // 都没收过。P2/P3 批 1 的 GC 验证全经 run 走 VM，x86 kind 表从未真正
+    // 落地；批 2 自由链复用一覆盖被扫块即现形（gc_stress 唯一活列表被整链
+    // 回收、kept[0] 越界 rc=4、--gc-stress 秒崩）。三处改 e1 单字节。
+    // ② 默认字节：SCALAR(0) -> MAYBE(2)。盖章循环在三遍发射之前跑，
+    // global_type 还没被 emit 的 def/set_global 填充（实测为空、循环零转），
+    // 未知类型全局落 MAYBE 兜底；与 mark 的三重过滤（对齐/堆界/起点位图）
+    // 配套，多扫的标量槽全被安全拒绝，代价是每全局每趟一次 mark 调用。
+    // 文档承诺的「未知词落 MAYBE 保守兜底」自此才真正成立。
+    // P3 batch 2: global kind table fix — two bugs in one pass.
+    // (1) Byte width: the fill/stamp/force writes used e8, the 8-BYTE encoder
+    // (e4+e4) — each slot wrote 8 bytes and the table grew to 8*n_globals,
+    // while rt_init's table address (consts' end - n_globals) and the desc
+    // splice's preserved-tail length both assume n_globals bytes — the
+    // runtime's "kind table" was always the last n_globals bytes of the zero
+    // pad, every global read as SCALAR, and the global scan never marked a
+    // single slot. P2/P3-batch-1 GC validation all went through the VM via
+    // run; the x86 kind table never touched silicon until batch 2's free-list
+    // reuse overwrote swept blocks and exposed it instantly (gc_stress's only
+    // live list collected wholesale, kept[0] out-of-bounds rc=4, --gc-stress
+    // instant segfault). All three writes now use e1, one byte per slot.
+    // (2) Default byte: SCALAR(0) -> MAYBE(2). The stamping loop runs before
+    // the three emission passes while global_type is not yet filled by emit's
+    // def/set_global (observed empty, zero iterations), so unknown-type
+    // globals fall back to MAYBE; paired with mark's three gates (alignment /
+    // heap range / start-bit) the over-scanned scalar slots are safely
+    // rejected at one extra mark call per global per pass — the documented
+    // "unknown words fall back to MAYBE" finally holds as written.
     let mut gk_bytes = ""
     let mut gk_i = 0
     while gk_i < n_globals {
-        gk_bytes = gk_bytes + e8(0)
+        gk_bytes = gk_bytes + e1(GC_SHADOW_MAYBE)
         gk_i = gk_i + 1
     }
     let gk_names = keys(global_type)
@@ -247,7 +279,7 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
             Some(gk_slot) => {
                 match get(global_type, gk_name) {
                     Some(gk_t) => {
-                        gk_bytes = substr(gk_bytes, 0, gk_slot) + e8(gc_kind_of(gk_t)) + substr(gk_bytes, gk_slot + 1, n_globals - gk_slot - 1)
+                        gk_bytes = substr(gk_bytes, 0, gk_slot) + e1(gc_kind_of(gk_t)) + substr(gk_bytes, gk_slot + 1, n_globals - gk_slot - 1)
                     },
                     None => {},
                 }
@@ -256,8 +288,8 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
         }
         gk_n = gk_n + 1
     }
-    gk_bytes = substr(gk_bytes, 0, proc_reg_g) + e8(GC_SHADOW_PTR) + substr(gk_bytes, proc_reg_g + 1, n_globals - proc_reg_g - 1)
-    gk_bytes = substr(gk_bytes, 0, net_reg_g) + e8(GC_SHADOW_PTR) + substr(gk_bytes, net_reg_g + 1, n_globals - net_reg_g - 1)
+    gk_bytes = substr(gk_bytes, 0, proc_reg_g) + e1(GC_SHADOW_PTR) + substr(gk_bytes, proc_reg_g + 1, n_globals - proc_reg_g - 1)
+    gk_bytes = substr(gk_bytes, 0, net_reg_g) + e1(GC_SHADOW_PTR) + substr(gk_bytes, net_reg_g + 1, n_globals - net_reg_g - 1)
     const_data = const_data + gk_bytes
     // 方法全名映射：CLOSURE + DEF_GLOBAL 配对记录「全局名 → fn handle」
     // map from fully-qualified method names to fn handles (CLOSURE + DEF_GLOBAL pairs)
@@ -820,9 +852,24 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // jump table + _start form the code domain; the runtime area becomes its own
     // data segment instead of sitting in the code stream
     let fn_base = code_origin() + const_data_len
+    // P3：rt 零垫必须铺满 RUNTIME_SIZE——旧公式 16+WS*16+TIMER*16+WS*8 比
+    // RUNTIME_SIZE 短 72B，P2 的尾部槽（shadow/global_kinds）一直骑在数据段
+    // 页尾之后的外来文件字节上（每槽用前必写才侥幸可用）；rt_free_head 入场
+    // 即踩破——小堆程序的 2760 处恰是 "6"，首次分配的复用分支把 6 当块指针
+    // 解引用即 SEGV。补满后镜像与符号布局对齐，thunk/fd/wsa 的 PE 初始态
+    // （0xFF 空闲表）也回到正确偏移。
+    // P3: the rt zero pad must span RUNTIME_SIZE — the old formula
+    // (16+WS*16+TIMER*16+WS*8) fell 72 bytes short, so P2's tail slots
+    // (shadow/global_kinds) always rode foreign file bytes past the data
+    // segment's page tail (survivable only because every slot is written
+    // before use); rt_free_head broke that rule — on small-heap programs
+    // offset 2760 held "6" and the first allocation's reuse branch
+    // dereferenced it as a block pointer and segfaulted. Padding to full
+    // size aligns the image with the symbolic layout, and the PE thunk/fd/
+    // wsa initial states (the 0xFF free table) return to their proper offsets.
     let mut rt_zero = ""
     let mut rzi = 0
-    while rzi < 16 + WAITSET_CAP * 16 + TIMER_CAP * 16 + WAITSET_CAP * 8 {
+    while rzi < RUNTIME_SIZE - 128 {
         rt_zero = rt_zero + byte_chr(0)
         rzi = rzi + 1
     }

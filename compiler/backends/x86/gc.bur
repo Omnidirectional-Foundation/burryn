@@ -176,18 +176,45 @@ pub fn desc_list(k) {
     }
 }
 
-// gc_desc_image 拼当前注册态的表镜像：条目字节 + 零垫到 GC_DESC_POOL。
+// gc_desc_image 拼当前注册态的表镜像：条目字节 + 零垫到 GC_DESC_TABLE_LEN。
+// P3 批 2：两处发射 bug 连修——
+// ① e8 改 e1：e8 是 8 字节编码器，每条目字节实写 8 字节 [v 00×7]，镜像膨胀
+// 8 倍（4128 -> 32760），splice 保留窗与 rt_init 的表址都按 GC_DESC_TABLE_LEN
+// 算——运行时 desc 表窗口全落零垫，每个条目读出 kind 0=NOSCAN，gc_pw 的载荷
+// 走查从未进过任何块（x86 的标记传播只到根对象本身）。
+// ② 垫零边界 GC_DESC_POOL 改 GC_DESC_TABLE_LEN：镜像长度 = 池字节 + 垫到
+// TABLE_LEN；旧边界让镜像恒短 len(desc_pool)（本程序 32 字节），splice 后
+// 表窗口相对镜像错位 32——条目 id（desc_pool 字节偏移）与 [表址+id] 寻址
+// 对不上，list 的 [4,3,2] 读成别的字节，数组/元素照样整链死亡（gc_stress
+// 的 kept[0] 串被链节点覆盖成空串，watchpoint 实锤）。表长恒为
+// GC_DESC_TABLE_LEN，三遍发射的 pic_data 才逐字节相等。
 // gc_desc_image assembles the table image for the current registration state:
-// entry bytes plus zero padding up to GC_DESC_POOL.
+// entry bytes plus zero padding up to GC_DESC_TABLE_LEN.
+// P3 batch 2: two emission bugs fixed in tandem —
+// (1) e8 -> e1: e8 is the 8-byte encoder, so each entry byte wrote 8 bytes
+// ([v 00*7]) and the image grew 8x (4128 -> 32760) while the splice's
+// preserved window and rt_init's table address both assume GC_DESC_TABLE_LEN —
+// the runtime's desc-table window fell entirely in the zero pad, every entry
+// read kind 0=NOSCAN, and gc_pw's payload walk never entered any block (x86
+// mark propagation stopped at the root objects themselves).
+// (2) the pad bound GC_DESC_POOL -> GC_DESC_TABLE_LEN: the image length is
+// pool bytes + padding up to TABLE_LEN; the old bound left the image
+// len(desc_pool) (32 bytes here) short, so the spliced window sat 32 bytes
+// off the image — the entry ids (desc_pool byte offsets) no longer matched
+// the [table + id] addressing, the list's [4,3,2] read as other bytes, and
+// arrays/elements still died wholesale (gc_stress's kept[0] string
+// overwritten by a chain node into an empty string — watchpoint-confirmed).
+// A fixed GC_DESC_TABLE_LEN also keeps the three emission passes'
+// pic_data byte-identical.
 pub fn gc_desc_image() {
     let mut out = ""
     let mut i = 0
     while i < len(desc_pool) {
-        out = out + e8(desc_pool[i])
+        out = out + e1(desc_pool[i])
         i = i + 1
     }
-    while i < GC_DESC_POOL {
-        out = out + e8(0)
+    while i < GC_DESC_TABLE_LEN {
+        out = out + e1(0)
         i = i + 1
     }
     out
@@ -259,17 +286,76 @@ fn x86gen_alloc(dst, size, desc) {
     let s1 = gc_scratch1(dst)
     let s2 = gc_scratch2(dst)
     let die = gc_oom_die()
-    let hdr = mov_ri64(s1, sz + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1)
+    let hdr_bump = mov_ri64(s1, sz + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1)
+    // 复用路径 hdr = 原块 cap（非请求尺寸）：hdr 链下一块 = hdr + 8 + size，写小
+    // 了走查会切进本块内部。cap 由 sweep 写在节点 [payload+8]。
+    // the reuse path's hdr = the block's original cap (not the requested size):
+    // the hdr chain's next block sits at hdr + 8 + size, so writing the smaller
+    // request would make the walk cut into this block. The sweep stores cap at
+    // node [payload+8].
+    let hdr_reuse = if desc != 0 {
+        mov_ri64(s1, desc * GC_DESC_SHIFT) + or_rr(s2, s1) + mov_mr(dst, 0 - 8, s2)
+    } else {
+        mov_mr(dst, 0 - 8, s2)
+    }
     let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
-    // --gc-stress：切块前先同步 collect（收集器全寄存器自保，rax 再 push/pop 双保险）
+    // --gc-stress：切块前先同步 collect（收集器全寄存器自保，rax 再 push/pop 双保
+    // 险）；非 stress 换成阈值钩子——r12 ≥ rt_gc_threshold 即同步 collect，同样挂
+    // 在切块前（新块尚不存在，无 born-unmarked 窗口），collect 尾把阈值抬到
+    // r12 + GC_THRESH_SLACK。stress 下每次 alloc 都 collect，阈值钩子被吸收不发。
     // --gc-stress: collect right before every bump (the collector saves all
-    // registers itself; the rax push/pop is belt and suspenders)
+    // registers itself; the rax push/pop is belt and suspenders). Non-stress
+    // swaps in the threshold hook — collect synchronously once r12 reaches
+    // rt_gc_threshold, also before the block exists (no born-unmarked window);
+    // the collect tail raises the threshold to r12 + GC_THRESH_SLACK. Under
+    // stress every alloc collects anyway, so the threshold hook would be absorbed.
     let hook = if gc_stress_g {
         push_r(rax) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     } else {
-        ""
+        push_r(rax) + mov_ri64(rax, rt_slot(rt_gc_threshold)) + mov_rm(rax, rax, 0) + cmp_rr(rax, r12) + ja_rel32(str_len(mov_ri64(rax, gc_collect_g)) + str_len(call_r(rax))) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     }
-    hook + push_r(s1) + push_r(s2) + lea(dst, r12, 8) + add_ri32(r12, sz + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die + hdr + bits + pop_r(s2) + pop_r(s1)
+    // P3 尺寸类自由链复用：sweep 把死块（payload ≥ 16B）按 cap 链入 16/32/64/
+    // big 四个类头；分配端按请求尺寸选类（立即数版发射期即常量）后 O(1) 查该类
+    // 链头，cap ≥ sz 即摘头复用，否则照旧 bump。单链头版本对混合尺寸 churn 的
+    // 命中率只有 ~25%（每轮 4-5 种尺寸轮转、链头只伺候一种），r12 仍线性增长直
+    // 至 OOM——分四类后 churn 类负载基本全命中。
+    // P3 size-class free-list reuse: the sweep chains dead blocks (payload
+    // >= 16B) into the 16/32/64/big class heads by cap; the alloc side picks
+    // the class by request size (an emission-time constant for immediate-size
+    // sites) and checks that class's head in O(1), popping when cap >= sz,
+    // else bumping as before. The single-head version matched only ~25% on
+    // mixed-size churn (4-5 rotating sizes vs one head), so r12 still grew
+    // linearly to OOM — with four classes the churn workload nearly always
+    // hits.
+    let cls = if sz <= 16 {
+        rt_free16
+    } else if sz <= 32 {
+        rt_free32
+    } else if sz <= 64 {
+        rt_free64
+    } else {
+        rt_free_big
+    }
+    let next_ld = mov_rm(dst, s1, 0)
+    // head_pop 的槽址走 s2（头加载前装入、贯穿复用段不毁）：旧版把槽址装 rax
+    // 再写 [rax]=dst——dst==rax 的站点（str 系，实测）mov_ri64(rax,&slot) 先毁
+    // 掉 rax 里的 next，[rax]=rax 把槽址自己写进链头=链头自指，后续 big 分配
+    // 把槽当块、cap 读到 .eh_frame 文本、hdr 写穿 rt_free64/rt_free_big。
+    // head_pop keeps the slot address in s2 (loaded before the head load, alive
+    // across the reuse stretch): the old cut parked it in rax and stored
+    // [rax]=dst — at dst==rax sites (the str family, observed) mov_ri64(rax,&slot)
+    // destroyed the next sitting in rax, so [rax]=rax wrote the slot's own
+    // address into the head: the next big alloc took the slot for a block, read
+    // .eh_frame text as its cap and wrote hdrs through rt_free64/rt_free_big.
+    let head_pop = mov_mr(s2, 0, dst)
+    let dst_set = mov_rr(dst, s1)
+    let cap_ld = mov_rm(s2, dst, 8)
+    let bump = lea(dst, r12, 8) + add_ri32(r12, sz + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die
+    let jmp_bits = jmp_rel32(str_len(bump) + str_len(hdr_bump))
+    let reuse_tail = cap_ld + hdr_reuse + jmp_bits
+    let cap_chk = mov_rm(dst, s1, 8) + cmp_ri32(dst, sz) + jb_rel32(str_len(next_ld) + str_len(head_pop) + str_len(dst_set) + str_len(reuse_tail))
+    let reuse = mov_ri64(s2, rt_slot(cls)) + mov_rm(s1, s2, 0) + test_rr(s1, s1) + je_rel32(str_len(cap_chk) + str_len(next_ld) + str_len(head_pop) + str_len(dst_set) + str_len(reuse_tail)) + cap_chk + next_ld + head_pop + dst_set + reuse_tail
+    hook + push_r(s1) + push_r(s2) + reuse + bump + hdr_bump + bits + pop_r(s2) + pop_r(s1)
 }
 
 // x86gen_alloc_r 寄存器尺寸分配（size_reg 承载 payload 字节数，运行期圆整）：
@@ -286,19 +372,89 @@ fn x86gen_alloc_r(dst, size_reg, desc) {
     let s1 = gc_scratch1(dst)
     let s2 = gc_scratch2(dst)
     let die = gc_oom_die()
+    // 圆整提前到分支前：s1 承载圆整尺寸贯穿 bump（add_rr r12）与 hdr_or；复用路
+    // 径不用圆整尺寸（hdr 写原 cap），s1 在复用尾重载为 cap，两路共用 hdr_or。
+    // the rounding hoists above the branch: s1 carries the rounded size through
+    // the bump (add_rr r12) and hdr_or; the reuse path ignores it (its hdr takes
+    // the original cap), reloading s1 with cap at its tail — both paths share
+    // the same hdr_or/hdr_write.
+    let round = mov_rr(s1, size_reg) + add_ri32(s1, 7) + and_ri32(s1, 0 - 8)
     let hdr_or = if desc != 0 {
         mov_ri64(s2, desc * GC_DESC_SHIFT) + or_rr(s1, s2)
     } else {
         ""
     }
+    let hdr_write = mov_mr(dst, 0 - 8, s1)
     let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
-    // --gc-stress：同 x86gen_alloc / --gc-stress: same as x86gen_alloc
+    // --gc-stress / 阈值钩子：同 x86gen_alloc / same as x86gen_alloc
     let hook = if gc_stress_g {
         push_r(rax) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     } else {
-        ""
+        push_r(rax) + mov_ri64(rax, rt_slot(rt_gc_threshold)) + mov_rm(rax, rax, 0) + cmp_rr(rax, r12) + ja_rel32(str_len(mov_ri64(rax, gc_collect_g)) + str_len(call_r(rax))) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     }
-    hook + push_r(s1) + push_r(s2) + lea(dst, r12, 8) + mov_rr(s1, size_reg) + add_ri32(s1, 7) + and_ri32(s1, 0 - 8) + add_rr(r12, s1) + add_ri32(r12, 8) + mov_ri64(s2, rt_slot(rt_heap_limit)) + mov_rm(s2, s2, 0) + cmp_rr(s2, r12) + ja_rel32(str_len(die)) + die + hdr_or + mov_mr(dst, 0 - 8, s1) + bits + pop_r(s2) + pop_r(s1)
+    // P3 尺寸类链头（alloc_r 运行期选类）：比较链选类头槽址进 s2，槽址存 rax
+    // 跨过头加载（rax 已 push 保护），弹头写回用 rax 指向的选中槽；cap ≥ sz 由
+    // 分配端再校验兜底，两条退出路径（je/jb）都先经 bail 还原 rax。类界用 jb
+    // 严格小于形式（24/40/72）：尺寸恒 8 倍数，cap ≤ 16 ⟺ cap < 24 等。
+    // P3 size-class heads (alloc_r picks at run time): the compare chain
+    // selects the class head slot into s2, the slot address parks in rax
+    // (push-protected) across the head load, the pop writes back through rax,
+    // cap >= sz is re-checked as a backstop, and both bail-outs (je/jb) restore
+    // rax via the bail stub first. The bounds use strict jb form (24/40/72):
+    // sizes are always 8-multiples, so cap <= 16 iff cap < 24, etc.
+    let sel3 = mov_ri64(s2, rt_slot(rt_free_big))
+    let sel2 = mov_ri64(s2, rt_slot(rt_free64)) + cmp_ri32(s1, 72) + jb_rel32(str_len(sel3))
+    let sel1 = mov_ri64(s2, rt_slot(rt_free32)) + cmp_ri32(s1, 40) + jb_rel32(str_len(sel2) + str_len(sel3))
+    let sel0 = mov_ri64(s2, rt_slot(rt_free16)) + cmp_ri32(s1, 24) + jb_rel32(str_len(sel1) + str_len(sel2) + str_len(sel3))
+    let bump = lea(dst, r12, 8) + add_rr(r12, s1) + add_ri32(r12, 8) + mov_ri64(s2, rt_slot(rt_heap_limit)) + mov_rm(s2, s2, 0) + cmp_rr(s2, r12) + ja_rel32(str_len(die)) + die
+    // bail 紧邻 bump：只还原 rax 即可——旧版在此加了 jmp_rel32(len(bump))，把
+    // 「跳过 bump」的位移用在了 bump 前面的存根上，空链头/cap 不足两条 miss 路
+    // 径双双越过 dst 设定与 r12 推进直落 hdr 写（r11 残留旧值→SEGV/双分配）。
+    // bail sits right before the bump: restoring rax is all it needs — the old
+    // cut appended jmp_rel32(len(bump)), applying the "skip the bump" relocation
+    // to a stub placed BEFORE the bump, so both miss exits (empty head / cap
+    // miss) leapt past the dst set and the r12 advance straight into the hdr
+    // write (stale r11 -> SEGV / double allocation).
+    // 槽址停靠寄存器按 dst 选：dst==rax 的站点停 r11——reuse_mid 的
+    // mov_rm(dst,...) 会先毁掉停在 rax 的槽址，[rax]=next 写到 next 自身、
+    // 槽头不动=同一节点双发；其余站点维持 rax。两者都 push/pop 全保护。
+    // the slot-address park register follows dst: dst==rax sites park in r11
+    // (reuse_mid's mov_rm(dst,...) would destroy a rax-parked address first,
+    // so [rax]=next stores into next itself and the head never moves = the
+    // same node handed out twice); the rest keep rax. Both push/pop saved.
+    let park = if dst == rax {
+        push_r(r11) + mov_rr(r11, s2)
+    } else {
+        push_r(rax) + mov_rr(rax, s2)
+    }
+    let slot_reg = if dst == rax {
+        r11
+    } else {
+        rax
+    }
+    let park_pop = if dst == rax {
+        pop_r(r11)
+    } else {
+        pop_r(rax)
+    }
+    let bail = park_pop
+    // jmp_hdr 跨过的是 bail+bump 两段：命中路径在 reuse_mid 内已 pop 还原停靠
+    // 寄存器，位移必须把 bail 的 1 字节一并计入——旧版只算 bump，恰好落在
+    // bail 的 pop 上=命中路径双 pop，栈错位 8B，尾部 pop rdx/rcx 取到错位值
+    //（rcx=复制长度变垃圾→rep movsb 段错误）。
+    // jmp_hdr skips bail AND bump: the hit path already restored the parked
+    // register inside reuse_mid, so the relocation must count bail's one byte
+    // too — the old cut counted only the bump and landed exactly on bail's pop,
+    // double-popping on every reuse hit (the stack slides 8B, the trailing
+    // pop rdx/rcx fetch shifted values, and rcx the copy length turns to
+    // garbage -> rep movsb segfault).
+    let jmp_hdr = jmp_rel32(str_len(bail) + str_len(bump))
+    let dst_set = mov_rr(dst, s2)
+    let cap_re = mov_rm(s1, dst, 8)
+    let reuse_mid = mov_rm(dst, s2, 0) + mov_mr(slot_reg, 0, dst) + park_pop + dst_set + cap_re + jmp_hdr
+    let cap_chk = mov_rm(dst, s2, 8) + cmp_rr(dst, s1) + jb_rel32(str_len(reuse_mid))
+    let reuse = sel0 + sel1 + sel2 + sel3 + park + mov_rm(s2, s2, 0) + test_rr(s2, s2) + je_rel32(str_len(cap_chk) + str_len(reuse_mid)) + cap_chk + reuse_mid + bail
+    hook + push_r(s1) + push_r(s2) + round + reuse + bump + hdr_or + hdr_write + bits + pop_r(s2) + pop_r(s1)
 }
 
 // x86gen_gc_verify_seq 生成堆走查校验序列（--gc-debug 时内联在调度器 exit0 前）：
@@ -555,6 +711,14 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_jcc(CC_E, "gc_sw_words"))
     push(it, la_b(cmp_ri32(rdi, 3)))
     push(it, la_jcc(CC_E, "gc_sw_bitmap"))
+    // P3 批 2：prefix(4) 不再落空——旧分支「跳过全部前缀词 + 尾 kind 0 不扫」
+    // 让 list 的数组指针永不被 mark（列表活着、数组与元素整链死亡，详见
+    // gc_sw_prefix 处注释）。list 形状专扫块外元素区，其余 prefix 形状并入全词扫。
+    // P3 batch 2: prefix(4) no longer falls through — the old branch ("skip
+    // every prefix word; tail kind 0 scans nothing") never marked the list's
+    // array pointer (list alive, array + elements collected wholesale; see the
+    // gc_sw_prefix note). The list shape gets a dedicated out-of-block element
+    // walk; other prefix shapes fold into the all-words scan.
     push(it, la_b(cmp_ri32(rdi, 4)))
     push(it, la_jcc(CC_E, "gc_sw_prefix"))
     push(it, la_jmp("gc_pw_next"))
@@ -562,16 +726,44 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_l("gc_sw_words"))
     push(it, la_b(shr_ri(rdx, 3) + xor_rr(rcx, rcx) + lea(r10, r9, 8)))
     push(it, la_jmp("gc_scan"))
-    // prefix：跳过头标量词；尾 kind 0=SCALAR 不扫，1=PTR/2=MAYBE 全词扫（尾
-    // kind 用的就是影子 kind 编码，0 恰是 SCALAR——只挡 0，1/2 都进扫尾）
-    // prefix: skip the head scalar words; a tail kind of 0=SCALAR scans nothing,
-    // 1=PTR/2=MAYBE scan every word (the tail byte uses the shadow kind encoding,
-    // where 0 is SCALAR — gate on 0 only, let 1/2 fall into the scan tail)
+    // prefix：list 形状（prefix=3）的元素区在块外——[len][cap][data 指针]，
+    // 元素指针躺在 data 数组里。P2 设计注释写明「尾元素区按元素 kind」，实现
+    // 却从未跟随 data 指针：数组块与全部元素首轮 collect 即不可达（gc_stress
+    // 的 kept[0] 串被 sweep 链节点 [next][cap] 覆盖成空串，watchpoint 实锤）。
+    // 此处补齐：mark(data 指针) 保活数组块，再按 cap 逐词 mark 元素（list-s
+    // 标量元素的位样由 mark 三重过滤安全拒绝）。其余 prefix 形状（cell/
+    // lenptrs/caplenptrs）指针都在块内，并进全词扫即可。
+    // prefix: the list shape (prefix=3) keeps its element region OUT of the
+    // block — [len][cap][data pointer], the element pointers living in the
+    // data array. The P2 design note says "the tail element region scans per
+    // the element kind", but the walk never followed the data pointer: the
+    // array block and all its elements went unreachable at the first collect
+    // (gc_stress's kept[0] string overwritten by a sweep chain node's
+    // [next][cap] into an empty string — watchpoint-confirmed). This fills it
+    // in: mark(data ptr) keeps the array block alive, then every array word
+    // under cap gets mark()ed (list-s scalar bit patterns fall to mark's three
+    // gates). Other prefix shapes (cell/lenptrs/caplenptrs) keep their
+    // pointers in-block and fold into the all-words scan.
     push(it, la_l("gc_sw_prefix"))
-    push(it, la_b(movzx_rm8(rcx, r8, 1) + movzx_rm8(rdi, r8, 2) + test_rr(rdi, rdi)))
-    push(it, la_jcc(CC_E, "gc_pw_next"))
-    push(it, la_b(shr_ri(rdx, 3) + lea(r10, r9, 8)))
-    push(it, la_jmp("gc_scan"))
+    push(it, la_b(movzx_rm8(rcx, r8, 1) + cmp_ri32(rcx, 3)))
+    push(it, la_jcc(CC_NE, "gc_sw_words"))
+    push(it, la_l("gc_sw_list"))
+    // r9 指向 hdr：payload 三词在 [r9+8]=len、[r9+16]=cap、[r9+24]=data 指针
+    // （首版写成 +16/+8——把 payload 相对序当 hdr 相对序，cap 被当地址解引用
+    // 即 SEGV）。数组块本身也要 mark（否则 sweep 链节点覆盖 elem 槽位），
+    // mark 的入参寄存器是 rdi。
+    // r9 points at the hdr: the three payload words live at [r9+8]=len,
+    // [r9+16]=cap, [r9+24]=data pointer (the first cut wrote +16/+8 — payload
+    // relative treated as hdr relative — and the cap got dereferenced as an
+    // address = SEGV). The array block itself must be mark()ed too (else the
+    // sweep chain node overwrites the element slots); mark's argument register
+    // is rdi.
+    push(it, la_b(mov_rm(r10, r9, 24) + mov_rr(rdi, r10) + mark_call + mov_rm(r11, r9, 16) + xor_rr(rcx, rcx)))
+    push(it, la_l("gc_list_loop"))
+    push(it, la_b(cmp_rr(rcx, r11)))
+    push(it, la_jcc(CC_AE, "gc_pw_next"))
+    push(it, la_b(mov_rr(rdi, rcx) + shl_ri(rdi, 3) + add_rr(rdi, r10) + mov_rm(rdi, rdi, 0) + mark_call + add_ri32(rcx, 1)))
+    push(it, la_jmp("gc_list_loop"))
     // bitmap：位图逐词（容量 = 表尾余量×8）/ bitmap: per-bit, capped by the
     // table's tail margin ×8
     push(it, la_l("gc_sw_bitmap"))
@@ -610,32 +802,85 @@ fn x86gen_gc_collect_block(n_globals) {
     // 收敛判定：cnt 与快照同 → sweep / convergence: cnt unchanged -> sweep
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rcx, rax, 0) + mov_rm(rdx, rsp, 112) + cmp_rr(rcx, rdx)))
     push(it, la_jcc(CC_NE, "gc_outer"))
-    // sweep：MARK 清位保活；其余置 FREE（poison 开时 payload 填 0xAB）
+    // sweep：MARK 清位保活；已 FREE（上轮入链未复用）跳过；其余置 FREE + desc
+    // 换 NOSCAN + 链入自由链（poison 开时 payload 填 0xAB）
+    // sweep: MARK set -> clear and keep; already-FREE (chained last round,
+    // unreused) -> skip; else FREE + desc swapped to NOSCAN + chained into the
+    // free list (payload filled with 0xAB when poison is on)
     push(it, la_b(mov_ri64(r9, rt_slot(rt_heap_start)) + mov_rm(r9, r9, 0) + xor_rr(r10, r10)))
     push(it, la_l("gc_sw"))
     push(it, la_b(cmp_rr(r9, r12)))
     push(it, la_jcc(CC_AE, "gc_sw_done"))
     push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_MARK_BIT) + test_rr(rcx, rax)))
     push(it, la_jcc(CC_NE, "gc_sw_live"))
+    // 已 FREE 直接跳推进——重链会让同一块在链上出现两次 = 双重分配
+    // already-FREE jumps straight to the advance — re-chaining would list the
+    // same block twice = double allocation
+    push(it, la_b(mov_ri64(rcx, 1) + shl_ri(rcx, 63) + test_rr(rcx, rax)))
+    push(it, la_jcc(CC_NE, "gc_sw_next"))
     push(it, la_b(mov_rr(rdx, rax) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rdx, rcx)))
-    // FREE 位 63 = 1<<63：imm64 字面量经 e8s 的 0−x 折算会在 i64 下溢，改移位合成
+    // FREE 位 63 = 1<<63：imm64 字面量经 e8s 的 0−x 折算会在 i64 下溢，改移位合成。
+    // hdr desc 同步换 NOSCAN：野指针把自由块误 mark 时 payload（含链 next）不可
+    // 扫，自由链不会整链复活；复用端写 hdr 时连 desc 一起重写。
     // the FREE bit 63 = 1<<63: an imm64 literal would overflow i64 inside e8s's
-    // 0-x fold, so synthesize it by shifting
-    push(it, la_b(mov_ri64(rcx, 1) + shl_ri(rcx, 63) + or_rr(rax, rcx) + mov_mr(r9, 0, rax) + add_rr(r10, rdx)))
+    // 0-x fold, so synthesize it by shifting. The hdr desc swaps to NOSCAN at
+    // the same time: if a stray pointer mis-marks a free block, its payload
+    // (including the chain next) must not be scanned or the whole free list
+    // revives; the reuse side rewrites the desc along with the hdr anyway.
+    push(it, la_b(mov_rr(rax, rdx) + mov_ri64(rcx, desc_noscan * GC_DESC_SHIFT) + or_rr(rax, rcx) + mov_ri64(rcx, 1) + shl_ri(rcx, 63) + or_rr(rax, rcx) + mov_mr(r9, 0, rax) + add_rr(r10, rdx)))
     if gc_poison_g {
         // rep stosb：rdi=payload、rcx=size、AL=0xAB（imm64 任意值低字节即可）
         // rep stosb: rdi=payload, rcx=size, AL=0xAB (any imm64 whose low byte is 0xAB)
         push(it, la_b(mov_rr(rdi, r9) + add_ri32(rdi, 8) + mov_rr(rcx, rdx) + mov_ri64(rax, 171) + e1(243) + e1(170)))
     }
+    // 链入尺寸类自由链：按 cap 选类头槽址（比较链，jb 严格小于界 24/40/72，
+    // 与分配端的 ≤16/≤32/≤64 对 8 倍数等价）进 rdi，节点 = [next:8][cap:8]
+    //（payload+0/+8）；payload <16B 不链——8B 块的 +8 槽已是下一块 hdr，节点
+    // 两词写不下
+    // chain into the size-class free list: the compare chain (strict jb bounds
+    // 24/40/72, equivalent to the alloc side's <=16/<=32/<=64 for 8-multiples)
+    // picks the class head slot into rdi, node = [next:8][cap:8]
+    // (payload+0/+8); a payload under 16B is not chained — an 8B block's +8
+    // slot is already the next block's hdr, no room for the two node words
+    push(it, la_b(cmp_ri32(rdx, 16)))
+    push(it, la_jcc(CC_B, "gc_sw_nolink"))
+    let sel3 = mov_ri64(rdi, rt_slot(rt_free_big))
+    let sel2 = mov_ri64(rdi, rt_slot(rt_free64)) + cmp_ri32(rdx, 72) + jb_rel32(str_len(sel3))
+    let sel1 = mov_ri64(rdi, rt_slot(rt_free32)) + cmp_ri32(rdx, 40) + jb_rel32(str_len(sel2) + str_len(sel3))
+    let sel0 = mov_ri64(rdi, rt_slot(rt_free16)) + cmp_ri32(rdx, 24) + jb_rel32(str_len(sel1) + str_len(sel2) + str_len(sel3))
+    push(it, la_b(sel0 + sel1 + sel2 + sel3 + mov_rm(rcx, rdi, 0) + mov_mr(r9, 8, rcx) + mov_mr(r9, 16, rdx) + lea(rcx, r9, 8) + mov_mr(rdi, 0, rcx)))
+    push(it, la_l("gc_sw_nolink"))
+    push(it, la_l("gc_sw_next"))
     push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rax, rcx) + lea(r9, r9, 8) + add_rr(r9, rax)))
     push(it, la_jmp("gc_sw"))
     push(it, la_l("gc_sw_live"))
-    push(it, la_b(and_rr(rax, rcx) + mov_mr(r9, 0, rax)))
+    // 活块清 MARK 必须用 XOR（此时 MARK 必已置位，异或即清位、size/desc 原样
+    // 保留）。P2 初版写成 and_rr(rax, rcx)＝hdr & MARK——hdr 只剩 MARK 位、
+    // size/desc 全毁成 0，下一轮走查每步只进 8B，把 fb 的字段逐槽当块释放，
+    // 节点覆盖 FB_STACK_LO/RSP 后收集器影子扫描解引用 [8] 段错误。该路径在
+    // P2/P3 批 1 从未真正执行过——彼时全部 GC 验证（三开关矩阵、hello 探针）
+    // 都经 run 走 VM，x86 sweep 直至本批二进制验收才首次落地。
+    // a live block's MARK clear must be XOR (MARK is guaranteed set here, so
+    // the xor clears exactly that bit and preserves size/desc). The original
+    // P2 cut wrote and_rr(rax, rcx) = hdr & MARK — the hdr collapses to the
+    // bare MARK bit, the next walk advances 8B per step, frees the fb's fields
+    // slot by slot as "blocks", the chained node overwrites FB_STACK_LO/RSP,
+    // and the next collect's shadow scan dereferences [8] and segfaults. That
+    // path never executed in P2/P3-batch-1: every GC validation back then
+    // (matrix, hello probes) went through the VM via run — the x86 sweep only
+    // touched silicon with this batch's binary-level acceptance.
+    push(it, la_b(xor_rr(rax, rcx) + mov_mr(r9, 0, rax)))
     push(it, la_b(mov_rm(rax, r9, 0) + mov_ri64(rcx, GC_SIZE_MASK) + and_rr(rax, rcx) + lea(r9, r9, 8) + add_rr(r9, rax)))
     push(it, la_jmp("gc_sw"))
     push(it, la_l("gc_sw_done"))
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cycles)) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx)))
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_mr(rax, 0, r10)))
+    // P3 阈值步进：下一轮回收点 = 当前堆顶 + GC_THRESH_SLACK（复用生效时 r12 几
+    // 乎不动，回收频率随之稳定）
+    // P3 threshold step: the next collection point = the current heap top +
+    // GC_THRESH_SLACK (with reuse working, r12 barely moves and the collection
+    // cadence settles)
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_threshold)) + mov_ri64(rcx, GC_THRESH_SLACK) + add_rr(rcx, r12) + mov_mr(rax, 0, rcx)))
     // 出口：逆序弹 14 个 GPR，还快照区，ret
     push(it, la_b(pop_r(r15) + pop_r(r14) + pop_r(r13) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rdi) + pop_r(rsi) + pop_r(rbp) + pop_r(rbx) + pop_r(rdx) + pop_r(rcx) + pop_r(rax) + add_ri32(rsp, 16) + ret()))
     la_link(it)
