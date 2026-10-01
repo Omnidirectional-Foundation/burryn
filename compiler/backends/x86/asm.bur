@@ -511,11 +511,14 @@ fn shadow_set(disp, k) {
 
 // shadow_bump(n)：游标槽 += n（n 槽，正进负退）。rt 槽在 data 段镜像，无「绝对
 // 地址 + 位移」直访编码——先 movabs 槽址进 rax（push/pop 保护），再 81 /0（ADD）
-// 或 /5（SUB）带 mod=00 rm=rax 的 [rax] 间访 + imm32。
+// 或 /5（SUB）带 mod=00 rm=rax 的 [rax] 间访 + imm32。ADD/SUB 写 FLAGS——夹在
+// test/cmp 与 jcc 之间会吃掉条件码（op_jump_if_false_pop 实测全线 rc=4）。
 // shadow_bump(n): cursor slot += n (n slots, forward or back). The rt slots
 // mirror into the data segment and no "absolute address + displacement" direct
 // addressing exists — movabs the slot address into rax first (push/pop saved),
 // then 81 /0 (ADD) or /5 (SUB) with mod=00 rm=rax indirect [rax] plus imm32.
+// ADD/SUB write FLAGS — sitting between a test/cmp and its jcc eats the
+// condition (op_jump_if_false_pop measured all-green programs going rc=4).
 fn shadow_bump(n) {
     if n == 0 {
         ""
@@ -524,6 +527,20 @@ fn shadow_bump(n) {
     } else {
         push_r(rax) + mov_ri64(rax, rt_slot(rt_shadow_top)) + rex(1, 0, 0, 0) + e1(129) + modrm(0, 5, rax) + e4s(0 - n) + pop_r(rax)
     }
+}
+
+// shadow_set_guarded(disp, k)：带界检查的槽盖章——目标字节地址落在影子区基址
+// 之下（槽在 stack_lo 之下，收集器本就扫不到 [stack_lo, r15) 之外的槽）时跳过
+// 写入。native 以 [r15-k] 作 TOS 下方暂存槽时不保证 k 槽都存在，无界盖章在
+// 栈底附近的调用点会写出影子 mmap 区（readir/fs 的 read_dir 实测段错误）。
+// shadow_set_guarded(disp, k): a bounds-checked slot stamp — skips the store
+// when the target byte lands below the shadow region base (the slot sits below
+// stack_lo, and the collector never scans outside [stack_lo, r15) anyway).
+// Natives that use [r15-k] slots as below-TOS scratch do not guarantee all k
+// slots exist; an unguarded stamp at a call site near the stack bottom writes
+// outside the shadow mmap (readir/fs segfaulted inside read_dir in testing).
+fn shadow_set_guarded(disp, k) {
+    push_r(rax) + push_r(rcx) + mov_ri64(rax, rt_slot(rt_shadow_top)) + mov_rm(rax, rax, 0) + mov_ri64(rcx, rt_slot(rt_cur_fiber)) + mov_rm(rcx, rcx, 0) + mov_rm(rcx, rcx, FB_SHADOW) + sub_ri32(rax, disp) + cmp_rr(rax, rcx) + jb_rel32(3) + e1(198) + modrm(0, 0, rax) + sb(k) + pop_r(rcx) + pop_r(rax)
 }
 
 // gc_kind_of 把静态类型词折成影子 kind：""（未知）→ MAYBE 兜底；

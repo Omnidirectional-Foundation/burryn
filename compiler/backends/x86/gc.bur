@@ -139,15 +139,21 @@ pub fn desc_reset() {
     desc_list_scalar = desc_register("list-s", [4, 3, 0])
     desc_list_ptr = desc_register("list-p", [4, 3, 1])
     desc_list_maybe = desc_register("list-m", [4, 3, 2])
-    // chan 14 词，位 1/4/7/10 = buf/sendq/recvq/waiters
-    // chan is 14 words; bits 1/4/7/10 = buf/sendq/recvq/waiters
-    desc_chan = desc_register("chan", [3, 2, 144, 4])
+    // chan 14 词，位 1/4/7/10 = buf/sendq/recvq/waiters：byte0 = 2|16|128 = 146，
+    // byte1 = 位10 = 4。位图字节紧随 kind 字节（收集器从 desc+1 顺序读），无计数字节
+    // chan is 14 words; bits 1/4/7/10 = buf/sendq/recvq/waiters: byte0 =
+    // 2|16|128 = 146, byte1 = bit10 = 4. Bitmap bytes follow the kind byte
+    // directly (the collector reads them sequentially from desc+1, no count byte)
+    desc_chan = desc_register("chan", [3, 146, 4])
     // map 4 词，位 2/3 = keys/vals
     // map is 4 words; bits 2/3 = keys/vals
     desc_map = desc_register("map", [3, 12])
-    // fb 11 词，位 7/8 = READY_NEXT/LIST_NEXT
-    // fb is 11 words; bits 7/8 = READY_NEXT/LIST_NEXT
-    desc_fb = desc_register("fb", [3, 128, 64])
+    // fb 11 词，位 7/8 = READY_NEXT/LIST_NEXT：byte0 = 128（位7），byte1 = 1（位8）
+    //——byte1 写 64 会指向词 14（fb 只有 11 词，LIST_NEXT 从此漏标）
+    // fb is 11 words; bits 7/8 = READY_NEXT/LIST_NEXT: byte0 = 128 (bit7),
+    // byte1 = 1 (bit8) — a byte1 of 64 points at word 14 (fb is 11 words, so
+    // LIST_NEXT would never be marked)
+    desc_fb = desc_register("fb", [3, 128, 1])
     // sb builder 88B，位 2 = buf 指针
     // the sb builder is 88B; bit 2 = the buf pointer
     desc_sb = desc_register("sb", [3, 4])
@@ -383,6 +389,7 @@ pub fn set_gc_stress(v: bool) {
 pub fn set_gc_poison(v: bool) {
     gc_poison_g = v
 }
+
 // hdr 标志位：位 62 = MARK（本轮可达），位 63 = FREE（已死，P3 复用时读）。
 // hdr flag bits: bit 62 = MARK (reachable this cycle), bit 63 = FREE (dead,
 // read back by P3's reuse).
@@ -392,11 +399,19 @@ pub let GC_SIZE_MASK = 1099511627775
 
 // x86gen_gc_mark_block：mark(rdi) 子程序——对齐过滤 + [heap_start, r12) 界内 +
 // start-bit 命中三者全过才认指针：置 hdr 位 62、rt_gc_cnt++。已 MARK 直退。
-// 保存 rax/rcx/rdx/rsi（push/pop），其余不碰；毁 FLAGS。
+// start-bit 按候选的块头粒度查（(rdi-8-heap)>>3，与分配站点/verify 同口径）：
+// 位只落在 hdr 粒度上，按 rdi 本身粒度查恒差一格——真指针全被拒收，而值恰为
+// 某块 hdr 地址的值反会过检，把 MARK 写进 [hdr-8] = 前一块 payload 尾字。
+// start-bit 是唯一把「值」变「块」的闸门，粒度错位即收集器整体失效。
 // x86gen_gc_mark_block: the mark(rdi) subroutine — an aligned candidate inside
 // [heap_start, r12) whose start-bit is set counts as a pointer: set hdr bit 62
-// and rt_gc_cnt++. Already-MARKed exits early. Saves rax/rcx/rdx/rsi
-// (push/pop), touches nothing else; clobbers FLAGS.
+// and rt_gc_cnt++. Already-MARKed exits early. The start-bit is checked at the
+// candidate's BLOCK-HEADER granule ((rdi-8-heap)>>3, same convention as the
+// alloc sites and verify): bits only ever land on hdr granules, so checking at
+// rdi's own granule is always one granule off — every real pointer gets
+// rejected, while any value that happens to equal some block's hdr address
+// passes and MARK lands at [hdr-8], the previous block's last payload word.
+// Saves rax/rcx/rdx/rsi (push/pop), touches nothing else; clobbers FLAGS.
 fn x86gen_gc_mark_block() {
     let mut it = []
     push(it, la_b(push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rsi)))
@@ -410,7 +425,7 @@ fn x86gen_gc_mark_block() {
     push(it, la_jcc(CC_B, "gm_done"))
     push(it, la_b(cmp_rr(rdi, r12)))
     push(it, la_jcc(CC_AE, "gm_done"))
-    push(it, la_b(mov_rr(rax, rdi) + sub_rr(rax, rsi) + shr_ri(rax, 3)))
+    push(it, la_b(mov_rr(rax, rdi) + sub_ri32(rax, 8) + sub_rr(rax, rsi) + shr_ri(rax, 3)))
     push(it, la_b(mov_ri64(rcx, rt_slot(rt_start_bitmap)) + mov_rm(rcx, rcx, 0)))
     // cmp byte [rcx+rax], 0（base+index 手写编码，同 verify_seq）
     // cmp byte [rcx+rax], 0 (handwritten base+index encoding, same as verify_seq)
@@ -547,11 +562,13 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_l("gc_sw_words"))
     push(it, la_b(shr_ri(rdx, 3) + xor_rr(rcx, rcx) + lea(r10, r9, 8)))
     push(it, la_jmp("gc_scan"))
-    // prefix：跳过头标量词，尾按 kind / prefix: skip head scalars, tail per kind
+    // prefix：跳过头标量词；尾 kind 0=SCALAR 不扫，1=PTR/2=MAYBE 全词扫（尾
+    // kind 用的就是影子 kind 编码，0 恰是 SCALAR——只挡 0，1/2 都进扫尾）
+    // prefix: skip the head scalar words; a tail kind of 0=SCALAR scans nothing,
+    // 1=PTR/2=MAYBE scan every word (the tail byte uses the shadow kind encoding,
+    // where 0 is SCALAR — gate on 0 only, let 1/2 fall into the scan tail)
     push(it, la_l("gc_sw_prefix"))
-    push(it, la_b(movzx_rm8(rcx, r8, 1) + movzx_rm8(rdi, r8, 2) + cmp_ri32(rdi, 1)))
-    push(it, la_jcc(CC_E, "gc_pw_next"))
-    push(it, la_b(cmp_ri32(rdi, 2)))
+    push(it, la_b(movzx_rm8(rcx, r8, 1) + movzx_rm8(rdi, r8, 2) + test_rr(rdi, rdi)))
     push(it, la_jcc(CC_E, "gc_pw_next"))
     push(it, la_b(shr_ri(rdx, 3) + lea(r10, r9, 8)))
     push(it, la_jmp("gc_scan"))
@@ -621,5 +638,36 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_mr(rax, 0, r10)))
     // 出口：逆序弹 14 个 GPR，还快照区，ret
     push(it, la_b(pop_r(r15) + pop_r(r14) + pop_r(r13) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rdi) + pop_r(rsi) + pop_r(rbp) + pop_r(rbx) + pop_r(rdx) + pop_r(rcx) + pop_r(rax) + add_ri32(rsp, 16) + ret()))
+    la_link(it)
+}
+
+// x86gen_heap_objects_block：heap_objects 内建体——沿 hdr 链走查 [heap_start, r12)，
+// 数 FREE 位（位 63）未置的块。heap_objects 的语义 = 当前存活对象数；P2 初版误读
+// rt_gc_cnt（只是上一轮 collect 的 mark 计数，collect 前恒 0），gc_stress.bur 的
+// after_churn > before 断言因此在 x86 假红（VM/C 用真实存活计数，两边不等）。
+// 保存 rax/rcx/rdx/r9/r10（push/pop），r12/rbx 只读；毁 FLAGS。
+// x86gen_heap_objects_block: the heap_objects builtin body — walk the hdr chain
+// over [heap_start, r12) counting blocks whose FREE bit (bit 63) is clear.
+// heap_objects' semantics = the current live-object count; the first P2 cut
+// misread rt_gc_cnt (only the last collect's mark count, always 0 before any
+// collect), which tripped gc_stress.bur's after_churn > before assertion on
+// x86 (VM/C use a true live count, so the three disagreed). Saves
+// rax/rcx/rdx/r9/r10 (push/pop), reads r12/rbx; clobbers FLAGS.
+fn x86gen_heap_objects_block() {
+    let mut it = []
+    push(it, la_b(push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(r9) + push_r(r10)))
+    push(it, la_b(mov_ri64(r9, rt_slot(rt_heap_start)) + mov_rm(r9, r9, 0) + xor_rr(rcx, rcx) + mov_ri64(r10, 1) + shl_ri(r10, 63)))
+    push(it, la_l("ho_loop"))
+    push(it, la_b(cmp_rr(r9, r12)))
+    push(it, la_jcc(CC_AE, "ho_done"))
+    push(it, la_b(mov_rm(rax, r9, 0) + test_rr(r10, rax)))
+    push(it, la_jcc(CC_NE, "ho_next"))
+    push(it, la_b(add_ri32(rcx, 1)))
+    push(it, la_l("ho_next"))
+    push(it, la_b(mov_rr(rdx, rax) + mov_ri64(rax, GC_SIZE_MASK) + and_rr(rdx, rax) + lea(r9, r9, 8) + add_rr(r9, rdx)))
+    push(it, la_jmp("ho_loop"))
+    push(it, la_l("ho_done"))
+    push(it, la_b(mov_mr(r15, 0 - 8, rcx)))
+    push(it, la_b(pop_r(r10) + pop_r(r9) + pop_r(rdx) + pop_r(rcx) + pop_r(rax)))
     la_link(it)
 }

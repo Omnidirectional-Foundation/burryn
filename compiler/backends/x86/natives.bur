@@ -1308,7 +1308,7 @@ fn x86gen_read_dir_native() {
     let addr_idx = mov_rm(rax, r15, 0 - 32) + mov_ri32(rcx, 3) + shl_rcl(rax) + mov_rm(r9, r15, 0 - 24) + add_rr(rax, r9)
     // 收集：单 pass 读目录，非点名字按 strcmp 顺序收集
     // collect: single pass over the directory, gathering non-dot names
-    let collect_seq = mov_mr(r15, 0 - 64, rsi) + shadow_set(8, GC_SHADOW_PTR) + entry_len + lea(r8, rdx, 9) + x86gen_alloc_r(r11, r8, GC_DESC_ALL) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + mov_rr(rsi, rcx) + mov_rr(rcx, rdx) + rep_movsb() + xor_rr(rax, rax) + e1(170) + mov_rm(rsi, r15, 0 - 64) + addr_idx + mov_mr(rax, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
+    let collect_seq = mov_mr(r15, 0 - 64, rsi) + shadow_set_guarded(8, GC_SHADOW_SCALAR) + entry_len + lea(r8, rdx, 9) + x86gen_alloc_r(r11, r8, GC_DESC_ALL) + mov_mr(r11, 0, rdx) + lea(rdi, r11, 8) + mov_rr(rsi, rcx) + mov_rr(rcx, rdx) + rep_movsb() + xor_rr(rax, rax) + e1(170) + mov_rm(rsi, r15, 0 - 64) + addr_idx + mov_mr(rax, 0, r11) + mov_rm(rax, r15, 0 - 32) + add_ri32(rax, 1) + mov_mr(r15, 0 - 32, rax)
     let inner_tail = mov_rm(rdx, r15, 0 - 40) + add_rr(rsi, rdx)
     let inner_work = mov_rr(rcx, rsp) + add_rr(rcx, rsi) + add_ri32(rcx, name_off) + mov_rr(rax, rsp) + add_rr(rax, rsi) + add_ri32(rax, reclen_off) + mov_rm(rdx, rax, 0) + mov_ri64(r9, 65535) + and_rr(rdx, r9) + mov_mr(r15, 0 - 40, rdx) + is_dotdot + test_rr(r9, r9) + jne_rel32(str_len(collect_seq)) + collect_seq + inner_tail
     let inner_cond = mov_rm(rdx, r15, 0 - 16) + cmp_rr(rsi, rdx) + jge_rel32(str_len(inner_work) + 5)
@@ -1339,7 +1339,7 @@ fn x86gen_read_dir_native() {
     let win_closeadd = mov_rm(rdi, rsp, 320) + sys_mov_rax(1002) + syscall() + add_ri32(rsp, 328)
     // 主流程拼装
     // main assembly
-    let list_alloc = mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + x86gen_alloc_r(r11, rax, GC_DESC_ALL) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + mov_mr(r15, 0 - 40, r11) + shadow_set(5, GC_SHADOW_PTR) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
+    let list_alloc = mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + x86gen_alloc_r(r11, rax, GC_DESC_ALL) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + mov_mr(r15, 0 - 40, r11) + shadow_set_guarded(5, GC_SHADOW_PTR) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
     // Windows FindFirst 失败路径同样要还 328B 帧，否则 rsp 从此偏斜。
     // The Windows FindFirst failure path must release the 328B frame too,
     // otherwise rsp stays skewed for the rest of the program.
@@ -1355,7 +1355,7 @@ fn x86gen_read_dir_native() {
         main_done_closeadd = win_closeadd
     }
     let main_done = main_done_closeadd + mov_rm(r10, r15, 0 - 32) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + test_rr(r10, r10) + je_rel32(str_len(outer_loop) + str_len(list_alloc) + str_len(build_loop) + str_len(build_tail)) + outer_loop + list_alloc + build_loop + build_tail
-    let names_alloc = x86gen_alloc(r9, 16384, GC_DESC_ALL) + mov_mr(r15, 0 - 24, r9) + shadow_set(3, GC_SHADOW_PTR) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
+    let names_alloc = x86gen_alloc(r9, 16384, GC_DESC_ALL) + mov_mr(r15, 0 - 24, r9) + shadow_set_guarded(3, GC_SHADOW_PTR) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
     let main_tail = sub_ri32(rsp, 8192) + names_alloc + collect_loop + main_done + empty_ok
     let open_fail = test_rr(rax, rax) + jl_rel32(str_len(main_tail))
     // Windows 全套：path + "/*" 堆串 → FindFirst → 句柄家 → names_alloc → 循环。

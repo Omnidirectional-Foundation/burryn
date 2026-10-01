@@ -923,7 +923,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             w(jne_rel32(0))
         } else if op == lib::op_jump_if_false_pop {
             let target = ip + 3 + read_u16(code, ip + 1)
-            w(mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + lea(r15, r15, 0 - 8))
+            // 弹条件槽必须同步回退影子游标：r15 每动 8B 游标就得动 1B，否则漂移
+            // 累积（每执行一次 +1B），影子字节整体上移直至写出 mmap 区段段错误。
+            // 顺序约束：先弹槽再 bump，最后才读值 + test——shadow_bump 的 SUB 会毁
+            // FLAGS，夹在 test 与 je 之间会把条件码吃掉（实测 hello/keywords 全线
+            // rc=4）；弹完后条件值落在 [r15]，按 disp 0 读。
+            // popping the condition slot must retreat the shadow cursor in step:
+            // every 8B of r15 moves the cursor 1B, else drift accumulates (+1B per
+            // execution) and the shadow bytes shift up until the mmap region
+            // faults. Ordering: pop, bump, then read + test — shadow_bump's SUB
+            // clobbers FLAGS, and sitting between test and je it eats the
+            // condition (hello/keywords all went rc=4 in testing); after the pop
+            // the condition sits at [r15], read at disp 0.
+            w(lea(r15, r15, 0 - 8) + shadow_bump(0 - 1) + mov_rm(rax, r15, 0) + test_rr(rax, rax))
             shadow_pop(shadow, 1)
             shadow_pop(type_shadow, 1)
             push(patches, [cur_byte() + 2, target])
@@ -1312,8 +1324,12 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(mov_ri64(rax, gc_collect_g) + call_r(rax) + mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 8, rax) + shadow_set(1, GC_SHADOW_SCALAR))
                 ret_type = "int"
             } else if callee == "heap_objects" {
-                // 返回当前存活对象数 / return the current live object count
-                w(mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rax, rax, 0) + mov_mr(r15, 0 - 8, rax) + shadow_set(1, GC_SHADOW_SCALAR))
+                // 返回当前存活对象数：堆走查数 FREE 未置块（rt_gc_cnt 只是上一轮
+                // collect 的 mark 计数，collect 前恒 0，不能当存活数用）
+                // return the current live-object count: walk the heap counting
+                // blocks with FREE clear (rt_gc_cnt is only the last collect's
+                // mark count — always 0 before any collect, not a live count)
+                w(x86gen_heap_objects_block() + shadow_set(1, GC_SHADOW_SCALAR))
                 ret_type = "int"
             } else if callee == "gc_cycles" {
                 // 返回已执行的回收次数 / return the number of collections run
@@ -2286,10 +2302,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // movabs 会毁 r8，chan_wake 也毁 r8），re_wake 只负责 call wake
                         // 后 pop 回来；re_fill 已含于 re_pop 末尾，exec_pre 不得重复拼接
                         let re_wake = mov_rm(rax, r15, chd) + mov_ri64(r8, chan_wake_addr) + call_r(r8) + pop_r(r8) + mov_mr(r15, base_disp, r8)
-                        // 值落 base 槽：pop 后为 TOS——set(1, 臂元素 kind)；弹掉其余 slots-1 槽
-                        // the value lands in the base slot and becomes TOS after the pop:
-                        // set(1, the arm's element kind); pop the remaining slots-1 slots
-                        exec_pre = re_head + re_pop + re_sendq + sel_unregs + re_wake + lea(r15, r15, base_disp + 8) + shadow_set(1, arm_ek[sel_j]) + shadow_bump(0 - (slots - 1))
+                        // 值落 base 槽：pop 后为 TOS——先弹槽回退游标再 set(1, 臂元素
+                        // kind)：set(1) 按「当前游标 - 1」寻址 TOS，set 在 bump 前执行
+                        // 会写到旧顶（仅 slots=1 时碰巧对）
+                        // the value lands in the base slot and becomes TOS after the
+                        // pop: bump the cursor back first, then set(1, the arm's
+                        // element kind) — set(1) addresses the TOS as cursor-1, so a
+                        // set before the bump writes the old top (only correct when
+                        // slots=1)
+                        exec_pre = re_head + re_pop + re_sendq + sel_unregs + re_wake + lea(r15, r15, base_disp + 8) + shadow_bump(0 - (slots - 1)) + shadow_set(1, arm_ek[sel_j])
                     }
                     push(sel_execs, exec_pre)
                     // 检查段：jcc 目标 = exec 开头（跳过 chk_next 的 5B）

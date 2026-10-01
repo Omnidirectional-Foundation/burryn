@@ -1441,29 +1441,25 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 psel_ti = psel_ti + 1
             }
             let mut psel_slots = 0
-            let mut psel_recvs = 0
             let mut psel_ets = []
-            // psel_cum: 已扫臂中 recv 臂的元素类型（臂体快照增量累积）
-            // psel_cum: element types of recv arms scanned so far (incremental for arm snapshots)
-            let mut psel_cum = []
+            // recv 臂：运行时值覆盖 chan 槽（[ch] → [v]），臂体栈多一个值类型；
+            // send 臂与 default 入口 = 选择基（无值）。臂入口深度与臂序无关——
+            // 运行时所有路径统一收缩到同一形状（recv=基+1，send/default=基）。
+            // recv arm: the runtime value overwrites the channel slot ([ch] -> [v]),
+            // so the arm body carries one extra value type; send arms and the
+            // default enter at the select base (no value). Arm-entry depth is
+            // arm-index-independent — the runtime collapses every path to the same
+            // shape (recv = base+1, send/default = base).
             let mut psel_i = 0
             while psel_i < psel_n {
                 let psel_kind = pcode[psel_p]
                 let psel_dist = read_u16(pcode, psel_p + 1)
                 psel_p = psel_p + 3
-                // recv 臂：运行时值覆盖 chan 槽（[ch] → [v]），臂体栈多一个值类型
-                // recv arm: the runtime value overwrites the channel slot
-                // ([ch] -> [v]); the arm body stack carries one extra value type
-                put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs + (if psel_kind == 1 {
+                put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_total + (if psel_kind == 1 {
                     0
                 } else {
                     1
                 }))
-                psel_recvs = psel_recvs + (if psel_kind == 1 {
-                    0
-                } else {
-                    1
-                })
                 if psel_kind == 1 {
                     push(psel_ets, "")
                 } else {
@@ -1480,21 +1476,24 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     }
                     push(psel_ets, paet)
                 }
-                // 臂体跳入点快照：底部槽 + 已扫 recv 值 + 本臂 recv 值（与深度公式对齐）
-                // arm-body snapshot: bottom slots + scanned recv values + this arm's recv
-                // value (aligned with the depth formula)
-                let mut psel_ss = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_slots)
-                let mut psel_ts = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_slots)
-                let mut psel_cj = 0
-                while psel_cj < len(psel_cum) {
-                    push(psel_ss, "")
-                    push(psel_ts, psel_cum[psel_cj])
-                    psel_cj = psel_cj + 1
-                }
+                // 臂体跳入点快照：底部槽 + 本臂 recv 值（与运行时臂入口深度一致）。
+                // 旧版按「已扫 recv 臂」累积值叠快照且汇合点把每个 recv 臂的值槽
+                // 重新压回线性模型——多 recv 臂时臂体与汇合点的模型深度随臂序膨胀
+                //（select_arms 3 recv 臂实测汇合 +3），epilogue height 虚高 → 游标
+                // 过退 → 影子字节写出 mmap 区段错误。
+                // arm-body snapshot: bottom slots + this arm's recv value (matching
+                // the runtime arm-entry depth). The old version stacked
+                // scanned-so-far recv values into every snapshot and re-pushed one
+                // value slot per recv arm into the linear flow — with multiple recv
+                // arms the arm-body and join model depths inflated with arm index
+                // (select_arms' 3 recv arms measured join +3), the epilogue height
+                // grew phantom slots, the cursor over-retreated, and the shadow
+                // stamp wrote outside the mmap region.
+                let mut psel_ss = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_total)
+                let mut psel_ts = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_total)
                 if psel_kind != 1 {
                     push(psel_ss, "")
                     push(psel_ts, psel_ets[psel_i])
-                    push(psel_cum, psel_ets[psel_i])
                 }
                 put(pt_target_shadow, str(ptfh) + ":" + str(psel_p + psel_dist), [psel_ss, psel_ts])
                 psel_slots = psel_slots + (if psel_kind == 1 {
@@ -1507,29 +1506,16 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             if psel_has_dflt {
                 let psel_dist = read_u16(pcode, psel_p)
                 psel_p = psel_p + 2
-                put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_slots + psel_recvs)
-                // default 跳入点快照：底部槽 + 全部 recv 值（与深度公式对齐）
-                // default snapshot: bottom slots + all recv values (aligned with the depth formula)
-                let mut psel_ds = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_slots)
-                let mut psel_dt = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_slots)
-                let mut psel_cj = 0
-                while psel_cj < len(psel_cum) {
-                    push(psel_ds, "")
-                    push(psel_dt, psel_cum[psel_cj])
-                    psel_cj = psel_cj + 1
-                }
+                put(p_depth_at, psel_p + psel_dist, len(pshadow_ps) - psel_total)
+                // default 跳入点快照：底部槽（运行时 default 入口 = 选择基）
+                // default snapshot: bottom slots (the runtime default enters at the
+                // select base)
+                let psel_ds = cp_ps_n(pshadow_ps, len(pshadow_ps) - psel_total)
+                let psel_dt = cp_ps_n(ptshadow_ps, len(ptshadow_ps) - psel_total)
                 put(pt_target_shadow, str(ptfh) + ":" + str(psel_p + psel_dist), [psel_ds, psel_dt])
             }
             shadow_pop(pshadow_ps, psel_slots)
             shadow_pop(ptshadow_ps, psel_slots)
-            let mut pv = 0
-            while pv < psel_n {
-                if pcode[pit + 3 + 3 * pv] != 1 {
-                    push(pshadow_ps, "")
-                    push(ptshadow_ps, psel_ets[pv])
-                }
-                pv = pv + 1
-            }
         }
         if pop != lib::op_no_match && len(ptshadow_ps) > 0 {
             // 种子含槽 0（链接槽）占位，栈顶槽号 = 模拟栈深 - 1（与 emit 的 vds 对齐）
