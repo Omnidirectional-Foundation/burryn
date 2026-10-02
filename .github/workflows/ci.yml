@@ -641,6 +641,145 @@ jobs:
             Write-Output "OK $t"
           }
 
+  sdk-pack:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Pack the macOS SDK for the darwin cross link
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --show-sdk-path)"
+          echo "SDK: $sdk"
+          mkdir -p sdk-out
+          tar cfz sdk-out/macos-sdk.tar.gz -C "$(dirname "$sdk")" "$(basename "$sdk")"
+          ls -la sdk-out
+
+      - name: Upload macOS SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-sdk
+          path: sdk-out
+          if-no-files-found: error
+          retention-days: 7
+
+  llvm-macho-build:
+    needs: [gen1, sdk-pack]
+    if: always() && needs.gen1.result == 'success' && needs.sdk-pack.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: Download macOS SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-sdk
+          path: sdk-out
+
+      - name: Install lld
+        run: |
+          set -euo pipefail
+          command -v ld64.lld >/dev/null 2>&1 || sudo apt-get update -qq
+          command -v ld64.lld >/dev/null 2>&1 || sudo apt-get install -y -qq lld
+          (ld64.lld --version 2>/dev/null || ld64.lld-18 --version 2>/dev/null || ld64.lld-17 --version 2>/dev/null || ld64.lld-16 --version 2>/dev/null || ld64.lld-15 --version 2>/dev/null || ld64.lld-14 --version) | head -n 1
+
+      # gen1 是上一代自举：还不带 --os darwin 的链接路——先用它（C 路）编出当前
+      # 编译器，跨链接由当前编译器驱动
+      # gen1 is the previous-generation bootstrap and predates the darwin link
+      # path — build the current compiler with it (C path) first and drive the
+      # cross link through that
+      - name: Build macho programs (LLVM backend)
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build compiler -o bur_cur
+          mkdir -p sdk
+          tar xfz sdk-out/macos-sdk.tar.gz -C sdk
+          sdkdir="$(ls sdk)"
+          echo "SDK dir: $sdkdir"
+          mkdir -p macho-out
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/basics/hello.bur -o macho-out/hello
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/basics/fib.bur -o macho-out/fib
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/basics/float_arith.bur -o macho-out/float_arith
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/concurrency/yield.bur -o macho-out/yield
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" testdata/regression/clock.bur -o macho-out/clock
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/io/fs.bur -o macho-out/fs
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/io/sleep.bur -o macho-out/sleep
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/net/net_loopback.bur -o macho-out/net_loopback
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" examples/net/net_nb.bur -o macho-out/net_nb
+          ./bur_cur build --backend llvm --os darwin --macos-sdk "sdk/$sdkdir" testdata/pkg/deferred -o macho-out/deferred
+
+      - name: Upload macho programs (LLVM backend)
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-macho-progs
+          path: macho-out
+          if-no-files-found: error
+          retention-days: 7
+
+  llvm-macho-run:
+    needs: llvm-macho-build
+    if: always() && needs.llvm-macho-build.result == 'success'
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download macho programs (LLVM backend)
+        uses: actions/download-artifact@v4
+        with:
+          name: llvm-macho-progs
+          path: macho-out
+
+      - name: Run slice vs goldens (hard gate)
+        run: |
+          set -euo pipefail
+          # 每例 30 秒看门狗（perl alarm，SIGALRM 退出码 142）：卡死即失败，不拖到 job 超时
+          # 30-second watchdog per program (perl alarm, SIGALRM exits 142): a hang
+          # fails fast instead of holding the job until its timeout
+          check_one() {
+            codesign -f -s - "macho-out/$1"
+            chmod +x "macho-out/$1"
+            set +e
+            perl -e 'alarm 30; exec @ARGV' "macho-out/$1" > "actual-$1.txt" 2>"run-$1.err"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then echo "$1 exited $rc"; head -5 "run-$1.err"; exit $rc; fi
+            diff "$2" "actual-$1.txt"
+            echo "OK $1"
+          }
+          check_one hello examples/basics/hello.golden
+          check_one fib examples/basics/fib.golden
+          check_one float_arith examples/basics/float_arith.golden
+          check_one yield examples/concurrency/yield.golden
+          check_one clock testdata/regression/clock.golden
+          check_one sleep examples/io/sleep.golden
+          check_one fs examples/io/fs.golden
+
+      - name: Run net slice (hard gate)
+        run: |
+          set -euo pipefail
+          check_one() {
+            codesign -f -s - "macho-out/$1"
+            chmod +x "macho-out/$1"
+            set +e
+            perl -e 'alarm 30; exec @ARGV' "macho-out/$1" > "actual-$1.txt" 2>"run-$1.err"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then echo "$1 exited $rc"; head -5 "run-$1.err"; exit $rc; fi
+            diff "examples/net/$1.golden" "actual-$1.txt"
+            echo "OK $1"
+          }
+          check_one net_loopback
+          check_one net_nb
+
   x86-pe-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -1160,8 +1299,9 @@ jobs:
   gate:
     needs:
       [gohost, seed, bur-base, gen1, check, fixpoint, llvm-fixpoint, testdata,
-       examples, std, lsp, multibackend, x86-repro, llvm, llvm-pe-build,
-       llvm-pe-run, x86-pe-build, x86-pe-run, x86-macho-build,
+       examples, std, lsp, multibackend, x86-repro, llvm, sdk-pack,
+       llvm-pe-build, llvm-pe-run, llvm-macho-build, llvm-macho-run,
+       x86-pe-build, x86-pe-run, x86-macho-build,
         x86-macho-run, runtime]
     if: always()
     runs-on: ubuntu-latest

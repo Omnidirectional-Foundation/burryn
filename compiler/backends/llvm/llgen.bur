@@ -14,7 +14,42 @@
 import "burryn.dev/compiler/lib"
 import "burryn.dev/compiler/frontend"
 
+// win_abi_g 当前程序是否落 windows 三元组——Value ABI 分叉开关：win64 的 C
+// ABI 对 16 字节结构体是按引用传 + 隐藏指针返回，LLVM 裸结构体实参却拆寄存器
+// （wine 实测对不上即段错误）；SysV（linux/darwin）裸结构体拆寄存器恰好与 C
+// 一致，加 sret 反而错（SysV 的 16B INTEGER 结构体走 RAX:RDX 返回）。发射期
+// 全局，llgen 入口按 f_triple 置位。
+// win_abi_g: whether the current program targets a windows triple — the Value
+// ABI fork. win64's C ABI passes a 16-byte struct by reference and returns it
+// through a hidden pointer, while LLVM lowers bare struct arguments to
+// register splits (a wine-verified segfault when they disagree); on SysV
+// (linux/darwin) the bare register split already matches C, and adding sret
+// would break it (a 16-byte INTEGER struct returns in RAX:RDX). Emission-time
+// global, set from f_triple at the llgen entry.
+let mut win_abi_g = false
+
+fn ll_contains(s, sub) {
+    let n = str_len(sub)
+    let mut i = 0
+    while i + n <= str_len(s) {
+        if substr(s, i, n) == sub {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn ll_triple_is_win(t) {
+    if ll_contains(t, "windows") {
+        true
+    } else {
+        ll_contains(t, "mingw")
+    }
+}
+
 pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans, f_consts, en_qual, en_vnames, en_varities, ls_files, ls_names, ls_tables, use_ptr, f_triple) {
+    win_abi_g = ll_triple_is_win(f_triple)
     let mut out = []
     let mut glue = []
     fn w(s) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
@@ -44,6 +79,54 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             "ptr"
         } else {
             "void ()*"
+        }
+    }
+    // VARG/VRET：Value 实参与返回的 ABI 形态，按 win_abi_g 分叉。win64 的 C
+    // ABI 对 16 字节结构体是按引用传 + 隐藏指针返回，LLVM 裸结构体实参却拆进
+    // 寄存器（对不上即段错误，wine 实证）——windows 三元组发 byval/sret；
+    // SysV（linux/darwin）裸拆恰好与 C 一致，保持裸形态。win 分支的临时槽是
+    // 函数序言里的 %vt0/%vt1/%vt2/%vr。
+    // VARG/VRET: the ABI shape of Value arguments and returns, forked on
+    // win_abi_g. win64's C ABI passes a 16-byte struct by reference and
+    // returns it through a hidden pointer while LLVM lowers bare struct
+    // arguments to register splits (a segfault when they disagree, verified
+    // under wine) — a windows triple emits byval/sret; on SysV (linux/darwin)
+    // the bare split already matches C, so the bare form stays. The win-form
+    // temp slots are %vt0/%vt1/%vt2/%vr in the prologue.
+    fn VARG() capture(ref use_ptr) {
+        if win_abi_g {
+            if use_ptr {
+                "ptr byval(%Value)"
+            } else {
+                "%Value* byval(%Value)"
+            }
+        } else {
+            "%Value"
+        }
+    }
+    fn VRET() capture(ref use_ptr) {
+        if win_abi_g {
+            if use_ptr {
+                "ptr sret(%Value)"
+            } else {
+                "%Value* sret(%Value)"
+            }
+        } else {
+            "%Value"
+        }
+    }
+    fn va(slot) capture(ref use_ptr) {
+        if use_ptr {
+            "ptr byval(%Value) %" + slot
+        } else {
+            "%Value* byval(%Value) %" + slot
+        }
+    }
+    fn vr_use() capture(ref use_ptr) {
+        if use_ptr {
+            "ptr sret(%Value) %vr"
+        } else {
+            "%Value* sret(%Value) %vr"
         }
     }
 
@@ -207,45 +290,65 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
     w("@bur_opt_enum = external global " + PT("%OEnumType") + "\n")
     w("@bur_res_enum = external global " + PT("%OEnumType") + "\n")
     w("@bur_out_enum = external global " + PT("%OEnumType") + "\n")
-    // mingw 的 stdout 是 dllimport 数据符号（__imp_stdout），IR 直引 stdout
-    // 断链（实测）——mingw 目标跳过声明并改用 fflush(null)（运行时唯一缓冲流
-    // 即 stdout，语义等价）；linux/darwin 的 stdout 是普通数据符号，照旧。
-    // mingw's stdout is a dllimport data symbol (__imp_stdout); a direct IR
-    // reference to stdout fails to link (tested) — mingw targets skip the
-    // declaration and flush via fflush(null) instead (stdout is the only
-    // buffered stream, so this is equivalent); linux/darwin keep stdout.
-    if !ll_is_mingw(f_triple) {
+    // 跨目标不直引 stdout：mingw 的 stdout 是 dllimport 数据符号
+    // （__imp_stdout）、darwin 的 SDK 头把 stdout 重定向成 __stdoutp——IR 裸引
+    // stdout 在两边都断链（实测）。凡显式 --os（triple 非空）一律改用
+    // fflush(null)（运行时唯一缓冲流即 stdout，语义等价且免疫 SDK 漂移）；
+    // linux 宿主默认路径照旧直引。
+    // Cross targets never reference stdout directly: mingw's stdout is a
+    // dllimport data symbol (__imp_stdout) and darwin's SDK headers redirect
+    // stdout to __stdoutp — a bare IR reference fails to link on both
+    // (tested). With an explicit --os (non-empty triple) the flush goes
+    // through fflush(null) instead (stdout is the only buffered stream, so
+    // this is equivalent and immune to SDK drift); the linux host-default
+    // path keeps the direct reference.
+    if f_triple == "" {
         w("@stdout = external global " + PT("i8") + "\n")
     }
 
-    w("declare void @bur_push(%Value)\n")
-    w("declare %Value @bur_pop()\n")
-    w("declare %Value @bur_peek(i32)\n")
-    w("declare i8 @bur_eq(%Value, %Value)\n")
-    w("declare %Value @bur_add(%Value, %Value)\n")
-    w("declare %Value @bur_compare(%Value, %Value, i32)\n")
-    w("declare %Value @bur_arith(%Value, %Value, i8)\n")
-    w("declare %Value @bur_neg(%Value)\n")
-    w("declare %Value @bur_not(%Value)\n")
-    w("declare " + PT("i8") + " @bur_typename(%Value)\n")
-    w("declare %Value @bur_index_get(%Value, %Value)\n")
-    w("declare void @bur_index_set(%Value, %Value, %Value)\n")
-    w("declare i64 @bur_len(%Value)\n")
-    w("declare %Value @upvalue_get(" + PT("%OUpvalue") + ")\n")
-    w("declare void @upvalue_set(" + PT("%OUpvalue") + ", %Value)\n")
+    if win_abi_g {
+        w("declare void @bur_pop(" + VRET() + ")\n")
+        w("declare void @bur_peek(" + VRET() + ", i32)\n")
+        w("declare void @bur_add(" + VRET() + ", " + VARG() + ", " + VARG() + ")\n")
+        w("declare void @bur_compare(" + VRET() + ", " + VARG() + ", " + VARG() + ", i32)\n")
+        w("declare void @bur_arith(" + VRET() + ", " + VARG() + ", " + VARG() + ", i8)\n")
+        w("declare void @bur_neg(" + VRET() + ", " + VARG() + ")\n")
+        w("declare void @bur_not(" + VRET() + ", " + VARG() + ")\n")
+        w("declare void @bur_index_get(" + VRET() + ", " + VARG() + ", " + VARG() + ")\n")
+        w("declare void @upvalue_get(" + VRET() + ", " + PT("%OUpvalue") + ")\n")
+        w("declare void @bur_get_global(" + VRET() + ", " + PT("i8") + ", i64)\n")
+        w("declare void @bur_recv(" + VRET() + ", " + VARG() + ")\n")
+    } else {
+        w("declare %Value @bur_pop()\n")
+        w("declare %Value @bur_peek(i32)\n")
+        w("declare %Value @bur_add(%Value, %Value)\n")
+        w("declare %Value @bur_compare(%Value, %Value, i32)\n")
+        w("declare %Value @bur_arith(%Value, %Value, i8)\n")
+        w("declare %Value @bur_neg(%Value)\n")
+        w("declare %Value @bur_not(%Value)\n")
+        w("declare %Value @bur_index_get(%Value, %Value)\n")
+        w("declare %Value @upvalue_get(" + PT("%OUpvalue") + ")\n")
+        w("declare %Value @bur_get_global(" + PT("i8") + ", i64)\n")
+        w("declare %Value @bur_recv(%Value)\n")
+    }
+    w("declare void @bur_push(" + VARG() + ")\n")
+    w("declare " + PT("i8") + " @bur_typename(" + VARG() + ")\n")
+    w("declare i8 @bur_eq(" + VARG() + ", " + VARG() + ")\n")
+    w("declare void @bur_index_set(" + VARG() + ", " + VARG() + ", " + VARG() + ")\n")
+    w("declare i64 @bur_len(" + VARG() + ")\n")
+    w("declare void @upvalue_set(" + PT("%OUpvalue") + ", " + VARG() + ")\n")
     w("declare " + PT("%OUpvalue") + " @bur_capture_upvalue(i32)\n")
-    w("declare " + PT("%OUpvalue") + " @bur_new_closed_cell(%Value)\n")
+    w("declare " + PT("%OUpvalue") + " @bur_new_closed_cell(" + VARG() + ")\n")
     w("declare " + PT("%OUpvalue") + " @bur_capture_value(i32)\n")
     w("declare void @bur_close_upvalues(i32)\n")
     w("declare void @bur_call(i32)\n")
-    w("declare void @bur_defer_push(%Value)\n")
+    w("declare void @bur_defer_push(" + VARG() + ")\n")
     w("declare void @bur_run_defers(i32)\n")
-    w("declare void @bur_globals_put(" + PT("i8") + ", i64, %Value)\n")
-    w("declare %Value @bur_get_global(" + PT("i8") + ", i64)\n")
-    w("declare void @bur_set_global(" + PT("i8") + ", i64, %Value)\n")
+    w("declare void @bur_globals_put(" + PT("i8") + ", i64, " + VARG() + ")\n")
+    w("declare void @bur_set_global(" + PT("i8") + ", i64, " + VARG() + ")\n")
     w("declare " + PT("%OClosure") + " @bur_new_closure(" + PT("%OFunc") + ")\n")
     w("declare " + PT("%OList") + " @bur_new_list(" + PT("%Value") + ", i64)\n")
-    w("declare void @bur_format(" + PT("%Buf") + ", %Value, i8)\n")
+    w("declare void @bur_format(" + PT("%Buf") + ", " + VARG() + ", i8)\n")
     w("declare void @buf_char(" + PT("%Buf") + ", i8)\n")
     w("declare void @bur_trap(" + PT("i8") + ", ...)\n")
     w("declare " + PT("%Obj") + " @bur_alloc(i64, i32)\n")
@@ -256,9 +359,8 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
     w("declare void @bur_record_get(" + PT("i8") + ")\n")
     w("declare void @bur_record_update(i32, " + PT("i8") + ")\n")
     w("declare void @bur_spawn(i32)\n")
-    w("declare void @bur_send(%Value, %Value)\n")
-    w("declare %Value @bur_recv(%Value)\n")
-    w("declare i8 @bur_chan_next(%Value, " + PT("%Value") + ")\n")
+    w("declare void @bur_send(" + VARG() + ", " + VARG() + ")\n")
+    w("declare i8 @bur_chan_next(" + VARG() + ", " + PT("%Value") + ")\n")
     w("declare void @bur_boot(i32, " + PT("i8") + ")\n")
     w("declare void @bur_register_natives()\n")
     w("declare " + PT("%Fiber") + " @bur_new_fiber(" + PT("%OClosure") + ", " + PT("%Value") + ", i32, i64)\n")
@@ -319,16 +421,31 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
         tp
     }
     fn push_val(v) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
-        w("  call void @bur_push(%Value " + v + ")\n")
+        if win_abi_g {
+            w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+            w("  call void @bur_push(" + va("vt0") + ")\n")
+        } else {
+            w("  call void @bur_push(%Value " + v + ")\n")
+        }
     }
     fn pop_val() capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
         let r = nt()
-        w("  " + r + " = call %Value @bur_pop()\n")
+        if win_abi_g {
+            w("  call void @bur_pop(" + vr_use() + ")\n")
+            w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+        } else {
+            w("  " + r + " = call %Value @bur_pop()\n")
+        }
         r
     }
     fn peek_val(n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
         let r = nt()
-        w("  " + r + " = call %Value @bur_peek(i32 " + str(n) + ")\n")
+        if win_abi_g {
+            w("  call void @bur_peek(" + vr_use() + ", i32 " + str(n) + ")\n")
+            w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+        } else {
+            w("  " + r + " = call %Value @bur_peek(i32 " + str(n) + ")\n")
+        }
         r
     }
     fn top_adj(n) capture(ref f_name, ref f_file, ref f_arity, ref f_nupvals, ref f_code, ref f_spans, ref f_consts, ref en_qual, ref en_vnames, ref en_varities, ref ls_files, ref ls_names, ref ls_tables, ref out, ref glue, ref o_kind, ref o_str, ref o_a, ref o_b, ref ids, ref sids, ref fconst_ids, ref tn, ref cur_term, ref use_ptr, ref _init_n, ref _init_parts) {
@@ -426,7 +543,12 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
         w("  br i1 " + bad + ", label %" + lab + "tp, label %" + lab + "ok\n")
         w(lab + "tp:\n")
         let tnreg = nt()
-        w("  " + tnreg + " = call " + PT("i8") + " @bur_typename(%Value " + v + ")\n")
+        if win_abi_g {
+            w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+            w("  " + tnreg + " = call " + PT("i8") + " @bur_typename(" + va("vt0") + ")\n")
+        } else {
+            w("  " + tnreg + " = call " + PT("i8") + " @bur_typename(%Value " + v + ")\n")
+        }
         w("  call void (" + PT("i8") + ", ...) @bur_trap(" + srefp(fmt) + ", " + PT("i8") + " " + tnreg + ")\n")
         w("  br label %" + lab + "ok\n")
         w(lab + "ok:\n")
@@ -500,35 +622,66 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
         } else if op == lib::op_get_global {
             let n = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
             let r = nt()
-            w("  " + r + " = call %Value @bur_get_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ")\n")
+            if win_abi_g {
+                w("  call void @bur_get_global(" + vr_use() + ", " + srefp(n) + ", i64 " + str(str_len(n)) + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value @bur_get_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ")\n")
+            }
             push_val(r)
             ip + 3
         } else if op == lib::op_def_global {
             let n = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
             let v = pop_val()
-            w("  call void @bur_globals_put(" + srefp(n) + ", i64 " + str(str_len(n)) + ", %Value " + v + ")\n")
+            if win_abi_g {
+                w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+                w("  call void @bur_globals_put(" + srefp(n) + ", i64 " + str(str_len(n)) + ", " + va("vt0") + ")\n")
+            } else {
+                w("  call void @bur_globals_put(" + srefp(n) + ", i64 " + str(str_len(n)) + ", %Value " + v + ")\n")
+            }
             ip + 3
         } else if op == lib::op_set_global {
             let n = ll_const_str(fh, ll_read_u16(code, ip + 1), f_consts)
             let v = peek_val(0)
-            w("  call void @bur_set_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ", %Value " + v + ")\n")
+            if win_abi_g {
+                w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+                w("  call void @bur_set_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ", " + va("vt0") + ")\n")
+            } else {
+                w("  call void @bur_set_global(" + srefp(n) + ", i64 " + str(str_len(n)) + ", %Value " + v + ")\n")
+            }
             ip + 3
         } else if op == lib::op_get_upval {
             let cell = upval_cell(ll_read_u16(code, ip + 1))
             let r = nt()
-            w("  " + r + " = call %Value @upvalue_get(" + PT("%OUpvalue") + " " + cell + ")\n")
+            if win_abi_g {
+                w("  call void @upvalue_get(" + vr_use() + ", " + PT("%OUpvalue") + " " + cell + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value @upvalue_get(" + PT("%OUpvalue") + " " + cell + ")\n")
+            }
             push_val(r)
             ip + 3
         } else if op == lib::op_set_upval {
             let pv = peek_val(0)
             let cell = upval_cell(ll_read_u16(code, ip + 1))
-            w("  call void @upvalue_set(" + PT("%OUpvalue") + " " + cell + ", %Value " + pv + ")\n")
+            if win_abi_g {
+                w("  store %Value " + pv + ", " + PB("%Value") + "%vt0\n")
+                w("  call void @upvalue_set(" + PT("%OUpvalue") + " " + cell + ", " + va("vt0") + ")\n")
+            } else {
+                w("  call void @upvalue_set(" + PT("%OUpvalue") + " " + cell + ", %Value " + pv + ")\n")
+            }
             ip + 3
         } else if op == lib::op_eq || op == lib::op_neq {
             let a = peek_val(1)
             let b = peek_val(0)
             let r8 = nt()
-            w("  " + r8 + " = call i8 @bur_eq(%Value " + a + ", %Value " + b + ")\n")
+            if win_abi_g {
+                w("  store %Value " + a + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + b + ", " + PB("%Value") + "%vt1\n")
+                w("  " + r8 + " = call i8 @bur_eq(" + va("vt0") + ", " + va("vt1") + ")\n")
+            } else {
+                w("  " + r8 + " = call i8 @bur_eq(%Value " + a + ", %Value " + b + ")\n")
+            }
             let r8b = if op == lib::op_neq {
                 let x = nt()
                 w("  " + x + " = xor i8 " + r8 + ", 1\n")
@@ -555,7 +708,14 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             let a = peek_val(1)
             let b = peek_val(0)
             let r = nt()
-            w("  " + r + " = call %Value @bur_compare(%Value " + a + ", %Value " + b + ", i32 " + str(kind) + ")\n")
+            if win_abi_g {
+                w("  store %Value " + a + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + b + ", " + PB("%Value") + "%vt1\n")
+                w("  call void @bur_compare(" + vr_use() + ", " + va("vt0") + ", " + va("vt1") + ", i32 " + str(kind) + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value @bur_compare(%Value " + a + ", %Value " + b + ", i32 " + str(kind) + ")\n")
+            }
             top_adj(2)
             push_val(r)
             ip + 1
@@ -563,7 +723,14 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             let a = peek_val(1)
             let b = peek_val(0)
             let r = nt()
-            w("  " + r + " = call %Value @bur_add(%Value " + a + ", %Value " + b + ")\n")
+            if win_abi_g {
+                w("  store %Value " + a + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + b + ", " + PB("%Value") + "%vt1\n")
+                w("  call void @bur_add(" + vr_use() + ", " + va("vt0") + ", " + va("vt1") + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value @bur_add(%Value " + a + ", %Value " + b + ")\n")
+            }
             top_adj(2)
             push_val(r)
             ip + 1
@@ -580,7 +747,14 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             let a = peek_val(1)
             let b = peek_val(0)
             let r = nt()
-            w("  " + r + " = call %Value @bur_arith(%Value " + a + ", %Value " + b + ", i8 " + str(c) + ")\n")
+            if win_abi_g {
+                w("  store %Value " + a + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + b + ", " + PB("%Value") + "%vt1\n")
+                w("  call void @bur_arith(" + vr_use() + ", " + va("vt0") + ", " + va("vt1") + ", i8 " + str(c) + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value @bur_arith(%Value " + a + ", %Value " + b + ", i8 " + str(c) + ")\n")
+            }
             top_adj(2)
             push_val(r)
             ip + 1
@@ -592,7 +766,13 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             }
             let v = pop_val()
             let r = nt()
-            w("  " + r + " = call %Value " + f + "(%Value " + v + ")\n")
+            if win_abi_g {
+                w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+                w("  call void " + f + "(" + vr_use() + ", " + va("vt0") + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value " + f + "(%Value " + v + ")\n")
+            }
             push_val(r)
             ip + 1
         } else if op == lib::op_jump {
@@ -702,9 +882,19 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
                     w("  br label %" + lab + "st\n")
                     w(lab + "new:\n")
                     let pv = nt()
-                    w("  " + pv + " = call %Value @upvalue_get(" + PT("%OUpvalue") + " " + cell + ")\n")
+                    if win_abi_g {
+                        w("  call void @upvalue_get(" + vr_use() + ", " + PT("%OUpvalue") + " " + cell + ")\n")
+                        w("  " + pv + " = load %Value, " + PB("%Value") + "%vr\n")
+                    } else {
+                        w("  " + pv + " = call %Value @upvalue_get(" + PT("%OUpvalue") + " " + cell + ")\n")
+                    }
                     let nc = nt()
-                    w("  " + nc + " = call " + PT("%OUpvalue") + " @bur_new_closed_cell(%Value " + pv + ")\n")
+                    if win_abi_g {
+                        w("  store %Value " + pv + ", " + PB("%Value") + "%vt0\n")
+                        w("  " + nc + " = call " + PT("%OUpvalue") + " @bur_new_closed_cell(" + va("vt0") + ")\n")
+                    } else {
+                        w("  " + nc + " = call " + PT("%OUpvalue") + " @bur_new_closed_cell(%Value " + pv + ")\n")
+                    }
                     w("  store " + PT("%OUpvalue") + " " + nc + ", " + PB(PT("%OUpvalue")) + "%cell\n")
                     w("  br label %" + lab + "st\n")
                     w(lab + "st:\n")
@@ -746,7 +936,14 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             let a = peek_val(1)
             let b = peek_val(0)
             let r = nt()
-            w("  " + r + " = call %Value @bur_index_get(%Value " + a + ", %Value " + b + ")\n")
+            if win_abi_g {
+                w("  store %Value " + a + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + b + ", " + PB("%Value") + "%vt1\n")
+                w("  call void @bur_index_get(" + vr_use() + ", " + va("vt0") + ", " + va("vt1") + ")\n")
+                w("  " + r + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + r + " = call %Value @bur_index_get(%Value " + a + ", %Value " + b + ")\n")
+            }
             top_adj(2)
             push_val(r)
             ip + 1
@@ -754,12 +951,24 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             let val = pop_val()
             let idx = pop_val()
             let tgt = pop_val()
-            w("  call void @bur_index_set(%Value " + tgt + ", %Value " + idx + ", %Value " + val + ")\n")
+            if win_abi_g {
+                w("  store %Value " + tgt + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + idx + ", " + PB("%Value") + "%vt1\n")
+                w("  store %Value " + val + ", " + PB("%Value") + "%vt2\n")
+                w("  call void @bur_index_set(" + va("vt0") + ", " + va("vt1") + ", " + va("vt2") + ")\n")
+            } else {
+                w("  call void @bur_index_set(%Value " + tgt + ", %Value " + idx + ", %Value " + val + ")\n")
+            }
             ip + 1
         } else if op == lib::op_len {
             let v = pop_val()
             let l = nt()
-            w("  " + l + " = call i64 @bur_len(%Value " + v + ")\n")
+            if win_abi_g {
+                w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+                w("  " + l + " = call i64 @bur_len(" + va("vt0") + ")\n")
+            } else {
+                w("  " + l + " = call i64 @bur_len(%Value " + v + ")\n")
+            }
             let r = v_int(l)
             push_val(r)
             ip + 1
@@ -849,7 +1058,12 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             w("  " + d2 + " = getelementptr %Buf, " + PB("%Buf") + "%nmb, i32 0, i32 2\n")
             w("  store i64 0, " + PB("i64") + d2 + "\n")
             let v = peek_val(0)
-            w("  call void @bur_format(" + PT("%Buf") + " %nmb, %Value " + v + ", i8 1)\n")
+            if win_abi_g {
+                w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+                w("  call void @bur_format(" + PT("%Buf") + " %nmb, " + va("vt0") + ", i8 1)\n")
+            } else {
+                w("  call void @bur_format(" + PT("%Buf") + " %nmb, %Value " + v + ", i8 1)\n")
+            }
             w("  call void @buf_char(" + PT("%Buf") + " %nmb, i8 0)\n")
             let dd = nt()
             w("  " + dd + " = load " + PT("i8") + ", " + PB(PT("i8")) + d0 + "\n")
@@ -866,7 +1080,12 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             w("  br i1 " + isobj + ", label %" + lab + "dr, label %" + lab + "tq\n")
             w(lab + "tq:\n")
             let tn2 = nt()
-            w("  " + tn2 + " = call " + PT("i8") + " @bur_typename(%Value " + v + ")\n")
+            if win_abi_g {
+                w("  store %Value " + v + ", " + PB("%Value") + "%vt0\n")
+                w("  " + tn2 + " = call " + PT("i8") + " @bur_typename(" + va("vt0") + ")\n")
+            } else {
+                w("  " + tn2 + " = call " + PT("i8") + " @bur_typename(%Value " + v + ")\n")
+            }
             w("  call void (" + PT("i8") + ", ...) @bur_trap(" + srefp("'?' needs an Option or Result, got %s") + ", " + PT("i8") + " " + tn2 + ")\n")
             w("  br label %" + lab + "dr\n")
             w(lab + "dr:\n")
@@ -916,7 +1135,12 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             ip + 1
         } else if op == lib::op_defer {
             let cl = pop_val()
-            w("  call void @bur_defer_push(%Value " + cl + ")\n")
+            if win_abi_g {
+                w("  store %Value " + cl + ", " + PB("%Value") + "%vt0\n")
+                w("  call void @bur_defer_push(" + va("vt0") + ")\n")
+            } else {
+                w("  call void @bur_defer_push(%Value " + cl + ")\n")
+            }
             ip + 1
         } else if op == lib::op_spawn {
             w("  call void @bur_spawn(i32 " + str(code[ip + 1]) + ")\n")
@@ -924,19 +1148,36 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
         } else if op == lib::op_send {
             let val = pop_val()
             let ch = pop_val()
-            w("  call void @bur_send(%Value " + ch + ", %Value " + val + ")\n")
+            if win_abi_g {
+                w("  store %Value " + ch + ", " + PB("%Value") + "%vt0\n")
+                w("  store %Value " + val + ", " + PB("%Value") + "%vt1\n")
+                w("  call void @bur_send(" + va("vt0") + ", " + va("vt1") + ")\n")
+            } else {
+                w("  call void @bur_send(%Value " + ch + ", %Value " + val + ")\n")
+            }
             ip + 1
         } else if op == lib::op_recv {
             let p = peek_val(0)
             let v = nt()
-            w("  " + v + " = call %Value @bur_recv(%Value " + p + ")\n")
+            if win_abi_g {
+                w("  store %Value " + p + ", " + PB("%Value") + "%vt0\n")
+                w("  call void @bur_recv(" + vr_use() + ", " + va("vt0") + ")\n")
+                w("  " + v + " = load %Value, " + PB("%Value") + "%vr\n")
+            } else {
+                w("  " + v + " = call %Value @bur_recv(%Value " + p + ")\n")
+            }
             let _d = pop_val()
             push_val(v)
             ip + 1
         } else if op == lib::op_chan_next {
             let p = peek_val(0)
             let c = nt()
-            w("  " + c + " = call i8 @bur_chan_next(%Value " + p + ", " + PT("%Value") + " %vslot)\n")
+            if win_abi_g {
+                w("  store %Value " + p + ", " + PB("%Value") + "%vt0\n")
+                w("  " + c + " = call i8 @bur_chan_next(" + va("vt0") + ", " + PT("%Value") + " %vslot)\n")
+            } else {
+                w("  " + c + " = call i8 @bur_chan_next(%Value " + p + ", " + PT("%Value") + " %vslot)\n")
+            }
             let b1 = nt()
             w("  " + b1 + " = icmp ne i8 " + c + ", 0\n")
             cur_term = true
@@ -1046,6 +1287,10 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
         w("  %tvi = alloca i8\n")
         w("  %nmb = alloca %Buf\n")
         w("  %vslot = alloca %Value\n")
+        w("  %vt0 = alloca %Value\n")
+        w("  %vt1 = alloca %Value\n")
+        w("  %vt2 = alloca %Value\n")
+        w("  %vr = alloca %Value\n")
         let b0 = nt()
         w("  " + b0 + " = load " + PT("%Fiber") + ", " + PB(PT("%Fiber")) + "@bur_cur\n")
         let t0 = nt()
@@ -1332,7 +1577,7 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
     w("  store " + PT("%Fiber") + " " + emf + ", " + PB(PT("%Fiber")) + "@bur_main_fiber\n")
     w("  call void @bur_schedule(" + PT("%Fiber") + " " + emf + ")\n")
     w("  call void @bur_scheduler()\n")
-    if ll_is_mingw(f_triple) {
+    if f_triple != "" {
         w("  call void @fflush(" + PT("i8") + " null)\n")
     } else {
         let eso = nt()
@@ -1377,19 +1622,6 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
 
 fn ll_read_u16(code, at) {
     code[at] * 256 + code[at + 1]
-}
-
-// ll_is_mingw 三元组含 mingw 段判定（dllimport 语义分叉用）
-// ll_is_mingw tells whether the triple carries a mingw segment
-fn ll_is_mingw(triple) {
-    let mut i = 0
-    while i + 5 <= str_len(triple) {
-        if substr(triple, i, 5) == "mingw" {
-            return true
-        }
-        i = i + 1
-    }
-    false
 }
 
 fn ll_line_of_off(table, off) {
