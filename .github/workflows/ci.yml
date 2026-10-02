@@ -852,7 +852,14 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path \tmp | Out-Null
-          cl /nologo /O1 /c runtime\burrt_impl.c runtime\burrt_natives.c /Iruntime 2>&1 | Select-Object -First 3
+          # 多文件一锅 cl 的 "Generating Code..." 批语义会与首个语例的链接竞争
+          # obj 落盘（LNK1181 flake 两度咬门禁）——拆成单文件串行编译，时序即定
+          # A single multi-file cl batch ("Generating Code...") raced the first
+          # corpus case's link to the obj files (the LNK1181 flake bit the gate
+          # twice) — compile one file per invocation so the ordering is fixed
+          cl /nologo /O1 /c runtime\burrt_impl.c /Iruntime 2>&1 | Select-Object -First 3
+          cl /nologo /O1 /c runtime\burrt_natives.c /Iruntime 2>&1 | Select-Object -First 3
+          if (-not (Test-Path burrt_impl.obj) -or -not (Test-Path burrt_natives.obj)) { Write-Error "runtime objs missing after compile"; exit 1 }
           $pass = 0; $fail = 0; $skip = 0
           foreach ($n in Get-Content pe-out/corpus/CASES) {
             if (-not (Test-Path "pe-out/corpus/$n.c")) { $skip++; continue }
