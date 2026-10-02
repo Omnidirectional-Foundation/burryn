@@ -3633,22 +3633,31 @@ fn psig_lookup(ctx: X86Ctx, h, ats) {
     }
 }
 
-// add_record_enc 注册 record 编码 / add_record_enc registers a record encoding
-fn add_record_enc(mut record_encs, mut record_offs, enc, mut const_data) {
+// add_record_enc 注册 record 编码 + 追加进常量区（list 累积模型：返回新的
+// 游程长度；字节与旧版逐一致——enc 后零垫到 8 的对齐不变，见 x86.bur 的
+// 常量环注释）。
+// add_record_enc registers a record encoding and appends it to the const
+// parts (the list-accumulation model: returns the new running length; the
+// bytes are identical to the old version — the enc is zero-padded to 8, see
+// the const-loop note in x86.bur).
+fn add_record_enc(mut record_encs, mut record_offs, enc, mut const_parts, const_len) {
     let mut i = 0
     while i < len(record_encs) {
         if record_encs[i] == enc {
-            return const_data
+            return const_len
         }
         i = i + 1
     }
     push(record_encs, enc)
-    push(record_offs, str_len(const_data))
-    const_data = const_data + enc
-    while str_len(const_data) % 8 != 0 {
-        const_data = const_data + byte_chr(0)
+    push(record_offs, const_len)
+    push(const_parts, enc)
+    let mut new_len = const_len + str_len(enc)
+    let pad = (8 - new_len % 8) % 8
+    if pad > 0 {
+        push(const_parts, x86_zeros(pad))
+        new_len = new_len + pad
     }
-    const_data
+    new_len
 }
 
 // is_record_type 判断是否为 record 类型 / is_record_type tells whether t is a record type

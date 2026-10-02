@@ -35,6 +35,17 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
     let mut const_data = ""
     let mut const_slot_map = map()
     let mut enum_const_map = map()
+    // 常量区 list 累积 + 收尾一次 join：逐条 `const_data = const_data + …`
+    // 是平方级拷贝，编译器规模下 malloc 碎片堆到 OOM（gdb 采样 + RSS 曲线
+    // 实锤：x86.bur 常量环 8 秒冲 7.6GB）。字节序不变——join 保序，offset
+    // 用 const_len 游程计数。
+    // The const table accumulates in a list and joins once: the per-item
+    // `const_data = const_data + …` is quadratic copying that piles malloc
+    // fragmentation into an OOM at compiler scale (gdb sampling plus the RSS
+    // curve: the const loop hit 7.6GB within 8 seconds). Byte order is
+    // unchanged — join preserves order, offsets come from a running length.
+    let mut const_parts = []
+    let mut const_len = 0
     let mut sf = 0
     while sf < nfn {
         let consts = f_consts[sf]
@@ -48,10 +59,14 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
                         None => false,
                     }
                     if !dup {
-                        put(const_slot_map, key, str_len(const_data))
-                        const_data = const_data + e8(str_len(s)) + s
-                        while str_len(const_data) % 8 != 0 {
-                            const_data = const_data + byte_chr(0)
+                        put(const_slot_map, key, const_len)
+                        let raw = e8(str_len(s)) + s
+                        push(const_parts, raw)
+                        const_len = const_len + str_len(raw)
+                        let pad = (8 - const_len % 8) % 8
+                        if pad > 0 {
+                            push(const_parts, x86_zeros(pad))
+                            const_len = const_len + pad
                         }
                     }
                 },
@@ -60,10 +75,11 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
                     match get(enum_const_map, ek) {
                         Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
                         None => {
-                            let off = str_len(const_data)
-                            put(enum_const_map, ek, off)
-                            put(const_slot_map, const_slot_key(sf, ci), off)
-                            const_data = const_data + enum_const_bytes(consts[ci])
+                            put(enum_const_map, ek, const_len)
+                            put(const_slot_map, const_slot_key(sf, ci), const_len)
+                            let raw = enum_const_bytes(consts[ci])
+                            push(const_parts, raw)
+                            const_len = const_len + str_len(raw)
                         },
                     }
                 },
@@ -72,10 +88,11 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
                     match get(enum_const_map, ek) {
                         Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
                         None => {
-                            let off = str_len(const_data)
-                            put(enum_const_map, ek, off)
-                            put(const_slot_map, const_slot_key(sf, ci), off)
-                            const_data = const_data + enum_const_bytes(consts[ci])
+                            put(enum_const_map, ek, const_len)
+                            put(const_slot_map, const_slot_key(sf, ci), const_len)
+                            let raw = enum_const_bytes(consts[ci])
+                            push(const_parts, raw)
+                            const_len = const_len + str_len(raw)
                         },
                     }
                 },
@@ -84,10 +101,11 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
                     match get(enum_const_map, ek) {
                         Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
                         None => {
-                            let off = str_len(const_data)
-                            put(enum_const_map, ek, off)
-                            put(const_slot_map, const_slot_key(sf, ci), off)
-                            const_data = const_data + enum_const_bytes(consts[ci])
+                            put(enum_const_map, ek, const_len)
+                            put(const_slot_map, const_slot_key(sf, ci), const_len)
+                            let raw = enum_const_bytes(consts[ci])
+                            push(const_parts, raw)
+                            const_len = const_len + str_len(raw)
                         },
                     }
                 },
@@ -174,13 +192,14 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
                 let cidx = read_u16(rcode, rip + 2)
                 let enc = const_str(ctx, rf, cidx)
                 if str_len(enc) > 0 {
-                    const_data = add_record_enc(record_encs, record_offs, enc, const_data)
+                    const_len = add_record_enc(record_encs, record_offs, enc, const_parts, const_len)
                 }
             }
             rip = rip + inst_len(ctx, rf, rcode, rip)
         }
         rf = rf + 1
     }
+    const_data = join(const_parts, "")
 
     // P2 批 4：desc 表挂 const_data 尾部（先 reset 注册表再挂占位镜像——定长
     // 静态+池，真实条目字节由 x86gen_image 逐遍拼接回这段区间）。下游
@@ -560,7 +579,38 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
     set_pic_pass(true)
     x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
     set_pic_pass(true)
+    // 暖机遍循环到自身字节稳定：发射会往共享表注册新条目（list 影子、chan 槽、
+    // upval 表……），单遍 throwaway 在编译器规模下收敛不掉全部——probe 与 real
+    // 起点不同，PIC diff 以「绝对地址不在 mov imm64」拒收（实测 shadow_set 的
+    // k 一边 PTR 一边 SCALAR），而只把发现喂给 real 又会丢 parity（keywords
+    // 实测）。字节稳定 ⇔ 表稳定 ⇔ real 与最后一遍暖机必然逐字节一致，且全部
+    // 发现都在原始表里留给 real。
+    // the warmup pass repeats until its own bytes stabilize: emission registers
+    // new entries in the shared tables (list shadows, chan slots, upval
+    // tables...) and one throwaway pass cannot converge them at compiler scale
+    // — probe and real then start from different states and the PIC diff
+    // rejects the image (measured: shadow_set's k came out PTR in one pass and
+    // SCALAR in the other), while feeding real without the reference breaks
+    // parity the other way (keywords regressed). Byte stability implies table
+    // stability implies real matches the last warmup pass byte for byte, with
+    // every discovery kept in the originals for real.
     x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
+    let mut prev_ref = pic_ref_text_get()
+    let mut stable = false
+    let mut wi = 0
+    while wi < 6 && !stable {
+        x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
+        if pic_ref_text_get() == prev_ref {
+            stable = true
+        } else {
+            prev_ref = pic_ref_text_get()
+        }
+        wi = wi + 1
+    }
+    if !stable {
+        eprintln("internal error: x86 shared tables did not converge across warmup passes")
+        exit(1)
+    }
     set_pic_pass(false)
     x86gen_image(ctx, const_data, n_globals, globals_map, p_depth_maps, pt_target_shadow, pd_sink, fn_extra_base, global_type, record_field_types, enum_field_types, enum_variant_types, f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases)
 }
@@ -752,6 +802,20 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
     // trace-table entries (flat [off, line, fh], off relative to the first user
     // function); fh_li is each function's line-table index
     let user_lo = str_len(funcs_bytes)
+    // 函数体也走 list 累积 + 收尾 join（同常量环的平方拷贝问题）：fb_len 是
+    // 游程长度，环内偏移全部取它，join 后与逐次拼接逐字节一致。
+    // Function bodies also accumulate in a list and join once (the same
+    // quadratic-copy problem as the const loop): fb_len is the running
+    // length, every in-loop offset reads it, and the join is byte-identical
+    // to the step-by-step concatenation.
+    let mut fb_parts = []
+    let mut fb_len = str_len(funcs_bytes)
+    // 引导块（runtime 子程序 + fn 名表）必须先入表，否则 join 会把它整段丢掉
+    // （hello 实测丢 12KB = 初始块尺寸，SIGILL）。
+    // the bootstrap blocks (runtime subroutines + the fn-name table) must seed
+    // the list first, or the join drops them wholesale (hello lost exactly
+    // their 12KB and died with SIGILL).
+    push(fb_parts, funcs_bytes)
     let mut tr_ents = []
     let mut fh_li = []
     let mut tli = 0
@@ -766,15 +830,15 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
         let mut vi = 0
         while vi < nv {
             if vi == 0 {
-                push(func_offsets, str_len(funcs_bytes))
+                push(func_offsets, fb_len)
             } else {
-                push(variant_offsets, str_len(funcs_bytes))
+                push(variant_offsets, fb_len)
             }
-            push(pdata_offsets, str_len(funcs_bytes))
+            push(pdata_offsets, fb_len)
             let mut ln_sink = []
             let fbytes = emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, en_vnames, nfn, f2s_h, p_depth_maps, pt_target_shadow, pd_sink, globals_map, n_globals, global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, record_field_types, enum_field_types, enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, ln_sink)
             push(pdata_lens, str_len(fbytes))
-            let vstart = str_len(funcs_bytes) - user_lo
+            let vstart = fb_len - user_lo
             let mut cur_line = 0
             let mut lk = 0
             while lk + 1 < len(ln_sink) {
@@ -800,11 +864,13 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
                 }
                 lk = lk + 2
             }
-            funcs_bytes = funcs_bytes + fbytes
+            push(fb_parts, fbytes)
+            fb_len = fb_len + str_len(fbytes)
             vi = vi + 1
         }
         fh = fh + 1
     }
+    funcs_bytes = join(fb_parts, "")
 
     // 跳转表：每个函数一项，存入口相对表基址的偏移（jt_load 加回 r13），供闭包按
     // fn 索引调用
@@ -1019,4 +1085,16 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
         let elf_tail = jt_bytes + start_bytes
         emit_elf(pic_text(const_data + die_splice(funcs_bytes, die_off, die_len, fn_base + str_len(funcs_bytes) + str_len(elf_tail), fn_base, user_lo, done_addr) + elf_tail + tr_bytes, img_base()), start_off, pic_data(runtime_bytes), pdata_offsets, pdata_lens, const_data_len, rt_unwind_offsets, rt_unwind_lens, rt_unwind_pushes)
     }
+}
+
+// x86_zeros n 个 NUL 字节（对齐垫，n ≤ 7 量级）/ x86_zeros builds n NUL bytes
+// (an alignment pad, n <= 7)
+fn x86_zeros(n) {
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        s = s + byte_chr(0)
+        i = i + 1
+    }
+    s
 }
