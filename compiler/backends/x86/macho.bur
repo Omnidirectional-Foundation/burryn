@@ -375,6 +375,15 @@ pub fn macho_build_dispatcher() {
     // mprotect(addr=rdi, len=rsi, prot=rdx): PROT_READ/WRITE/EXEC share values; passes through
     let mprotect_case = mov_ri64(rax, 33554506) + e1(15) + e1(5) + errno_tail
 
+    // 11 munmap(addr=rdi, len=rsi)：BSD 73（0x2000049），参数序与 Linux 相同零洗
+    // 牌；返 -1 = 失败（调用方不查）。P4 批 4 done fiber 栈 mmap 摘除专用——
+    // 不补臂则摘除落未处理分支，darwin 上静默不释放。
+    // 11 munmap(addr=rdi, len=rsi): BSD 73 (0x2000049), same argument order as
+    // Linux, zero shuffle; -1 = failure (callers don't check). Dedicated to the
+    // P4 batch-4 done-fiber stack-mmap reaping — without this arm the reap hits
+    // the unhandled branch and silently leaks on darwin.
+    let munmap_case = mov_ri64(rax, 33554505) + e1(15) + e1(5)
+
     // open(path=rdi, flags=rsi, mode=rdx)：BSD 号直通，参数寄存器与 Linux 同形。
     // 注意调用方传 Linux 标志：write_file 在 darwin 下改传 1537
     // （O_WRONLY|O_CREAT|O_TRUNC 的 BSD 值），见 read_file/write_file。
@@ -521,7 +530,7 @@ pub fn macho_build_dispatcher() {
     // and take poll(NULL, 0, ms)
     let nanosleep_case = mov_rm(rax, rdi, 8) + xor_rr(rdx, rdx) + mov_ri64(r11, 1000000) + div_r(r11) + mov_rr(r8, rax) + mov_rm(rax, rdi, 0) + mov_ri64(r11, 1000) + imul_rr(rax, r11) + add_rr(rax, r8) + mov_rr(rdx, rax) + xor_rr(rdi, rdi) + xor_rr(rsi, rsi) + mov_ri64(rax, 33554662) + sc + errno_tail
 
-    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 2, 0, 3, 4, 5, 217, 41, 42, 43, 49, 50, 54, 55, 72, 57, 59, 61, 33, 293, 35], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case, socket_case, connect_case, accept_case, bind_case, listen_case, setsockopt_case, getsockopt_case, fcntl_case, fork_case, execve_case, wait4_case, dup2_case, pipe2_case, nanosleep_case], epilogue)
+    sys_dispatch_chain(head, [1, 60, 9, 228, 7, 10, 11, 2, 0, 3, 4, 5, 217, 41, 42, 43, 49, 50, 54, 55, 72, 57, 59, 61, 33, 293, 35], [write_case, exit_case, mmap_case, clock_case, poll_case, mprotect_case, munmap_case, open_case, read_case, close_case, stat_case, fstat_case, getdirentries_case, socket_case, connect_case, accept_case, bind_case, listen_case, setsockopt_case, getsockopt_case, fcntl_case, fork_case, execve_case, wait4_case, dup2_case, pipe2_case, nanosleep_case], epilogue)
 }
 
 // macho_header 生成 mach_header_64 / macho_header builds the mach_header_64
