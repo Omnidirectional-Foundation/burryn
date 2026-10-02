@@ -319,6 +319,37 @@ jobs:
           sha256sum g1llvm g2llvm
           cmp g1llvm g2llvm
 
+  x86-fixpoint:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MALLOC_ARENA_MAX: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      # x86 后端自举链——gen1（C 自举）经 x86 后端编出编译器，再用它把编译器
+      # 再编一遍，两次产物逐字节相同。多遍暖机 + 三段 list 化之后首次可行。
+      # the x86 backend self-chain — gen1 (C-built) compiles the compiler
+      # through the x86 backend, then that compiler compiles the compiler
+      # again; both artifacts must be byte-identical. First feasible after the
+      # multi-pass warmup and the list-based segment assembly.
+      - name: x86 three-generation fixpoint
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build --backend x86 compiler -o g1x
+          ./g1x build --backend x86 compiler -o g2x
+          sha256sum g1x g2x
+          cmp g1x g2x
+
   testdata:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -1298,10 +1329,10 @@ jobs:
 
   gate:
     needs:
-      [gohost, seed, bur-base, gen1, check, fixpoint, llvm-fixpoint, testdata,
-       examples, std, lsp, multibackend, x86-repro, llvm, sdk-pack,
-       llvm-pe-build, llvm-pe-run, llvm-macho-build, llvm-macho-run,
-       x86-pe-build, x86-pe-run, x86-macho-build,
+      [gohost, seed, bur-base, gen1, check, fixpoint, llvm-fixpoint,
+       x86-fixpoint, testdata, examples, std, lsp, multibackend, x86-repro,
+       llvm, sdk-pack, llvm-pe-build, llvm-pe-run, llvm-macho-build,
+       llvm-macho-run, x86-pe-build, x86-pe-run, x86-macho-build,
         x86-macho-run, runtime]
     if: always()
     runs-on: ubuntu-latest
