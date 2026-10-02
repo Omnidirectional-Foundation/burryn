@@ -95,15 +95,11 @@ pub fn build_cmd(rest) {
     if backend == "x86" {
         x86::set_target_os(target_os_flag)
     }
-    if backend == "llvm" && target_os_flag != "linux" {
-        eprintln("error: --os is not supported by the LLVM backend yet")
-        exit(exit_usage)
-    }
-    build_input(input, emit_c, emit_llvm, out, backend)
+    build_input(input, emit_c, emit_llvm, out, backend, target_os_flag)
 }
 
 // build_input 解析 build 输入（文件/目录/backend） / build_input resolves the build input (file/dir/backend)
-fn build_input(input, emit_c, emit_llvm, out, backend) {
+fn build_input(input, emit_c, emit_llvm, out, backend, target_os) {
     if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
         eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
         exit(exit_usage)
@@ -178,7 +174,7 @@ fn build_input(input, emit_c, emit_llvm, out, backend) {
         // clang >= 15 parses opaque ptr; clang 14 only parses typed pointers
         // (a bare ptr is rejected by its parser outright)
         let use_ptr = major >= 15
-        let llsr = compile_to_llvm(input, use_ptr)
+        let llsr = compile_to_llvm(input, use_ptr, llvm_triple(target_os))
         let dst = if out == "" {
             default_out_name(input)
         } else {
@@ -201,7 +197,7 @@ fn build_input(input, emit_c, emit_llvm, out, backend) {
                 }
             }
         } else {
-            build_native_llvm(cc, llsr, dst)
+            build_native_llvm(cc, llsr, dst, target_os)
         }
     } else {
         eprintln("error: backend '" + backend + "' is not yet implemented")
@@ -496,18 +492,18 @@ fn compile_file_to_x86(path) {
 }
 
 // compile_to_llvm 编译为 LLVM IR / compile_to_llvm compiles to LLVM IR
-fn compile_to_llvm(input, use_ptr) {
+fn compile_to_llvm(input, use_ptr, triple) {
     if is_dir(input) {
-        compile_module_to_llvm(lib::strip_trailing_slash(input), use_ptr)
+        compile_module_to_llvm(lib::strip_trailing_slash(input), use_ptr, triple)
     } else {
-        compile_file_to_llvm(input, use_ptr)
+        compile_file_to_llvm(input, use_ptr, triple)
     }
 }
 
 // compile_file_to_llvm 单文件转 LLVM IR / compile_file_to_llvm compiles a
 // single file to LLVM IR (the C pipeline verbatim; the C runtime carries
 // float formatting, so no float_rt/dns_rt injection)
-fn compile_file_to_llvm(path, use_ptr) {
+fn compile_file_to_llvm(path, use_ptr, triple) {
     let src = match read_file(path) {
         Ok(s) => s,
         Err(msg) => {
@@ -536,7 +532,7 @@ fn compile_file_to_llvm(path, use_ptr) {
                                     eprintln(tooling::render_diag(d, path))
                                     exit(exit_static)
                                 },
-                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => llvm::llgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)], use_ptr),
+                                bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => llvm::llgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, [""], [path], [lib::line_starts(src)], use_ptr, triple),
                             }
                         },
                     }
@@ -548,7 +544,7 @@ fn compile_file_to_llvm(path, use_ptr) {
 
 // compile_module_to_llvm 模块转 LLVM IR / compile_module_to_llvm compiles a
 // module to LLVM IR (mirrors compile_module_to_c)
-fn compile_module_to_llvm(dir, use_ptr) {
+fn compile_module_to_llvm(dir, use_ptr, triple) {
     if !file_exists(dir + "/bur.mod") {
         eprintln("error: bur.mod not found in " + dir)
         exit(exit_no_input)
@@ -575,7 +571,7 @@ fn compile_module_to_llvm(dir, use_ptr) {
                             eprintln(tooling::render_diag(d, f))
                             exit(exit_static)
                         },
-                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => llvm::llgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables, use_ptr),
+                        bytecode::CompileOut::Compiled(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea) => llvm::llgen_program_to_buf(fnames, ffile, fa, fu, fc, fspans, fk, eq, ev, ea, ls_files, ls_files, ls_tables, use_ptr, triple),
                     }
                 },
             }
@@ -583,10 +579,20 @@ fn compile_module_to_llvm(dir, use_ptr) {
     }
 }
 
-// build_native_llvm 一次 clang 调用吃下 .ll + burrt 两个 .c 并链接
-// build_native_llvm feeds the .ll plus the two burrt .c files to a single
-// clang invocation and links
-fn build_native_llvm(cc, files, out) {
+// build_native_llvm 按目标分派链接：linux 一次 clang 调用吃下 .ll + burrt
+// 两个 .c 并链接；windows 交 mingw 交叉链接；darwin 待 osxcross 工具链接入。
+// build_native_llvm dispatches linking per target: linux feeds the .ll plus
+// the two burrt .c files to a single clang invocation and links; windows
+// goes through the mingw cross path; darwin waits for the osxcross toolchain.
+fn build_native_llvm(cc, files, out, target_os) {
+    if target_os == "windows" {
+        build_native_llvm_cross(cc, files, out, "x86_64-w64-mingw32", "x86_64-w64-mingw32-gcc")
+        return
+    }
+    if target_os != "linux" {
+        eprintln("error: native linking for --os " + target_os + " is not available yet (use --emit llvm)")
+        exit(exit_static)
+    }
     for f in files {
         match write_file(f[0], f[1]) {
             Ok(_) => {},
@@ -616,6 +622,90 @@ fn build_native_llvm(cc, files, out) {
     }
     cleanup_native(files, [], [])
     if !ok {
+        exit(exit_static)
+    }
+}
+
+// llvm_triple 目标三元组：windows/darwin 是固定 x86-64 交叉目标（与 x86 后端的
+// PE/Mach-O 同口径）；linux 返回空串不发射，保持宿主默认，非 x86-64 宿主不变。
+// llvm_triple target triples: windows/darwin are fixed x86-64 cross targets
+// (same scope as the x86 backend's PE/Mach-O); linux returns "" and emits
+// nothing, keeping the host default so non-x86-64 hosts are unaffected.
+fn llvm_triple(os) {
+    if os == "windows" {
+        "x86_64-w64-mingw32"
+    } else if os == "darwin" {
+        "x86_64-apple-macos11.0.0"
+    } else {
+        ""
+    }
+}
+
+// build_native_llvm_cross Windows 交叉链接：clang 按 mingw 三元组把 .ll 编成
+// COFF 目标文件，再交给 mingw gcc 编译 burrt 两个 .c 并链接（免 Windows SDK
+// 的交叉路；ws2_32/shell32 是 burrt Windows 侧用到的非默认系统库）。
+// build_native_llvm_cross cross-links for Windows: clang lowers the .ll to a
+// COFF object under the mingw triple, then mingw gcc compiles the two burrt
+// .c files and links (the SDK-free cross path; ws2_32/shell32 are the
+// non-default system libs burrt's Windows side needs).
+fn build_native_llvm_cross(cc, files, out, triple, gcc) {
+    for f in files {
+        match write_file(f[0], f[1]) {
+            Ok(_) => {},
+            Err(msg) => {
+                cleanup_native(files, [], [])
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+    }
+    if !cc_works(gcc) {
+        cleanup_native(files, [], [])
+        eprintln("error: cross linking for --os windows needs the mingw-w64 toolchain")
+        eprintln("hint: install mingw-w64 (provides " + gcc + ") or use --emit llvm")
+        exit(exit_static)
+    }
+    let obj = files[0][0] + ".o"
+    let mut compiled = false
+    match exec(cc, [cc_opt, "-g1", "--target=" + triple, "-c", files[0][0], "-o", obj]) {
+        Ok(o) => match o {
+            Output(code, _, err) => {
+                if code != 0 {
+                    eprint_raw(err)
+                    eprintln("error: clang failed for target " + triple)
+                } else {
+                    compiled = true
+                }
+            },
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+        },
+    }
+    let mut linked = false
+    if compiled {
+        match exec(gcc, [cc_opt, "-g1", obj, "runtime/burrt_impl.c", "runtime/burrt_natives.c", "-Iruntime", "-lws2_32", "-lshell32", "-o", out]) {
+            Ok(o) => match o {
+                Output(code, _, err) => {
+                    if code != 0 {
+                        eprint_raw(err)
+                        eprintln("error: mingw gcc failed")
+                    } else {
+                        linked = true
+                    }
+                },
+            },
+            Err(msg) => {
+                eprintln("error: " + msg)
+            },
+        }
+    }
+    match exec("rm", [obj]) {
+        Ok(_) => {},
+        Err(_) => {},
+    }
+    cleanup_native(files, [], [])
+    if !compiled || !linked {
         exit(exit_static)
     }
 }
