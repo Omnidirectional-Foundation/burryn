@@ -21,6 +21,7 @@ pub fn build_cmd(rest) {
     let mut emit_llvm = false
     let mut backend = "c"
     let mut target_os_flag = "linux"
+    let mut macos_sdk = ""
     let mut input = ""
     let mut i = 0
     while i < len(rest) {
@@ -72,6 +73,13 @@ pub fn build_cmd(rest) {
             }
             target_os_flag = rest[i + 1]
             i = i + 2
+        } else if arg == "--macos-sdk" {
+            if i + 1 >= len(rest) {
+                usage()
+                exit(exit_usage)
+            }
+            macos_sdk = rest[i + 1]
+            i = i + 2
         } else if lib::str_has_prefix(arg, "-") {
             usage()
             exit(exit_usage)
@@ -95,11 +103,11 @@ pub fn build_cmd(rest) {
     if backend == "x86" {
         x86::set_target_os(target_os_flag)
     }
-    build_input(input, emit_c, emit_llvm, out, backend, target_os_flag)
+    build_input(input, emit_c, emit_llvm, out, backend, target_os_flag, macos_sdk)
 }
 
 // build_input 解析 build 输入（文件/目录/backend） / build_input resolves the build input (file/dir/backend)
-fn build_input(input, emit_c, emit_llvm, out, backend, target_os) {
+fn build_input(input, emit_c, emit_llvm, out, backend, target_os, macos_sdk) {
     if backend != "c" && backend != "x86" && backend != "llvm" && backend != "cranelift" && backend != "wasm" {
         eprintln("error: unknown backend '" + backend + "' (available: c, x86, llvm, cranelift, wasm)")
         exit(exit_usage)
@@ -197,7 +205,7 @@ fn build_input(input, emit_c, emit_llvm, out, backend, target_os) {
                 }
             }
         } else {
-            build_native_llvm(cc, llsr, dst, target_os)
+            build_native_llvm(cc, llsr, dst, target_os, macos_sdk)
         }
     } else {
         eprintln("error: backend '" + backend + "' is not yet implemented")
@@ -584,9 +592,13 @@ fn compile_module_to_llvm(dir, use_ptr, triple) {
 // build_native_llvm dispatches linking per target: linux feeds the .ll plus
 // the two burrt .c files to a single clang invocation and links; windows
 // goes through the mingw cross path; darwin waits for the osxcross toolchain.
-fn build_native_llvm(cc, files, out, target_os) {
+fn build_native_llvm(cc, files, out, target_os, macos_sdk) {
     if target_os == "windows" {
         build_native_llvm_cross(cc, files, out, "x86_64-w64-mingw32", "x86_64-w64-mingw32-gcc")
+        return
+    }
+    if target_os == "darwin" {
+        build_native_llvm_darwin(cc, files, out, macos_sdk)
         return
     }
     if target_os != "linux" {
@@ -708,6 +720,136 @@ fn build_native_llvm_cross(cc, files, out, triple, gcc) {
     if !compiled || !linked {
         exit(exit_static)
     }
+}
+
+// build_native_llvm_darwin darwin 交叉链接：clang 按 apple 三元组把 .ll 与
+// burrt 两个 .c 编成 Mach-O 对象（SDK 头负责 __stdoutp 重定向等平台细节），
+// 再交 ld64.lld 链接（-arch/-platform_version 是 lld 的 ld64 移植必填项）。
+// build_native_llvm_darwin cross-links for darwin: clang lowers the .ll and
+// the two burrt .c files to Mach-O objects under the apple triple (the SDK
+// headers handle the __stdoutp redirect and friends), then ld64.lld links
+// (-arch/-platform_version are mandatory for lld's ld64 port).
+fn build_native_llvm_darwin(cc, files, out, sdk) {
+    for f in files {
+        match write_file(f[0], f[1]) {
+            Ok(_) => {},
+            Err(msg) => {
+                cleanup_native(files, [], [])
+                eprintln("error: " + msg)
+                exit(exit_no_input)
+            },
+        }
+    }
+    // is_dir 是「模块目录」探测器（认 bur.mod），不认普通目录——SDK 用它
+    // 自带的 stdio.h 做存在性判定
+    // is_dir is a module-directory probe (it looks for bur.mod) and rejects
+    // plain directories — validate the SDK by its own stdio.h instead
+    if sdk == "" || !file_exists(sdk + "/usr/include/stdio.h") {
+        cleanup_native(files, [], [])
+        eprintln("error: cross linking for --os darwin needs a macOS SDK (extract one from an Xcode install)")
+        eprintln("hint: pass --macos-sdk <dir> pointing at a MacOSX*.sdk directory")
+        exit(exit_static)
+    }
+    let ld = find_ld64()
+    if ld == "" {
+        cleanup_native(files, [], [])
+        eprintln("error: no Mach-O linker for --os darwin (install lld, which provides ld64.lld)")
+        exit(exit_static)
+    }
+    let tgt = "--target=x86_64-apple-macos11.0.0"
+    let sysr = "--sysroot=" + sdk
+    let obj = files[0][0] + ".o"
+    let o1 = "burrt_impl.macho.o"
+    let o2 = "burrt_natives.macho.o"
+    let mut ok = true
+    match exec(cc, [cc_opt, "-g1", tgt, sysr, "-c", files[0][0], "-o", obj]) {
+        Ok(o) => match o {
+            Output(code, _, err) => {
+                if code != 0 {
+                    eprint_raw(err)
+                    eprintln("error: clang failed for target darwin")
+                    ok = false
+                }
+            },
+        },
+        Err(msg) => {
+            eprintln("error: " + msg)
+            ok = false
+        },
+    }
+    if ok {
+        match exec(cc, [cc_opt, "-g1", tgt, sysr, "-c", "runtime/burrt_impl.c", "-Iruntime", "-o", o1]) {
+            Ok(o) => match o {
+                Output(code, _, err) => {
+                    if code != 0 {
+                        eprint_raw(err)
+                        eprintln("error: clang failed for the darwin runtime")
+                        ok = false
+                    }
+                },
+            },
+            Err(msg) => {
+                eprintln("error: " + msg)
+                ok = false
+            },
+        }
+    }
+    if ok {
+        match exec(cc, [cc_opt, "-g1", tgt, sysr, "-c", "runtime/burrt_natives.c", "-Iruntime", "-o", o2]) {
+            Ok(o) => match o {
+                Output(code, _, err) => {
+                    if code != 0 {
+                        eprint_raw(err)
+                        eprintln("error: clang failed for the darwin runtime")
+                        ok = false
+                    }
+                },
+            },
+            Err(msg) => {
+                eprintln("error: " + msg)
+                ok = false
+            },
+        }
+    }
+    let mut linked = false
+    if ok {
+        match exec(ld, ["-arch", "x86_64", "-platform_version", "macos", "11.0.0", "11.0.0", "-syslibroot", sdk, obj, o1, o2, "-lSystem", "-o", out]) {
+            Ok(o) => match o {
+                Output(code, _, err) => {
+                    if code != 0 {
+                        eprint_raw(err)
+                        eprintln("error: ld64.lld failed")
+                    } else {
+                        linked = true
+                    }
+                },
+            },
+            Err(msg) => {
+                eprintln("error: " + msg)
+            },
+        }
+    }
+    match exec("rm", [obj, o1, o2]) {
+        Ok(_) => {},
+        Err(_) => {},
+    }
+    cleanup_native(files, [], [])
+    if !ok || !linked {
+        exit(exit_static)
+    }
+}
+
+// find_ld64 探测 lld 的 Mach-O 链接器（Debian/Ubuntu 带版本后缀）
+// find_ld64 probes lld's Mach-O linker (Debian/Ubuntu suffix a version)
+fn find_ld64() {
+    let candidates = ["ld64.lld", "ld64.lld-20", "ld64.lld-19", "ld64.lld-18", "ld64.lld-17", "ld64.lld-16", "ld64.lld-15", "ld64.lld-14"]
+    let mut found = ""
+    for name in candidates {
+        if found == "" && cc_works(name) {
+            found = name
+        }
+    }
+    found
 }
 
 // find_clang 探测 clang（LLVM 后端硬依赖，cc/gcc 不吃 .ll）
