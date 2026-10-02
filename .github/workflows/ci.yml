@@ -811,6 +811,219 @@ jobs:
           check_one net_loopback
           check_one net_nb
 
+  c-pe-build:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      # S8：C 后端 mingw 交叉产 Windows PE（免 SDK 交叉路），切片与
+      # x86-pe-build 同单
+      # S8: the C backend cross-links Windows PEs through mingw (the SDK-free
+      # path); the slice matches x86-pe-build case for case
+      - name: Install mingw-w64
+        run: |
+          set -euo pipefail
+          command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || sudo apt-get update -qq
+          command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || sudo apt-get install -y -qq mingw-w64
+          x86_64-w64-mingw32-gcc --version | head -n 1
+
+      - name: Build windows programs (C backend)
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build compiler -o bur_cur
+          mkdir -p c-pe-out
+          ./bur_cur build --backend c --os windows examples/basics/hello.bur -o c-pe-out/hello.exe
+          ./bur_cur build --backend c --os windows examples/basics/fib.bur -o c-pe-out/fib.exe
+          ./bur_cur build --backend c --os windows examples/basics/float_arith.bur -o c-pe-out/float_arith.exe
+          ./bur_cur build --backend c --os windows examples/concurrency/yield.bur -o c-pe-out/yield.exe
+          ./bur_cur build --backend c --os windows testdata/regression/clock.bur -o c-pe-out/clock.exe
+          ./bur_cur build --backend c --os windows examples/io/fs.bur -o c-pe-out/fs.exe
+          ./bur_cur build --backend c --os windows examples/io/sleep.bur -o c-pe-out/sleep.exe
+          ./bur_cur build --backend c --os windows examples/net/net_loopback.bur -o c-pe-out/net_loopback.exe
+          ./bur_cur build --backend c --os windows examples/net/net_nb.bur -o c-pe-out/net_nb.exe
+
+      - name: Upload windows programs (C backend)
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-pe-progs
+          path: c-pe-out
+          if-no-files-found: error
+          retention-days: 7
+
+  c-pe-run:
+    needs: c-pe-build
+    if: always() && needs.c-pe-build.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download windows programs (C backend)
+        uses: actions/download-artifact@v4
+        with:
+          name: c-pe-progs
+          path: pe-out
+
+      # mingw CRT 的 stdout 是文本模式（\n→\r\n）：金样是 LF，比对前 CRLF 归一
+      # the mingw CRT's stdout is text mode (\n -> \r\n) while the goldens are
+      # LF: normalize CRLF before comparing
+      - name: Run slice vs goldens (hard gate)
+        shell: pwsh
+        run: |
+          function Check-One([string]$bin, [string]$golden) {
+            $n = [IO.Path]::GetFileNameWithoutExtension($bin)
+            $p = Start-Process -FilePath $bin -RedirectStandardOutput "raw-$n.txt" -PassThru -NoNewWindow
+            $null = $p.Handle
+            if (-not $p.WaitForExit(30000)) { taskkill /F /T /PID $p.Id | Out-Null; Write-Error "$n timed out"; exit 1 }
+            if ($p.ExitCode -ne 0) { Write-Error "$n exit code $($p.ExitCode)"; exit 1 }
+            [IO.File]::WriteAllText("act-$n.txt", ([IO.File]::ReadAllText("raw-$n.txt") -replace "`r`n", "`n"))
+            if ((Get-Item "act-$n.txt").Length -eq 0) { Write-Error "empty stdout from $n"; exit 1 }
+            git diff --no-index --text $golden "act-$n.txt"
+            if ($LASTEXITCODE -ne 0) { Write-Error "$n output mismatch"; exit 1 }
+            Write-Output "OK $n"
+          }
+          Check-One ".\pe-out\hello.exe" "examples/basics/hello.golden"
+          Check-One ".\pe-out\fib.exe" "examples/basics/fib.golden"
+          Check-One ".\pe-out\float_arith.exe" "examples/basics/float_arith.golden"
+          Check-One ".\pe-out\yield.exe" "examples/concurrency/yield.golden"
+          Check-One ".\pe-out\clock.exe" "testdata/regression/clock.golden"
+          Check-One ".\pe-out\sleep.exe" "examples/io/sleep.golden"
+          Check-One ".\pe-out\fs.exe" "examples/io/fs.golden"
+
+      - name: Run net slice (hard gate)
+        shell: pwsh
+        run: |
+          foreach ($t in @("net_loopback", "net_nb")) {
+            $p = Start-Process -FilePath ".\pe-out\$t.exe" -RedirectStandardOutput "raw-$t.txt" -PassThru -NoNewWindow
+            $null = $p.Handle
+            if (-not $p.WaitForExit(30000)) { taskkill /F /T /PID $p.Id | Out-Null; Write-Error "$t timed out"; exit 1 }
+            if ($p.ExitCode -ne 0) { Write-Error "$t exit code $($p.ExitCode)"; exit 1 }
+            [IO.File]::WriteAllText("act-$t.txt", ([IO.File]::ReadAllText("raw-$t.txt") -replace "`r`n", "`n"))
+            git diff --no-index --exit-code --text "examples/net/$t.golden" "act-$t.txt"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Write-Output "OK $t"
+          }
+
+  c-macho-build:
+    needs: [gen1, sdk-pack]
+    if: always() && needs.gen1.result == 'success' && needs.sdk-pack.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      - name: Download macOS SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-sdk
+          path: sdk-out
+
+      - name: Install lld
+        run: |
+          set -euo pipefail
+          command -v ld64.lld >/dev/null 2>&1 || sudo apt-get update -qq
+          command -v ld64.lld >/dev/null 2>&1 || sudo apt-get install -y -qq lld
+          (ld64.lld --version 2>/dev/null || ld64.lld-18 --version 2>/dev/null || ld64.lld-17 --version 2>/dev/null || ld64.lld-16 --version 2>/dev/null || ld64.lld-15 --version 2>/dev/null || ld64.lld-14 --version) | head -n 1
+
+      - name: Build macho programs (C backend)
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./gen1 build compiler -o bur_cur
+          mkdir -p sdk
+          tar xfz sdk-out/macos-sdk.tar.gz -C sdk
+          sdkdir="$(ls sdk)"
+          echo "SDK dir: $sdkdir"
+          mkdir -p macho-out
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/basics/hello.bur -o macho-out/hello
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/basics/fib.bur -o macho-out/fib
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/basics/float_arith.bur -o macho-out/float_arith
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/concurrency/yield.bur -o macho-out/yield
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" testdata/regression/clock.bur -o macho-out/clock
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/io/fs.bur -o macho-out/fs
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/io/sleep.bur -o macho-out/sleep
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/net/net_loopback.bur -o macho-out/net_loopback
+          ./bur_cur build --backend c --os darwin --macos-sdk "sdk/$sdkdir" examples/net/net_nb.bur -o macho-out/net_nb
+
+      - name: Upload macho programs (C backend)
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-macho-progs
+          path: macho-out
+          if-no-files-found: error
+          retention-days: 7
+
+  c-macho-run:
+    needs: c-macho-build
+    if: always() && needs.c-macho-build.result == 'success'
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download macho programs (C backend)
+        uses: actions/download-artifact@v4
+        with:
+          name: c-macho-progs
+          path: macho-out
+
+      - name: Run slice vs goldens (hard gate)
+        run: |
+          set -euo pipefail
+          check_one() {
+            codesign -f -s - "macho-out/$1"
+            chmod +x "macho-out/$1"
+            set +e
+            perl -e 'alarm 30; exec @ARGV' "macho-out/$1" > "actual-$1.txt" 2>"run-$1.err"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then echo "$1 exited $rc"; head -5 "run-$1.err"; exit $rc; fi
+            diff "$2" "actual-$1.txt"
+            echo "OK $1"
+          }
+          check_one hello examples/basics/hello.golden
+          check_one fib examples/basics/fib.golden
+          check_one float_arith examples/basics/float_arith.golden
+          check_one yield examples/concurrency/yield.golden
+          check_one clock testdata/regression/clock.golden
+          check_one sleep examples/io/sleep.golden
+          check_one fs examples/io/fs.golden
+
+      - name: Run net slice (hard gate)
+        run: |
+          set -euo pipefail
+          check_one() {
+            codesign -f -s - "macho-out/$1"
+            chmod +x "macho-out/$1"
+            set +e
+            perl -e 'alarm 30; exec @ARGV' "macho-out/$1" > "actual-$1.txt" 2>"run-$1.err"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then echo "$1 exited $rc"; head -5 "run-$1.err"; exit $rc; fi
+            diff "examples/net/$1.golden" "actual-$1.txt"
+            echo "OK $1"
+          }
+          check_one net_loopback
+          check_one net_nb
+
   x86-pe-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -1332,7 +1545,8 @@ jobs:
       [gohost, seed, bur-base, gen1, check, fixpoint, llvm-fixpoint,
        x86-fixpoint, testdata, examples, std, lsp, multibackend, x86-repro,
        llvm, sdk-pack, llvm-pe-build, llvm-pe-run, llvm-macho-build,
-       llvm-macho-run, x86-pe-build, x86-pe-run, x86-macho-build,
+       llvm-macho-run, c-pe-build, c-pe-run, c-macho-build, c-macho-run,
+       x86-pe-build, x86-pe-run, x86-macho-build,
         x86-macho-run, runtime]
     if: always()
     runs-on: ubuntu-latest
