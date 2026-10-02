@@ -655,14 +655,16 @@ fn x86gen_gc_mark_block() {
 }
 
 // x86gen_gc_collect_block：完整回收一轮。fixpoint 线性趟——每趟扫根（①保存区
-// 14 词 MAYBE、②全局 kind 表非 SCALAR 槽、③各 fiber 值栈影子（当前 fiber 用
+// 9 个 caller GPR 词 MAYBE（callee 槽持非堆地址，扫描可证明空操作）、②全局
+// kind 表非 SCALAR 槽、③各 fiber 值栈影子（当前 fiber 用
 // 保存区里的活 r15）、④fb 结构自身、⑤exec 排水自由链 rt_gray）再沿 hdr 链扫
 // 全部 MARK 块 payload 按 desc 试 mark；cnt 相邻两趟不变即收敛。sweep：MARK 清
 // 位保活，否则置 FREE 并（poison 开时）payload 填 0xAB；rt_gc_cycles++、
 // rt_gc_last_freed=死块字节和。栈布局：入口 sub rsp,16 后 [rsp+112]=cnt 快照、
 // [rsp+120]=cur_fiber，再 push 14 个 GPR。毁 FLAGS，其余全保。
 // x86gen_gc_collect_block: one full collection round. Fixpoint linear passes —
-// each pass scans the roots (1. the 14-word save area as MAYBE, 2. non-SCALAR
+// each pass scans the roots (1. the save area's 9 caller-GPR words as MAYBE —
+// the callee slots hold non-heap addresses, a provable no-op — 2. non-SCALAR
 // global-kind slots, 3. every fiber's value-stack shadow, the current fiber
 // using the live r15 from the save area, 4. the fb structs themselves, 5.
 // exec's drain free chain at rt_gray), then walks the hdr chain marking every
@@ -684,11 +686,34 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_l("gc_outer"))
     // 本趟基线快照 / this pass's baseline
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cnt)) + mov_rm(rax, rax, 0) + mov_mr(rsp, 112, rax)))
-    // ①保存区：14 词全 MAYBE / save area: all 14 words MAYBE
-    push(it, la_b(mov_rr(r10, rsp) + mov_ri64(rcx, 14)))
-    push(it, la_l("gc_sv"))
+    // ①保存区：仅 9 个 caller GPR 按 MAYBE 扫（findings §11.3 收紧）。callee
+    // 槽——r15 值栈顶、r14 帧基、r13 跳转表、rbp 帧指针、rbx 全局基——按寄存器
+    // 约定（x86.bur:6）只持镜像/跳转表/纤维栈/原生栈地址，全在 GC 堆预留之外；
+    // mark 的三重过滤（对齐/堆界/起点位图）对它们恒拒绝，扫描是可证明的空操作
+    // （发射端 grep 实锤：这些寄存器只在 park/resume 保存恢复与 prologue 帧
+    // 建立、trap die 扫栈时被写，值全是非堆地址）。caller 槽在保存区里分两段
+    // 连续：r11,r10,r9,r8,rdi,rsi（[rsp+24..72)）与 rdx,rcx,rax
+    // （[rsp+88..112)），rbp/rbx（+72/+80）夹在中间跳过。
+    // ① save area: only the 9 caller GPRs get the MAYBE scan (findings §11.3
+    // tightening). The callee slots — r15 value-stack top, r14 frame base, r13
+    // jump table, rbp frame pointer, rbx globals base — hold image, jump-table,
+    // fiber-stack or native-stack addresses by the register conventions
+    // (x86.bur:6), all outside the GC-heap reservation; mark's three gates
+    // (alignment / heap range / start bitmap) reject them unconditionally, so
+    // scanning them is a provable no-op (emitter grep confirms these registers
+    // are written only by park/resume save-restore, prologue frame setup and
+    // trap's die-path stack scan — all non-heap values). The caller slots form
+    // two contiguous runs in the save area: r11,r10,r9,r8,rdi,rsi
+    // ([rsp+24..72)) and rdx,rcx,rax ([rsp+88..112)), skipping rbp/rbx
+    // (+72/+80) in between.
+    push(it, la_b(mov_rr(r10, rsp) + add_ri32(r10, 24) + mov_ri64(rcx, 6)))
+    push(it, la_l("gc_sv1"))
     push(it, la_b(mov_rm(rdi, r10, 0) + mark_call + add_ri32(r10, 8) + sub_ri32(rcx, 1)))
-    push(it, la_jcc(CC_NE, "gc_sv"))
+    push(it, la_jcc(CC_NE, "gc_sv1"))
+    push(it, la_b(mov_rr(r10, rsp) + add_ri32(r10, 88) + mov_ri64(rcx, 3)))
+    push(it, la_l("gc_sv2"))
+    push(it, la_b(mov_rm(rdi, r10, 0) + mark_call + add_ri32(r10, 8) + sub_ri32(rcx, 1)))
+    push(it, la_jcc(CC_NE, "gc_sv2"))
     // ②全局：kind 表字节非 SCALAR 的槽 / globals: non-SCALAR kind slots
     push(it, la_b(mov_ri64(r10, rt_slot(rt_global_kinds)) + mov_rm(r10, r10, 0) + mov_rr(r11, rbx) + mov_ri64(rcx, n_globals)))
     push(it, la_l("gc_gl"))
