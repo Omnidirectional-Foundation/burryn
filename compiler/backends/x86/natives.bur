@@ -1678,8 +1678,15 @@ fn x86gen_exec_spawn_native() {
     // the EACCES-seen flag [rsp+56] must start cleared (stack garbage would
     // otherwise report a missing command as EACCES)
     let walk = xor_rr(rax, rax) + mov_mr(rsp, 56, rax) + cmd_len_seq + env_scan + seg_head + seg_body + scan_back + seg_end + path_end
-    // 直接 execve（含 '/'）失败：写 errno 后走 fail_write / direct execve (cmd contains '/') failure: write
-    // errno, then fail_write
+    // 直接 execve（含 '/'）失败：写 errno 后走 fail_write。位移语义：walk 紧
+    // 邻在 direct 之后，jmp_rel32(str_len(walk)) 的落点 = walk 末尾 =
+    // fail_write 起点——改这段前先画清运行序（slash_head→slash_body→
+    // slash_back→direct→walk→fail_write），rel32 从指令末尾起算。
+    // direct execve (cmd contains '/') failure: write errno, then fail_write.
+    // Displacement note: walk sits right after direct, so jmp_rel32(
+    // str_len(walk)) lands at the END of walk = the start of fail_write —
+    // draw the run order (slash_head→slash_body→slash_back→direct→walk→
+    // fail_write) before touching this; rel32 counts from the instruction end.
     let direct = envp_load + mov_rm(r11, rsp, 32) + mov_rm(rdi, r11, 0) + mov_rm(rsi, rsp, 32) + sys_mov_rax(59) + syscall() + neg_r(rax) + mov_mr(rsp, 60, rax) + jmp_rel32(str_len(walk))
     // 斜杠扫描：'/' → 直接 execve；NUL → PATH 走查 / slash scan: '/' -> direct execve, NUL -> PATH walk
     let nul_je = e1(132) + e1(192) + je_rel32(5 + str_len(direct))
@@ -1714,7 +1721,23 @@ fn x86gen_exec_spawn_native() {
         mov_ri64(rdi, fd) + mov_ri64(rsi, 3) + sys_mov_rax(72) + syscall() + mov_ri64(r10, 0 - 2049) + and_rr(rax, r10) + mov_rr(rdx, rax) + mov_ri64(rdi, fd) + mov_ri64(rsi, 4) + sys_mov_rax(72) + syscall()
     }
     let child_closes = c1(0) + c1(4) + c1(8) + c1(12) + c1(16)
-    let child_seq = dup1 + dup2 + unblock_fd(1) + unblock_fd(2) + child_closes + slash_head + slash_body + slash_back + direct + walk + fail_write
+    // 空命令特判（对齐 glibc execvp 的 ENOENT 短路）：不扫 PATH——空 cmd 的
+    // 候选会变成「dir + /」即目录本身，execve 目录恒返 EACCES，EACCES 记忆标
+    // 志遂把空命令错报成 Permission denied（VM/C 均报 No such file or
+    // directory，strace 实锤）。位移语义：jne(非空) 跳过 empty_tail 落
+    // slash_head 起点；empty_tail 的 jmp 跨过 slash_head..walk 整段落
+    // fail_write 起点（rel32 一律从指令末尾起算）。
+    // empty-command special case (matching glibc execvp's ENOENT short
+    // circuit): never scan PATH — an empty cmd makes every candidate
+    // "dir + /", the directory itself, and execve on a directory always
+    // returns EACCES, so the EACCES memory flag turned an empty command into
+    // "Permission denied" (VM and C both report "No such file or directory";
+    // strace-confirmed). Displacement semantics: the jne (non-empty) skips
+    // empty_tail and lands on slash_head; empty_tail's jmp crosses the whole
+    // slash_head..walk run to fail_write (rel32 counts from instruction end).
+    let empty_tail = mov_ri64(rax, 2) + mov_mr(rsp, 60, rax) + jmp_rel32(str_len(slash_head) + str_len(slash_body) + str_len(slash_back) + str_len(direct) + str_len(walk))
+    let empty_chk = mov_rm(r11, rsp, 32) + mov_rm(rsi, r11, 0) + movzx_rm8(rax, rsi, 0) + test_rr(rax, rax) + jne_rel32(str_len(empty_tail)) + empty_tail
+    let child_seq = dup1 + dup2 + unblock_fd(1) + unblock_fd(2) + child_closes + empty_chk + slash_head + slash_body + slash_back + direct + walk + fail_write
     // 父进程：关写端，建 proc 结构（失败关读端）/ parent: close write ends, build the proc struct (on failure close
     // read ends)
     let init_out = x86gen_drain_fl_take(8192, rax, rdi) + mov_mr(r9, proc_out_ptr, rax) + mov_mr(r9, proc_out_cap, rdi)
