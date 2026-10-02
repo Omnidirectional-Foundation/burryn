@@ -501,6 +501,113 @@ jobs:
           echo "=== llvm-vs-c: $pass pass, $fail fail ==="
           [ "$fail" -eq 0 ]
 
+  llvm-pe-build:
+    needs: gen1
+    if: always() && needs.gen1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download gen1
+        uses: actions/download-artifact@v4
+        with:
+          name: gen1
+
+      # S8.8：llvm 后端 mingw 交叉链接产 Windows PE（免 SDK 交叉路），切片与
+      # x86-pe-build 同单（net/fs/exec/timer/float 形状全覆盖）
+      # S8.8: the LLVM backend cross-links Windows PEs through mingw (the
+      # SDK-free path); the slice matches x86-pe-build case for case
+      - name: Install mingw-w64
+        run: |
+          set -euo pipefail
+          command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || sudo apt-get update -qq
+          command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || sudo apt-get install -y -qq mingw-w64
+          x86_64-w64-mingw32-gcc --version | head -n 1
+
+      - name: Build windows programs (LLVM backend)
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          mkdir -p llvm-pe-out
+          ./gen1 build --backend llvm --os windows examples/basics/hello.bur -o llvm-pe-out/hello.exe
+          ./gen1 build --backend llvm --os windows examples/basics/fib.bur -o llvm-pe-out/fib.exe
+          ./gen1 build --backend llvm --os windows examples/basics/float_arith.bur -o llvm-pe-out/float_arith.exe
+          ./gen1 build --backend llvm --os windows examples/concurrency/yield.bur -o llvm-pe-out/yield.exe
+          ./gen1 build --backend llvm --os windows testdata/regression/clock.bur -o llvm-pe-out/clock.exe
+          ./gen1 build --backend llvm --os windows examples/io/fs.bur -o llvm-pe-out/fs.exe
+          ./gen1 build --backend llvm --os windows examples/io/sleep.bur -o llvm-pe-out/sleep.exe
+          ./gen1 build --backend llvm --os windows examples/net/net_loopback.bur -o llvm-pe-out/net_loopback.exe
+          ./gen1 build --backend llvm --os windows examples/net/net_nb.bur -o llvm-pe-out/net_nb.exe
+
+      - name: Upload windows programs (LLVM backend)
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-pe-progs
+          path: llvm-pe-out
+          if-no-files-found: error
+          retention-days: 7
+
+  llvm-pe-run:
+    needs: llvm-pe-build
+    if: always() && needs.llvm-pe-build.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download windows programs (LLVM backend)
+        uses: actions/download-artifact@v4
+        with:
+          name: llvm-pe-progs
+          path: pe-out
+
+      # mingw CRT 的 stdout 是文本模式（\n→\r\n，与 MSVC 同），金样是 LF：
+      # 比对前做 CRLF 归一，剔除 CRT 平台工件
+      # mingw CRT's stdout is text mode (\n -> \r\n, same as MSVC) while the
+      # goldens are LF: normalize CRLF before comparing to strip the CRT
+      # platform artifact
+      - name: Run slice vs goldens (hard gate)
+        shell: pwsh
+        run: |
+          function Check-One([string]$bin, [string]$golden) {
+            $n = [IO.Path]::GetFileNameWithoutExtension($bin)
+            $p = Start-Process -FilePath $bin -RedirectStandardOutput "raw-$n.txt" -PassThru -NoNewWindow
+            $null = $p.Handle
+            if (-not $p.WaitForExit(30000)) { taskkill /F /T /PID $p.Id | Out-Null; Write-Error "$n timed out"; exit 1 }
+            if ($p.ExitCode -ne 0) { Write-Error "$n exit code $($p.ExitCode)"; exit 1 }
+            [IO.File]::WriteAllText("act-$n.txt", ([IO.File]::ReadAllText("raw-$n.txt") -replace "`r`n", "`n"))
+            if ((Get-Item "act-$n.txt").Length -eq 0) { Write-Error "empty stdout from $n"; exit 1 }
+            git diff --no-index --text $golden "act-$n.txt"
+            if ($LASTEXITCODE -ne 0) { Write-Error "$n output mismatch"; exit 1 }
+            Write-Output "OK $n"
+          }
+          Check-One ".\pe-out\hello.exe" "examples/basics/hello.golden"
+          Check-One ".\pe-out\fib.exe" "examples/basics/fib.golden"
+          Check-One ".\pe-out\float_arith.exe" "examples/basics/float_arith.golden"
+          Check-One ".\pe-out\yield.exe" "examples/concurrency/yield.golden"
+          Check-One ".\pe-out\clock.exe" "testdata/regression/clock.golden"
+          Check-One ".\pe-out\sleep.exe" "examples/io/sleep.golden"
+          Check-One ".\pe-out\fs.exe" "examples/io/fs.golden"
+
+      # net 用例走看门狗：卡死的 fiber 唤醒路径不该把 job 拖到超时才暴露
+      # Net cases run under a watchdog: a stuck fiber wake path must fail fast
+      - name: Run net slice (hard gate)
+        shell: pwsh
+        run: |
+          foreach ($t in @("net_loopback", "net_nb")) {
+            $p = Start-Process -FilePath ".\pe-out\$t.exe" -RedirectStandardOutput "raw-$t.txt" -PassThru -NoNewWindow
+            $null = $p.Handle
+            if (-not $p.WaitForExit(30000)) { taskkill /F /T /PID $p.Id | Out-Null; Write-Error "$t timed out"; exit 1 }
+            if ($p.ExitCode -ne 0) { Write-Error "$t exit code $($p.ExitCode)"; exit 1 }
+            [IO.File]::WriteAllText("act-$t.txt", ([IO.File]::ReadAllText("raw-$t.txt") -replace "`r`n", "`n"))
+            git diff --no-index --exit-code --text "examples/net/$t.golden" "act-$t.txt"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Write-Output "OK $t"
+          }
+
   x86-pe-build:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
@@ -1013,7 +1120,8 @@ jobs:
   gate:
     needs:
       [gohost, seed, bur-base, gen1, check, fixpoint, testdata, examples, std,
-       lsp, multibackend, x86-repro, llvm, x86-pe-build, x86-pe-run, x86-macho-build,
+       lsp, multibackend, x86-repro, llvm, llvm-pe-build, llvm-pe-run,
+       x86-pe-build, x86-pe-run, x86-macho-build,
         x86-macho-run, runtime]
     if: always()
     runs-on: ubuntu-latest
