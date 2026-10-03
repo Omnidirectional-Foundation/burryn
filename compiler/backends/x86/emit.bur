@@ -242,7 +242,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         } else if op == lib::op_get_local {
             let slot = read_u16(code, ip + 1)
             if slot == 0 {
-                w(vs_push_zero(GC_SHADOW_MAYBE))
+                // 自引用（递归）转发本帧 slot0 的函数值：带 upvalue 的嵌套 fn 必经
+                // CLOSURE 进入，slot0 是真闭包对象，转发后递归帧的 get_upval 才有
+                // 对象可解引用；纯静态调用链上无人读 slot0，转发值无关紧要。旧版压
+                // 常量 0，首个自递归调用的被调方 slot0=0，get_upval 解引用 [0+8]
+                // 即 SEGV（load_pkg 等递归模块加载函数全灭）。
+                // self-reference (recursion) forwards this frame's slot0: a nested
+                // fn with upvalues always enters through CLOSURE, so slot0 holds a
+                // real closure object and forwarding keeps get_upval dereferenceable
+                // in the recursive frame; on pure static call chains nobody reads
+                // slot0, so the forwarded value is irrelevant. The old cut pushed a
+                // constant 0 — the first self-recursive callee got slot0=0 and
+                // get_upval died dereferencing [0+8] (recursive module loaders).
+                w(mov_rm(rax, r14, 0) + vs_push(rax, GC_SHADOW_MAYBE))
                 push(shadow, f_name[fh])
                 push(type_shadow, "")
             } else {
@@ -3914,3 +3926,4 @@ fn variant_index(ctx: X86Ctx, h, ats) {
     }
     0
 }
+
