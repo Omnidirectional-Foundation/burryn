@@ -1909,6 +1909,43 @@ fn x86gen_eq_str() {
     mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
 }
 
+// x86gen_str_rel 生成字符串关系比较（kind 取 gt/ge/lt/le）：先比公共前缀字节
+// （无符号，memcmp 口径），前缀相等再比长度（短为小），与 C 的 bur_compare 同语义
+// x86gen_str_rel emits string relational comparison (kind is gt/ge/lt/le): first the
+// common-prefix bytes (unsigned, memcmp semantics), then the lengths on a prefix tie
+// (shorter is smaller), matching C's bur_compare
+fn x86gen_str_rel(kind) {
+    let byte_set = if kind == "gt" {
+        seta(rdx)
+    } else if kind == "ge" {
+        setae(rdx)
+    } else if kind == "lt" {
+        setb(rdx)
+    } else {
+        setbe(rdx)
+    }
+    let len_set = if kind == "gt" {
+        setg(rdx)
+    } else if kind == "ge" {
+        setge(rdx)
+    } else if kind == "lt" {
+        setl(rdx)
+    } else {
+        setle(rdx)
+    }
+    let setup = mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(r10, rax, 0) + mov_rm(r11, rcx, 0)
+    let take_b = mov_rr(rdx, r11)
+    let min_seq = mov_rr(rdx, r10) + cmp_rr(rdx, r11) + jb_rel32(str_len(take_b)) + take_b
+    // 先清 rdx：repe 之后 xor 会吃掉字节比较留下的条件码，setCC 必须直接读它
+    // clear rdx first: an xor after repe would eat the byte compare's flags, which setCC must read directly
+    let go = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + xor_rr(rdx, rdx) + repe_cmpsb()
+    let len_case = cmp_rr(r10, r11) + len_set
+    let diff_case = byte_set
+    let to_done = jmp_rel32(str_len(diff_case))
+    let done = mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR)
+    setup + min_seq + go + jne_rel32(str_len(len_case) + str_len(to_done)) + len_case + to_done + diff_case + done
+}
+
 // x86gen_tcp_listen_native 内联 tcp_listen：socket/bind/listen syscalls，返回 Result<int, str>
 // x86gen_tcp_listen_native inlines tcp_listen: socket/bind/listen syscalls, returning Result<int,
 // str>
