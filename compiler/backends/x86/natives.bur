@@ -1270,7 +1270,31 @@ fn x86gen_pop_native() {
 // x86gen_read_dir_native inlines read_dir: open/getdents64/close syscalls with name sorting,
 // returning Result<[str], str>
 // read_dir inline: getdents64 syscalls into a sorted name list
+// 暂存槽预留：本序列用 TOS 下方 8 槽作暂存（j/字节数、names 基址、idx/i、
+// reclen/min/list、saved-rsi），入序列即压 8 个零槽占住——TOS 下方槽是调用方
+// 的 live 区（大函数里直接就是 locals），不预留会盖掉调用方 locals：load_pkg
+// 的 dep_ix（slot 9）曾被 getdents 游标盖成 0x70、is_external 被 list 指针盖成
+// 真，dep_paths[112] 空表越界。预留后中段偏移保持原样（暂存槽恰好落在新压的
+// 8 槽里），只有 path 参数从 [r15-8] 移到 [r15-72]；出序列（fail/ok 两路）先
+// 还 8 槽再走原收尾（结果落回 [r15-16] 原位）。影子盖章位移不变（r15 与游标
+// 同步进退，相对关系守恒）。
+// Scratch reservation: this sequence uses 8 below-TOS slots as scratch (j/byte
+// count, names base, idx/i, reclen/min/list, saved-rsi), so it pushes 8 zero
+// slots on entry — below-TOS slots are the caller's live area (locals in a big
+// function), and scribbling there clobbers caller locals: load_pkg's dep_ix
+// (slot 9) was overwritten by the getdents cursor (0x70) with is_external
+// flipped true by the list pointer, dying on dep_paths[112] over an empty
+// list. After reservation the mid-body offsets stay as they were (the scratch
+// slots land exactly on the 8 pushed slots); only the path argument moves from
+// [r15-8] to [r15-72]. Both exits (fail/ok) release the 8 slots before the
+// original tails (the result lands back at [r15-16]). Shadow stamp
+// displacements are unchanged (r15 and the cursor move in lockstep).
 fn x86gen_read_dir_native() {
+    // 8 暂存槽：入序列预留、出序列归还（fail/ok 收尾前先还，几何回到原位）
+    // 8 scratch slots: reserved on entry, released before the fail/ok tails
+    // (restoring the entry geometry)
+    let reserve = vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR) + vs_push_zero(GC_SHADOW_SCALAR)
+    let release = vs_pop_n(8)
     // 失败：Linux/darwin 为 opendir 的 strerror 文本（rax = 负 errno），Windows 同 C
     // 的 FindFirstFileA 路径报固定文本
     // failure: the strerror text of opendir on Linux/darwin (rax = negative
@@ -1280,10 +1304,11 @@ fn x86gen_read_dir_native() {
     } else {
         x86gen_err_from_errno()
     }
-    let fail = fail_err + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR)
-    // Ok 结果：list 对象在 r11
-    // Ok result: list object in r11
-    let ok_inst = x86gen_alloc(rcx, 24, desc_box_ptr) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r11) + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR)
+    let fail = release + fail_err + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR)
+    // Ok 结果：list 对象在 r11（先还 8 暂存槽，几何回到入序列原位再走原收尾）
+    // Ok result: list object in r11 (release the 8 scratch slots first,
+    // restoring the entry geometry, then the original tail)
+    let ok_inst = x86gen_alloc(rcx, 24, desc_box_ptr) + mov_ri64(rdx, 1) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, r11) + release + mov_mr(r15, 0 - 16, rcx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR)
     let close = sys_mov_rax(3) + syscall()
     // 子序列：is_dotdot（rcx=名字指针 → r9=布尔）、strcmp_lt（rsi/rdi → r8=a<b）、strlen（rcx → rdx=长度）
     // sub-sequences: is_dotdot, strcmp_lt, strlen
@@ -1402,9 +1427,9 @@ fn x86gen_read_dir_native() {
     } else {
         mov_ri64(rsi, 65536)
     }
-    let mut head_w = x86gen_nul_path_at(0 - 8) + mov_rr(rdi, r11) + dir_flags + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail + main_tail + fail
+    let mut head_w = reserve + x86gen_nul_path_at(0 - 72) + mov_rr(rdi, r11) + dir_flags + xor_rr(rdx, rdx) + sys_mov_rax(2) + syscall() + mov_rr(r8, rax) + open_fail + main_tail + fail
     if target_os == "windows" {
-        head_w = x86gen_nul_path_at(0 - 8) + win_star + sub_ri32(rsp, 328) + win_find + win_find_money + names_alloc + win_loop + main_done + empty_ok + fail_pad + fail
+        head_w = reserve + x86gen_nul_path_at(0 - 72) + win_star + sub_ri32(rsp, 328) + win_find + win_find_money + names_alloc + win_loop + main_done + empty_ok + fail_pad + fail
     }
     head_w
 }
