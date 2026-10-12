@@ -28,6 +28,10 @@ fi
 TMP="/tmp/mbverify-$$"
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
+# case-table:逐例一行结果（免登录可读的定位依据，随 summary 上报）
+# case-table: one result line per case (login-free triage, reported via summary)
+TABLE="$TMP/case-table"
+: >"$TABLE"
 
 PASS=0
 FAIL=0
@@ -93,6 +97,7 @@ run_quad() {
     if [ "$vm_rc" -eq 133 ] || [ "$c_rc" -eq 133 ] || [ "$x_rc" -eq 133 ] || [ "$l_rc" -eq 133 ]; then
         echo "  SKIP $label (SIGTRAP unimplemented opcode)"
         SKIP=$((SKIP + 1))
+        echo "SKIP $label" >>"$TABLE"
         return
     fi
 
@@ -106,12 +111,14 @@ run_quad() {
         od -An -tx1 "$TMP/x_err" | head -3
         PROBE=$((PROBE + 1))
         PROBES="$PROBES $label"
+        echo "PROBE $label" >>"$TABLE"
         return
     fi
 
     if [ "$vm_rc" = "$c_rc" ] && [ "$c_rc" = "$x_rc" ] && [ "$x_rc" = "$l_rc" ] && [ "$vm_out" = "$c_out" ] && [ "$c_out" = "$x_out" ] && [ "$x_out" = "$l_out" ] && [ "$vm_err" = "$c_err" ] && [ "$c_err" = "$x_err" ] && [ "$x_err" = "$l_err" ]; then
         echo "  PASS $label"
         PASS=$((PASS + 1))
+        echo "PASS $label" >>"$TABLE"
         return
     fi
 
@@ -130,6 +137,7 @@ run_quad() {
     fi
     FAIL=$((FAIL + 1))
     FAILURES="$FAILURES $label"
+    echo "FAIL $label vm=$vm_rc c=$c_rc x86=$x_rc llvm=$l_rc" >>"$TABLE"
 }
 
 echo "=== Multi-backend verify (VM / C / x86 / LLVM) ==="
@@ -172,6 +180,15 @@ if [ -n "$FAILURES" ]; then
 fi
 if [ -n "$PROBES" ]; then
     echo "PROBE-HITS:$PROBES"
+fi
+# summary 上报逐例表（本地跑时 GITHUB_STEP_SUMMARY 为空即跳过；判定语义不变）
+# report the case table via summary (skipped locally when unset; verdict unchanged)
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+        echo "## multibackend case table"
+        echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP PROBE=$PROBE"
+        cat "$TABLE"
+    } >>"$GITHUB_STEP_SUMMARY"
 fi
 if [ "$FAIL" -gt 0 ]; then
     exit 1
