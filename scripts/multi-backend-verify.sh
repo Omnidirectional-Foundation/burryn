@@ -190,6 +190,22 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         cat "$TABLE"
     } >>"$GITHUB_STEP_SUMMARY"
 fi
+# CI 成果上报：结论进 outputs（artifact 名用），全表落盘供上传；本地皆跳过
+# CI result reporting: verdict to outputs (used in the artifact name), full
+# table to disk for upload; both skipped locally
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    mb_first=$(printf '%s' "$FAILURES" | awk '{print $1}')
+    mb_base=$(basename "$mb_first" 2>/dev/null || true)
+    mb_safe=$(printf '%s' "$mb_base" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-60)
+    if [ "$FAIL" -gt 0 ]; then
+        echo "mb_status=FAIL" >>"$GITHUB_OUTPUT"
+        echo "mb_tag=F${FAIL}-${mb_safe}" >>"$GITHUB_OUTPUT"
+    else
+        echo "mb_status=PASS" >>"$GITHUB_OUTPUT"
+        echo "mb_tag=ok" >>"$GITHUB_OUTPUT"
+    fi
+    cp "$TABLE" ./mb-case-table.txt
+fi
 if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
