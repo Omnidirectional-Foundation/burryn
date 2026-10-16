@@ -716,13 +716,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         } else if op == lib::op_index_get {
             let st = type_shadow[len(type_shadow) - 2]
 
-            if st == "str" {
-                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + x86gen_alloc(r11, 16, desc_noscan) + xor_rr(r9, r9) + add_ri32(r9, 1) + mov_mr(r11, 0, r9) + mov_rm(r9, rax, 8) + add_rr(r9, rcx) + mov_mr(r11, 8, r9) + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR))
-                shadow_pop(shadow, 2)
-                shadow_pop(type_shadow, 2)
-                push(shadow, "str")
-                push(type_shadow, "str")
-            } else if str_len(st) > 4 && substr(st, 0, 4) == "tup:" {
+            // 字符串不可下标（checker 只许 list，`s[i]` 报 E0308），故不存在真正的
+            // str 容器索引：容器类型读到 str 只能是类型影子把 list 误判成 str。
+            // 不设 str 分支——误判时仍走 list 分支（读 [list+16]），元素值正确。
+            // Strings are not indexable (the checker allows lists only; `s[i]` is
+            // E0308), so a `str` container cannot be a real string index — a `str`
+            // container type is only the type shadow misreading a list. No str
+            // branch: the misread falls through to the list branch (reads
+            // [list+16]), yielding the correct element.
+            if str_len(st) > 4 && substr(st, 0, 4) == "tup:" {
                 // tuple 索引：元素 = [tuple + 8 + 8*idx]
                 // tuple index: element at [tuple + 8 + 8*idx]
                 // 类型先算后发（kind 落影子）：索引常量（解构场景）回看前一条 CONST；
@@ -758,7 +760,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // 元素 kind 先算后发 / element kind computed before emitting
                 let li_k = if is_list_type(st) {
                     gc_kind_of(list_elem_type(st))
-                } else if st == "" || st == "int" {
+                } else if st == "" || st == "int" || st == "str" {
                     GC_SHADOW_MAYBE
                 } else {
                     GC_SHADOW_SCALAR
@@ -780,7 +782,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     } else {
                         push(type_shadow, st_el)
                     }
-                } else if st == "" || st == "int" {
+                } else if st == "" || st == "int" || st == "str" {
                     push(type_shadow, "")
                 } else {
                     push(type_shadow, "int")
