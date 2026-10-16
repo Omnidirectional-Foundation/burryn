@@ -385,8 +385,18 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
     // applied by the emit loop); fixes static-simulation drift from mutually exclusive
     // pops on break/return paths
     let mut pt_target_shadow = map()
+    // 聚合求解：迭代到不动点（带 guard）。参数/返回类型沿调用图逐轮传播，固定 4 轮在
+    // 编译器规模下收敛不足——残留的空串影子会让下游字符串比较退化成指针比较。
+    // 下方签名求解（while s_changed）同法收敛；此处对齐，floor 4 保留原基线，guard 封顶。
+    // Aggregation solve: iterate to a fixpoint (guarded). Param/return types propagate
+    // one call-graph level per round, and a fixed 4 rounds does not converge at compiler
+    // scale — leftover empty-string shadows make downstream string compares degrade to
+    // pointer compares. The signature solve below converges the same way; this matches it,
+    // keeping the original 4-round baseline as a floor and a guard as the ceiling.
     let mut round = 0
-    while round < 4 {
+    let mut agg_prev = ""
+    let mut agg_conv = false
+    while round < 16 && (round < 4 || !agg_conv) {
         let mut pti = nfn
         p_depth_maps = []
         // 每轮重置跳转目标快照：跨函数 chan 元素类型在轮间收敛，首次 wins 会卡住首轮
@@ -400,6 +410,17 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
             push(p_depth_maps, pd_round)
             pti = pti - 1
         }
+        // 收敛判据：本模拟唯一会写的六处状态（两个数组的内容 + 四张表的全量内容）逐轮
+        // 比对（确定性）。表值会被 merge_type 就地精化而不增键，故必须比内容而非键数。
+        // convergence test: the only state this simulation writes — the two arrays plus the
+        // full contents of the four tables — compared whole-round (deterministic). Table
+        // values are refined in place by merge_type without adding keys, so contents, not
+        // key counts, are what must be compared.
+        let agg_now = str(fn_param_types) + "|" + str(fn_ret_type) + "|" + str(sig_specs) + "|" + str(global_type) + "|" + str(record_field_types) + "|" + str(enum_variant_types)
+        if round > 0 && agg_now == agg_prev {
+            agg_conv = true
+        }
+        agg_prev = agg_now
         round = round + 1
     }
     // 签名求解：迭代至收敛（嵌套多态经 sig_ret/sig_specs 传播，直到签名不再增长）
