@@ -1935,9 +1935,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(mov_rm(rcx, r14, 0) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 8 + 8 * idx, rax))
             }
         } else if op == lib::op_close_upvalue {
-            // no-op：x86 闭包捕获即拷贝，无 open upvalue cell 需关闭
-            // no-op: x86 closures capture by copy, there is no open upvalue cell to close
-            w("")
+            // 无 open cell 需关闭（捕获局部在声明处已 cell 化），但槽仍须弹出、
+            // 影子游标同步回退：前端以本指令替换 op_pop，净效果与 VM/C/LLVM 一致。
+            // No open cell to close (captured locals are cell-ified at declaration),
+            // but the slot must still be popped and the shadow cursor retreated: the
+            // frontend emits this in place of op_pop (same net effect as VM/C/LLVM).
+            w(vs_pop_n(1))
+            shadow_pop(shadow, 1)
+            shadow_pop(type_shadow, 1)
         } else if op == lib::op_tuple {
             let n = code[ip + 1]
             let alloc = x86gen_alloc(r11, 8 + 8 * n, desc_lenptrs) + mov_ri64(rdx, n) + mov_mr(r11, 0, rdx)
