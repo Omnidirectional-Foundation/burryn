@@ -488,8 +488,13 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 ""
             }
             if sa_neq == "str" && sb_neq == "str" {
+                // 长度不同即不等：先 setne 落 1，再跳过字节比较。缺这一步会让
+                // 不同长度的串比较（如 pdir != "") 静默返回假。
+                // Different lengths are unequal: setne first, then skip the byte
+                // compare. Without it a differing-length compare (e.g. pdir != "")
+                // silently returns false.
                 let cmp_body_neq = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + setne(r10)
-                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body_neq)) + cmp_body_neq + mov_mr(r15, 0 - 16, r10) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
+                w(mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + setne(r10) + jne_rel32(str_len(cmp_body_neq)) + cmp_body_neq + mov_mr(r15, 0 - 16, r10) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
             } else if is_record_type(sa_neq) && is_record_type(sb_neq) {
                 let rn_schema = if str_len(record_schema(sa_neq)) > 0 {
                     record_schema(sa_neq)
