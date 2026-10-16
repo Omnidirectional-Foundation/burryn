@@ -447,7 +447,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            if sa_eq == "str" && sb_eq == "str" {
+            // 字符串字面量操作数无歧义是 str，而 `==` 要求两侧同型，故另一侧也必是 str：
+            // 影子尚未收敛（如空 list 的元素在 4 轮聚合后仍为 int）时仍按内容比较，
+            // 否则会退化成指针比较，让 match 臂静默全部落空。
+            // A string-literal operand is unambiguously a str, and `==` requires both
+            // operands to share a type, so the other side is a str too: compare by
+            // content even when that side's shadow has not converged yet (e.g. an
+            // element of a list built from `[]`), which would otherwise degrade to a
+            // pointer compare and silently drop every `match` arm.
+            if sa_eq == "str" && sb_eq == "str" || prev_is_str_const(ctx, fh, code, ip) {
                 w(x86gen_eq_str())
             } else if is_record_type(sa_eq) && is_record_type(sb_eq) {
                 let rq_schema = if str_len(record_schema(sa_eq)) > 0 {
@@ -487,7 +495,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            if sa_neq == "str" && sb_neq == "str" {
+            // 同上：字符串字面量操作数即证明两侧都是 str
+            // same as op_eq: a string-literal operand proves both sides are strs
+            if sa_neq == "str" && sb_neq == "str" || prev_is_str_const(ctx, fh, code, ip) {
                 // 长度不同即不等：先 setne 落 1，再跳过字节比较。缺这一步会让
                 // 不同长度的串比较（如 pdir != "") 静默返回假。
                 // Different lengths are unequal: setne first, then skip the byte
@@ -2865,6 +2875,21 @@ fn merge_enum_ann(a, b) {
         }
     } else {
         b
+    }
+}
+
+// prev_is_str_const 判断当前指令的前一条是否加载字符串常量
+// prev_is_str_const tells whether the instruction before ip loads a string constant
+fn prev_is_str_const(ctx: X86Ctx, fh, code, ip) {
+    if ip < 3 {
+        false
+    } else if code[ip - 3] != lib::op_const {
+        false
+    } else {
+        match ctx.f_consts[fh][read_u16(code, ip - 2)] {
+            lib::CVal::CStr(_) => true,
+            _ => false,
+        }
     }
 }
 
