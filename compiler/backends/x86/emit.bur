@@ -119,7 +119,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
 
     // emit_inst 发射单条指令 / emit_inst emits one instruction
     // Emit one instruction
-    fn emit_inst(ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
+    fn emit_inst(ip, prev_ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
         if in_dead {
             // 死代码不可达：只发占位 trap，不做任何 shadow 维护
             // unreachable code: emit a placeholder trap, no shadow bookkeeping
@@ -455,7 +455,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // content even when that side's shadow has not converged yet (e.g. an
             // element of a list built from `[]`), which would otherwise degrade to a
             // pointer compare and silently drop every `match` arm.
-            if sa_eq == "str" && sb_eq == "str" || prev_is_str_const(ctx, fh, code, ip) {
+            if sa_eq == "str" && sb_eq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 w(x86gen_eq_str())
             } else if is_record_type(sa_eq) && is_record_type(sb_eq) {
                 let rq_schema = if str_len(record_schema(sa_eq)) > 0 {
@@ -497,7 +497,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             // 同上：字符串字面量操作数即证明两侧都是 str
             // same as op_eq: a string-literal operand proves both sides are strs
-            if sa_neq == "str" && sb_neq == "str" || prev_is_str_const(ctx, fh, code, ip) {
+            if sa_neq == "str" && sb_neq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 // 长度不同即不等：先 setne 落 1，再跳过字节比较。缺这一步会让
                 // 不同长度的串比较（如 pdir != "") 静默返回假。
                 // Different lengths are unequal: setne first, then skip the byte
@@ -2687,6 +2687,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     w(x86gen_prologue(arity, locals, yield_addr, lifted))
     let dm = p_depth_maps[nfn - 1 - fh]
     let mut ip = 0
+    let mut prev_ip = 0 - 1
     let mut in_dead = false
     while ip < len(code) {
         top_slot = -1
@@ -2726,7 +2727,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         if in_dead {
             let sl = len(shadow)
             let tl = len(type_shadow)
-            emit_inst(ip, in_dead)
+            emit_inst(ip, prev_ip, in_dead)
             while len(shadow) > sl {
                 shadow_pop(shadow, 1)
             }
@@ -2734,11 +2735,12 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 shadow_pop(type_shadow, 1)
             }
         } else {
-            emit_inst(ip, in_dead)
+            emit_inst(ip, prev_ip, in_dead)
             if code[ip] == lib::op_jump || code[ip] == lib::op_select {
                 in_dead = true
             }
         }
+        prev_ip = ip
         ip = ip + inst_len(ctx, fh, code, ip)
     }
     // 跳转补丁：回填 rel32 偏移（字节位置差）
@@ -2878,15 +2880,19 @@ fn merge_enum_ann(a, b) {
     }
 }
 
-// prev_is_str_const 判断当前指令的前一条是否加载字符串常量
-// prev_is_str_const tells whether the instruction before ip loads a string constant
-fn prev_is_str_const(ctx: X86Ctx, fh, code, ip) {
-    if ip < 3 {
+// prev_is_str_const 判断 prev_ip 处的指令是否加载字符串常量。指令长度不定
+// （见 inst_len），故前一条指令的起点由发射循环逐条给出，不能用固定回退。
+// prev_is_str_const tells whether the instruction at prev_ip loads a string
+// constant. Instructions have variable length (see inst_len), so the previous
+// instruction's start offset is supplied by the dispatch loop rather than
+// re-derived with a fixed back-step.
+fn prev_is_str_const(ctx: X86Ctx, fh, code, prev_ip) {
+    if prev_ip < 0 {
         false
-    } else if code[ip - 3] != lib::op_const {
+    } else if code[prev_ip] != lib::op_const {
         false
     } else {
-        match ctx.f_consts[fh][read_u16(code, ip - 2)] {
+        match ctx.f_consts[fh][read_u16(code, prev_ip + 1)] {
             lib::CVal::CStr(_) => true,
             _ => false,
         }
