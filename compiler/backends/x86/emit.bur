@@ -2052,14 +2052,36 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         } else if op == lib::op_get_field_name {
             let cidx = read_u16(code, ip + 1)
             let fname = const_str(ctx, fh, cidx)
+            // 字段号按**接收者自己的记录形态**解：记录按该形态字段名排序后的次序
+            // 布局，同名域在不同形态里序号不同；只按名字全局取首个命中会把别的形
+            // 态的槽号套到本接收者上（编译器自身 BcCtx 与 X86Ctx 共用 f_name/
+            // f_code/f_arity/f_nupvals/f_consts 而序号不同，f_name 的写入会落到
+            // c_lp_conts，f_name 自身永为空）。
+            // resolve the field index inside the receiver's own record shape: a
+            // record is laid out in its shape's sorted field order, so one name has
+            // a different index in each shape; a global first-match search applies
+            // another shape's slot number to this receiver (in the compiler itself
+            // BcCtx and X86Ctx share f_name/f_code/f_arity/f_nupvals/f_consts at
+            // different indices, so the push to f_name lands in c_lp_conts and
+            // f_name itself stays empty).
+            let g_rt0 = if len(type_shadow) > 0 {
+                type_shadow[len(type_shadow) - 1]
+            } else {
+                ""
+            }
             let mut fidx = -1
-            let mut fi = 0
-            while fi < len(record_encs) && fidx < 0 {
-                let fi2 = find_field_in_enc(record_encs[fi], fname)
-                if fi2 >= 0 {
-                    fidx = fi2
+            if is_record_type(g_rt0) {
+                fidx = find_field_in_enc(record_schema(g_rt0), fname)
+            }
+            if fidx < 0 {
+                let mut fi = 0
+                while fi < len(record_encs) && fidx < 0 {
+                    let fi2 = find_field_in_enc(record_encs[fi], fname)
+                    if fi2 >= 0 {
+                        fidx = fi2
+                    }
+                    fi = fi + 1
                 }
-                fi = fi + 1
             }
             if fidx >= 0 {
                 w(mov_rm(rax, r15, 0 - 8) + mov_rm(rax, rax, 16 + 8 * fidx) + mov_mr(r15, 0 - 8, rax))
@@ -2092,6 +2114,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             let cidx = read_u16(code, ip + 2)
             let enc = const_str(ctx, fh, cidx)
             let mut upd_indices = []
+            // 更新名的字段号同样按 base 自己的形态解（栈为 [base][v0..vn-1]）
+            // the update names' field indices also come from the base's own shape
+            // (the stack is [base][v0..vn-1])
+            let upd_base0 = if len(type_shadow) > n {
+                type_shadow[len(type_shadow) - n - 1]
+            } else {
+                ""
+            }
+            let upd_schema = if is_record_type(upd_base0) {
+                record_schema(upd_base0)
+            } else {
+                ""
+            }
             let mut ui = 0
             let mut upos = 0
             while ui < n && upos < str_len(enc) {
@@ -2106,10 +2141,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     },
                 }
                 let mut ufi = -1
-                let mut eci = 0
-                while eci < len(record_encs) && ufi < 0 {
-                    ufi = find_field_in_enc(record_encs[eci], ufname)
-                    eci = eci + 1
+                if str_len(upd_schema) > 0 {
+                    ufi = find_field_in_enc(upd_schema, ufname)
+                }
+                if ufi < 0 {
+                    let mut eci = 0
+                    while eci < len(record_encs) && ufi < 0 {
+                        ufi = find_field_in_enc(record_encs[eci], ufname)
+                        eci = eci + 1
+                    }
                 }
                 push(upd_indices, ufi)
                 match str_index_of(rest, "\n") {
