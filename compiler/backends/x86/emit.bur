@@ -21,6 +21,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     let mut cur_enum_eh = -1
     let mut pos_types = []
     let mut pos_auth = []
+    // cell 权威表：仅 lift 分支读，记录「该槽此刻确实持有 cell 指针」。pos_auth
+    // 兼作类型盖章权威，是流不敏感静态标志——提升槽被裸值重填（声明压栈）后它
+    // 不失效，SET_LOCAL 于是误走「写穿 cell」，把裸值当 cell 指针写；裸值若是
+    // 只读常量即 SIGSEGV。cell_auth 随栈深回落复位。
+    // cell authority (lift branches only): whether the slot currently holds a
+    // cell pointer. pos_auth doubles as the stamping authority and is a
+    // flow-insensitive static flag — after a lifted slot is refilled with a raw
+    // value (a declaration push) it stays set, so SET_LOCAL wrongly takes the
+    // write-through path and writes through a raw value; a read-only constant
+    // then faults. cell_auth is reset as the stack depth falls back.
+    let mut cell_auth = []
     let mut top_slot = -1
     let mut pending_cvds = []
     let mut pending_olds = []
@@ -119,7 +130,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
 
     // emit_inst 发射单条指令 / emit_inst emits one instruction
     // Emit one instruction
-    fn emit_inst(ip, prev_ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
+    fn emit_inst(ip, prev_ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref cell_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
         if in_dead {
             // 死代码不可达：只发占位 trap，不做任何 shadow 维护
             // unreachable code: emit a placeholder trap, no shadow bookkeeping
@@ -286,7 +297,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     pos_types[slot] = stype
                 }
                 if is_lifted(slot) {
-                    if slot < len(pos_auth) && pos_auth[slot] {
+                    if slot < len(cell_auth) && cell_auth[slot] {
                         // 提升槽：槽存 cell 指针，读须解引用
                         // lifted slot: the slot holds a cell pointer, dereference on read
                         w(mov_rm(rax, r14, 8 * slot) + mov_rm(rax, rax, 0) + vs_push(rax, gc_kind_of(stype)))
@@ -308,6 +319,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             push(pos_auth, false)
                         }
                         pos_auth[slot] = true
+                        while len(cell_auth) <= slot {
+                            push(cell_auth, false)
+                        }
+                        cell_auth[slot] = true
                     }
                 } else {
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax, gc_kind_of(stype)))
@@ -333,7 +348,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
         } else if op == lib::op_set_local {
             let slot = read_u16(code, ip + 1)
-            let was_auth = slot > 0 && slot < len(pos_auth) && pos_auth[slot]
+            let was_auth = slot > 0 && slot < len(cell_auth) && cell_auth[slot]
             if slot > 0 {
                 while len(pos_types) <= slot {
                     push(pos_types, "")
@@ -350,6 +365,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     push(pos_auth, false)
                 }
                 pos_auth[slot] = true
+                while len(cell_auth) <= slot {
+                    push(cell_auth, false)
+                }
+                cell_auth[slot] = true
             }
             if is_lifted(slot) {
                 if was_auth {
@@ -1872,7 +1891,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // ref 捕获：闭包槽存 cell 指针（读侧解引用，见 GET 侧）
                     // ref capture: the closure slot holds the cell pointer (the read
                     // side dereferences it, see the GET side)
-                    if is_lifted(uidx) && !(uidx < len(pos_auth) && pos_auth[uidx]) {
+                    if is_lifted(uidx) && !(uidx < len(cell_auth) && cell_auth[uidx]) {
                         // 兜底：let 初始化无 SET_LOCAL，槽里是裸值——cell 化后闭包槽存指针
                         // fallback: no SET_LOCAL for the let init; lift the raw value
                         // into a cell so the closure slot holds the cell pointer
@@ -1884,6 +1903,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             push(pos_auth, false)
                         }
                         pos_auth[uidx] = true
+                        while len(cell_auth) <= uidx {
+                            push(cell_auth, false)
+                        }
+                        cell_auth[uidx] = true
                     } else {
                         w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
                     }
@@ -1895,7 +1918,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // VM does). A lifted slot holds a cell, so dereference it; an unlifted
                     // slot is copied as-is. The read side uses the non-ref two-load form,
                     // so storing a cell would fetch the neighbouring object's header.
-                    if is_lifted(uidx) && !(uidx < len(pos_auth) && pos_auth[uidx]) {
+                    if is_lifted(uidx) && !(uidx < len(cell_auth) && cell_auth[uidx]) {
                         // 槽尚未 cell 化：先存值，再把槽提升为 cell（保持提升槽不变式）
                         // slot not yet lifted: store the value, then lift the slot into a
                         // cell (keeps the lifted-slot invariant)
@@ -1904,6 +1927,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             push(pos_auth, false)
                         }
                         pos_auth[uidx] = true
+                        while len(cell_auth) <= uidx {
+                            push(cell_auth, false)
+                        }
+                        cell_auth[uidx] = true
                     } else if is_lifted(uidx) {
                         w(mov_rm(rax, r14, 8 * uidx) + mov_rm(rax, rax, 0) + mov_mr(r11, 8 + 8 * ui, rax))
                     } else {
@@ -2743,6 +2770,20 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 shadow_pop(type_shadow, 1)
             }
         } else {
+            // cell 权威复位：栈深裁剪后活深之下的提升槽已死，不再持 cell。下一
+            // 指令若把裸值落到该槽（声明压栈），其后的 SET_LOCAL 必须走「首次写」
+            // 分配新 cell，而不是写穿一个已经不是 cell 的槽。
+            // reset cell authority: below the live depth a lifted slot is dead and
+            // no longer holds a cell. If the next instruction lands a raw value
+            // there (a declaration push), a later SET_LOCAL must allocate a fresh
+            // cell instead of writing through a non-cell.
+            let mut ca = len(type_shadow)
+            while ca < len(cell_auth) {
+                if is_lifted(ca) {
+                    cell_auth[ca] = false
+                }
+                ca = ca + 1
+            }
             emit_inst(ip, prev_ip, in_dead)
             if code[ip] == lib::op_jump || code[ip] == lib::op_select {
                 in_dead = true
