@@ -2635,10 +2635,18 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // a new value may write
                 let nopush = op == lib::op_pop || op == lib::op_pop_n || op == lib::op_end_block || op == lib::op_jump_if_false_pop || op == lib::op_index_set || op == lib::op_no_match || op == lib::op_return || op == lib::op_set_local || op == lib::op_def_global || op == lib::op_set_global || op == lib::op_spawn || op == lib::op_send
                 // 只写死槽（声明位置，类型为空）与 get_local 自写副本；活槽被
-                // 非自写指令的栈顶写穿会污染同号槽（str 拼接、EQ 误判）
+                // 非自写指令的栈顶写穿会污染同号槽（str 拼接、EQ 误判）。
+                // get_local 写进死槽即声明（`let b = a`、for 迭代量副本），必须
+                // 盖章，否则该槽类型恒空，按类型分派的原语（println/print）走错
+                // 分支，把 str 当 int 打印出指针；psim 同判据早已允许，两遍一致。
                 // write only into dead slots (declaration positions, empty type)
                 // and get_local self-copies; transients writing through a live
-                // slot corrupt it (str concat, EQ misclassification)
+                // slot corrupt it (str concat, EQ misclassification).
+                // A get_local writing a dead slot is a declaration (`let b = a`,
+                // the for-loop iterable copy) and must be stamped: otherwise the
+                // slot's type stays empty and type-dispatched natives (println,
+                // print) take the wrong branch, printing a str as an int; psim
+                // already allows it and the two passes must agree.
                 // test_variant 的结果项是控制流元数据（被测枚举描述符），
                 // 不是槽内值的类型——盖章会污染 scrutinee 槽
                 // the test_variant result entry is control metadata (the tested
@@ -2647,7 +2655,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // CALL/GET_FIELD 换的是栈顶值，top_slot 仍可能停在实参/枚举槽，必须给 vds 盖章
                 // CALL/GET_FIELD replace TOS; top_slot may still name the arg/enum slot
                 let replaces_tos = op == lib::op_call || op == lib::op_get_field || op == lib::op_get_field_name || op == lib::op_tuple || op == lib::op_list || op == lib::op_record || op == lib::op_index_get || op == lib::op_get_global || op == lib::op_try
-                if !nopush && !sup_stamp && op != lib::op_test_variant && (top_slot < 0 || top_slot == vds || replaces_tos) {
+                if !nopush && !sup_stamp && op != lib::op_test_variant && (top_slot < 0 || top_slot == vds || replaces_tos || str_len(pos_types[vds]) == 0) {
                     let w_old = pos_types[vds]
                     if str_len(w_old) == 0 || replaces_tos || op == lib::op_const || op == lib::op_closure {
                         let w_new = if op == lib::op_call || op == lib::op_get_field || op == lib::op_get_field_name {
