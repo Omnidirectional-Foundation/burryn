@@ -1858,7 +1858,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                 }
                 put(ctx.global_type, "upval:" + str(sub) + ":" + str(ui), uvt)
-                if flag % 2 == 1 {
+                if flag % 2 == 1 && flag >= 2 {
+                    // ref 捕获：闭包槽存 cell 指针（读侧解引用，见 GET 侧）
+                    // ref capture: the closure slot holds the cell pointer (the read
+                    // side dereferences it, see the GET side)
                     if is_lifted(uidx) && !(uidx < len(pos_auth) && pos_auth[uidx]) {
                         // 兜底：let 初始化无 SET_LOCAL，槽里是裸值——cell 化后闭包槽存指针
                         // fallback: no SET_LOCAL for the let init; lift the raw value
@@ -1871,6 +1874,28 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             push(pos_auth, false)
                         }
                         pos_auth[uidx] = true
+                    } else {
+                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
+                    }
+                } else if flag % 2 == 1 {
+                    // 值捕获：闭包槽存**值**快照（与 VM 一致）。提升槽里放的是 cell，
+                    // 故解引用取值；槽未提升则原样搬。读侧按非 ref 两段取，存 cell 会取到
+                    // 邻接对象的头字。
+                    // by-value capture: the closure slot holds the value snapshot (as the
+                    // VM does). A lifted slot holds a cell, so dereference it; an unlifted
+                    // slot is copied as-is. The read side uses the non-ref two-load form,
+                    // so storing a cell would fetch the neighbouring object's header.
+                    if is_lifted(uidx) && !(uidx < len(pos_auth) && pos_auth[uidx]) {
+                        // 槽尚未 cell 化：先存值，再把槽提升为 cell（保持提升槽不变式）
+                        // slot not yet lifted: store the value, then lift the slot into a
+                        // cell (keeps the lifted-slot invariant)
+                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10))
+                        while len(pos_auth) <= uidx {
+                            push(pos_auth, false)
+                        }
+                        pos_auth[uidx] = true
+                    } else if is_lifted(uidx) {
+                        w(mov_rm(rax, r14, 8 * uidx) + mov_rm(rax, rax, 0) + mov_mr(r11, 8 + 8 * ui, rax))
                     } else {
                         w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
                     }
