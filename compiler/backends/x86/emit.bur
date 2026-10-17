@@ -813,7 +813,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     "list-" + el_top
                 }
             } else {
-                "list-int"
+                // 空字面量的元素类型未知，留空（"list-"）而不是猜成 int：猜成 int
+                // 后，此后 push 进去的字符串会被当成整数，拼接与 `==` 都按整数路径发；
+                // 元素类型未知时 op_index_get 折出 ""，两条路径都不再误判。
+                // An empty literal's element type is unknown and stays empty ("list-")
+                // rather than a guess of int: guessing int would later treat the
+                // strings pushed in as integers and send both concatenation and `==`
+                // down the integer path; an unknown element folds to "" in
+                // op_index_get, so neither path is misread.
+                "list-"
             }
             w(x86gen_alloc(r11, 24 + 8 * n, desc_list(gc_kind_of(el_top))) + mov_ri64(rax, n) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(rax, r11, 24) + mov_mr(r11, 16, rax) + lea(rsi, r15, 0 - 8 * n) + mov_rr(rdi, rax) + mov_ri64(rcx, 8 * n) + rep_movsb() + lea(r15, r15, 0 - 8 * n) + shadow_bump(0 - n) + vs_push(r11, GC_SHADOW_PTR))
             shadow_pop(shadow, n)
@@ -3879,7 +3887,9 @@ fn list_elem_format_code(ctx: X86Ctx, et, ff_h) {
 
 // is_list_type 判断是否为 list 类型 / is_list_type tells whether t is a list type
 fn is_list_type(t) {
-    str_len(t) > 5 && substr(t, 0, 5) == "list-"
+    // 裸 "list-"（长度 5）表示元素类型未知，同属 list 型
+    // A bare "list-" (length 5) marks an unknown element type and is still a list type
+    str_len(t) >= 5 && substr(t, 0, 5) == "list-"
 }
 
 // list_elem_type 取 list 元素类型（非 list 类型返回 ""）
@@ -4025,6 +4035,19 @@ fn merge_type(cur, new) {
         // overwrite a known element type
         let cur_has = str_len(cur) > 5 && substr(cur, 0, 5) == "chan:"
         let new_has = str_len(new) > 5 && substr(new, 0, 5) == "chan:"
+        if new_has {
+            new
+        } else if cur_has {
+            cur
+        } else {
+            new
+        }
+    } else if is_list_type(cur) && is_list_type(new) {
+        // list 元素合并：有元素者优先，裸 "list-"（元素未知）不覆盖已有元素类型
+        // list element merge: the side with an element wins; a bare "list-" (unknown
+        // element) does not overwrite a known element type
+        let cur_has = str_len(cur) > 5
+        let new_has = str_len(new) > 5
         if new_has {
             new
         } else if cur_has {
