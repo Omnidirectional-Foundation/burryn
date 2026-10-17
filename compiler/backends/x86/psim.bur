@@ -84,13 +84,24 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     ctx.fn_ret_type[ptfh] = merge_enum_ann(ctx.fn_ret_type[ptfh], pret_type)
                 }
             }
-            // 直接返回参数：返回类型跟随实参类型（多态函数异构调用修正）
-            // Direct param return: ret type follows the arg type (fixes hetero polymorphic calls)
+            // 直接返回参数：返回类型跟随实参类型（多态函数异构调用修正）。参数槽现在可能以
+            // cell 的同一性作位置影子（ref 捕获的提升参数），故两种形式都取槽位。
+            // Direct param return: ret type follows the arg type (fixes hetero polymorphic
+            // calls). A param slot may now carry the cell's identity as its location shadow
+            // (a lifted param that a closure captures by ref), so accept both forms.
             let mut pret_param = 0 - 1
             if len(pshadow_ps) > 0 {
                 let pt = pshadow_ps[len(pshadow_ps) - 1]
-                if str_len(pt) > 5 && substr(pt, 0, 5) == "slot:" {
-                    match parse_int(substr(pt, 5, str_len(pt) - 5)) {
+                let pcp = "cell:" + str(ptfh) + ":"
+                let pt_off = if str_len(pt) > 5 && substr(pt, 0, 5) == "slot:" {
+                    5
+                } else if str_len(pt) > str_len(pcp) && substr(pt, 0, str_len(pcp)) == pcp {
+                    str_len(pcp)
+                } else {
+                    0 - 1
+                }
+                if pt_off >= 0 {
+                    match parse_int(substr(pt, pt_off, str_len(pt) - pt_off)) {
                         Some(psn) => {
                             if psn >= 1 && psn <= pa_ps {
                                 pret_param = psn - 1
