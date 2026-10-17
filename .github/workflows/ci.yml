@@ -335,6 +335,14 @@ jobs:
         with:
           name: gen1
 
+      # 崩溃取证：默认 core_pattern 是管道，跑完一个 core 文件都不留；改成落盘到
+      # 工作目录，失败步骤才能读它的寄存器（临时步骤，定位完即撤）。
+      # crash forensics: the default core_pattern pipes cores away and leaves no file;
+      # point it at the working directory so the failure step can read the registers
+      # (temporary step, dropped once the crash site is pinned down).
+      - name: Enable core dumps
+        run: sudo -n sysctl -w kernel.core_pattern=core.g1x.%p || true
+
       # x86 后端自举链——gen1（C 自举）经 x86 后端编出编译器，再用它把编译器
       # 再编一遍，两次产物逐字节相同。多遍暖机 + 三段 list 化之后首次可行。
       # the x86 backend self-chain — gen1 (C-built) compiles the compiler
@@ -344,11 +352,34 @@ jobs:
       - name: x86 three-generation fixpoint
         run: |
           set -euo pipefail
+          ulimit -c unlimited || true
           chmod +x gen1
           ./gen1 build --backend x86 compiler -o g1x
           ./g1x build --backend x86 compiler -o g2x
           sha256sum g1x g2x
           cmp g1x g2x
+
+      # 失败即抄出 core 里的 PRSTATUS 寄存器、映射表与崩溃点前后的反汇编：崩溃点
+      # （写只读段）只在 runner 的编译器规模下复现，rip/r14/r15 足以判读是哪个槽被
+      # 当成 cell 写穿（临时步骤，定位完即撤）。
+      # on failure, copy the core's PRSTATUS registers, the mapping table and the
+      # disassembly around the fault into the log: the fault (a store into a read-only
+      # segment) only reproduces at compiler scale on the runner, and rip/r14/r15 are
+      # enough to read off which slot is written through as a cell (temporary step).
+      - name: Crash post-mortem
+        if: failure()
+        run: |
+          set -x
+          ls -la core.g1x.* || true
+          for c in core.g1x.*; do
+            [ -f "$c" ] || continue
+            readelf -n "$c" | head -200 || true
+            if command -v gdb > /dev/null; then
+              timeout 180 gdb -batch -nx -ex 'set pagination off' -ex 'info registers' -ex 'info proc mappings' -ex 'bt' -ex 'x/24i $rip-40' -ex 'x/64gx $r14-32' ./g1x "$c" 2>&1 | head -260 || true
+            else
+              readelf -l "$c" | head -40 || true
+            fi
+          done
 
       # 失败也把 g1x 落成 artifact：x86 编译器的运行期 bug 在小机器上复现不了
       # （本机 gen OOM），拉回 quicksrv 本地调试
