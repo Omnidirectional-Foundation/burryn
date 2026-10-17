@@ -473,15 +473,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            // 字符串字面量操作数无歧义是 str，而 `==` 要求两侧同型，故另一侧也必是 str：
-            // 影子尚未收敛（如空 list 的元素在 4 轮聚合后仍为 int）时仍按内容比较，
-            // 否则会退化成指针比较，让 match 臂静默全部落空。
-            // A string-literal operand is unambiguously a str, and `==` requires both
-            // operands to share a type, so the other side is a str too: compare by
-            // content even when that side's shadow has not converged yet (e.g. an
-            // element of a list built from `[]`), which would otherwise degrade to a
-            // pointer compare and silently drop every `match` arm.
-            if sa_eq == "str" && sb_eq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+            // `==` 要求两侧同型，故任一侧为 str 即按内容比较：两侧影子都可能未收敛
+            // （空 list 起家的表、经 upvalue 读出的元素常落在默认 int），而字面量
+            // 一侧的 str 由常量盖章保证。指针比较会让 match 臂静默全部落空。
+            // `==` requires both operands to share a type, so a str on either side
+            // selects the content compare: both shadows may be unconverged (a table
+            // built from `[]`, an element read through an upvalue), while a literal
+            // operand's str is guaranteed by its constant stamp. A pointer compare
+            // would silently drop every `match` arm.
+            if sa_eq == "str" || sb_eq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 w(x86gen_eq_str())
             } else if is_record_type(sa_eq) && is_record_type(sb_eq) {
                 let rq_schema = if str_len(record_schema(sa_eq)) > 0 {
@@ -521,9 +521,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            // 同上：字符串字面量操作数即证明两侧都是 str
-            // same as op_eq: a string-literal operand proves both sides are strs
-            if sa_neq == "str" && sb_neq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+            // 同上：任一侧为 str 即按内容比较
+            // same as op_eq: either side's str selects the content compare
+            if sa_neq == "str" || sb_neq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 // 长度不同即不等：先 setne 落 1，再跳过字节比较。缺这一步会让
                 // 不同长度的串比较（如 pdir != "") 静默返回假。
                 // Different lengths are unequal: setne first, then skip the byte
@@ -569,9 +569,16 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
+            // 关系比较判型：任一侧为 str 即按内容比较——良类型程序里两操作数同型，
+            // 而另一侧的影子可能尚未收敛（空 list 起家的表、经 upvalue 读出的元素
+            // 常落在默认 int），整数比较会让 `c >= "0"` 这类判断静默为假。
+            // Relational comparisons resolve from either side: both operands share a
+            // type in a well-typed program while the other side's shadow may not have
+            // converged (a table built from `[]`, an element read through an upvalue),
+            // and the integer compare would silently make `c >= "0"` false.
             if s_gt == "float" {
                 w(x86gen_float_cmp("gt"))
-            } else if sa_gt == "str" && s_gt == "str" {
+            } else if sa_gt == "str" || s_gt == "str" {
                 w(x86gen_str_rel("gt"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -593,7 +600,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             if s_ge == "float" {
                 w(x86gen_float_cmp("ge"))
-            } else if sa_ge == "str" && s_ge == "str" {
+            } else if sa_ge == "str" || s_ge == "str" {
+                // 同上：任一侧为 str 即按内容比较 / same as op_gt: either side's str selects the content compare
                 w(x86gen_str_rel("ge"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -615,7 +623,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             if s_lt == "float" {
                 w(x86gen_float_cmp("lt"))
-            } else if sa_lt == "str" && s_lt == "str" {
+            } else if sa_lt == "str" || s_lt == "str" {
+                // 同上：任一侧为 str 即按内容比较 / same as op_gt: either side's str selects the content compare
                 w(x86gen_str_rel("lt"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -637,7 +646,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             if s_le == "float" {
                 w(x86gen_float_cmp("le"))
-            } else if sa_le == "str" && s_le == "str" {
+            } else if sa_le == "str" || s_le == "str" {
+                // 同上：任一侧为 str 即按内容比较 / same as op_gt: either side's str selects the content compare
                 w(x86gen_str_rel("le"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
