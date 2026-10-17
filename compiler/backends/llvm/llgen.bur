@@ -262,6 +262,7 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
     w("%OEnumType = type " + OB + " %Obj, " + PT("i8") + ", " + PT("%VariantInfo") + ", i32 }\n")
     w("%OVariantCtor = type " + OB + " %Obj, " + PT("%OEnumType") + ", i32 }\n")
     w("%OEnumInst = type " + OB + " %Obj, " + PT("%OEnumType") + ", i32, " + PT("%Value") + ", i32 }\n")
+    w("%ORecord = type " + OB + " %Obj, " + PT(PT("%OString")) + ", " + PT("%Value") + ", i32 }\n")
     w("%Buf = type " + OB + " " + PT("i8") + ", i64, i64 }\n")
     w("%Fiber = type " + OB + " " + PT("%Value") + ", i32, i32, " + PT(PT("%OUpvalue")) + ", i32, i32, i32, i32, %Value, " + PT("%OClosure") + ", i32, " + PT(PT("%OFunc")) + ", " + PT("i32") + ", i32, i32, i64, i64, i64, i16, i8, " + PT("%Value") + ", i32, i32 }\n")
 
@@ -1032,17 +1033,38 @@ pub fn llgen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans,
             push_val(r)
             ip + 2
         } else if op == lib::op_get_field {
+            // 下标臂读对象的按序载荷：枚举实例与记录都存 fields，偏移不同
+            //（%OEnumInst 的在 enm/variant 之后是第 4 项，%ORecord 的紧跟 names 是第 3 项），
+            // 故按形态挑指针。两个 getelementptr 都只算地址、不取值，另一个不会解引用。
+            // The index arm reads the object's ordered payload: an enum instance and a
+            // record both keep fields, at different offsets (%OEnumInst's is member 4,
+            // %ORecord's member 3), so pick the pointer by shape. Both getelementptr
+            // only compute addresses, so the unselected one is never dereferenced.
             let v = pop_val()
             let o64 = nt()
             w("  " + o64 + " = extractvalue %Value " + v + ", 1\n")
-            let op = nt()
-            w("  " + op + " = inttoptr i64 " + o64 + " to " + PT("%OEnumInst") + "\n")
+            let obj = nt()
+            w("  " + obj + " = inttoptr i64 " + o64 + " to " + PT("%Obj") + "\n")
+            let tp = nt()
+            w("  " + tp + " = getelementptr %Obj, " + PB("%Obj") + obj + ", i32 0, i32 0\n")
+            let tg = nt()
+            w("  " + tg + " = load i32, " + PB("i32") + tp + "\n")
+            let isrec = nt()
+            w("  " + isrec + " = icmp eq i32 " + tg + ", 11\n")
+            let ei = bc(obj, "%Obj", "%OEnumInst")
+            let efp = nt()
+            w("  " + efp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + ei + ", i32 0, i32 3\n")
+            let efa = nt()
+            w("  " + efa + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + efp + "\n")
+            let ri = bc(obj, "%Obj", "%ORecord")
+            let rfp = nt()
+            w("  " + rfp + " = getelementptr %ORecord, " + PB("%ORecord") + ri + ", i32 0, i32 2\n")
+            let rfa = nt()
+            w("  " + rfa + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + rfp + "\n")
             let fp = nt()
-            w("  " + fp + " = getelementptr %OEnumInst, " + PB("%OEnumInst") + op + ", i32 0, i32 3\n")
-            let fa = nt()
-            w("  " + fa + " = load " + PT("%Value") + ", " + PB(PT("%Value")) + fp + "\n")
+            w("  " + fp + " = select i1 " + isrec + ", " + PT("%Value") + " " + rfa + ", " + PT("%Value") + " " + efa + "\n")
             let slot = nt()
-            w("  " + slot + " = getelementptr %Value, " + PB("%Value") + fa + ", i64 " + str(code[ip + 1]) + "\n")
+            w("  " + slot + " = getelementptr %Value, " + PB("%Value") + fp + ", i64 " + str(code[ip + 1]) + "\n")
             let fld = nt()
             w("  " + fld + " = load %Value, " + PB("%Value") + slot + "\n")
             push_val(fld)
