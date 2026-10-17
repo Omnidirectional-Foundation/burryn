@@ -944,6 +944,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 "int"
             }
             let mut gf_from_enc = false
+            let mut gf_known = false
             if is_record_type(gf_rt) {
                 let gf_schema = record_schema(gf_rt)
                 match get(record_field_types, gf_schema) {
@@ -951,6 +952,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         if fidx < len(gf_ft) {
                             gf_t = gf_ft[fidx]
                             gf_from_enc = true
+                            gf_known = true
                         }
                     },
                     None => {},
@@ -960,6 +962,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 if fidx < len(gf_var) {
                     gf_t = gf_var[fidx]
                     gf_from_enc = true
+                    gf_known = true
                 }
             } else if str_len(gf_rt) >= 4 && substr(gf_rt, 0, 4) == "tup:" {
                 // tuple 载荷的类型就在影子自己的编码里（长度前缀），不必查形态表；
@@ -971,12 +974,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 if fidx < len(gf_te) {
                     gf_t = gf_te[fidx]
                     gf_from_enc = true
+                    gf_known = true
                 }
             }
             if !gf_from_enc && (gf_t == "int" || gf_t == "") && cur_enum_eh >= 0 {
                 let gf_fb = enum_variant_fields(ctx, cur_enum_eh, cur_variant)
                 if fidx < len(gf_fb) && str_len(gf_fb[fidx]) > 0 {
                     gf_t = gf_fb[fidx]
+                    gf_known = true
                 }
             }
             if !gf_from_enc && (gf_t == "int" || gf_t == "") && cur_enum_eh >= 0 && cur_enum_eh < len(en_qual) {
@@ -990,8 +995,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     let gf_bv = enum_fields_for_variant(ctx, gf_be, cur_variant)
                     if fidx < len(gf_bv) && str_len(gf_bv[fidx]) > 0 {
                         gf_t = gf_bv[fidx]
+                        gf_known = true
                     }
                 }
+            }
+            // 猜出来的字段类型不可信：宁可留空（未知/MAYBE）也不落成 int——标量 kind
+            // 加一个假类型影子，指针载荷会漏扫。
+            // a guessed field type is not trusted: leave it empty (unknown/MAYBE) rather
+            // than landing as int — a scalar kind plus a wrong type shadow drops a
+            // pointer payload from the scan.
+            if !gf_known {
+                gf_t = ""
             }
             // gf_t 先算后发：TOS 置换的 kind 随写随落影
             // compute gf_t before emitting: the TOS-replacement kind lands in the
