@@ -2212,13 +2212,35 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 fidx = find_field_in_enc(record_schema(g_rt0), fname)
             }
             if fidx < 0 {
+                // 诊断：接收者形态没解出字段号时只能落全局首命中，后者可能把别的形
+                // 态的槽号套上来。打印现场（含各形态是否对该名给出不同槽号）以便定
+                // 位；行为不变。
+                // diagnostic: a receiver-shape miss falls back to the global first match,
+                // which may apply another shape's slot number. Print the site (including
+                // whether shapes disagree on the index) to locate it; behaviour unchanged.
+                let gf_schema = record_schema(g_rt0)
+                let mut gf_amb = "none"
                 let mut fi = 0
-                while fi < len(record_encs) && fidx < 0 {
+                while fi < len(record_encs) {
                     let fi2 = find_field_in_enc(record_encs[fi], fname)
                     if fi2 >= 0 {
-                        fidx = fi2
+                        if fidx < 0 {
+                            fidx = fi2
+                        } else if fi2 != fidx {
+                            gf_amb = "AMBIG"
+                        }
                     }
                     fi = fi + 1
+                }
+                if len(ctx.f_code) > 200 {
+                    let mut gf_desc = gf_schema
+                    match str_index_of(gf_schema, "\n") {
+                        Some(_) => {
+                            gf_desc = "<" + str(str_len(gf_schema)) + ">"
+                        },
+                        None => {},
+                    }
+                    eprintln("X86FIELD fn=" + ctx.f_name[fh] + " field=" + fname + " rec=" + str(is_record_type(g_rt0)) + " schema=" + gf_desc + " idx=" + str(fidx) + " " + gf_amb)
                 }
             }
             if fidx >= 0 {
