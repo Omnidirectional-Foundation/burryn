@@ -113,7 +113,7 @@ pub fn compile_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_imports,
             // Record literals: push field values, then build the object
             frontend::Node::RecordLit(names, vals, sp) => cp_record_lit(emit_ctx, ch, names, vals, sp, cp_expr_ref),
             frontend::Node::RecordUpdate(base, names, vals, sp) => cp_record_update(emit_ctx, ch, base, names, vals, sp, cp_expr_ref),
-            frontend::Node::FieldAccess(base, field, sp) => cp_field_access(emit_ctx, ch, base, field, sp, cp_expr_ref),
+            frontend::Node::FieldAccess(base, field, sp) => cp_field_access(emit_ctx, cur_file, ch, base, field, sp, cp_expr_ref),
             _ => Ok(true),
         }
     }
@@ -837,12 +837,27 @@ fn cp_record_update(ctx: BcCtx, ch, base, names, vals, sp, cp_expr) {
     Ok(true)
 }
 
-fn cp_field_access(ctx: BcCtx, ch, base, field, sp, cp_expr) {
+fn cp_field_access(ctx: BcCtx, cur_file, ch, base, field, sp, cp_expr) {
     match cp_expr(ch, base) {
         Ok(_) => {},
         Err(d) => {
             return Err(d)
         },
+    }
+    // 检查器定案的字段号优先（布局按字段名升序）：后端按名字猜接收者形态时，同名
+    // 域可能套上别的形态的槽号；带上字段号即不必再猜。
+    // A checker-resolved field index wins (a layout sorts by field name): guessing the
+    // receiver's shape by name can apply another shape's slot to a shared field name.
+    let mut fixed = -1
+    match sp {
+        frontend::SpanT::Sp(fs, fe) => {
+            fixed = frontend::rec_field_index_at(cur_file, fs, fe, field)
+        },
+    }
+    if fixed >= 0 {
+        emit(ctx, ch, lib::op_get_field, sp)
+        emit(ctx, ch, fixed, sp)
+        return Ok(true)
     }
     let cidx = add_const(ctx, ch, lib::CVal::CStr(field))
     emit(ctx, ch, lib::op_get_field_name, sp)

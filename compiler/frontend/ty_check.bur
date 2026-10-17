@@ -78,6 +78,44 @@ let mut rec_field_keys = []
 let mut rec_field_offs = []
 let mut rec_field_files = []
 
+// record 字段号表：字段访问面 → 检查器定案的字段号（布局为字段名升序，字段号即名次）
+// 后端按名字猜接收者形态时，同名域可能套上别的形态的槽号；带下字段号即可免猜。
+// Resolved field indices: a field-access span → the index the checker fixed (a layout
+// sorts by field name, so the index is the name's rank). The backend otherwise guesses
+// the receiver's shape by name, which applies another shape's slot to a shared name.
+let mut rec_idx_files = []
+let mut rec_idx_starts = []
+let mut rec_idx_ends = []
+let mut rec_idx_names = []
+let mut rec_idx_ranks = []
+
+// rec_idx_record 记录一次字段访问的字段号 / rec_idx_record records an access's field index
+fn rec_idx_record(sp, file, name, rank) {
+    match sp {
+        Sp(s, e) => {
+            push(rec_idx_files, file)
+            push(rec_idx_starts, s)
+            push(rec_idx_ends, e)
+            push(rec_idx_names, name)
+            push(rec_idx_ranks, rank)
+        },
+    }
+}
+
+// rec_field_index_at 按文件、区间与字段名查字段号，未命中返回 -1
+// rec_field_index_at looks up a field index by file, span and field, -1 when absent
+pub fn rec_field_index_at(file, start, end, name) {
+    let mut hit = -1
+    let mut i = 0
+    while i < len(rec_idx_ranks) {
+        if rec_idx_files[i] == file && rec_idx_starts[i] == start && rec_idx_ends[i] == end && rec_idx_names[i] == name {
+            hit = rec_idx_ranks[i]
+        }
+        i = i + 1
+    }
+    hit
+}
+
 // lsp_record_type 记录表达式的推断类型（供 hover 查询） / lsp_record_type records an expression type (for hover)
 fn lsp_record_type(sp, h, file) {
     match sp {
@@ -3113,6 +3151,23 @@ pub fn typecheck_program(pkgs_stmts, pkgs_fpaths, is_pkg, pkg_paths, pkgs_import
                         j = j + 1
                     }
                     if result >= 0 {
+                        // 字段号 = 布局次序（字段名升序）里的名次；闭行（无 `?`）名集才完整
+                        // the index is the name's rank in layout order (names ascending);
+                        // only a closed row (no `?`) carries the complete name set
+                        let mut closed = true
+                        let mut rank = 0
+                        let mut q = 0
+                        while q < len(fnames) {
+                            if substr(fnames[q], 0, 1) == "?" {
+                                closed = false
+                            } else if fnames[q] < field {
+                                rank = rank + 1
+                            }
+                            q = q + 1
+                        }
+                        if closed && rank < 256 {
+                            rec_idx_record(fsp, cur_file, field, rank)
+                        }
                         ta[resolved][result]
                     } else {
                         cerr(fsp, "E0609", "", "record has no field `" + field + "`")
