@@ -1365,6 +1365,7 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 "int"
             }
             let mut pg_from_enc = false
+            let mut pg_known = false
             if is_record_type(pg_rt) {
                 let pg_schema = record_schema(pg_rt)
                 let mut pg_idx = -1
@@ -1390,6 +1391,7 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                         if pg_idx >= 0 && pg_idx < len(pg_ft) {
                             pg_field_t = pg_ft[pg_idx]
                             pg_from_enc = true
+                            pg_known = true
                         }
                     },
                     None => {},
@@ -1400,16 +1402,21 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 if pg_fidx < len(pg_var) {
                     pg_field_t = pg_var[pg_fidx]
                     pg_from_enc = true
+                    pg_known = true
                 }
             }
-            if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && pcur_enum_eh >= 0 {
+            // 与发射侧一致：接收者一旦确定为非容器就不再查形态表
+            // same as the emitter: no shape-table guess once the receiver is
+            // determined and non-container
+            if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && str_len(pg_rt) == 0 && pcur_enum_eh >= 0 {
                 let pg_fb = enum_variant_fields(ctx, pcur_enum_eh, pcur_variant)
                 let pg_fidx2 = pcode[pit + 1]
                 if pg_fidx2 < len(pg_fb) && str_len(pg_fb[pg_fidx2]) > 0 {
                     pg_field_t = pg_fb[pg_fidx2]
+                    pg_known = true
                 }
             }
-            if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && pcur_enum_eh >= 0 && pcur_enum_eh < len(ctx.en_qual) {
+            if !pg_from_enc && (pg_field_t == "int" || pg_field_t == "") && str_len(pg_rt) == 0 && pcur_enum_eh >= 0 && pcur_enum_eh < len(ctx.en_qual) {
                 let pg_q = ctx.en_qual[pcur_enum_eh]
                 let pg_be = if pg_q == "Output" {
                     ctx.out_enc
@@ -1421,8 +1428,15 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     let pg_fidx3 = pcode[pit + 1]
                     if pg_fidx3 < len(pg_bv) && str_len(pg_bv[pg_fidx3]) > 0 {
                         pg_field_t = pg_bv[pg_fidx3]
+                        pg_known = true
                     }
                 }
+            }
+            // 猜出来的字段类型不可信：与发射侧一样留空（未知/MAYBE）而不落成 int
+            // a guessed field type is not trusted: leave it empty (unknown/MAYBE)
+            // exactly as the emitter does, rather than landing as int
+            if !pg_known {
+                pg_field_t = ""
             }
             shadow_pop(pshadow_ps, 1)
             shadow_pop(ptshadow_ps, 1)
