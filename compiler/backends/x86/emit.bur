@@ -33,6 +33,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     // then faults. cell_auth is reset as the stack depth falls back.
     let mut cell_auth = []
     let mut top_slot = -1
+    // 前两条指令的 ip：左操作数常量的启发式读取要回溯到「左」产出链末条
+    // the ip of the instruction before prev_ip: the left-operand constant heuristic
+    // read needs to reach the end of the "left" producer chain
+    let mut prev_ip2 = 0 - 1
     let mut pending_cvds = []
     let mut pending_olds = []
     // 本条指令是否为描述符常量加载（盖章抑制标志，供启发式读取）
@@ -117,7 +121,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
 
     // emit_inst 发射单条指令 / emit_inst emits one instruction
     // Emit one instruction
-    fn emit_inst(ip, prev_ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref cell_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp) {
+    fn emit_inst(ip, prev_ip, in_dead) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref script_defs, ref cur_variant, ref shadow, ref type_shadow, ref pos_types, ref pos_auth, ref cell_auth, ref top_slot, ref pending_cvds, ref pending_olds, ref sched_addr, ref timer_add_addr, ref sup_stamp, ref prev_ip2) {
         if in_dead {
             // 死代码不可达：只发占位 trap，不做任何 shadow 维护
             // unreachable code: emit a placeholder trap, no shadow bookkeeping
@@ -698,7 +702,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // 两侧同型（"no implicit conversions"），故「一侧 str、另一侧已判出非 str
             // 类型」在良类型程序里不可能出现，出现即至少一侧影子错；此时走不解引用的
             // 整数路径更稳。另一侧未判出类型（""）不构成反证：同型约束保证它也是 str，
-            // 拼接仍然正确；右操作数是字符串字面量时同样由 prev_is_str_const 定案。
+            // 拼接仍然正确；任一侧是字符串字面量时同样定案（右靠 prev_is_str_const，
+            // 左靠 prev2_is_str_const）。
             // A single str shadow is not enough to select this dereferencing path:
             // concatenation reads both operands as string pointers, and a reused stack
             // slot can leave a stale str shadow. The frontend requires both sides of `+`
@@ -707,8 +712,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // — at least one shadow is wrong, and the non-dereferencing integer path is
             // the safer read. An undetermined other side ("") is no counter-evidence:
             // the same-type constraint makes it a str too, so concatenation stays
-            // correct; a string constant on the right settles it via prev_is_str_const.
-            let add_str = sa == "str" && (sb == "str" || sb == "") || sb == "str" && (sa == "str" || sa == "") || prev_is_str_const(ctx, fh, code, prev_ip)
+            // correct. A string constant on either side settles it — on the right via
+            // prev_is_str_const, on the left via prev2_is_str_const.
+            let add_str = sa == "str" && (sb == "str" || sb == "") || sb == "str" && (sa == "str" || sa == "") || prev_is_str_const(ctx, fh, code, prev_ip) || prev2_is_str_const(ctx, fh, code, prev_ip, prev_ip2)
             if add_str {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r10, r9, 0) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + add_ri32(rcx, 8) + x86gen_alloc_r(r11, rcx, GC_DESC_ALL) + sub_ri32(rcx, 8) + mov_mr(r11, 0, rcx) + lea(rsi, rax, 8) + lea(rdi, r11, 8) + mov_rr(rcx, rdx) + rep_movsb() + lea(rsi, r9, 8) + lea(rdi, r11, 8) + add_rr(rdi, rdx) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR))
                 shadow_pop(shadow, 2)
@@ -3056,6 +3062,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 in_dead = true
             }
         }
+        prev_ip2 = prev_ip
         prev_ip = ip
         ip = ip + inst_len(ctx, fh, code, ip)
     }
@@ -3212,6 +3219,37 @@ fn prev_is_str_const(ctx: X86Ctx, fh, code, prev_ip) {
             lib::CVal::CStr(_) => true,
             _ => false,
         }
+    }
+}
+
+// push_only 该指令不消费栈值、只压入一个值——表达式产出链的末条通常就是它，
+// 因此它前面那条是「左」操作数产出链的末条。
+// push_only: the instruction consumes no stack value and pushes exactly one; an
+// expression's producer usually ends with one, so the instruction before it ends
+// the left operand's producer chain.
+fn push_only(op) {
+    op == lib::op_const || op == lib::op_unit || op == lib::op_true || op == lib::op_false || op == lib::op_get_local || op == lib::op_get_global || op == lib::op_get_upval || op == lib::op_closure
+}
+
+// prev2_is_str_const 左操作数是否为字符串常量 / whether the left operand is a string constant
+// 「右」操作数（紧邻 ADD 的那条）由一条 push_only 指令产出时，右操作数产出链只有它一条，
+// 于是前一条指令就是左操作数产出链的末条；那里是字符串常量即左操作数就是它。前端要求
+// `+` 两侧同型，故此处强制拼接是安全的（与 prev_is_str_const 同一论证，只是换了同一条
+// `CONST; GET_LOCAL; ADD` 指令序的哪一侧）。
+// When the "right" operand (the one immediately before the ADD) is produced by a
+// single push_only instruction, the right producer chain is that instruction alone,
+// so the instruction before it ends the left operand's producer chain; a string
+// constant there is the left operand itself. The frontend requires both sides of `+`
+// to unify, so forcing concatenation here is sound — the same argument as
+// prev_is_str_const, applied to the other side of the same `CONST; GET_LOCAL; ADD`
+// sequence.
+fn prev2_is_str_const(ctx: X86Ctx, fh, code, prev_ip, prev_ip2) {
+    if prev_ip2 < 0 || prev_ip < 0 {
+        false
+    } else if !push_only(code[prev_ip]) {
+        false
+    } else {
+        prev_is_str_const(ctx, fh, code, prev_ip2)
     }
 }
 
