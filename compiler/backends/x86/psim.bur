@@ -84,24 +84,13 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     ctx.fn_ret_type[ptfh] = merge_enum_ann(ctx.fn_ret_type[ptfh], pret_type)
                 }
             }
-            // 直接返回参数：返回类型跟随实参类型（多态函数异构调用修正）。参数槽现在可能以
-            // cell 的同一性作位置影子（ref 捕获的提升参数），故两种形式都取槽位。
-            // Direct param return: ret type follows the arg type (fixes hetero polymorphic
-            // calls). A param slot may now carry the cell's identity as its location shadow
-            // (a lifted param that a closure captures by ref), so accept both forms.
+            // 直接返回参数：返回类型跟随实参类型（多态函数异构调用修正）
+            // Direct param return: ret type follows the arg type (fixes hetero polymorphic calls)
             let mut pret_param = 0 - 1
             if len(pshadow_ps) > 0 {
                 let pt = pshadow_ps[len(pshadow_ps) - 1]
-                let pcp = "cell:" + str(ptfh) + ":"
-                let pt_off = if str_len(pt) > 5 && substr(pt, 0, 5) == "slot:" {
-                    5
-                } else if str_len(pt) > str_len(pcp) && substr(pt, 0, str_len(pcp)) == pcp {
-                    str_len(pcp)
-                } else {
-                    0 - 1
-                }
-                if pt_off >= 0 {
-                    match parse_int(substr(pt, pt_off, str_len(pt) - pt_off)) {
+                if str_len(pt) > 5 && substr(pt, 0, 5) == "slot:" {
+                    match parse_int(substr(pt, 5, str_len(pt) - 5)) {
                         Some(psn) => {
                             if psn >= 1 && psn <= pa_ps {
                                 pret_param = psn - 1
@@ -149,11 +138,12 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 push(ptshadow_ps, "")
             } else {
                 let pcell = pslot < len(plifted) && plifted[pslot]
-                if pcell {
-                    push(pshadow_ps, "cell:" + str(ptfh) + ":" + str(pslot))
-                } else {
-                    push(pshadow_ps, "slot:" + str(pslot))
-                }
+                // 与发射侧一致：位置影子保持槽位形式（经参数槽的间接调用解析按它取值），
+                // cell 的类型视图在下方合并进来。
+                // as in the emitter: keep the slot form as the location shadow (indirect-call
+                // resolution through a param slot resolves from it); the cell's type view is
+                // merged below.
+                push(pshadow_ps, "slot:" + str(pslot))
                 // 仅当读的是刚 push 的栈顶时才消耗 pending（CLOSURE 后偶发）；
                 // 不可把 pending 写到任意旧槽（连续 let 闭包会串柄）
                 // only consume pending when reading the just-pushed TOS

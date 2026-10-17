@@ -314,11 +314,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax, gc_kind_of(stype)))
                 }
-                // ref 捕获的局部是共享 cell：位置影子取 cell 的同一性，类型取局部视图与
-                // cell 视图的合并，闭包里 push/put 的结论才会被定义函数的读取看到。
-                // a ref-captured local is a shared cell: take the cell's identity as the
-                // location shadow and merge the local view with the cell view, so the
-                // defining function sees what a closure pushed or put.
+                // 提升槽是共享 cell：类型取局部视图与 cell 视图的合并，闭包里 push/put 的
+                // 结论才会被定义函数的读取看到；位置影子仍取槽位形式——经参数槽的间接调用
+                // 解析与调用点的 slot 反查都按这一形式取值，换成 cell 键会让它们认不出参数。
+                // A lifted slot is a shared cell: merge the local view with the cell's view
+                // so the defining function reads what a closure pushed or put. The location
+                // shadow stays the slot form — indirect-call resolution through a param slot
+                // and the call site's slot back-lookup both resolve from that form, and a cell
+                // key would make them miss the parameter.
                 if is_lifted(slot) {
                     let ck = "cell:" + str(fh) + ":" + str(slot)
                     match get(global_type, ck) {
@@ -327,10 +330,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         },
                         None => {},
                     }
-                    push(shadow, ck)
-                } else {
-                    push(shadow, "slot:" + str(slot))
                 }
+                push(shadow, "slot:" + str(slot))
                 top_slot = slot
                 // 声明值被读取，确认是真声明：摘除该槽的回滚链，不再回滚
                 // the declaration value has been read; confirm it and drop
