@@ -10,6 +10,12 @@ import "burryn.dev/compiler/lib"
 // X86Ctx 结构见 x86gen_program_to_buf 构造处 / see the X86Ctx construction in x86gen_program_to_buf
 fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_depth) {
     let pcode = ctx.f_code[ptfh]
+    // 本函数被 ref 捕获的局部槽提升为 cell 指针槽，判定与发射侧共用同一函数：这些槽
+    // 在推断里以 cell 的同一性为键，闭包里的 push/put 结论才能回流到定义函数的读取。
+    // the locals of this function that a ref capture lifts to cell slots, decided by the
+    // same helper as the emitter: in the inference they are keyed by the cell's identity,
+    // so what a closure pushes or puts flows back to the defining function's reads.
+    let plifted = lifted_slots(ctx, ptfh, pcode)
     let mut pret_type = ""
     let mut pshadow_ps = []
     let mut ptshadow_ps = []
@@ -131,7 +137,12 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 push(pshadow_ps, ctx.f_name[ptfh])
                 push(ptshadow_ps, "")
             } else {
-                push(pshadow_ps, "slot:" + str(pslot))
+                let pcell = pslot < len(plifted) && plifted[pslot]
+                if pcell {
+                    push(pshadow_ps, "cell:" + str(ptfh) + ":" + str(pslot))
+                } else {
+                    push(pshadow_ps, "slot:" + str(pslot))
+                }
                 // 仅当读的是刚 push 的栈顶时才消耗 pending（CLOSURE 后偶发）；
                 // 不可把 pending 写到任意旧槽（连续 let 闭包会串柄）
                 // only consume pending when reading the just-pushed TOS
@@ -175,6 +186,17 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     }
                     ppos_types[pslot] = pstype
                 }
+                // ref 捕获的局部：类型取局部视图与 cell 视图的合并（见发射侧）
+                // a ref-captured local: merge the local view with the cell view
+                // (see the emitter)
+                if pcell {
+                    match get(ctx.global_type, "cell:" + str(ptfh) + ":" + str(pslot)) {
+                        Some(pct) => {
+                            pstype = merge_type(pstype, pct)
+                        },
+                        None => {},
+                    }
+                }
                 push(ptshadow_ps, pstype)
             }
         } else if pop == lib::op_set_local {
@@ -186,6 +208,18 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     }
                 }
                 ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
+                // ref 捕获的局部：cell 类型只在首次建立时落一次种子，后续写不覆盖，
+                // 否则循环体的每轮重声明都会打回空列表默认值（与发射侧一致）
+                // a ref-captured local: seed the cell's type once and never overwrite it
+                // on later writes, or a loop body's re-declaration resets it to the empty
+                // list's default (as in the emitter)
+                if pslot < len(plifted) && plifted[pslot] {
+                    let pck = "cell:" + str(ptfh) + ":" + str(pslot)
+                    match get(ctx.global_type, pck) {
+                        Some(_) => {},
+                        None => put(ctx.global_type, pck, ppos_types[pslot]),
+                    }
+                }
                 if len(ppos_auth) <= pslot {
                     while len(ppos_auth) <= pslot {
                         push(ppos_auth, false)
@@ -833,13 +867,44 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     } else {
                         ""
                     }
+                } else if puflag >= 2 {
+                    match get(ctx.global_type, cell_key(ctx, ptfh, puidx)) {
+                        Some(pt) => pt,
+                        None => "",
+                    }
                 } else {
                     match get(ctx.global_type, "upval:" + str(ptfh) + ":" + str(puidx)) {
                         Some(pt) => pt,
                         None => "",
                     }
                 }
-                put(ctx.global_type, "upval:" + str(p_sub) + ":" + str(pui), uvt)
+                // 与发射侧同一套键：值捕获是各闭包一份拷贝，ref 捕获共享 cell 的同一性
+                // the same key scheme as the emitter: a value capture is a per-closure
+                // copy, a ref capture shares the cell's identity
+                let pukey = if puflag >= 2 {
+                    if puflag % 2 == 1 {
+                        "cell:" + str(ptfh) + ":" + str(puidx)
+                    } else {
+                        cell_key(ctx, ptfh, puidx)
+                    }
+                } else {
+                    "upval:" + str(p_sub) + ":" + str(pui)
+                }
+                let pucur = match get(ctx.global_type, pukey) {
+                    Some(pt) => pt,
+                    None => "",
+                }
+                if puflag >= 2 {
+                    // 同发射侧：cell 类型只落一次种子，之后由 push/put 与调用点反查精化
+                    // as in the emitter: a cell's type lands as a seed once and is then
+                    // refined by push/put and call-site back-lookups
+                    match get(ctx.global_type, pukey) {
+                        Some(_) => {},
+                        None => put(ctx.global_type, pukey, uvt),
+                    }
+                } else {
+                    put(ctx.global_type, pukey, merge_type(pucur, uvt))
+                }
                 puip = puip + 3
                 pui = pui + 1
             }
@@ -886,14 +951,22 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             }
             p_pending_sub = -1
         } else if pop == lib::op_get_upval {
-            // 位置影子 = 共享表键（与发射侧一致）：被调参数类型可经调用点的全局实参
-            // 反查回流到这条 upvalue，闭包内的元素读取才拿得到正确元素类型。
-            // The location shadow is the shared-table key (as in the emitter): the
-            // callee's param type flows back to this upvalue through the call site's
-            // global arg back-lookup, so element reads inside the closure are typed.
+            // ref 捕获读的是共享 cell：键取 cell 的同一性（跨任意层闭包都落到定义处），
+            // 值捕获读的是本闭包那份拷贝，键仍按闭包槽位；被调参数类型可经调用点的全局
+            // 实参反查回流到这个键，闭包内的元素读取才拿得到正确元素类型。
+            // a ref capture reads the shared cell and is keyed by the cell's identity (it
+            // reaches the definition through any number of closures), while a value capture
+            // keeps the per-closure key; the callee's param type flows back to this key
+            // through the call site's global arg back-lookup, so element reads inside the
+            // closure are typed.
             let pidx = read_u16(pcode, pit + 1)
-            push(pshadow_ps, "upval:" + str(ptfh) + ":" + str(pidx))
-            match get(ctx.global_type, "upval:" + str(ptfh) + ":" + str(pidx)) {
+            let pukey = if upval_is_ref(ctx, ptfh, pidx) {
+                cell_key(ctx, ptfh, pidx)
+            } else {
+                "upval:" + str(ptfh) + ":" + str(pidx)
+            }
+            push(pshadow_ps, pukey)
+            match get(ctx.global_type, pukey) {
                 Some(pt) => {
                     push(ptshadow_ps, pt)
                 },

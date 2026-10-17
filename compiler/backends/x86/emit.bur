@@ -66,29 +66,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         cell_auth[pseed_e] = true
         pseed_e = pseed_e + 1
     }
-    // 预扫描本函数闭包描述符：ref 捕获的局部槽提升为 cell 指针槽
-    // pre-scan closure descriptors: ref-captured locals are lifted to cell slots
-    let mut lifted = []
-    let mut lip = 0
-    while lip < len(code) {
-        if code[lip] == lib::op_closure {
-            let lsub = fn_const(ctx, fh, read_u16(code, lip + 1))
-            let lnup = f_nupvals[lsub]
-            let mut lui = 0
-            while lui < lnup {
-                let lflag = code[lip + 3 + 3 * lui]
-                if lflag >= 2 && lflag % 2 == 1 {
-                    let luidx = read_u16(code, lip + 4 + 3 * lui)
-                    while len(lifted) <= luidx {
-                        push(lifted, false)
-                    }
-                    lifted[luidx] = true
-                }
-                lui = lui + 1
-            }
-        }
-        lip = lip + inst_len(ctx, fh, code, lip)
-    }
+    // 本函数被 ref 捕获的局部槽提升为 cell 指针槽
+    // the locals of this function that a ref capture lifts to cell slots
+    let lifted = lifted_slots(ctx, fh, code)
     let mut ip_to_byte = map()
     // 顶层脚本里已按序执行过 DEF_GLOBAL 的名字：其后同函数内的读写无需已定义检查
     // （顶层 let 无条件按序执行，块内 let 是局部）
@@ -334,7 +314,23 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax, gc_kind_of(stype)))
                 }
-                push(shadow, "slot:" + str(slot))
+                // ref 捕获的局部是共享 cell：位置影子取 cell 的同一性，类型取局部视图与
+                // cell 视图的合并，闭包里 push/put 的结论才会被定义函数的读取看到。
+                // a ref-captured local is a shared cell: take the cell's identity as the
+                // location shadow and merge the local view with the cell view, so the
+                // defining function sees what a closure pushed or put.
+                if is_lifted(slot) {
+                    let ck = "cell:" + str(fh) + ":" + str(slot)
+                    match get(global_type, ck) {
+                        Some(ct) => {
+                            stype = merge_type(stype, ct)
+                        },
+                        None => {},
+                    }
+                    push(shadow, ck)
+                } else {
+                    push(shadow, "slot:" + str(slot))
+                }
                 top_slot = slot
                 // 声明值被读取，确认是真声明：摘除该槽的回滚链，不再回滚
                 // the declaration value has been read; confirm it and drop
@@ -391,6 +387,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     push(cell_auth, false)
                 }
                 cell_auth[slot] = true
+            }
+            // ref 捕获的局部：cell 的类型只在首次建立时落一次种子，后续写不再覆盖，否则
+            // 循环体的每轮重声明都会把闭包里 push/put 收敛出来的元素类型打回空列表默认值。
+            // a ref-captured local: seed the cell's type once when it is first seen and do
+            // not overwrite it on later writes, otherwise every re-declaration in a loop
+            // body resets the element type a closure's push/put converged to back to the
+            // empty list's default.
+            if slot > 0 && is_lifted(slot) {
+                let ck = "cell:" + str(fh) + ":" + str(slot)
+                match get(global_type, ck) {
+                    Some(_) => {},
+                    None => put(ctx.global_type, ck, pos_types[slot]),
+                }
             }
             if is_lifted(slot) {
                 if was_auth {
@@ -1941,13 +1950,49 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     } else {
                         ""
                     }
+                } else if flag >= 2 {
+                    match get(global_type, cell_key(ctx, fh, uidx)) {
+                        Some(t) => t,
+                        None => "",
+                    }
                 } else {
                     match get(global_type, "upval:" + str(fh) + ":" + str(uidx)) {
                         Some(t) => t,
                         None => "",
                     }
                 }
-                put(ctx.global_type, "upval:" + str(sub) + ":" + str(ui), uvt)
+                // 值捕获是一份拷贝，各闭包自成一份类型；ref 捕获共享同一个 cell，键取
+                // cell 的同一性（本地捕获 = 本函数的槽，继承 = 沿链上溯到定义处）
+                // a value capture is a copy and each closure keeps its own type; a ref
+                // capture shares one cell, keyed by the cell's identity (a local capture
+                // is this function's slot, an inherited one walks up to the definition)
+                let ukey = if flag >= 2 {
+                    if flag % 2 == 1 {
+                        "cell:" + str(fh) + ":" + str(uidx)
+                    } else {
+                        cell_key(ctx, fh, uidx)
+                    }
+                } else {
+                    "upval:" + str(sub) + ":" + str(ui)
+                }
+                let ucur = match get(global_type, ukey) {
+                    Some(t) => t,
+                    None => "",
+                }
+                if flag >= 2 {
+                    // cell 的类型只在首次见时落种子，之后由 push/put 与调用点反查精化；
+                    // 用当前帧的局部视图覆盖等于每轮把已收敛的元素类型打回默认值
+                    // a cell's type lands as a seed the first time it is seen and is then
+                    // refined by push/put and call-site back-lookups; overwriting it with
+                    // the current frame's local view would reset the converged element
+                    // type to the default every round
+                    match get(global_type, ukey) {
+                        Some(_) => {},
+                        None => put(ctx.global_type, ukey, uvt),
+                    }
+                } else {
+                    put(ctx.global_type, ukey, merge_type(ucur, uvt))
+                }
                 if flag % 2 == 1 && flag >= 2 {
                     // ref 捕获：闭包槽存 cell 指针（读侧解引用，见 GET 侧）
                     // ref capture: the closure slot holds the cell pointer (the read
@@ -2008,25 +2053,31 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             push(type_shadow, "closure:" + str(sub))
         } else if op == lib::op_get_upval {
             let idx = read_u16(code, ip + 1)
+            let is_ref = upval_is_ref(ctx, fh, idx)
+            // ref 捕获读的是共享 cell：键取 cell 的同一性（跨任意层闭包都落到定义处），
+            // 值捕获读的是本闭包那份拷贝，键仍按闭包槽位。
+            // a ref capture reads the shared cell: the key is the cell's identity (it
+            // reaches the definition through any number of closures), while a value
+            // capture reads this closure's own copy and keeps the per-slot key.
+            let ukey = if is_ref {
+                cell_key(ctx, fh, idx)
+            } else {
+                "upval:" + str(fh) + ":" + str(idx)
+            }
             // upval 类型先读（kind 与 type_shadow 同源）
             // read the upval type first (kind shares its source with type_shadow)
-            let uv_t = match get(global_type, "upval:" + str(fh) + ":" + str(idx)) {
+            let uv_t = match get(global_type, ukey) {
                 Some(t) => t,
                 None => "",
             }
-            if upval_is_ref(ctx, fh, idx) {
+            if is_ref {
                 // ref 捕获槽：cell 指针须解引用
                 // ref-captured slot: dereference the cell pointer
                 w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + mov_rm(rax, rax, 0) + vs_push(rax, gc_kind_of(uv_t)))
             } else {
                 w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax, gc_kind_of(uv_t)))
             }
-            // upvalue 的位置影子取共享表键：闭包内对 ref 捕获的列表 push / map put 时，
-            // 元素或键类型经 push/put 的全局反查写回这个键，读取侧才能拿到正确元素类型。
-            // The upvalue's location shadow is its shared-table key: a push into (or a put
-            // through) a ref-captured list or map inside the closure writes the element or
-            // key type back to this key, which is what the read side then resolves from.
-            push(shadow, "upval:" + str(fh) + ":" + str(idx))
+            push(shadow, ukey)
             push(type_shadow, uv_t)
         } else if op == lib::op_set_upval {
             let idx = read_u16(code, ip + 1)
@@ -4132,6 +4183,68 @@ fn upval_is_ref(ctx: X86Ctx, fh, ui) {
         },
         None => false,
     }
+}
+
+// cell_key 给一个 ref 捕获的局部所在的 cell 命名：定义它的函数 + 槽位。
+// 闭包的 upvalue 读、透传链上的继承读、定义函数自己的局部读写共用这一个键，于是
+// 「一个共享 cell」在类型推断里只有一个身份；否则每个闭包各持一键，一个被 N 个闭包
+// 捕获的变量就裂成 N 份互不相通的类型，定义函数也永远学不到闭包里的 push/put 结论
+// （checker 的 tn/tk/tr、编译器自查的 ty_unify 都吃这个亏：读侧元素类型停在空列表
+// 默认值，名称比较退化成指针比较而报出伪 E0308）。
+// cell_key names the cell that holds a ref-captured local: the function that defines
+// it plus the slot. A closure's upvalue read, the inherited reads along the chain, and
+// the defining function's own local reads and writes all use that single key, so one
+// shared cell has a single identity in the inference; otherwise every closure keeps its
+// own key, a variable captured by N closures splits into N disconnected types, and the
+// defining function never learns what a closure pushed or put (the checker's tn/tk/tr
+// and the compiler's own ty_unify all suffer this way: the element read side stays at
+// the empty list's default, the name compare degrades to a pointer compare and reports
+// a spurious E0308).
+fn cell_key(ctx: X86Ctx, fh, ui) {
+    match get(ctx.created_by, fh) {
+        Some(cb) => {
+            let cfh = cb[0]
+            let cip = cb[1]
+            let flag = ctx.f_code[cfh][cip + 3 + 3 * ui]
+            let cuidx = read_u16(ctx.f_code[cfh], cip + 4 + 3 * ui)
+            if flag % 2 == 1 {
+                "cell:" + str(cfh) + ":" + str(cuidx)
+            } else if flag >= 2 {
+                cell_key(ctx, fn_const(ctx, cfh, read_u16(ctx.f_code[cfh], cip + 1)), cuidx)
+            } else {
+                ""
+            }
+        },
+        None => "",
+    }
+}
+
+// lifted_slots 预扫本函数的闭包描述符，列出被 ref 捕获（提升为 cell 指针槽）的局部槽。
+// lifted_slots pre-scans this function's closure descriptors and lists the locals that
+// a ref capture lifts to cell-pointer slots.
+fn lifted_slots(ctx: X86Ctx, fh, code) {
+    let mut lifted = []
+    let mut lip = 0
+    while lip < len(code) {
+        if code[lip] == lib::op_closure {
+            let lsub = fn_const(ctx, fh, read_u16(code, lip + 1))
+            let lnup = ctx.f_nupvals[lsub]
+            let mut lui = 0
+            while lui < lnup {
+                let lflag = code[lip + 3 + 3 * lui]
+                if lflag >= 2 && lflag % 2 == 1 {
+                    let luidx = read_u16(code, lip + 4 + 3 * lui)
+                    while len(lifted) <= luidx {
+                        push(lifted, false)
+                    }
+                    lifted[luidx] = true
+                }
+                lui = lui + 1
+            }
+        }
+        lip = lip + inst_len(ctx, fh, code, lip)
+    }
+    lifted
 }
 
 // variant_index: 实参类型在 fn_variants 中的下标（未命中 0 = 默认变体）
