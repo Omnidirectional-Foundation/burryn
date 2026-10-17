@@ -257,15 +257,20 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     stype = pos_types[slot]
                     // 活槽以槽内值自身的影子类型为准：match 的臂或 if 的分支在别处
                     // 写过同一槽后，pos_types 还留着声明时的枚举类型，影子却已是该值
-                    // 真正落下的类型。枚举标注与实际类型不一致时影子胜出；不限栈顶槽
-                    // ——臂的结果槽在 END_BLOCK 折叠前并不是栈顶。
+                    // 真正落下的类型。枚举标注与实际类型不一致时影子胜出；栈顶槽之外
+                    // 仅限非提升槽——提升槽的影子装的是 cell 里推入的元素类型，不是槽
+                    // 自身值的类型；臂的结果槽在 END_BLOCK 折叠前并不是栈顶，故栈顶槽
+                    // 依旧保留原有判定。
                     // a live slot trusts the shadow type of the value it holds: after a
                     // match arm or an if branch writes the same slot elsewhere,
                     // pos_types still holds the declaration-time enum while the shadow
                     // already carries the type the value actually landed with. On an
-                    // enum-annotation mismatch the shadow wins; not limited to the TOS
-                    // slot — an arm's result slot is not the TOS before END_BLOCK folds.
-                    if slot < len(type_shadow) {
+                    // enum-annotation mismatch the shadow wins; beyond the TOS slot only
+                    // non-lifted slots qualify — a lifted slot's shadow holds the element
+                    // type pushed into the cell, not the slot's own value type. An arm's
+                    // result slot is not the TOS before END_BLOCK folds, so the TOS keeps
+                    // its original judgement.
+                    if slot < len(type_shadow) && (slot == len(type_shadow) - 1 || !is_lifted(slot)) {
                         let top_t = type_shadow[slot]
                         if is_enum_enc(top_t) && top_t != stype {
                             stype = top_t
