@@ -3,6 +3,95 @@
 
 import "burryn.dev/compiler/lib"
 
+// native_arg_types 返回原生函数的形参类型表。签名真身在 frontend/ty_check.bur 的
+// decl_native 调用；后端只见字节码，故与既有返回类型表同法按名硬编码。多态
+// （str/type_of/slice/concat/contains/pop/keys…）、变参（print/println/eprintln）
+// 与无参原生返回空表，表示不播种。
+// native_arg_types gives a native's declared parameter types. The signature of record
+// lives in the decl_native calls in frontend/ty_check.bur; the backend only sees
+// bytecode, so this is hardcoded by name exactly like the existing return-type table.
+// Polymorphic (str/type_of/slice/concat/contains/pop/keys…), variadic
+// (print/println/eprintln) and zero-arg natives return an empty list — seed nothing.
+fn native_arg_types(pcallee) {
+    if pcallee == "str_len" || pcallee == "ord" || pcallee == "parse_int" || pcallee == "parse_float" || pcallee == "trim" || pcallee == "read_file" || pcallee == "file_exists" || pcallee == "read_dir" {
+        ["str"]
+    } else if pcallee == "chr" || pcallee == "byte_chr" || pcallee == "to_float" || pcallee == "exit" || pcallee == "sleep" || pcallee == "exec_poll" || pcallee == "tcp_accept" || pcallee == "net_close" || pcallee == "read_stdin" || pcallee == "stdin_nb" {
+        ["int"]
+    } else if pcallee == "trunc" || pcallee == "float_bits" {
+        ["float"]
+    } else if pcallee == "char_at" || pcallee == "byte_at" || pcallee == "tcp_listen" || pcallee == "tcp_dial" {
+        ["str", "int"]
+    } else if pcallee == "substr" {
+        ["str", "int", "int"]
+    } else if pcallee == "str_contains" || pcallee == "str_index_of" || pcallee == "split" || pcallee == "write_file" {
+        ["str", "str"]
+    } else if pcallee == "range" || pcallee == "net_read" {
+        ["int", "int"]
+    } else if pcallee == "join" {
+        ["list-str", "str"]
+    } else if pcallee == "net_write" {
+        ["int", "str"]
+    } else if pcallee == "exec" || pcallee == "exec_start" {
+        ["str", "list-str"]
+    } else if pcallee == "assert" {
+        ["bool", "str"]
+    } else if pcallee == "net_nb" {
+        ["int", "int", "str", "int"]
+    } else {
+        []
+    }
+}
+
+// seed_arg_type 把一处实参的已知识别类型回流到它的槽或全局：槽写 ppos_types，
+// authoritative 标记由调用方决定（原生签名与 push 的元素类型是事实，put 的键值
+// 类型是推断）；backflow 开启时形参槽另回流 fn_param_types 以跨轮保留；全局名写
+// global_type（仅聚合轮）。
+// seed_arg_type flows an argument's known type back to its slot or global: a slot
+// updates ppos_types, the authoritative flag is the caller's call (a native signature
+// and a push element type are facts, a put key/value type is an inference); with
+// backflow on, a param slot also flows into fn_param_types so it survives rounds; a
+// global name updates global_type (aggregating rounds only).
+fn seed_arg_type(ctx: X86Ctx, ptfh, pa_ps, aggregate, mut ppos_types, mut ppos_auth, loc, t, authoritative, backflow) {
+    if str_len(loc) > 5 && substr(loc, 0, 5) == "slot:" {
+        match parse_int(substr(loc, 5, str_len(loc) - 5)) {
+            Some(sn) => {
+                if sn > 0 {
+                    if len(ppos_types) <= sn {
+                        while len(ppos_types) <= sn {
+                            push(ppos_types, "")
+                        }
+                    }
+                    ppos_types[sn] = merge_type(ppos_types[sn], t)
+                    if authoritative {
+                        if len(ppos_auth) <= sn {
+                            while len(ppos_auth) <= sn {
+                                push(ppos_auth, false)
+                            }
+                        }
+                        ppos_auth[sn] = true
+                    }
+                    if backflow {
+                        if sn <= pa_ps {
+                            if aggregate {
+                                ctx.fn_param_types[ptfh][sn - 1] = merge_type(ctx.fn_param_types[ptfh][sn - 1], t)
+                            }
+                        }
+                    }
+                }
+            },
+            None => {},
+        }
+    } else if str_len(loc) > 0 {
+        let pg_cur = match get(ctx.global_type, loc) {
+            Some(pgt) => pgt,
+            None => "",
+        }
+        if aggregate {
+            put(ctx.global_type, loc, merge_type(pg_cur, t))
+        }
+    }
+}
+
 // psim 预扫单函数体模拟：aggregate=true 写入共享类型表（多轮传播），
 // aggregate=false 纯读（per-signature 返回类型查询）。返回模拟的返回类型。
 // psim pre-scans one function body: aggregate=true writes the shared type tables
@@ -342,6 +431,19 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             }
             shadow_pop(pshadow_ps, pn + 1)
             shadow_pop(ptshadow_ps, pn + 1)
+            // 预扫 native：按 decl_native 的形参签名回流实参类型，使只经原生函数传递的
+            // 形参/局部也拿到确定类型（原生签名是良类型程序的事实，合并安全）。
+            // pre-scan native: flow the argument types from decl_native's signature so a
+            // param/local seen only through a native also gets a definite type (a native
+            // signature is a fact about a well-typed program, so merging is safe).
+            let pnpt = native_arg_types(pcallee)
+            let mut pni = 0
+            while pni < pn && pni < len(pnpt) {
+                if str_len(pnpt[pni]) > 0 {
+                    seed_arg_type(ctx, ptfh, pa_ps, aggregate, ppos_types, ppos_auth, p_arg_s[pni], pnpt[pni], true, true)
+                }
+                pni = pni + 1
+            }
             if str_len(pcallee) > 5 && substr(pcallee, 0, 5) == "ctor:" {
                 // 预扫 ctor：按 eh:vi 注册字段类型 / pre-scan ctor: register field types by eh:vi
                 let pctor_rest = substr(pcallee, 5, str_len(pcallee) - 5)
@@ -423,34 +525,7 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 } else {
                     ""
                 }
-                if str_len(mslot) > 5 && substr(mslot, 0, 5) == "slot:" {
-                    match parse_int(substr(mslot, 5, str_len(mslot) - 5)) {
-                        Some(sn) => {
-                            if sn > 0 {
-                                if len(ppos_types) <= sn {
-                                    while len(ppos_types) <= sn {
-                                        push(ppos_types, "")
-                                    }
-                                }
-                                ppos_types[sn] = merge_type(ppos_types[sn], refined)
-                                if sn <= pa_ps {
-                                    if aggregate {
-                                        ctx.fn_param_types[ptfh][sn - 1] = merge_type(ctx.fn_param_types[ptfh][sn - 1], refined)
-                                    }
-                                }
-                            }
-                        },
-                        None => {},
-                    }
-                } else if str_len(mslot) > 0 {
-                    let pg_cur = match get(ctx.global_type, mslot) {
-                        Some(pgt) => pgt,
-                        None => "",
-                    }
-                    if aggregate {
-                        put(ctx.global_type, mslot, merge_type(pg_cur, refined))
-                    }
-                }
+                seed_arg_type(ctx, ptfh, pa_ps, aggregate, ppos_types, ppos_auth, mslot, refined, false, true)
                 push(pshadow_ps, "")
                 if pcallee == "get" {
                     let pv_kind = map_val_type(mt)
@@ -478,38 +553,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     } else {
                         ""
                     }
-                    if str_len(pslot) > 5 && substr(pslot, 0, 5) == "slot:" {
-                        match parse_int(substr(pslot, 5, str_len(pslot) - 5)) {
-                            Some(sn) => {
-                                if sn > 0 {
-                                    if len(ppos_types) <= sn {
-                                        while len(ppos_types) <= sn {
-                                            push(ppos_types, "")
-                                        }
-                                    }
-                                    if len(ppos_auth) <= sn {
-                                        while len(ppos_auth) <= sn {
-                                            push(ppos_auth, false)
-                                        }
-                                    }
-                                    ppos_types[sn] = merge_type(ppos_types[sn], pltag)
-                                    // 标记权威：push 已确定元素类型，栈顶启发式不得覆写
-                                    // mark authoritative: push fixed the element type; the
-                                    // stack-top heuristic must not overwrite it
-                                    ppos_auth[sn] = true
-                                }
-                            },
-                            None => {},
-                        }
-                    } else if str_len(pslot) > 0 {
-                        let pg_cur = match get(ctx.global_type, pslot) {
-                            Some(pgt) => pgt,
-                            None => "",
-                        }
-                        if aggregate {
-                            put(ctx.global_type, pslot, merge_type(pg_cur, pltag))
-                        }
-                    }
+                    // 标记权威：push 已确定元素类型，栈顶启发式不得覆写
+                    // mark authoritative: push fixed the element type; the stack-top
+                    // heuristic must not overwrite it
+                    seed_arg_type(ctx, ptfh, pa_ps, aggregate, ppos_types, ppos_auth, pslot, pltag, true, false)
                 }
                 push(pshadow_ps, "")
                 push(ptshadow_ps, "unit")
