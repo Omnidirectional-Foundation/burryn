@@ -703,7 +703,11 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // 类型」在良类型程序里不可能出现，出现即至少一侧影子错；此时走不解引用的
             // 整数路径更稳。另一侧未判出类型（""）不构成反证：同型约束保证它也是 str，
             // 拼接仍然正确；任一侧是字符串字面量时同样定案（右靠 prev_is_str_const，
-            // 左靠 prev2_is_str_const）。
+            // 左靠 prev2_is_str_const）。刚算出的 str 同样权威：影子串 "str" 只由字符串
+            // 字面量与拼接结果这两个真 str 生产者推入（槽与 upval 的读取推的是槽键），
+            // 槽复用留下的陈旧 str 不带这个标记。一侧新鲜 str、另一侧判出确定非 str 时，
+            // 错的是后者——同型约束保证它也是 str，只有取拼接路径才不会把两个指针的和
+            // 当成值存进槽。
             // A single str shadow is not enough to select this dereferencing path:
             // concatenation reads both operands as string pointers, and a reused stack
             // slot can leave a stale str shadow. The frontend requires both sides of `+`
@@ -713,8 +717,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // the safer read. An undetermined other side ("") is no counter-evidence:
             // the same-type constraint makes it a str too, so concatenation stays
             // correct. A string constant on either side settles it — on the right via
-            // prev_is_str_const, on the left via prev2_is_str_const.
-            let add_str = sa == "str" && (sb == "str" || sb == "") || sb == "str" && (sa == "str" || sa == "") || prev_is_str_const(ctx, fh, code, prev_ip) || prev2_is_str_const(ctx, fh, code, prev_ip, prev_ip2)
+            // prev_is_str_const, on the left via prev2_is_str_const. A str produced here
+            // and now is authoritative too: the shadow entry "str" is pushed only by the
+            // two real str producers — a string literal and a concatenation result (slot
+            // and upval reads push slot keys), so a stale str left behind by stack-slot
+            // reuse never carries that marker. With a fresh str on one side and a
+            // determined non-str on the other, the latter shadow is the wrong one: the
+            // same-type constraint makes it a str as well, and only the concatenation
+            // path keeps a sum of two pointers from being stored as a value.
+            let sa_fresh = len(shadow) >= 2 && shadow[len(shadow) - 2] == "str"
+            let sb_fresh = len(shadow) >= 1 && shadow[len(shadow) - 1] == "str"
+            let add_str = sa == "str" && (sb == "str" || sb == "" || sa_fresh) || sb == "str" && (sa == "str" || sa == "" || sb_fresh) || prev_is_str_const(ctx, fh, code, prev_ip) || prev2_is_str_const(ctx, fh, code, prev_ip, prev_ip2)
             if add_str {
                 w(mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r10, r9, 0) + mov_rr(rcx, rdx) + add_rr(rcx, r10) + add_ri32(rcx, 8) + x86gen_alloc_r(r11, rcx, GC_DESC_ALL) + sub_ri32(rcx, 8) + mov_mr(r11, 0, rcx) + lea(rsi, rax, 8) + lea(rdi, r11, 8) + mov_rr(rcx, rdx) + rep_movsb() + lea(rsi, r9, 8) + lea(rdi, r11, 8) + add_rr(rdi, rdx) + mov_rr(rcx, r10) + rep_movsb() + mov_mr(r15, 0 - 16, r11) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR))
                 shadow_pop(shadow, 2)
