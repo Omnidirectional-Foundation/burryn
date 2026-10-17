@@ -1713,25 +1713,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             },
                             None => {},
                         }
-                    } else if str_len(bshadow) > 0 {
-                        // 实参落在全局名或 ref 捕获的 upvalue 上：被调参数类型回流升级它。
-                        // 闭包内 `push(<upvalue 列表>, v)` 或 `put(<upvalue map>, …)` 确定的
-                        // 元素/键类型，只能靠这条路径回到 upvalue 的读取侧；否则闭包内每次
-                        // 读出的元素都停在空列表的默认 int。
-                        // global or ref-captured upvalue argument: the callee's param type
-                        // flows back to promote it. The element/key type fixed inside a
-                        // closure by `push(<upvalue list>, v)` or `put(<upvalue map>, …)`
-                        // reaches the read side only here; otherwise every element read in
-                        // the closure stays at the empty list's default int.
-                        match get(ctx.global_type, bshadow) {
-                            Some(bgt) => {
-                                let bmerged = merge_type(bgt, fn_param_types[handle][bmi])
-                                if bmerged != bgt {
-                                    put(ctx.global_type, bshadow, bmerged)
-                                }
-                            },
-                            None => {},
-                        }
                     }
                     bmi = bmi + 1
                 }
@@ -2040,11 +2021,11 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 w(mov_rm(rax, r14, 0) + mov_rm(rax, rax, 8 + 8 * idx) + vs_push(rax, gc_kind_of(uv_t)))
             }
-            // upvalue 的位置影子用共享表键：ref 捕获的列表在闭包里被 push 时，
-            // 元素类型只能经这个键回流（见内联调用点的全局实参反查）。
-            // The upvalue's location shadow is its shared-table key: when a ref-captured
-            // list is pushed to inside a closure, this key is the only route for the
-            // element type to flow back (see the global arg back-lookup at call sites).
+            // upvalue 的位置影子取共享表键：闭包内对 ref 捕获的列表 push / map put 时，
+            // 元素或键类型经 push/put 的全局反查写回这个键，读取侧才能拿到正确元素类型。
+            // The upvalue's location shadow is its shared-table key: a push into (or a put
+            // through) a ref-captured list or map inside the closure writes the element or
+            // key type back to this key, which is what the read side then resolves from.
             push(shadow, "upval:" + str(fh) + ":" + str(idx))
             push(type_shadow, uv_t)
         } else if op == lib::op_set_upval {
