@@ -488,15 +488,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            // `==` 要求两侧同型，故任一侧为 str 即按内容比较：两侧影子都可能未收敛
-            // （空 list 起家的表、经 upvalue 读出的元素常落在默认 int），而字面量
-            // 一侧的 str 由常量盖章保证。指针比较会让 match 臂静默全部落空。
-            // `==` requires both operands to share a type, so a str on either side
-            // selects the content compare: both shadows may be unconverged (a table
-            // built from `[]`, an element read through an upvalue), while a literal
-            // operand's str is guaranteed by its constant stamp. A pointer compare
-            // would silently drop every `match` arm.
-            if sa_eq == "str" || sb_eq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+            // `==` 要求两侧同型：只有两侧影子同为 str（两次独立判定一致）或一侧是字符串
+            // 字面量（常量盖章保证）才按内容比较。单个影子为 str 不足以选定这条解引用
+            // 路径——栈槽复用会让影子停留在上一轮的 str，按内容比较就会解引用一个整数。
+            // `==` requires both operands to share a type: compare by content only when both
+            // shadows say str (two independent agreements) or one operand is a string literal
+            // (guaranteed by its constant stamp). A single str shadow is not enough to select
+            // this dereferencing path — a reused stack slot can leave a stale str behind, and
+            // the content compare then dereferences an integer.
+            if sa_eq == "str" && sb_eq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 w(x86gen_eq_str())
             } else if is_record_type(sa_eq) && is_record_type(sb_eq) {
                 let rq_schema = if str_len(record_schema(sa_eq)) > 0 {
@@ -536,9 +536,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            // 同上：任一侧为 str 即按内容比较
-            // same as op_eq: either side's str selects the content compare
-            if sa_neq == "str" || sb_neq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+            // 同上：两侧同为 str 或一侧是字符串字面量才按内容比较
+            // same as op_eq: both sides str, or one side a string literal
+            if sa_neq == "str" && sb_neq == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 // 长度不同即不等：先 setne 落 1，再跳过字节比较。缺这一步会让
                 // 不同长度的串比较（如 pdir != "") 静默返回假。
                 // Different lengths are unequal: setne first, then skip the byte
@@ -584,16 +584,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
-            // 关系比较判型：任一侧为 str 即按内容比较——良类型程序里两操作数同型，
-            // 而另一侧的影子可能尚未收敛（空 list 起家的表、经 upvalue 读出的元素
-            // 常落在默认 int），整数比较会让 `c >= "0"` 这类判断静默为假。
-            // Relational comparisons resolve from either side: both operands share a
-            // type in a well-typed program while the other side's shadow may not have
-            // converged (a table built from `[]`, an element read through an upvalue),
-            // and the integer compare would silently make `c >= "0"` false.
+            // 关系比较判型：两侧影子同为 str（两次独立判定一致）或一侧是字符串字面量
+            // （常量盖章保证，如 `c >= "0"` 的右操作数）才按内容比较；单个影子为 str
+            // 不足以选定这条解引用路径，栈槽复用会让影子停留在上一轮的 str。
+            // Relational comparisons resolve from both sides: both shadows must say str
+            // (two independent agreements) or one operand must be a string literal
+            // (guaranteed by its constant stamp, e.g. the right operand of `c >= "0"`); a
+            // single str shadow is not enough to select this dereferencing path, since a
+            // reused stack slot can leave a stale str behind.
             if s_gt == "float" {
                 w(x86gen_float_cmp("gt"))
-            } else if sa_gt == "str" || s_gt == "str" {
+            } else if sa_gt == "str" && s_gt == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
                 w(x86gen_str_rel("gt"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setg(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -615,8 +616,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             if s_ge == "float" {
                 w(x86gen_float_cmp("ge"))
-            } else if sa_ge == "str" || s_ge == "str" {
-                // 同上：任一侧为 str 即按内容比较 / same as op_gt: either side's str selects the content compare
+            } else if sa_ge == "str" && s_ge == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+                // 同上：两侧同为 str 或一侧是字面量 / same as op_gt: both sides str, or one side a literal
                 w(x86gen_str_rel("ge"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setge(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -638,8 +639,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             if s_lt == "float" {
                 w(x86gen_float_cmp("lt"))
-            } else if sa_lt == "str" || s_lt == "str" {
-                // 同上：任一侧为 str 即按内容比较 / same as op_gt: either side's str selects the content compare
+            } else if sa_lt == "str" && s_lt == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+                // 同上：两侧同为 str 或一侧是字面量 / same as op_gt: both sides str, or one side a literal
                 w(x86gen_str_rel("lt"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setl(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -661,8 +662,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
             if s_le == "float" {
                 w(x86gen_float_cmp("le"))
-            } else if sa_le == "str" || s_le == "str" {
-                // 同上：任一侧为 str 即按内容比较 / same as op_gt: either side's str selects the content compare
+            } else if sa_le == "str" && s_le == "str" || prev_is_str_const(ctx, fh, code, prev_ip) {
+                // 同上：两侧同为 str 或一侧是字面量 / same as op_gt: both sides str, or one side a literal
                 w(x86gen_str_rel("le"))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setle(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
