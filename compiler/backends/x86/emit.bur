@@ -355,7 +355,22 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
         } else if op == lib::op_set_local {
             let slot = read_u16(code, ip + 1)
-            let was_auth = slot > 0 && slot < len(cell_auth) && cell_auth[slot]
+            // 声明 vs 赋值：声明时被存的值正落在目标槽位（槽位即栈位，表达式的求值
+            // 结果留在其起始槽），赋值时值在目标槽之上的栈顶。提升槽的「首次写」必须
+            // 分配新 cell（循环体里每轮声明都要一个新 cell，闭包捕获的是那一轮的），
+            // 故此时不采信可能过期的 cell_auth——它只说明该槽号此前是提升变量，不说明
+            // 这一轮的槽里已经是 cell；采信它就会写穿一个裸值（SEGV 写只读常量区）。
+            // declaration vs assignment: in a declaration the stored value lands exactly
+            // on the target slot (a slot is a stack position and an expression's result
+            // stays in its starting slot), while an assignment's value sits on the stack
+            // top above the target. The first write of a lifted slot must allocate a
+            // fresh cell (a declaration in a loop body needs one per iteration, and a
+            // closure captures that iteration's), so do not trust the possibly stale
+            // cell_auth here — it only says the slot number was lifted earlier, not that
+            // this round's slot already holds a cell; trusting it writes through a raw
+            // value (a SEGV into the read-only constant area).
+            let is_decl = slot > 0 && len(type_shadow) > 0 && slot == len(type_shadow) - 1
+            let was_auth = slot > 0 && slot < len(cell_auth) && cell_auth[slot] && !is_decl
             if slot > 0 {
                 while len(pos_types) <= slot {
                     push(pos_types, "")
