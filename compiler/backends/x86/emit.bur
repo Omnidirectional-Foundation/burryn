@@ -195,15 +195,16 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             w(vs_push_zero(GC_SHADOW_SCALAR))
             push(shadow, "")
             push(type_shadow, "bool")
-        } else if op == lib::op_pop {
-            w(vs_pop_n(1))
-            shadow_pop(shadow, 1)
-            shadow_pop(type_shadow, 1)
-        } else if op == lib::op_pop_n {
-            let n = code[ip + 1]
+        } else if op == lib::op_pop || op == lib::op_pop_n {
+            let n = if op == lib::op_pop {
+                1
+            } else {
+                code[ip + 1]
+            }
             w(vs_pop_n(n))
             shadow_pop(shadow, n)
             shadow_pop(type_shadow, n)
+            forget_types_above(pos_types, pos_auth, len(type_shadow))
         } else if op == lib::op_end_block {
             let n = code[ip + 1]
             // 结果 kind 先读后发（w 之后 type_shadow 才被裁剪）
@@ -228,15 +229,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             shadow_pop(type_shadow, n + 1)
             push(shadow, res_name)
             push(type_shadow, res_type)
-            let live_n = len(type_shadow)
-            let mut ci = live_n
-            while ci < len(pos_types) {
-                pos_types[ci] = ""
-                if ci < len(pos_auth) {
-                    pos_auth[ci] = false
-                }
-                ci = ci + 1
-            }
+            forget_types_above(pos_types, pos_auth, len(type_shadow))
         } else if op == lib::op_get_local {
             let slot = read_u16(code, ip + 1)
             if slot == 0 {
@@ -2154,6 +2147,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             w(vs_pop_n(1))
             shadow_pop(shadow, 1)
             shadow_pop(type_shadow, 1)
+            forget_types_above(pos_types, pos_auth, len(type_shadow))
         } else if op == lib::op_tuple {
             let n = code[ip + 1]
             let alloc = x86gen_alloc(r11, 8 + 8 * n, desc_lenptrs) + mov_ri64(rdx, n) + mov_mr(r11, 0, rdx)
@@ -4073,6 +4067,26 @@ fn record_schema(t) {
 // Read a u16 operand
 fn read_u16(code, at) {
     code[at] * 256 + code[at + 1]
+}
+
+// forget_types_above 遗忘影子栈活深之上的槽类型与权威：一次弹栈或收块之后这些槽已
+// 死，残留的类型会被下一处同号声明继承——`let` 的常量落槽即声明，不经 set_local 的
+// 权威写，不会覆盖旧类型——此后按类型分派的判据（字符串拼接、六比较）就走错路径。
+// forget_types_above forgets the slot types and authority above the live shadow depth:
+// a pop or a block close leaves those slots dead, and a surviving type is inherited by
+// the next declaration of the same slot number — a `let`'s constant landing on the slot
+// declares without set_local's authoritative write, so nothing overwrites the old type —
+// after which the type-dispatched judgements (string concat, the six comparisons) take
+// the wrong path.
+fn forget_types_above(mut pos_types, mut pos_auth, live) {
+    let mut ci = live
+    while ci < len(pos_types) {
+        pos_types[ci] = ""
+        if ci < len(pos_auth) {
+            pos_auth[ci] = false
+        }
+        ci = ci + 1
+    }
 }
 
 // shadow_pop 弹出影子栈 n 项 / shadow_pop pops n entries from the shadow stack

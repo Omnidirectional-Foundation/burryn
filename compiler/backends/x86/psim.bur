@@ -369,17 +369,17 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             }
             shadow_pop(pshadow_ps, 1)
             shadow_pop(ptshadow_ps, 1)
-        } else if pop == lib::op_pop {
-            shadow_pop(pshadow_ps, 1)
-            shadow_pop(ptshadow_ps, 1)
-        } else if pop == lib::op_pop_n {
-            shadow_pop(pshadow_ps, pcode[pit + 1])
-            shadow_pop(ptshadow_ps, pcode[pit + 1])
-        } else if pop == lib::op_close_upvalue {
-            // 与发射侧同步：本指令在字节码里替换 op_pop，弹 1 槽
-            // kept in step with the emitter: this opcode replaces op_pop and pops 1
-            shadow_pop(pshadow_ps, 1)
-            shadow_pop(ptshadow_ps, 1)
+        } else if pop == lib::op_pop || pop == lib::op_pop_n || pop == lib::op_close_upvalue {
+            // close_upvalue 在字节码里替换 op_pop，弹 1 槽（与发射侧同步）
+            // close_upvalue replaces op_pop and pops 1 (kept in step with the emitter)
+            let pn_pop = if pop == lib::op_pop_n {
+                pcode[pit + 1]
+            } else {
+                1
+            }
+            shadow_pop(pshadow_ps, pn_pop)
+            shadow_pop(ptshadow_ps, pn_pop)
+            forget_types_above(ppos_types, ppos_auth, len(ptshadow_ps))
         } else if pop == lib::op_end_block {
             let pn_eb = pcode[pit + 1]
             let presult = if len(ptshadow_ps) > 0 {
@@ -396,15 +396,7 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             shadow_pop(ptshadow_ps, pn_eb + 1)
             push(pshadow_ps, presname)
             push(ptshadow_ps, presult)
-            let plive = len(ptshadow_ps)
-            let mut pci = plive
-            while pci < len(ppos_types) {
-                ppos_types[pci] = ""
-                if pci < len(ppos_auth) {
-                    ppos_auth[pci] = false
-                }
-                pci = pci + 1
-            }
+            forget_types_above(ppos_types, ppos_auth, len(ptshadow_ps))
         } else if pop == lib::op_call {
             let pn = pcode[pit + 1]
             let mut pcallee = if len(pshadow_ps) > pn {
