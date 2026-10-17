@@ -1563,11 +1563,26 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(x86gen_clock_native(n_globals))
                 ret_type = "float"
             } else if callee == "contains" {
+                // 容器侧元素类型是可靠判据：list 字面量（`["num", …]`）与 split/keys
+                // 等原语产出的影子都准确，而被查值的影子可能尚未收敛。`contains` 的
+                // 签名是 list<α> × α ⇒ 良类型程序里被查值必与元素同型，故元素类型为
+                // str 时按内容比较是可靠的；被查值影子仍作为兜底，容器类型未知时不回退。
+                // The container's element type is a reliable signal: list literals
+                // (`["num", …]`) and natives such as split/keys carry accurate shadows,
+                // while the searched value's shadow may not have converged. `contains`
+                // is typed list<α> × α, so in a well-typed program the searched value
+                // shares the element type — hence a str element type reliably selects
+                // the content compare. The value's shadow stays as a fallback.
+                let cl_t = if len(type_shadow) >= n {
+                    type_shadow[len(type_shadow) - n]
+                } else {
+                    ""
+                }
                 let mut contains_str = false
-                if len(type_shadow) > 0 {
-                    if type_shadow[len(type_shadow) - 1] == "str" {
-                        contains_str = true
-                    }
+                if list_elem_type(cl_t) == "str" {
+                    contains_str = true
+                } else if len(type_shadow) > 0 && type_shadow[len(type_shadow) - 1] == "str" {
+                    contains_str = true
                 }
                 w(x86gen_contains_native(contains_str))
                 ret_type = "bool"
