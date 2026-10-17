@@ -375,16 +375,49 @@ jobs:
         if: failure()
         run: |
           set -x
+          # gdb 在 ubuntu-latest 上默认缺席，而 readelf 拿不到寄存器；缺了才装。
+          # gdb is absent from ubuntu-latest by default and readelf cannot show the
+          # registers, so install it only when missing.
+          if ! command -v gdb > /dev/null; then
+            sudo -n apt-get update -qq || true
+            sudo -n apt-get install -y -qq gdb || true
+          fi
           ls -la core.g1x.* || true
           for c in core.g1x.*; do
             [ -f "$c" ] || continue
-            readelf -n "$c" | head -200 || true
+            readelf -n "$c" | head -60 || true
             if command -v gdb > /dev/null; then
-              timeout 180 gdb -batch -nx -ex 'set pagination off' -ex 'info registers' -ex 'info proc mappings' -ex 'bt' -ex 'x/24i $rip-40' -ex 'x/64gx $r14-32' ./g1x "$c" 2>&1 | head -260 || true
+              # 故障地址、寄存器、栈与崩溃点反汇编：$_siginfo 的 si_addr 能把
+              # 「一个整数被当成指针解引用」和「野指针」分开。
+              # fault address, registers, stack and the disassembly at the crash
+              # site: $_siginfo's si_addr separates an integer dereferenced as a
+              # pointer from a wild pointer.
+              timeout 300 gdb -batch -nx \
+                -ex 'set pagination off' \
+                -ex 'p $_siginfo' \
+                -ex 'info registers rax rbx rcx rdx rsi rdi rip rsp rbp r12 r13 r14 r15' \
+                -ex 'bt' \
+                -ex 'info proc mappings' \
+                -ex 'x/24i $rip-40' \
+                -ex 'x/64gx $r14-32' \
+                ./g1x "$c" 2>&1 | head -300 || true
             else
               readelf -l "$c" | head -40 || true
             fi
           done
+          # 拿刚崩过的 g1x 扫一遍小样例：能在小样例上复现就得到一个可反复调试的最小复现。
+          # sweep the small programs with the g1x that just crashed: a crash on a
+          # small program yields a minimal reproducer that can be debugged repeatedly
+          if [ -x ./g1x ]; then
+            for f in testdata/basics/*.bur; do
+              [ -f "$f" ] || continue
+              timeout 30 ./g1x build --backend x86 "$f" -o /tmp/g1x-repro > /dev/null 2>&1
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "g1x-repro rc=$rc $f"
+              fi
+            done
+          fi
 
       # 失败也把 g1x 落成 artifact：x86 编译器的运行期 bug 在小机器上复现不了
       # （本机 gen OOM），拉回 quicksrv 本地调试
