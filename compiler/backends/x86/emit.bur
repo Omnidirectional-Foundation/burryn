@@ -255,12 +255,22 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 let mut stype = ""
                 if slot < len(pos_types) && str_len(pos_types[slot]) > 0 {
                     stype = pos_types[slot]
-                    if len(type_shadow) > 0 {
-                        let top_t = type_shadow[len(type_shadow) - 1]
-                        if slot == len(type_shadow) - 1 && is_enum_enc(top_t) && top_t != stype {
+                    // 活槽以槽内值自身的影子类型为准：match 的臂或 if 的分支在别处
+                    // 写过同一槽后，pos_types 还留着声明时的枚举类型，影子却已是该值
+                    // 真正落下的类型。枚举标注与实际类型不一致时影子胜出；不限栈顶槽
+                    // ——臂的结果槽在 END_BLOCK 折叠前并不是栈顶。
+                    // a live slot trusts the shadow type of the value it holds: after a
+                    // match arm or an if branch writes the same slot elsewhere,
+                    // pos_types still holds the declaration-time enum while the shadow
+                    // already carries the type the value actually landed with. On an
+                    // enum-annotation mismatch the shadow wins; not limited to the TOS
+                    // slot — an arm's result slot is not the TOS before END_BLOCK folds.
+                    if slot < len(type_shadow) {
+                        let top_t = type_shadow[slot]
+                        if is_enum_enc(top_t) && top_t != stype {
                             stype = top_t
                             pos_types[slot] = top_t
-                        } else if slot == len(type_shadow) - 1 && is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
+                        } else if is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
                             stype = top_t
                             pos_types[slot] = top_t
                         }
@@ -3013,6 +3023,28 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     cell_auth[ca] = false
                 }
                 ca = ca + 1
+            }
+            // 汇合点补型：本 ip 是别的路径的跳转落点（两臂 match 的外 END_BLOCK、if
+            // 表达式的合并点）时，线性扫描只带走最后一条路径的结论；栈顶类型为空
+            // 就用快照里对侧路径的栈顶类型补上。臂以 exit() 之类无返回调用收尾时其
+            // 值型为空串，正是这里丢掉 str/list 类型的地方。
+            // join fill-in: when this ip is another path's jump target (a two-arm
+            // match's outer END_BLOCK, an if-expression merge), the linear scan only
+            // carries the last path's conclusion; when the top type is empty, take the
+            // other path's top type from the snapshot. An arm ending in a no-return
+            // call like exit() has an empty type — exactly the str/list lost here.
+            if code[ip] != lib::op_no_match && len(type_shadow) > 0 && str_len(type_shadow[len(type_shadow) - 1]) == 0 {
+                match get(pt_target_shadow, str(fh) + ":" + str(ip)) {
+                    Some(tss) => {
+                        if len(tss[1]) == len(type_shadow) && len(tss[1]) > 0 {
+                            let jo_t = tss[1][len(tss[1]) - 1]
+                            if str_len(jo_t) > 0 {
+                                type_shadow[len(type_shadow) - 1] = jo_t
+                            }
+                        }
+                    },
+                    None => {},
+                }
             }
             emit_inst(ip, prev_ip, in_dead)
             if code[ip] == lib::op_jump || code[ip] == lib::op_select {

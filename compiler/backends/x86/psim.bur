@@ -165,6 +165,23 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             pit = pit + inst_len(ctx, ptfh, pcode, pit)
             continue
         }
+        // 见发射侧：汇合点处栈顶类型为空时，用跳转落点快照里对侧路径的栈顶类型
+        // 补齐（臂以 exit() 收尾时其值型为空串）。
+        // as in the emitter: at a join point, fill an empty top type from the other
+        // path's top type in the jump-target snapshot (an arm ending in exit() has "").
+        if pcode[pit] != lib::op_no_match && len(ptshadow_ps) > 0 && str_len(ptshadow_ps[len(ptshadow_ps) - 1]) == 0 {
+            match get(pt_target_shadow, str(ptfh) + ":" + str(pit)) {
+                Some(pss) => {
+                    if len(pss[1]) == len(ptshadow_ps) && len(pss[1]) > 0 {
+                        let pjo_t = pss[1][len(pss[1]) - 1]
+                        if str_len(pjo_t) > 0 {
+                            ptshadow_ps[len(ptshadow_ps) - 1] = pjo_t
+                        }
+                    }
+                },
+                None => {},
+            }
+        }
         let pop = pcode[pit]
         if pop == lib::op_return {
             if len(ptshadow_ps) > 0 {
@@ -255,12 +272,16 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 let mut pstype = ""
                 if pslot < len(ppos_types) && str_len(ppos_types[pslot]) > 0 {
                     pstype = ppos_types[pslot]
-                    if len(ptshadow_ps) > 0 {
-                        let ptop = ptshadow_ps[len(ptshadow_ps) - 1]
-                        if pslot == len(ptshadow_ps) - 1 && is_enum_enc(ptop) && ptop != pstype {
+                    // 见发射侧：活槽以槽内值自身的影子类型为准，枚举标注与实际类型
+                    // 不一致时影子胜出，不限栈顶槽。
+                    // as in the emitter: a live slot trusts its value's own shadow type;
+                    // on an enum-annotation mismatch the shadow wins, any live slot.
+                    if pslot < len(ptshadow_ps) {
+                        let ptop = ptshadow_ps[pslot]
+                        if is_enum_enc(ptop) && ptop != pstype {
                             pstype = ptop
                             ppos_types[pslot] = ptop
-                        } else if pslot == len(ptshadow_ps) - 1 && is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
+                        } else if is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
                             pstype = ptop
                             ppos_types[pslot] = ptop
                         }
