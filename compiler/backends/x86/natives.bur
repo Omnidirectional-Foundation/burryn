@@ -1238,8 +1238,13 @@ fn x86gen_proc_pump() {
 fn x86gen_proc_result_inst() {
     let ob_str = mov_rm(r10, r9, proc_ob_len) + lea(rcx, r10, 8) + x86gen_alloc_r(r11, rcx, GC_DESC_ALL) + mov_mr(r11, 0, r10) + mov_rm(rsi, r9, proc_out_ptr) + lea(rdi, r11, 8) + mov_rr(rcx, r10) + rep_movsb()
     let eb_str = mov_rm(r10, r9, proc_eb_len) + lea(rcx, r10, 8) + x86gen_alloc_r(r8, rcx, GC_DESC_ALL) + mov_mr(r8, 0, r10) + mov_rm(rsi, r9, proc_err_ptr) + lea(rdi, r8, 8) + mov_rr(rcx, r10) + rep_movsb()
-    let out_inst = x86gen_alloc(rcx, 40, GC_DESC_ALL) + mov_ri64(rdx, 2) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_rm(rax, r9, proc_code) + mov_mr(rcx, 16, rax) + mov_mr(rcx, 24, r11) + mov_mr(rcx, 32, r8)
-    let ok_inst = x86gen_alloc(rax, 24, GC_DESC_ALL) + mov_ri64(rdx, 1) + mov_mr(rax, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rax, 8, rdx) + mov_mr(rax, 16, rcx)
+    // P3 批 3 补漏：proc 结果实例的载荷指针此前挂 GC_DESC_ALL=noscan，从未被扫，
+    // 唯一持有时 collect 后悬垂（ob/eb 串在词 3/4，ok 实例在词 2）。
+    // P3 batch 3 follow-up: the proc result instances' payload pointers hung off
+    // GC_DESC_ALL = noscan and were never scanned, dangling when solely held
+    // (the ob/eb strings at words 3/4, the ok instance at word 2).
+    let out_inst = x86gen_alloc(rcx, 40, bitmap_desc("x86-proc-result", 3, ["str", "str"])) + mov_ri64(rdx, 2) + mov_mr(rcx, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rcx, 8, rdx) + mov_rm(rax, r9, proc_code) + mov_mr(rcx, 16, rax) + mov_mr(rcx, 24, r11) + mov_mr(rcx, 32, r8)
+    let ok_inst = x86gen_alloc(rax, 24, desc_box_ptr) + mov_ri64(rdx, 1) + mov_mr(rax, 0, rdx) + xor_rr(rdx, rdx) + mov_mr(rax, 8, rdx) + mov_mr(rax, 16, rcx)
     let ok_path = ob_str + eb_str + out_inst + ok_inst
     // 子进程 exec 失败：child_err 为正 errno，报其 strerror 文本（同 C）；errtext 会用 r9，先存
     // the child's exec failed: child_err holds a positive errno, reported as its
@@ -1383,7 +1388,14 @@ fn x86gen_read_dir_native() {
     let win_closeadd = mov_rm(rdi, rsp, 320) + sys_mov_rax(1002) + syscall() + add_ri32(rsp, 328)
     // 主流程拼装
     // main assembly
-    let list_alloc = mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + x86gen_alloc_r(r11, rax, GC_DESC_ALL) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + mov_mr(r15, 0 - 40, r11) + shadow_set_guarded(5, GC_SHADOW_PTR) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
+    // P3 批 3 补漏：read_dir 结果列表是 [len][cap][内联元素] 的串指针数组（args
+    // 同形，已用 desc_list_ptr），此前挂 GC_DESC_ALL=noscan ⇒ 名字串指针从未被扫，
+    // 唯一持有时 collect 后悬垂。
+    // P3 batch 3 follow-up: read_dir's result list is a [len][cap][inline] array of
+    // string pointers (args' shape, already on desc_list_ptr) that hung off
+    // GC_DESC_ALL = noscan, so the name pointers were never scanned and dangled
+    // when solely held.
+    let list_alloc = mov_rr(rax, r10) + mov_ri32(rcx, 3) + shl_rcl(rax) + add_ri32(rax, 24) + x86gen_alloc_r(r11, rax, desc_list_ptr) + mov_mr(r11, 0, r10) + mov_mr(r11, 8, r10) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + mov_mr(r15, 0 - 40, r11) + shadow_set_guarded(5, GC_SHADOW_PTR) + xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax)
     // Windows FindFirst 失败路径同样要还 328B 帧，否则 rsp 从此偏斜。
     // The Windows FindFirst failure path must release the 328B frame too,
     // otherwise rsp stays skewed for the rest of the program.
@@ -1392,7 +1404,7 @@ fn x86gen_read_dir_native() {
     } else {
         ""
     }
-    let empty_ok = x86gen_alloc(r11, 24, GC_DESC_ALL) + xor_rr(rax, rax) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + ok_inst + jmp_rel32(str_len(fail_pad) + str_len(fail))
+    let empty_ok = x86gen_alloc(r11, 24, desc_list_ptr) + xor_rr(rax, rax) + mov_mr(r11, 0, rax) + mov_mr(r11, 8, rax) + lea(r9, r11, 24) + mov_mr(r11, 16, r9) + ok_inst + jmp_rel32(str_len(fail_pad) + str_len(fail))
     let build_tail = mov_rm(r11, r15, 0 - 40) + ok_inst + jmp_rel32(str_len(empty_ok) + str_len(fail_pad) + str_len(fail))
     let mut main_done_closeadd = close + add_ri32(rsp, 8192)
     if target_os == "windows" {
@@ -1601,8 +1613,11 @@ fn x86gen_contains_native(is_str) {
 // x86gen_slice_native 内联 slice：复制 [start, end) 元素到新列表
 // x86gen_slice_native inlines slice: copy [start, end) elements into a new list
 // slice inline: copy elements [start, end) into a new list
+// P3 批 3 补漏：新列表 [len][cap][内联元素] 的元素 kind 随源列表，按 maybe 扫。
+// P3 batch 3 follow-up: the new [len][cap][inline] list's element kind follows
+// the source list, so scan as maybe.
 fn x86gen_slice_native() {
-    mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + sub_rr(r9, r8) + mov_rm(r10, rax, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rr(rcx, r9) + add_rr(rcx, rcx) + add_rr(rcx, rcx) + add_rr(rcx, rcx) + add_ri32(rcx, 24) + x86gen_alloc_r(r11, rcx, GC_DESC_ALL) + mov_mr(r11, 0, r9) + mov_mr(r11, 8, r9) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rsi, rdx) + mov_rr(rdi, r10) + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_mr(r15, 0 - 32, r11) + shadow_set(4, GC_SHADOW_PTR) + vs_pop_n(3)
+    mov_rm(rax, r15, 0 - 24) + mov_rm(r8, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + sub_rr(r9, r8) + mov_rm(r10, rax, 16) + mov_rr(rdx, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rdx, r10) + mov_rr(rcx, r9) + add_rr(rcx, rcx) + add_rr(rcx, rcx) + add_rr(rcx, rcx) + add_ri32(rcx, 24) + x86gen_alloc_r(r11, rcx, desc_list_maybe) + mov_mr(r11, 0, r9) + mov_mr(r11, 8, r9) + lea(r10, r11, 24) + mov_mr(r11, 16, r10) + mov_rr(rsi, rdx) + mov_rr(rdi, r10) + mov_rr(rdx, r9) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb() + mov_mr(r15, 0 - 32, r11) + shadow_set(4, GC_SHADOW_PTR) + vs_pop_n(3)
 }
 
 // x86gen_exec_spawn_native 内联 spawn：pipe2×3 + fork，子进程 execvp PATH 解析，父进程建 proc 结构
@@ -1768,7 +1783,14 @@ fn x86gen_exec_spawn_native() {
     let init_out = x86gen_drain_fl_take(8192, rax, rdi) + mov_mr(r9, proc_out_ptr, rax) + mov_mr(r9, proc_out_cap, rdi)
     let init_err = x86gen_drain_fl_take(8192, rax, rdi) + mov_mr(r9, proc_err_ptr, rax) + mov_mr(r9, proc_err_cap, rdi)
     let proc_rest = init_out + init_err + xor_rr(rax, rax) + mov_mr(r9, proc_ob_len, rax) + mov_mr(r9, proc_eb_len, rax) + mov_mr(r9, proc_child_err, rax) + mov_mr(r9, proc_have_err, rax) + mov_mr(r9, proc_code, rax) + mov_mr(r9, proc_complete, rax) + mov_mr(r9, proc_consumed, rax) + mov_rr(rax, r9)
-    let parent_ok = x86gen_alloc(r9, proc_size, GC_DESC_ALL) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + proc_rest
+    // P3 批 3 补漏：proc 句柄块持有两个排空缓冲指针（词 6/8），此前挂
+    // GC_DESC_ALL=noscan ⇒ 缓冲只活在机器栈/寄存器里跨分配点时会被扫丢。全词扫
+    // 加 mark 门即可（pid/fd/HANDLE 等标量位样被门拒）。
+    // P3 batch 3 follow-up: the proc handle block holds two drain-buffer pointers
+    // (words 6/8) and hung off GC_DESC_ALL = noscan, so a buffer live only in the
+    // machine stack/registers across an allocation could be swept. An all-words
+    // scan plus mark's gates covers it (pid/fd/HANDLE scalars are rejected).
+    let parent_ok = x86gen_alloc(r9, proc_size, desc_allptr) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm32(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm32(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_rm32(rax, rsp, 16) + mov_mr(r9, proc_failfd, rax) + proc_rest
     // fork 失败：先存 -errno 进 [rsp+72] 再关读端（close 会覆写 rax），收栈前
     // 必须装回——漏掉装回会以 rax=0 伪装成功句柄返回（与管道链同一教训）
     // fork failure: stash -errno at [rsp+72] before closing the read ends (the
@@ -1819,7 +1841,7 @@ fn x86gen_exec_spawn_native() {
         let reg = fn(off) {
             mov_rm(rax, rsp, off) + x86gen_fdtable_alloc() + x86gen_fdtable_mark_kind(2) + mov_mr(rsp, off, rax)
         }
-        let win_ok = mov_mr(rsp, 24, rax) + reg(0) + reg(8) + x86gen_alloc(r9, proc_size, GC_DESC_ALL) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_ri64(rax, 0 - 1) + mov_mr(r9, proc_failfd, rax) + proc_rest
+        let win_ok = mov_mr(rsp, 24, rax) + reg(0) + reg(8) + x86gen_alloc(r9, proc_size, desc_allptr) + mov_rm(rax, rsp, 24) + mov_mr(r9, proc_pid, rax) + mov_rm(rax, rsp, 0) + mov_mr(r9, proc_outfd, rax) + mov_rm(rax, rsp, 8) + mov_mr(r9, proc_errfd, rax) + mov_ri64(rax, 0 - 1) + mov_mr(r9, proc_failfd, rax) + proc_rest
         // Windows 失败值：-1 = 建管失败，-2 = CreateProcess 失败（分派器 1004 臂
         // 分两尾返回）；win_fail 保持 rax 原样传给消费端定串
         // windows failure values: -1 = pipe creation, -2 = CreateProcess (the
@@ -1834,6 +1856,9 @@ fn x86gen_exec_spawn_native() {
 
 // x86gen_split_native 内联 split：按分隔符拆分 / x86gen_split_native inlines split: divide by a separator
 // split inline: split on a separator
+// P3 批 3 补漏：结果列表 [len][cap][内联元素] 装的是串指针，此前挂 noscan。
+// P3 batch 3 follow-up: the result [len][cap][inline] list holds string pointers
+// but hung off noscan.
 fn x86gen_split_native() {
     let push = add_ri32(rcx, 8) + x86gen_alloc_r(rdi, rcx, GC_DESC_ALL) + sub_ri32(rcx, 8) + mov_mr(rdi, 0, rcx) + mov_mr(r15, 0 - 24, rdi) + mov_rr(rsi, r9) + add_rr(rsi, rdx) + add_ri32(rsi, 8) + add_ri32(rdi, 8) + rep_movsb() + mov_rm(rdi, r15, 0 - 8) + mov_rm(rsi, r15, 0 - 24) + mov_mr(rdi, 0, rsi) + add_ri32(rdi, 8) + mov_mr(r15, 0 - 8, rdi)
     let done = mov_rr(rcx, r8) + sub_rr(rcx, rdx) + push + mov_rm(rdi, r15, 0 - 16) + mov_rm(rsi, r15, 0 - 8) + sub_rr(rsi, rdi) + sub_ri32(rsi, 24) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shr_rcl(rsi) + mov_mr(rdi, 0, rsi) + mov_mr(r15, 0 - 24, rdi) + vs_pop_n(2) + shadow_set(1, GC_SHADOW_PTR)
@@ -1845,7 +1870,7 @@ fn x86gen_split_native() {
     let loop_head = cond_je + cond_ja + loop_tail
     let back = jmp_rel32(0 - (str_len(loop_head) + str_len(no_match) + 5))
     let matched_back = jmp_rel32(0 - (str_len(loop_head) + str_len(no_match) + 5 + str_len(matched) + 5))
-    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + mov_rr(rdx, r8) + add_ri32(rdx, 1) + mov_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + x86gen_alloc_r(rdi, rdx, GC_DESC_ALL) + xor_rr(rax, rax) + mov_mr(rdi, 0, rax) + mov_rr(rdx, r8) + add_ri32(rdx, 1) + mov_mr(rdi, 8, rdx) + lea(rax, rdi, 24) + mov_mr(rdi, 16, rax) + mov_mr(r15, 0 - 16, rdi) + mov_rr(rsi, rdi) + add_ri32(rsi, 24) + mov_mr(r15, 0 - 8, rsi) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
+    let head = mov_rm(r9, r15, 0 - 16) + mov_rm(r10, r15, 0 - 8) + mov_rm(r8, r9, 0) + mov_rm(r11, r10, 0) + mov_rr(rdx, r8) + add_ri32(rdx, 1) + mov_ri32(rcx, 3) + shl_rcl(rdx) + add_ri32(rdx, 24) + x86gen_alloc_r(rdi, rdx, desc_list_ptr) + xor_rr(rax, rax) + mov_mr(rdi, 0, rax) + mov_rr(rdx, r8) + add_ri32(rdx, 1) + mov_mr(rdi, 8, rdx) + lea(rax, rdi, 24) + mov_mr(rdi, 16, rax) + mov_mr(r15, 0 - 16, rdi) + mov_rr(rsi, rdi) + add_ri32(rsi, 24) + mov_mr(r15, 0 - 8, rsi) + xor_rr(rax, rax) + xor_rr(rdx, rdx)
     head + loop_head + no_match + back + matched + matched_back + done
 }
 
