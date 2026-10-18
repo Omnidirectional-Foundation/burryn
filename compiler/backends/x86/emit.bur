@@ -314,11 +314,22 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // P3 批 3：cell 挂 allptr——8B 槽值可以是任意指针，noscan
                         // （GC_DESC_ALL=id 0）让 cell 内容从未被扫，提升槽唯一持有时
                         // 值即悬垂；标量值由 mark 三重过滤安全拒绝。
+                        // 槽里换成 cell 指针后影子字节也要跟着盖章（与 SET_LOCAL 侧同理），
+                        // 否则槽里是 PTR 而影子说 SCALAR，cell 自身无根。
                         // P3 batch 3: cells hang off allptr — the 8B slot value can be
                         // any pointer; noscan (GC_DESC_ALL = id 0) meant the cell
                         // content was never scanned, so a lifted slot as the sole
                         // holder dangled; scalars are safely rejected by mark's gates.
-                        w(mov_rm(rax, r14, 8 * slot) + x86gen_alloc(r11, 8, desc_allptr) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11) + mov_rm(rax, r11, 0) + vs_push(rax, gc_kind_of(stype)))
+                        // Once the slot holds the cell pointer its byte must be stamped
+                        // too (as on the SET_LOCAL side) or the slot's byte says SCALAR
+                        // while the slot holds a pointer and the cell itself is unrooted.
+                        let cbox = mov_rm(rax, r14, 8 * slot) + x86gen_alloc(r11, 8, desc_allptr) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11)
+                        let cstamp = if len(type_shadow) > slot {
+                            shadow_set(len(type_shadow) - slot, GC_SHADOW_PTR)
+                        } else {
+                            ""
+                        }
+                        w(cbox + cstamp + mov_rm(rax, r11, 0) + vs_push(rax, gc_kind_of(stype)))
                         while len(pos_auth) <= slot {
                             push(pos_auth, false)
                         }
@@ -434,6 +445,27 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 }
             } else {
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
+            }
+            // 槽的影子字节跟着槽里实际放的东西走：被存的值并不总是刚压栈的那个——嵌套 fn
+            // 声明先压 op_unit 占住槽位（declare_local 取的是该 unit 的栈位），闭包再压其
+            // 上，SET_LOCAL 只搬值、不盖章，槽的影子便停在 unit 的 SCALAR 上；槽里的闭包
+            // 从此对收集器不可见，扫掉后调用点读回垃圾——flush_tries 一类野跳如此。赋值也
+            // 走这里：声明期的字节可能本来就不对。提升槽里放的是 cell 指针，恒为 PTR。
+            // the slot's shadow byte follows what the slot actually holds: the stored value
+            // is not always the one just pushed — a nested fn declaration pushes op_unit to
+            // reserve the slot (declare_local takes that unit's stack position) and pushes
+            // the closure above it, so SET_LOCAL moves the value without stamping and the
+            // slot's byte stays the unit's SCALAR; the closure then turns invisible to the
+            // collector and the call reads back garbage — the wild dispatch on flush_tries.
+            // Assignments pass here too: the declaration-time byte may already be wrong.
+            // A lifted slot holds a cell pointer and is always PTR.
+            if slot > 0 && len(type_shadow) > slot {
+                let sk = if is_lifted(slot) {
+                    GC_SHADOW_PTR
+                } else {
+                    gc_kind_of(type_shadow[len(type_shadow) - 1])
+                }
+                w(shadow_set(len(type_shadow) - slot, sk))
             }
         } else if op == lib::op_get_global {
             let idx = read_u16(code, ip + 1)
