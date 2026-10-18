@@ -213,10 +213,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             let n = code[ip + 1]
             // 结果 kind 先读后发（w 之后 type_shadow 才被裁剪）
             // read the result kind before emitting (type_shadow is pruned after w)
+            // 模型栈空时结果类型判不出：留空（未知/MAYBE），不落成 int——假 int 会
+            // 把结果槽盖成标量，指针结果（如新建的列表/串）漏出扫描后读回垃圾
+            // with an empty model stack the result type is unknown: leave it empty
+            // (anonymous/MAYBE) rather than int — a fake int stamps the result slot
+            // scalar and a pointer result (a fresh list/string) drops out of the scan
             let eb_res_t = if len(type_shadow) > 0 {
                 type_shadow[len(type_shadow) - 1]
             } else {
-                "int"
+                ""
             }
             w(mov_rm(rax, r15, 0 - 8) + sub_ri32(r15, 8 * (n + 1)) + mov_mr(r15, 0, rax) + add_ri32(r15, 8) + shadow_bump(0 - n) + shadow_set(1, gc_kind_of(eb_res_t)))
             let res_name = if len(shadow) > 0 {
@@ -227,7 +232,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             let res_type = if len(type_shadow) > 0 {
                 type_shadow[len(type_shadow) - 1]
             } else {
-                "int"
+                ""
             }
             shadow_pop(shadow, n + 1)
             shadow_pop(type_shadow, n + 1)
@@ -856,11 +861,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // tuple 索引：元素 = [tuple + 8 + 8*idx]
                 // tuple index: element at [tuple + 8 + 8*idx]
                 // 类型先算后发（kind 落影子）：索引常量（解构场景）回看前一条 CONST；
-                // 运行时索引回退 int
+                // 运行时索引判不出元素类型，留空（未知）——不落成 int，否则可能的
+                // 指针元素被当标量漏出扫描
                 // compute the element type before emitting (kind lands in the shadow):
-                // constant indices (destructuring) peek at the preceding CONST;
-                // runtime indices fall back to int
-                let mut el_t = "int"
+                // constant indices (destructuring) peek at the preceding CONST; a runtime
+                // index cannot resolve the element type, so leave it empty (unknown) —
+                // never int, or a possible pointer element is marked scalar and dropped
+                // from the scan
+                let mut el_t = ""
                 let pt = if ip >= 3 {
                     code[ip - 3]
                 } else {
@@ -886,12 +894,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 push(type_shadow, el_t)
             } else {
                 // 元素 kind 先算后发 / element kind computed before emitting
+                // 非 list 容器只可能是影子把 list 认错（只有 list 可下标）：元素类型
+                // 未知，kind 一律 MAYBE。SCALAR 会把可能的指针漏出扫描，回收复用后
+                // 读回的值是垃圾。
+                // a non-list container can only be the shadow misreading a list (only
+                // lists take an index): the element type is unknown, so the kind is
+                // always MAYBE. SCALAR would drop a possible pointer from the scan and
+                // the value reads back as garbage after collection and reuse.
                 let li_k = if is_list_type(st) {
                     gc_kind_of(list_elem_type(st))
-                } else if st == "" || st == "int" || st == "str" {
-                    GC_SHADOW_MAYBE
                 } else {
-                    GC_SHADOW_SCALAR
+                    GC_SHADOW_MAYBE
                 }
                 w(x86gen_idx_check(0 - 16, 0 - 8, "list index") + mov_rm(rax, r15, 0 - 16) + mov_rm(r9, r15, 0 - 8) + mov_rm(rax, rax, 16) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(r9) + add_rr(rax, r9) + mov_rm(rdx, rax, 0) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, li_k))
                 shadow_pop(shadow, 2)
@@ -910,10 +923,13 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     } else {
                         push(type_shadow, st_el)
                     }
-                } else if st == "" || st == "int" || st == "str" {
-                    push(type_shadow, "")
                 } else {
-                    push(type_shadow, "int")
+                    // 容器影子非 list：元素类型判不出，留空（未知），不落成 int——
+                    // 假 int 既把它当标量（见上），又在并合里挡住后来的真类型
+                    // the container shadow is not a list: the element type cannot be
+                    // resolved, so leave it empty (unknown) rather than int — a fake int
+                    // marks it scalar (see above) and blocks later real types in merges
+                    push(type_shadow, "")
                 }
             }
         } else if op == lib::op_index_set {
@@ -1086,15 +1102,20 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             } else {
                 ""
             }
+            // payload 类型解不出时留空（未知），不落成 int——假 int 会把可能的指针
+            // 载荷当标量、漏出扫描
+            // when the payload type cannot be resolved leave it empty (unknown) rather
+            // than int: a fake int marks a possible pointer payload scalar and drops it
+            // from the scan
             let t_payload = if is_enum_enc(t_t) {
                 let t_var = enum_fields_resolve(ctx, t_t, 0)
                 if len(t_var) > 0 {
                     t_var[0]
                 } else {
-                    "int"
+                    ""
                 }
             } else {
-                "int"
+                ""
             }
             let ok_path = mov_rm(rdx, rax, 16) + mov_mr(r15, 0 - 8, rdx)
             // P2：epilogue 携带本函数返回 kind 与发射期帧高（塌缩后写影子字节）
@@ -1934,7 +1955,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     } else if n > 0 {
                         ret_type = type_shadow[len(type_shadow) - n]
                     } else {
-                        ret_type = "int"
+                        // 无实参可跟、返回类型未知：留空（未知）不落成 int（与 psim 同源）
+                        // no arg to follow and the return type is unknown: leave it empty
+                        // rather than int (same source as psim)
+                        ret_type = ""
                     }
                 }
             }
@@ -2207,7 +2231,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 if len(type_shadow) >= n - tti {
                     push(tup_types, type_shadow[len(type_shadow) - n + tti])
                 } else {
-                    push(tup_types, "int")
+                    // 模型栈不足：元素类型未知，留空不落成 int（与 psim 同源）
+                    // model stack too short: the element type is unknown, empty not int
+                    // (same source as psim)
+                    push(tup_types, "")
                 }
                 tti = tti + 1
             }

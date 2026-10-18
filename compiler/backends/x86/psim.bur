@@ -408,7 +408,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             let presult = if len(ptshadow_ps) > 0 {
                 ptshadow_ps[len(ptshadow_ps) - 1]
             } else {
-                "int"
+                // 模型栈空（块结果判不出）：留空（未知）不落成 int（与发射端同源）
+                // empty model stack (the block result is unknown): empty, not int
+                // (same source as the emitter)
+                ""
             }
             let presname = if len(pshadow_ps) > 0 {
                 pshadow_ps[len(pshadow_ps) - 1]
@@ -558,7 +561,9 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 let pelem = if pn >= 2 {
                     p_arg_t[1]
                 } else {
-                    "int"
+                    // 实参不全（模拟走样）：元素类型未知，留空不落成 int
+                    // missing arg (a skewed simulation): unknown element type, empty not int
+                    ""
                 }
                 let pis_known = pelem == "str" || pelem == "int" || pelem == "float" || pelem == "bool" || pelem == "unit" || is_list_type(pelem) || is_map_type(pelem) || is_record_type(pelem) || is_enum_enc(pelem) || str_len(pelem) > 4 && substr(pelem, 0, 4) == "tup:"
                 if pis_known {
@@ -773,8 +778,13 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                             push(ptshadow_ps, pnested_ret)
                         }
                     } else {
+                        // 被调返回类型这一轮还没解出：留空（未知，后续轮次可填上），
+                        // 不落成 int——假 int 会写回 fn_ret_type/实参并污染整张聚合表
+                        // the callee's return type is not solved this round: leave it empty
+                        // (unknown, later rounds can fill it) rather than int — a fake int
+                        // writes back into fn_ret_type/args and poisons the whole aggregate
                         push(pshadow_ps, "")
-                        push(ptshadow_ps, "int")
+                        push(ptshadow_ps, "")
                     }
                 } else {
                     let mut anon_sub = -1
@@ -905,8 +915,11 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                         push(pshadow_ps, "")
                         push(ptshadow_ps, p_arg_t[0])
                     } else {
+                        // 无实参可跟、返回类型未知：留空（未知）不落成 int（与发射端同源）
+                        // no arg to follow and the return type is unknown: leave it empty
+                        // rather than int (same source as the emitter)
                         push(pshadow_ps, "")
-                        push(ptshadow_ps, "int")
+                        push(ptshadow_ps, "")
                     }
                 }
             }
@@ -1226,7 +1239,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 // container is only the shadow misreading a list, not a real string
                 // index, so there is no str branch.
             } else if str_len(plt) > 4 && substr(plt, 0, 4) == "tup:" {
-                let mut pel_t = "int"
+                // 判不出元素类型就留空（未知），不落成 int（与发射端同源）
+                // leave the element type empty (unknown) when it cannot be resolved,
+                // never int (same source as the emitter)
+                let mut pel_t = ""
                 let ppt = if pit >= 3 {
                     pcode[pit - 3]
                 } else {
@@ -1245,10 +1261,11 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     }
                 }
                 push(ptshadow_ps, pel_t)
-            } else if plt == "" || plt == "int" || plt == "str" {
-                push(ptshadow_ps, "")
             } else {
-                push(ptshadow_ps, "int")
+                // 非 list 容器（影子认错）：元素类型未知，留空不落成 int
+                // non-list container (a misread shadow): the element type is unknown,
+                // empty not int
+                push(ptshadow_ps, "")
             }
         } else if pop == lib::op_index_set {
             shadow_pop(pshadow_ps, 3)
@@ -1266,7 +1283,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 if len(ptshadow_ps) >= ptup_n - ptup_i {
                     push(ptup_ts, ptshadow_ps[len(ptshadow_ps) - ptup_n + ptup_i])
                 } else {
-                    push(ptup_ts, "int")
+                    // 模型栈不足：元素类型未知，留空不落成 int（与发射端同源）
+                    // model stack too short: the element type is unknown, empty not int
+                    // (same source as the emitter)
+                    push(ptup_ts, "")
                 }
                 ptup_i = ptup_i + 1
             }
