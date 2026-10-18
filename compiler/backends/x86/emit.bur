@@ -417,17 +417,34 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 }
                 cell_auth[slot] = true
             }
-            // ref 捕获的局部：cell 的类型只在首次建立时落一次种子，后续写不再覆盖，否则
-            // 循环体的每轮重声明都会把闭包里 push/put 收敛出来的元素类型打回空列表默认值。
-            // a ref-captured local: seed the cell's type once when it is first seen and do
-            // not overwrite it on later writes, otherwise every re-declaration in a loop
-            // body resets the element type a closure's push/put converged to back to the
-            // empty list's default.
+            // ref 捕获的局部：声明只在首次建立时落一次种子（循环体的每轮重声明不能把
+            // 闭包里 push/put 收敛出来的元素类型打回空列表默认值）；赋值则把所写值的类型
+            // 并进 cell——cell 里放的已经是那个值，类型影子必须跟着走，否则停在首次落下的
+            // 占位闭包句柄（如前置声明 `fn(_e){0}`），之后每次经该 cell 读取（upval 或提升
+            // 槽）都被静态分派到占位函数的变体（返回 0、无副作用）。容器类型由 merge_type
+            // 保住有元素的一侧，不会被裸 `list-` 打回。
+            // a ref-captured local: a declaration seeds the cell once (a loop body's
+            // re-declaration must not reset the element type a closure's push/put
+            // converged to); an assignment merges the written value's type in — the cell
+            // already holds that value, so its type shadow must follow, or it stays at the
+            // placeholder closure handle it first landed with (e.g. a forward-declared
+            // `fn(_e){0}`) and every later cell read (upval or lifted slot) statically
+            // dispatches to the placeholder's variant (returns 0, no side effects).
+            // merge_type keeps a container's element-bearing side, so a bare `list-` cannot
+            // reset it.
             if slot > 0 && is_lifted(slot) {
                 let ck = "cell:" + str(fh) + ":" + str(slot)
-                match get(global_type, ck) {
-                    Some(_) => {},
-                    None => put(ctx.global_type, ck, pos_types[slot]),
+                if was_auth {
+                    let ccur = match get(global_type, ck) {
+                        Some(t) => t,
+                        None => "",
+                    }
+                    put(ctx.global_type, ck, merge_type(ccur, pos_types[slot]))
+                } else {
+                    match get(global_type, ck) {
+                        Some(_) => {},
+                        None => put(ctx.global_type, ck, pos_types[slot]),
+                    }
                 }
             }
             if is_lifted(slot) {
@@ -2142,12 +2159,13 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     None => "",
                 }
                 if flag >= 2 {
-                    // cell 的类型只在首次见时落种子，之后由 push/put 与调用点反查精化；
-                    // 用当前帧的局部视图覆盖等于每轮把已收敛的元素类型打回默认值
+                    // cell 的类型只在首次见时落种子，之后由 push/put、赋值写穿与调用点反查
+                    // 精化（见 op_set_local）；用当前帧的局部视图覆盖等于每轮把已收敛的
+                    // 元素类型打回默认值
                     // a cell's type lands as a seed the first time it is seen and is then
-                    // refined by push/put and call-site back-lookups; overwriting it with
-                    // the current frame's local view would reset the converged element
-                    // type to the default every round
+                    // refined by push/put, assignment write-through (see op_set_local) and
+                    // call-site back-lookups; overwriting it with the current frame's local
+                    // view would reset the converged element type to the default every round
                     match get(global_type, ukey) {
                         Some(_) => {},
                         None => put(ctx.global_type, ukey, uvt),

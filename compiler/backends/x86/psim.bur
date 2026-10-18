@@ -314,6 +314,7 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             }
         } else if pop == lib::op_set_local {
             let pslot = read_u16(pcode, pit + 1)
+            let pis_decl = pslot > 0 && len(ptshadow_ps) > 0 && pslot == len(ptshadow_ps) - 1
             if pslot > 0 && len(ptshadow_ps) > 0 {
                 if len(ppos_types) <= pslot {
                     while len(ppos_types) <= pslot {
@@ -321,16 +322,27 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     }
                 }
                 ppos_types[pslot] = ptshadow_ps[len(ptshadow_ps) - 1]
-                // ref 捕获的局部：cell 类型只在首次建立时落一次种子，后续写不覆盖，
-                // 否则循环体的每轮重声明都会打回空列表默认值（与发射侧一致）
-                // a ref-captured local: seed the cell's type once and never overwrite it
-                // on later writes, or a loop body's re-declaration resets it to the empty
-                // list's default (as in the emitter)
+                // ref 捕获的局部：声明只在首次建立时落一次种子，赋值则把所写值的类型并进
+                // cell（与发射侧一致：cell 里已是那个值，影子要跟着走，否则停在首次落下的
+                // 占位闭包句柄上；容器由 merge_type 保住有元素的一侧）
+                // a ref-captured local: a declaration seeds the cell once, an assignment
+                // merges the written value's type in (as in the emitter: the cell already
+                // holds that value, so its shadow must follow, or it stays at the
+                // placeholder closure handle it first landed with; merge_type keeps a
+                // container's element-bearing side)
                 if pslot < len(plifted) && plifted[pslot] {
                     let pck = "cell:" + str(ptfh) + ":" + str(pslot)
-                    match get(ctx.global_type, pck) {
-                        Some(_) => {},
-                        None => put(ctx.global_type, pck, ppos_types[pslot]),
+                    if pis_decl {
+                        match get(ctx.global_type, pck) {
+                            Some(_) => {},
+                            None => put(ctx.global_type, pck, ppos_types[pslot]),
+                        }
+                    } else {
+                        let pccur = match get(ctx.global_type, pck) {
+                            Some(t) => t,
+                            None => "",
+                        }
+                        put(ctx.global_type, pck, merge_type(pccur, ppos_types[pslot]))
                     }
                 }
                 if len(ppos_auth) <= pslot {
@@ -976,9 +988,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     None => "",
                 }
                 if puflag >= 2 {
-                    // 同发射侧：cell 类型只落一次种子，之后由 push/put 与调用点反查精化
+                    // 同发射侧：cell 类型只落一次种子，之后由 push/put、赋值写穿与调用点反查
+                    // 精化
                     // as in the emitter: a cell's type lands as a seed once and is then
-                    // refined by push/put and call-site back-lookups
+                    // refined by push/put, assignment write-through and call-site back-lookups
                     match get(ctx.global_type, pukey) {
                         Some(_) => {},
                         None => put(ctx.global_type, pukey, uvt),
