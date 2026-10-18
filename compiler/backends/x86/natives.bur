@@ -1940,14 +1940,15 @@ fn x86gen_eq_str() {
 }
 
 // x86gen_eq_dyn 生成类型未知时的相等/不等比较：词相等即按词判（int 与同一对象都成立）；
-// 词不等时，只有两侧都是「字节串」对象（堆内 + noscan 描述符 + 载荷恰为 8+长度）才按内容
-// 比较，其余保持按词不等——列表/记录/元组/盒子的载荷形状与 8+长度 不合，不会误入内容比较。
+// 词不等时，只有两侧都是「字节串」对象（堆内 + noscan 描述符 + 载荷恰为 8 + 圆整长度）
+// 才按内容比较，其余保持按词不等——列表/记录/元组/盒子的载荷形状与字节串不合，不会误入
+// 内容比较。
 // x86gen_eq_dyn emits an equality/inequality compare for operands the model cannot
 // type: equal words decide as words (ints and identical objects both hold); when the
 // words differ, only two byte-string objects (in-heap, noscan desc, payload exactly
-// 8 + length) compare by content; everything else stays not-equal on the words —
-// lists, records, tuples and boxes fail the 8+length shape test and never take the
-// content path.
+// 8 + the rounded length) compare by content; everything else stays not-equal on the
+// words — lists, records, tuples and boxes fail the byte-string shape test and never
+// take the content path.
 fn x86gen_eq_dyn(neg) {
     // 默认结果：词不等（neq 真、eq 假）；词相等时取反
     // default result: the words differ (true for neq, false for eq); inverted when equal
@@ -1967,16 +1968,21 @@ fn x86gen_eq_dyn(neg) {
         sete(r10)
     }
     let tail = mov_mr(r15, 0 - 16, r10) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR)
-    // 内容比较：此刻两侧长度已相等（rdx = 长度）
-    // content compare: the lengths are equal by now (rdx = the length)
+    // 内容比较：rdx 已由长度门载入 a 的字节数（b 的与它相等），repe_cmpsb 用它作计数
+    // content compare: the length gate left a's byte count in rdx (equal to b's);
+    // repe_cmpsb counts it
     let mut seq = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + res_set
-    // 长度必须相等：不等即不是同一串
-    // the lengths must match: a mismatch is not the same string
-    seq = cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
-    // 两侧载荷都恰为 8+长度、描述符都是 noscan：字节串的形状
-    // both payloads are exactly 8+length with a noscan desc: the byte-string shape
-    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
-    seq = mov_rm(rdx, rax, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rax, 0) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    // 长度必须相等：两侧各取自己的长度字，不等即不是同一串
+    // the lengths must match: each operand contributes its own length word; a mismatch
+    // is not the same string
+    seq = mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    // 两侧载荷都是 8 + 圆整长度、描述符都是 noscan：字节串的形状。分配器把载荷圆整到
+    // 8 的倍数（x86gen_alloc/x86gen_alloc_r 的 (n+7)&-8），故载荷恒为 8 + roundup8(len)
+    // both payloads are 8 + the rounded length with a noscan desc: the byte-string shape.
+    // The allocator rounds the payload to a multiple of 8 (x86gen_alloc/x86gen_alloc_r's
+    // (n+7)&-8), so a payload is always 8 + roundup8(len)
+    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    seq = mov_rm(rdx, rax, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rax, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
     seq = mov_rm(r8, rcx, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
     seq = mov_rm(r8, rax, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
     // 两个操作数都要落在 [堆底, 堆顶) 内：堆外的值只可能是整数，按词比较
