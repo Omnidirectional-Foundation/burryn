@@ -1939,6 +1939,56 @@ fn x86gen_eq_str() {
     mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
 }
 
+// x86gen_eq_dyn 生成类型未知时的相等/不等比较：词相等即按词判（int 与同一对象都成立）；
+// 词不等时，只有两侧都是「字节串」对象（堆内 + noscan 描述符 + 载荷恰为 8+长度）才按内容
+// 比较，其余保持按词不等——列表/记录/元组/盒子的载荷形状与 8+长度 不合，不会误入内容比较。
+// x86gen_eq_dyn emits an equality/inequality compare for operands the model cannot
+// type: equal words decide as words (ints and identical objects both hold); when the
+// words differ, only two byte-string objects (in-heap, noscan desc, payload exactly
+// 8 + length) compare by content; everything else stays not-equal on the words —
+// lists, records, tuples and boxes fail the 8+length shape test and never take the
+// content path.
+fn x86gen_eq_dyn(neg) {
+    // 默认结果：词不等（neq 真、eq 假）；词相等时取反
+    // default result: the words differ (true for neq, false for eq); inverted when equal
+    let init = if neg {
+        mov_ri64(r10, 1)
+    } else {
+        xor_rr(r10, r10)
+    }
+    let same = if neg {
+        xor_rr(r10, r10)
+    } else {
+        mov_ri64(r10, 1)
+    }
+    let res_set = if neg {
+        setne(r10)
+    } else {
+        sete(r10)
+    }
+    let tail = mov_mr(r15, 0 - 16, r10) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR)
+    // 内容比较：此刻两侧长度已相等（rdx = 长度）
+    // content compare: the lengths are equal by now (rdx = the length)
+    let mut seq = lea(rsi, rax, 8) + lea(rdi, rcx, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + res_set
+    // 长度必须相等：不等即不是同一串
+    // the lengths must match: a mismatch is not the same string
+    seq = cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    // 两侧载荷都恰为 8+长度、描述符都是 noscan：字节串的形状
+    // both payloads are exactly 8+length with a noscan desc: the byte-string shape
+    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    seq = mov_rm(rdx, rax, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rax, 0) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    seq = mov_rm(r8, rcx, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
+    seq = mov_rm(r8, rax, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
+    // 两个操作数都要落在 [堆底, 堆顶) 内：堆外的值只可能是整数，按词比较
+    // both operands must sit in [heap_start, bump): anything outside is a plain int
+    seq = cmp_rr(rcx, r12) + jae_rel32(str_len(seq)) + seq
+    seq = cmp_rr(rcx, r8) + jb_rel32(str_len(seq)) + seq
+    seq = cmp_rr(rax, r12) + jae_rel32(str_len(seq)) + seq
+    seq = mov_ri64(r8, rt_slot(rt_heap_start)) + mov_rm(r8, r8, 0) + cmp_rr(rax, r8) + jb_rel32(str_len(seq)) + seq
+    let jmp_tail = jmp_rel32(str_len(seq))
+    init + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + jne_rel32(str_len(same) + str_len(jmp_tail)) + same + jmp_tail + seq + tail
+}
+
 // x86gen_str_rel 生成字符串关系比较（kind 取 gt/ge/lt/le）：先比公共前缀字节
 // （无符号，memcmp 口径），前缀相等再比长度（短为小），与 C 的 bur_compare 同语义
 // x86gen_str_rel emits string relational comparison (kind is gt/ge/lt/le): first the
