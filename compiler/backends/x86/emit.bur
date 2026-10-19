@@ -1691,23 +1691,23 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     ""
                 }
-                // 键比较策略：map 的键类型是声明性事实，而被查键的影子可能是未收敛的
-                // 默认 int——从 `[]` 起家的表和经 upvalue 读出的元素都会落到那里。
-                // 良类型程序里键必与 map 的键同型，故任一侧为 str 即按内容比较、为 int
-                // 按词比较；两侧都判不出键类型时走动态比较（词相等或字节串内容相等即
-                // 命中），与 VM/C 的动态键语义一致。
-                // key-compare strategy: the map's key type is a declarative fact,
-                // while the key operand's shadow may be an unconverged default (int) —
-                // tables built from `[]` and elements read through an upvalue land
-                // there. In a well-typed program the key shares the map's key type, so
-                // a str on either side selects the content compare and an int the word
-                // compare; when neither side determines the key type the dynamic
-                // compare takes over (a word hit or equal byte-string content),
-                // matching the VM/C dynamic key semantics.
+                // 键比较策略：任一侧为 str 即按内容比较；词比较只由 map 侧的 int 键
+                // 型决定——被查键的影子可能是未收敛的默认 int（从 `[]` 起家的表和经
+                // upvalue 读出的元素都会落到那里），单凭它不足以选词比较。map 侧判
+                // 不出键型时走动态比较（词相等或字节串内容相等即命中），对真 int 键
+                // 同样成立，与 VM/C 的动态键语义一致。
+                // key-compare strategy: a str on either side selects the content
+                // compare; the word compare is chosen only by an int key type on the
+                // map side — the key operand's shadow may be an unconverged default
+                // (int), which is not evidence enough (tables built from `[]` and
+                // elements read through an upvalue land there). When the map side is
+                // undecided the dynamic compare takes over (a word hit or equal
+                // byte-string content) — also correct for real int keys — matching the
+                // VM/C dynamic key semantics.
                 let mk_t = map_key_type(m_t)
                 let kk = if k_t == "str" || mk_t == "str" {
                     "str"
-                } else if k_t == "int" || mk_t == "int" {
+                } else if mk_t == "int" {
                     "int"
                 } else {
                     ""
@@ -1734,7 +1734,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 let dbg_fn = ctx.f_name[fh]
                 let dbg_z = str_len(dbg_fn) >= 4 && substr(dbg_fn, 0, 4) == "zdbg"
                 let dbg_c = len(ctx.f_code) > 200 && (dbg_fn == "convert_type_expr" || dbg_fn == "instantiate_enum" || dbg_fn == "infer_match" || dbg_fn == "collect_annotation_vars")
-                if dbg_z || dbg_c {
+                let dbg_k = dbg_fn == "is_fresh_source" || dbg_fn == "fresh_pattern_names" || dbg_fn == "fresh_name_copy"
+                if dbg_z || dbg_c || dbg_k {
                     println("X86MAP fn=" + dbg_fn + " op=" + callee + " msh=" + msh + " mt=" + m_t + " kt=" + k_t + " kk=" + kk)
                 }
                 let refined = if callee == "put" {
@@ -1765,8 +1766,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(x86gen_keys_map_native())
                 if kk == "str" {
                     ret_type = "list-str"
-                } else {
+                } else if kk == "int" {
                     ret_type = "list-int"
+                } else {
+                    // 键型未定则元素型同样未定，不能断言 int：假的 int 元素会经 put 的
+                    // 键型细化把 map 改成 int 键，之后同一张 map 上的字符串键查询退化
+                    // 成词比较，内容相等的不同对象查不到。
+                    // An undecided key kind leaves the element kind undecided too;
+                    // claiming int would let put's key refinement retype the map as
+                    // int-keyed, after which string-key lookups on it degrade to a
+                    // word compare and equal-content keys miss.
+                    ret_type = "list-"
                 }
             } else if callee == "to_float" {
                 w(mov_rm(rax, r15, 0 - 8) + cvtsi2sd_xmm(0, rax) + movq_gpr_xmm(rax, 0) + x86gen_alloc(r11, 8, GC_DESC_ALL) + mov_mr(r11, 0, rax) + mov_mr(r15, 0 - 16, r11) + shadow_set(2, GC_SHADOW_PTR) + vs_pop_n(1))
