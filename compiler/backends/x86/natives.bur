@@ -1939,16 +1939,51 @@ fn x86gen_eq_str() {
     mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + xor_rr(r10, r10) + cmp_rr(rdx, r9) + jne_rel32(str_len(cmp_body)) + cmp_body + done
 }
 
+// x86gen_eq_dyn_seg 生成「操作数可作字节串」的区间判定，0/1 落 r9：堆内
+// （[heap_start, r12)）或常量区字节串段（[img_base()+8, img_base()+x86_const_str_len)）。
+// 常量区操作数此前一律落在门外——常量串无块头，形态门必败，字符串字面量与堆串只能
+// 退化成按词比较。段首 +8 跳过首个对象的块头，段内每个操作数的 [p-8] 都落在镜像内
+// （段内只有字节串，块头由常量环逐个写出，见 x86.bur）；常量区无字节串时不生成段判定，
+// 免得空段上界（len-8 的补码）被下溢出的巨大差值当成命中。
+// 需 r8 已载入 heap_start；只动 rdi/rsi/r9/r11。
+// x86gen_eq_dyn_seg emits the "operand can be a byte string" range test, leaving 0/1
+// in r9: in-heap ([heap_start, r12)) or in the constant area's byte-string segment
+// ([img_base()+8, img_base()+x86_const_str_len)). A constant-area operand used to
+// always fall outside — constant strings carried no block header, so the shape test
+// could never accept them, and a string literal degraded to a word compare against a
+// heap string. The +8 skips the first object's block header, so an admitted operand's
+// [p-8] always lands inside the image (the segment holds byte strings only, each with a
+// header written by the const loop, see x86.bur). When the constant area has no byte
+// strings the segment test is not emitted at all — with an empty segment the bound
+// (len-8 in two's complement) would let a wrapped large difference read as a hit.
+// r8 must already hold heap_start; clobbers rdi/rsi/r9/r11.
+fn x86gen_eq_dyn_seg(R) {
+    // 堆内：R - heap_start < r12 - heap_start（无符号）
+    // in-heap: R - heap_start < r12 - heap_start (unsigned)
+    // setcc 只写低字节，rex 又只按寄存器号补前缀——低寄存器（dl 之外）会落到 bh 那类
+    // 同名槽位，置位寄存器一律取 r9/r11（≥8，前缀必到）。命中标志最终落在 r9。
+    // setcc writes the low byte only and rex() adds a prefix by register number, so a low
+    // register (anything but dl) lands on a same-numbered byte slot like bh; the flag
+    // registers are therefore r9/r11 (>= 8, prefix always emitted). The hit flag ends in r9.
+    let in_heap = xor_rr(r9, r9) + mov_rr(rsi, R) + sub_rr(rsi, r8) + mov_rr(r11, r12) + sub_rr(r11, r8) + cmp_rr(rsi, r11) + setb(r9)
+    if x86_const_str_len <= 8 {
+        return in_heap
+    }
+    // 常量区字节串段：R - (img_base()+8) < const_str_len - 8
+    // constant byte-string segment: R - (img_base()+8) < const_str_len - 8
+    in_heap + xor_rr(r11, r11) + mov_rr(rsi, R) + mov_ri64(rdi, img_base() + 8) + sub_rr(rsi, rdi) + cmp_ri32(rsi, x86_const_str_len - 8) + setb(r11) + or_rr(r9, r11)
+}
+
 // x86gen_eq_dyn 生成类型未知时的相等/不等比较：词相等即按词判（int 与同一对象都成立）；
-// 词不等时，只有两侧都是「字节串」对象（堆内 + noscan 描述符 + 载荷恰为 8 + 圆整长度）
-// 才按内容比较，其余保持按词不等——列表/记录/元组/盒子的载荷形状与字节串不合，不会误入
-// 内容比较。
+// 词不等时，只有两侧都是「字节串」对象（堆内或常量区字节串段 + noscan 描述符 + 载荷恰为
+// 8 + 圆整长度）才按内容比较，其余保持按词不等——列表/记录/元组/盒子的载荷形状与字节串
+// 不合，不会误入内容比较。
 // x86gen_eq_dyn emits an equality/inequality compare for operands the model cannot
 // type: equal words decide as words (ints and identical objects both hold); when the
-// words differ, only two byte-string objects (in-heap, noscan desc, payload exactly
-// 8 + the rounded length) compare by content; everything else stays not-equal on the
-// words — lists, records, tuples and boxes fail the byte-string shape test and never
-// take the content path.
+// words differ, only two byte-string objects (in-heap or in the constant area's
+// byte-string segment, noscan desc, payload exactly 8 + the rounded length) compare by
+// content; everything else stays not-equal on the words — lists, records, tuples and
+// boxes fail the byte-string shape test and never take the content path.
 fn x86gen_eq_dyn(neg) {
     // 默认结果：词不等（neq 真、eq 假）；词相等时取反
     // default result: the words differ (true for neq, false for eq); inverted when equal
@@ -1985,12 +2020,14 @@ fn x86gen_eq_dyn(neg) {
     seq = mov_rm(rdx, rax, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rax, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
     seq = mov_rm(r8, rcx, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
     seq = mov_rm(r8, rax, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
-    // 两个操作数都要落在 [堆底, 堆顶) 内：堆外的值只可能是整数，按词比较
-    // both operands must sit in [heap_start, bump): anything outside is a plain int
-    seq = cmp_rr(rcx, r12) + jae_rel32(str_len(seq)) + seq
-    seq = cmp_rr(rcx, r8) + jb_rel32(str_len(seq)) + seq
-    seq = cmp_rr(rax, r12) + jae_rel32(str_len(seq)) + seq
-    seq = mov_ri64(r8, rt_slot(rt_heap_start)) + mov_rm(r8, r8, 0) + cmp_rr(rax, r8) + jb_rel32(str_len(seq)) + seq
+    // 两个操作数都要落在「字节串可寻址区间」内：堆内或常量区字节串段；区间外的值
+    // 只可能是整数，保持按词比较。
+    // Both operands must sit in a byte-string addressable region: the heap or the
+    // constant area's byte-string segment; anything outside can only be a plain int
+    // and stays on the word compare.
+    seq = x86gen_eq_dyn_seg(rcx) + test_rr(r9, r9) + je_rel32(str_len(seq)) + seq
+    seq = x86gen_eq_dyn_seg(rax) + test_rr(r9, r9) + je_rel32(str_len(seq)) + seq
+    seq = mov_ri64(r8, rt_slot(rt_heap_start)) + mov_rm(r8, r8, 0) + seq
     let jmp_tail = jmp_rel32(str_len(seq))
     init + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + jne_rel32(str_len(same) + str_len(jmp_tail)) + same + jmp_tail + seq + tail
 }

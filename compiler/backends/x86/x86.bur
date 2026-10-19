@@ -46,74 +46,121 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
     // unchanged — join preserves order, offsets come from a running length.
     let mut const_parts = []
     let mut const_len = 0
-    let mut sf = 0
-    while sf < nfn {
-        let consts = f_consts[sf]
-        let mut ci = 0
-        while ci < len(consts) {
-            match consts[ci] {
-                lib::CVal::CStr(s) => {
-                    let key = const_slot_key(sf, ci)
-                    let dup = match get(const_slot_map, key) {
-                        Some(_) => true,
-                        None => false,
-                    }
-                    if !dup {
-                        put(const_slot_map, key, const_len)
-                        let raw = e8(str_len(s)) + s
-                        push(const_parts, raw)
-                        const_len = const_len + str_len(raw)
-                        let pad = (8 - const_len % 8) % 8
-                        if pad > 0 {
-                            push(const_parts, x86_zeros(pad))
-                            const_len = const_len + pad
+    // 两遍过常量：第一遍字节串，第二遍枚举常量。eq_dyn 的类型未知比较只在「字节串段」
+    // 内认常量区操作数（见 natives.bur 的段判定），把串铺成全常量区最前的连续段，段内
+    // 就不会混进枚举常量；段末偏移即门的上界 x86_const_str_len（见 layout.bur）。
+    // Two passes over the constants: byte strings first, enum constants second.
+    // eq_dyn's unknown-typed compare accepts constant-area operands only inside the
+    // byte-string segment (see the segment test in natives.bur). Laying the strings out
+    // as the contiguous head of the constant area keeps enum constants out of that
+    // segment; the segment's end offset is the gate's upper bound, x86_const_str_len
+    // (see layout.bur).
+    let mut cph = 0
+    while cph < 2 {
+        let mut sf = 0
+        while sf < nfn {
+            let consts = f_consts[sf]
+            let mut ci = 0
+            while ci < len(consts) {
+                match consts[ci] {
+                    lib::CVal::CStr(s) => {
+                        // 第一遍只铺字节串：常量区最前的连续段，段内每个对象都带块头
+                        // [size:40][desc:22]（size = 圆整后载荷长 = 堆上字节串的 alloc
+                        // 尺寸；desc = GC_DESC_ALL = noscan，与堆上字节串同一挂法——常量环
+                        // 跑在 desc_reset 之前，运行期注册的 noscan id 尚不可知，两者同值
+                        // 0），载荷 [len:8][bytes][pad] 与堆上字节串逐字节同形，eq_dyn 的
+                        // 字节串形态门才认得出常量区操作数：无头时字符串字面量与堆串按内容
+                        // 比较永远走不到，退化成按词比较。const_slot_map 记载荷地址（块头后
+                        // +8），const_addr 由此定位载荷，运行期读 [p+0] 长度 / [p+8] 字节。
+                        // The first pass lays byte strings only: the contiguous segment at
+                        // the head of the constant area, where every object carries a block
+                        // header [size:40][desc:22] (size = the rounded payload length = a
+                        // heap byte string's alloc size; desc = GC_DESC_ALL = noscan, the
+                        // same desc heap byte strings carry — the const loop runs before
+                        // desc_reset, so the runtime-registered noscan id is not known yet,
+                        // but the two share the value 0). The payload [len:8][bytes][pad] is
+                        // byte-for-byte the heap byte-string shape, which is what lets
+                        // eq_dyn's byte-string shape gate accept a constant-area operand:
+                        // headerless, a string literal could never reach the content compare
+                        // and degraded to a word compare. const_slot_map records the payload
+                        // address (header + 8), so const_addr lands on the payload and the
+                        // runtime reads [p+0] length / [p+8] bytes.
+                        if cph == 0 {
+                            let key = const_slot_key(sf, ci)
+                            let dup = match get(const_slot_map, key) {
+                                Some(_) => true,
+                                None => false,
+                            }
+                            if !dup {
+                                put(const_slot_map, key, const_len + 8)
+                                let blen = 8 + str_len(s)
+                                let bpad = (8 - blen % 8) % 8
+                                let bsz = blen + bpad
+                                let raw = e8s(bsz + GC_DESC_ALL * GC_DESC_SHIFT) + e8(str_len(s)) + s
+                                push(const_parts, raw)
+                                const_len = const_len + str_len(raw)
+                                if bpad > 0 {
+                                    push(const_parts, x86_zeros(bpad))
+                                    const_len = const_len + bpad
+                                }
+                            }
                         }
-                    }
-                },
-                lib::CVal::CEnumType(_) => {
-                    let ek = enum_const_key(consts[ci])
-                    match get(enum_const_map, ek) {
-                        Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
-                        None => {
-                            put(enum_const_map, ek, const_len)
-                            put(const_slot_map, const_slot_key(sf, ci), const_len)
-                            let raw = enum_const_bytes(consts[ci])
-                            push(const_parts, raw)
-                            const_len = const_len + str_len(raw)
-                        },
-                    }
-                },
-                lib::CVal::CSingleton(_, _) => {
-                    let ek = enum_const_key(consts[ci])
-                    match get(enum_const_map, ek) {
-                        Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
-                        None => {
-                            put(enum_const_map, ek, const_len)
-                            put(const_slot_map, const_slot_key(sf, ci), const_len)
-                            let raw = enum_const_bytes(consts[ci])
-                            push(const_parts, raw)
-                            const_len = const_len + str_len(raw)
-                        },
-                    }
-                },
-                lib::CVal::CCtor(_, _) => {
-                    let ek = enum_const_key(consts[ci])
-                    match get(enum_const_map, ek) {
-                        Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
-                        None => {
-                            put(enum_const_map, ek, const_len)
-                            put(const_slot_map, const_slot_key(sf, ci), const_len)
-                            let raw = enum_const_bytes(consts[ci])
-                            push(const_parts, raw)
-                            const_len = const_len + str_len(raw)
-                        },
-                    }
-                },
-                _ => {},
+                    },
+                    lib::CVal::CEnumType(_) => {
+                        if cph == 1 {
+                            let ek = enum_const_key(consts[ci])
+                            match get(enum_const_map, ek) {
+                                Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
+                                None => {
+                                    put(enum_const_map, ek, const_len)
+                                    put(const_slot_map, const_slot_key(sf, ci), const_len)
+                                    let raw = enum_const_bytes(consts[ci])
+                                    push(const_parts, raw)
+                                    const_len = const_len + str_len(raw)
+                                },
+                            }
+                        }
+                    },
+                    lib::CVal::CSingleton(_, _) => {
+                        if cph == 1 {
+                            let ek = enum_const_key(consts[ci])
+                            match get(enum_const_map, ek) {
+                                Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
+                                None => {
+                                    put(enum_const_map, ek, const_len)
+                                    put(const_slot_map, const_slot_key(sf, ci), const_len)
+                                    let raw = enum_const_bytes(consts[ci])
+                                    push(const_parts, raw)
+                                    const_len = const_len + str_len(raw)
+                                },
+                            }
+                        }
+                    },
+                    lib::CVal::CCtor(_, _) => {
+                        if cph == 1 {
+                            let ek = enum_const_key(consts[ci])
+                            match get(enum_const_map, ek) {
+                                Some(off) => put(const_slot_map, const_slot_key(sf, ci), off),
+                                None => {
+                                    put(enum_const_map, ek, const_len)
+                                    put(const_slot_map, const_slot_key(sf, ci), const_len)
+                                    let raw = enum_const_bytes(consts[ci])
+                                    push(const_parts, raw)
+                                    const_len = const_len + str_len(raw)
+                                },
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+                ci = ci + 1
             }
-            ci = ci + 1
+            sf = sf + 1
         }
-        sf = sf + 1
+        if cph == 0 {
+            x86_const_str_len = const_len
+        }
+        cph = cph + 1
     }
     let mut record_encs = []
     let mut record_offs = []
