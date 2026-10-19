@@ -1693,14 +1693,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 }
                 // 键比较策略：map 的键类型是声明性事实，而被查键的影子可能是未收敛的
                 // 默认 int——从 `[]` 起家的表和经 upvalue 读出的元素都会落到那里。
-                // 良类型程序里键必与 map 的键同型，故任一侧为 str 即按内容比较；
-                // 两侧都判不出键类型时保持原来的 int 兜底。
+                // 良类型程序里键必与 map 的键同型，故任一侧为 str 即按内容比较、为 int
+                // 按词比较；两侧都判不出键类型时走动态比较（词相等或字节串内容相等即
+                // 命中），与 VM/C 的动态键语义一致。
                 // key-compare strategy: the map's key type is a declarative fact,
                 // while the key operand's shadow may be an unconverged default (int) —
                 // tables built from `[]` and elements read through an upvalue land
                 // there. In a well-typed program the key shares the map's key type, so
-                // a str on either side selects the content compare; when neither side
-                // determines the key type, keep the int fallback.
+                // a str on either side selects the content compare and an int the word
+                // compare; when neither side determines the key type the dynamic
+                // compare takes over (a word hit or equal byte-string content),
+                // matching the VM/C dynamic key semantics.
                 let mk_t = map_key_type(m_t)
                 let kk = if k_t == "str" || mk_t == "str" {
                     "str"
@@ -1710,7 +1713,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     ""
                 }
                 if callee == "get" {
-                    w(x86gen_get_map_native(kk == "str"))
+                    w(x86gen_get_map_native(kk))
                     let v_kind = map_val_type(m_t)
                     if v_kind == "" || v_kind == "closure" {
                         ret_type = "enum"
@@ -1718,10 +1721,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         ret_type = enum_payload_enc_ctx(ctx, "Option", [[v_kind]])
                     }
                 } else if callee == "put" {
-                    w(x86gen_put_map_native(kk == "str"))
+                    w(x86gen_put_map_native(kk))
                     ret_type = "unit"
                 } else {
-                    w(x86gen_delete_map_native(kk == "str"))
+                    w(x86gen_delete_map_native(kk))
                     ret_type = "unit"
                 }
                 let msh = shadow[len(shadow) - n]

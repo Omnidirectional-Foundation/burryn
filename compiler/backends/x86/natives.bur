@@ -596,20 +596,72 @@ fn x86gen_list_format_at(off, elem_type, elem_code, ff_h) {
     h1 + test1 + sep1 + e1_load + tail1 + next1 + alloc_zone + test2 + sep2 + e2_load + tail2 + next2 + endfill
 }
 
+// x86gen_map_key_dyn 生成键类型未知时的键相等判据：先按词判等（int 与同一对象都成立）；
+// 词不等时仅当两侧都是字节串对象（x86gen_eq_dyn_seg 的区间判定 + noscan 描述符 + 载荷恰为
+// 8 + 圆整长度）才按内容比较，其余保持不等——与 VM/C 的动态键语义一致（str 按内容、int 按值）。
+// 命中跳 hit_off（自片段末尾算起，即越过调用方 advance 之后的命中块）；未命中落到片段末尾
+// （调用方的 advance）。保存 r8/r9/r11（调用方的表内计数/游标与下标），r10 不动；a_reg 为
+// 表内键、b_reg 为查询键，rdx 携结果标志。
+// x86gen_map_key_dyn emits the key-equality test for an unknown key kind: the words decide
+// first (holds for ints and for the same object); when they differ, only two byte-string
+// objects (x86gen_eq_dyn_seg's range test + noscan desc + payload exactly 8 + the rounded
+// length) compare by content, everything else stays unequal — the VM/C dynamic key
+// semantics (str by content, int by value). A hit jumps hit_off (measured from the
+// fragment's end, i.e. past the caller's advance to the hit block); a miss falls through to
+// the fragment's end (the caller's advance). r8/r9/r11 (the caller's in-table count/cursors
+// and index) are saved, r10 is untouched; a_reg holds the stored key, b_reg the query key,
+// rdx carries the result flag.
+fn x86gen_map_key_dyn(a_reg, b_reg, hit_off) {
+    // 出口：命中置 1 后跳过未命中块，未命中置 0；恢复保存的寄存器，rdx 非零即跳命中块
+    // exits: a hit stores 1 and skips the miss block, a miss stores 0; the saved registers
+    // are restored and a nonzero rdx jumps to the hit block
+    let miss = xor_rr(rdx, rdx)
+    let hit = mov_ri64(rdx, 1) + jmp_rel32(str_len(miss))
+    let restore = pop_r(r11) + pop_r(r9) + pop_r(r8) + test_rr(rdx, rdx) + jne_rel32(hit_off)
+    let fail_tail = str_len(miss) + str_len(restore)
+    let mut seq = hit + miss + restore
+    // 内容比较：rdx 由长度门载入 a 的字节数，repe_cmpsb 用它作计数
+    // content compare: the length gate left a's byte count in rdx, repe_cmpsb counts it
+    seq = lea(rsi, rcx, 8) + lea(rdi, b_reg, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + jne_rel32(str_len(seq) - fail_tail) + seq
+    // 长度必须相等：两侧各取自己的长度字 / the lengths must match: each side contributes its length word
+    seq = mov_rm(rdx, rcx, 0) + mov_rm(r9, b_reg, 0) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq) - fail_tail) + seq
+    // 两侧载荷都是 8 + 圆整长度、描述符都是 noscan：字节串形状
+    // both payloads are 8 + the rounded length with a noscan desc: the byte-string shape
+    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq) - fail_tail) + seq
+    seq = mov_rm(rdx, b_reg, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, b_reg, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq) - fail_tail) + seq
+    seq = mov_rm(r8, rcx, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq) - fail_tail) + seq
+    seq = mov_rm(r8, b_reg, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq) - fail_tail) + seq
+    // 两侧都要落在「字节串可寻址区间」内：区间外的值只可能是整数，保持按词比较
+    // both sides must sit in a byte-string addressable region; anything outside can only
+    // be a plain int and stays on the word compare
+    seq = x86gen_eq_dyn_seg(rcx) + test_rr(r9, r9) + je_rel32(str_len(seq) - fail_tail) + seq
+    seq = x86gen_eq_dyn_seg(b_reg) + test_rr(r9, r9) + je_rel32(str_len(seq) - fail_tail) + seq
+    seq = mov_ri64(r8, rt_slot(rt_heap_start)) + mov_rm(r8, r8, 0) + seq
+    seq = mov_rr(rcx, a_reg) + seq
+    seq = push_r(r8) + push_r(r9) + push_r(r11) + seq
+    // 词相等直接命中，否则进入动态判定
+    // equal words hit directly, otherwise the dynamic test runs
+    cmp_rr(a_reg, b_reg) + je_rel32(str_len(seq) + hit_off) + seq
+}
+
 // x86gen_get_map_native 内联 get：按键查 map / x86gen_get_map_native inlines get: look up a map key
 // get inline: lookup by key
-fn x86gen_get_map_native(key_is_str) {
+// cmp_mode 取 "str"/"int"/""（"" 即键类型未知，走动态比较）
+// cmp_mode is "str"/"int"/"" (empty means an unknown key kind → the dynamic compare)
+fn x86gen_get_map_native(cmp_mode) {
     let some_body = mov_rm(rax, r9, 0) + x86gen_alloc(rcx, 24, desc_box_ptr) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 0) + mov_mr(rcx, 8, rdx) + mov_mr(rcx, 16, rax) + mov_mr(r15, 0 - 24, rcx) + shadow_set(3, GC_SHADOW_PTR) + vs_pop_n(2)
     let none = x86gen_alloc(rcx, 16, desc_noscan) + mov_ri64(rdx, 0) + mov_mr(rcx, 0, rdx) + mov_ri64(rdx, 1) + mov_mr(rcx, 8, rdx) + mov_mr(r15, 0 - 24, rcx) + shadow_set(3, GC_SHADOW_PTR) + vs_pop_n(2) + jmp_rel32(str_len(some_body))
     let advance = add_ri32(r10, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
     let access = mov_rm(rdx, r10, 0)
-    let body = if key_is_str {
+    let body = if cmp_mode == "str" {
         let klen = mov_rm(rcx, rax, 0)
         let clen = mov_rm(rdi, rdx, 0)
         let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(none))
         access + mov_rm(rax, r15, 0 - 8) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
-    } else {
+    } else if cmp_mode == "int" {
         access + mov_rm(rax, r15, 0 - 8) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(none))
+    } else {
+        access + mov_rm(rax, r15, 0 - 8) + x86gen_map_key_dyn(rdx, rax, str_len(advance) + 5 + str_len(none))
     }
     let loop_head = cmp_rr(r11, r8) + jae_rel32(str_len(body) + str_len(advance) + 5)
     let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
@@ -619,7 +671,8 @@ fn x86gen_get_map_native(key_is_str) {
 
 // x86gen_delete_map_native 内联 delete：删除键 / x86gen_delete_map_native inlines delete: remove a key
 // delete inline: remove a key
-fn x86gen_delete_map_native(key_is_str) {
+// cmp_mode 同 x86gen_get_map_native / cmp_mode as in x86gen_get_map_native
+fn x86gen_delete_map_native(cmp_mode) {
     let finish = xor_rr(rax, rax) + mov_mr(r15, 0 - 24, rax) + vs_pop_n(2)
     let kshift = mov_rr(rsi, r8) + add_ri32(rsi, 8) + mov_rr(rdi, r8) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + mov_rr(rcx, rdx) + rep_movsb()
     let keys_block = mov_rr(rdx, r10) + sub_rr(rdx, r11) + sub_ri32(rdx, 1) + test_rr(rdx, rdx) + jle_rel32(str_len(kshift)) + kshift
@@ -630,13 +683,15 @@ fn x86gen_delete_map_native(key_is_str) {
     let not_found = jmp_rel32(str_len(found_body))
     let advance = add_ri32(r8, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
     let access = mov_rm(rdx, r8, 0)
-    let body = if key_is_str {
+    let body = if cmp_mode == "str" {
         let klen = mov_rm(rcx, rax, 0)
         let clen = mov_rm(rdi, rdx, 0)
         let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(not_found))
         access + mov_rm(rax, r15, 0 - 8) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
-    } else {
+    } else if cmp_mode == "int" {
         access + mov_rm(rax, r15, 0 - 8) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(not_found))
+    } else {
+        access + mov_rm(rax, r15, 0 - 8) + x86gen_map_key_dyn(rdx, rax, str_len(advance) + 5 + str_len(not_found))
     }
     let loop_head = cmp_rr(r11, r10) + jae_rel32(str_len(body) + str_len(advance) + 5)
     let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
@@ -721,19 +776,22 @@ fn x86gen_keys_map_native() {
 
 // x86gen_put_map_native 内联 put：插入或更新键 / x86gen_put_map_native inlines put: insert or update a key
 // put inline: insert or update a key
-fn x86gen_put_map_native(key_is_str) {
+// cmp_mode 同 x86gen_get_map_native / cmp_mode as in x86gen_get_map_native
+fn x86gen_put_map_native(cmp_mode) {
     let done = xor_rr(rax, rax) + mov_mr(r15, 0 - 32, rax) + vs_pop_n(3)
     let found = mov_rm(rax, r15, 0 - 8) + mov_mr(r9, 0, rax)
     let not_found = mov_rm(rax, r15, 0 - 24) + mov_rm(rsi, rax, 16) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(rsi, rdx) + mov_rm(r8, r15, 0 - 16) + mov_mr(rsi, 0, r8) + mov_rm(r9, rax, 24) + mov_rm(rdx, rax, 0) + xor_rr(rcx, rcx) + add_ri32(rcx, 3) + shl_rcl(rdx) + add_rr(r9, rdx) + mov_rm(r8, r15, 0 - 8) + mov_mr(r9, 0, r8) + mov_rm(rdx, rax, 0) + add_ri32(rdx, 1) + mov_mr(rax, 0, rdx) + jmp_rel32(str_len(found))
     let advance = add_ri32(r8, 8) + add_ri32(r9, 8) + add_ri32(r11, 1)
     let access = mov_rm(rdx, r8, 0)
-    let body = if key_is_str {
+    let body = if cmp_mode == "str" {
         let klen = mov_rm(rcx, rax, 0)
         let clen = mov_rm(rdi, rdx, 0)
         let cmpsb_je = lea(rsi, rdx, 8) + lea(rdi, rax, 8) + repe_cmpsb() + je_rel32(str_len(advance) + 5 + str_len(not_found))
         access + mov_rm(rax, r15, 0 - 16) + klen + clen + cmp_rr(rcx, rdi) + jne_rel32(str_len(cmpsb_je)) + cmpsb_je
-    } else {
+    } else if cmp_mode == "int" {
         access + mov_rm(rax, r15, 0 - 16) + cmp_rr(rdx, rax) + je_rel32(str_len(advance) + 5 + str_len(not_found))
+    } else {
+        access + mov_rm(rax, r15, 0 - 16) + x86gen_map_key_dyn(rdx, rax, str_len(advance) + 5 + str_len(not_found))
     }
     let loop_head = cmp_rr(r11, r10) + jae_rel32(str_len(body) + str_len(advance) + 5)
     let back = jmp_rel32(0 - (str_len(loop_head) + str_len(body) + str_len(advance) + 5))
