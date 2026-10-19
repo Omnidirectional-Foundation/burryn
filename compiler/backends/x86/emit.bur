@@ -4035,10 +4035,21 @@ fn find_fn_by_name(f_name, name) {
 }
 
 // map_key_type 取 map 键类型 / map_key_type extracts the map key type
+// 键是 map-<键>[-<值>] 的首段，按前缀判而不枚举值类型：值类型是开放集（bool、
+// list-…、enum:…、record:…、tup:…），枚举漏项会把已精化的键类型读成未知，merge_type
+// 随后按裸 map 处理、把键类型丢回 "map"——map-str-bool 与自身并合都掉成 map，聚合
+// 求解拿不到稳定态，map 的键比较与 keys() 的元素类型跟着退化。
+// The key is the first segment of map-<key>[-<val>]; match by prefix instead of
+// enumerating value kinds: the value kind is an open set (bool, list-…, enum:…,
+// record:…, tup:…), and a missing entry reads a refined key kind as unknown, so
+// merge_type treats the type as a bare map and drops the key kind back to "map" —
+// map-str-bool merged with itself already falls to map. The aggregation solve then
+// has no stable state, and the map key compares and keys() element kinds degrade
+// with it.
 fn map_key_type(t) {
-    if t == "map-str" || t == "map-str-int" || t == "map-str-str" || t == "map-str-float" || t == "map-str-closure" {
+    if str_len(t) >= 7 && substr(t, 0, 7) == "map-str" {
         "str"
-    } else if t == "map-int" || t == "map-int-str" || t == "map-int-int" || t == "map-int-float" || t == "map-int-closure" {
+    } else if str_len(t) >= 7 && substr(t, 0, 7) == "map-int" {
         "int"
     } else {
         ""
@@ -4046,6 +4057,11 @@ fn map_key_type(t) {
 }
 
 // map_val_type 取 map 值类型 / map_val_type extracts the map value type
+// 与 map_key_type 的前缀判不同，这里保持枚举：值类型决定 get 的 Option 编码（v_kind
+// 影响 enum_payload_enc 与 Option 展开），放宽会把已定型 map 的取值路径一并改掉。
+// Unlike map_key_type's prefix match this stays enumerated: the value kind decides
+// get's Option encoding (v_kind feeds enum_payload_enc and the Option unrolling), and
+// broadening it would change the extraction path of already-typed maps.
 fn map_val_type(t) {
     if t == "map-str-int" || t == "map-int-int" {
         "int"
