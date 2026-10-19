@@ -594,10 +594,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(x86gen_enum_eq_at(ctx, eq_enc2))
             } else if sa_eq == "float" && sb_eq == "float" {
                 w(x86gen_float_cmp("eq"))
-            } else if sa_eq == "" || sb_eq == "" {
-                // 类型未知：静态分不出 int 路径与 str 路径，按运行时形状定案
-                // unknown type: the int and str paths cannot be told apart statically, so
-                // the runtime shape decides
+            } else if sa_eq == "" || sb_eq == "" || sa_eq != sb_eq {
+                // 影子不一致或未知：两侧独立判型给出不同的结论（如一侧 int、一侧 str），
+                // 说明至少一侧是未收敛的默认值，静态分不出 int 路径与 str 路径，按运行时
+                // 形状定案。
+                // shadows disagree or are unknown: two independent reads reached different
+                // conclusions (say int on one side, str on the other), so at least one is an
+                // unconverged default and the int and str paths cannot be told apart
+                // statically; the runtime shape decides.
                 w(x86gen_eq_dyn(false))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + sete(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -647,9 +651,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 w(x86gen_enum_eq_at(ctx, neq_enc2) + mov_rm(rax, r15, 0 - 8) + test_rr(rax, rax) + sete(r8) + mov_mr(r15, 0 - 8, r8))
             } else if sa_neq == "float" && sb_neq == "float" {
                 w(x86gen_float_cmp("neq"))
-            } else if sa_neq == "" || sb_neq == "" {
-                // 同 op_eq：类型未知时按运行时形状定案
-                // as in op_eq: an unknown type is settled by the runtime shape
+            } else if sa_neq == "" || sb_neq == "" || sa_neq != sb_neq {
+                // 同 op_eq：影子不一致或未知时按运行时形状定案
+                // as in op_eq: disagreeing or unknown shadows are settled by the runtime shape
                 w(x86gen_eq_dyn(true))
             } else {
                 w(xor_rr(rdx, rdx) + mov_rm(rax, r15, 0 - 16) + mov_rm(rcx, r15, 0 - 8) + cmp_rr(rax, rcx) + setne(rdx) + mov_mr(r15, 0 - 16, rdx) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_SCALAR))
@@ -1691,23 +1695,24 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     ""
                 }
-                // 键比较策略：任一侧为 str 即按内容比较；词比较只由 map 侧的 int 键
-                // 型决定——被查键的影子可能是未收敛的默认 int（从 `[]` 起家的表和经
-                // upvalue 读出的元素都会落到那里），单凭它不足以选词比较。map 侧判
-                // 不出键型时走动态比较（词相等或字节串内容相等即命中），对真 int 键
-                // 同样成立，与 VM/C 的动态键语义一致。
-                // key-compare strategy: a str on either side selects the content
-                // compare; the word compare is chosen only by an int key type on the
-                // map side — the key operand's shadow may be an unconverged default
-                // (int), which is not evidence enough (tables built from `[]` and
-                // elements read through an upvalue land there). When the map side is
-                // undecided the dynamic compare takes over (a word hit or equal
-                // byte-string content) — also correct for real int keys — matching the
-                // VM/C dynamic key semantics.
+                // 键比较策略：两侧影子同为 str 才按内容比较、同为 int 才按词比较。
+                // 单侧影子不足以选定解引用路径——map 的键型可能被 put 的假 int 键
+                // （`[]` 起家的表和 upvalue 读出的元素会落到 int）细化成 int，被查
+                // 键的影子也可能是同样的未收敛默认值；两侧不一致时走动态比较（词
+                // 相等或字节串内容相等即命中），对真 int 键同样成立，与 VM/C 的动态
+                // 键语义一致。
+                // key-compare strategy: content-compare only when both shadows say
+                // str, word-compare only when both say int. One side alone cannot
+                // select the dereferencing path — a map's key kind may have been
+                // refined to int by a put's fake int key (tables built from `[]` and
+                // elements read through an upvalue land there), and the looked-up key's
+                // shadow may be the same unconverged default. Disagreement falls back to
+                // the dynamic compare (a word hit or equal byte-string content), which
+                // also holds for real int keys, matching the VM/C dynamic key semantics.
                 let mk_t = map_key_type(m_t)
-                let kk = if k_t == "str" || mk_t == "str" {
+                let kk = if k_t == "str" && mk_t == "str" {
                     "str"
-                } else if mk_t == "int" {
+                } else if k_t == "int" && mk_t == "int" {
                     "int"
                 } else {
                     ""
@@ -4117,7 +4122,17 @@ fn refine_map_arg(arg_t, k, v) {
     if arg_t == "" || is_map_type(arg_t) {
         let cur_k = map_key_type(arg_t)
         let cur_v = map_val_type(arg_t)
-        let new_k = if k != "" {
+        // 键型只有 int 与 str 两种；其他影子（未定、或键表达式给出的 list-/bool/
+        // 枚举等噪声）都不是可写进 map 类型的键型，保持原键型。代表性的是
+        // `for k in keys(m) { put(out, k, true) }`：m 键型未定时循环变量带着
+        // "list-" 之类的容器标签，写进类型会拼出 map-list--bool 这种伪类型。
+        // only int and str are key kinds; any other shadow (undecided, or noise such
+        // as list-/bool/enum from the key expression) is not a key kind and the
+        // existing one is kept. The typical case is
+        // `for k in keys(m) { put(out, k, true) }`: with an undecided key kind the
+        // loop variable carries a container tag like "list-", which would spell a
+        // pseudo-type such as map-list--bool.
+        let new_k = if k == "str" || k == "int" {
             k
         } else {
             cur_k
