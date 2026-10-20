@@ -110,26 +110,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     }
     // w_fmt 把 [r15+off] 的值按类型 t 就地格式化为字符串 / w_fmt formats the value at
     // [r15+off] in place into a string by type t
-    fn w_fmt(off, t) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl, ref shadow) {
-        // 诊断：按枚举类型格式化某个值。递归枚举的变体载荷本就是自身编码，所以
-        // 「字段类型等于自身」不是判据；格式化调用点是唯一能点名的位置——影子
-        // 猜错时格式化器会把标量当对象解引用。实参的位置键一并打出，定位被污染
-        // 的槽。
-        // diagnostic: a value formatted under an enum type. A recursive enum
-        // legitimately carries its own encoding as a field type, so "the field
-        // type equals the receiver" is no verdict; the format call is the only
-        // place that names the site — when the shadow is wrong the formatter
-        // dereferences a scalar as an object. The argument's location key comes
-        // out too, to name the polluted slot.
-        if is_enum_enc(t) {
-            let k = 0 - off / 8
-            let loc = if k > 0 && len(shadow) >= k {
-                shadow[len(shadow) - k]
-            } else {
-                ""
-            }
-            eprintln("X86ENUMFMT fn=" + ctx.f_name[fh] + " loc=" + loc + " t=" + t)
-        }
+    fn w_fmt(off, t) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl) {
         let lbl = fmt_label(ctx, fmtg, t, false)
         w(fmt_top_pre(off, t) + e1(232))
         push(fmt_call_pos, cur_byte())
@@ -1142,21 +1123,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // than landing as int — a scalar kind plus a wrong type shadow drops a
             // pointer payload from the scan.
             if !gf_known {
-                // 诊断：字段类型只能靠猜时打印现场（接收者影子与所用字段号），以便
-                // 定位形态解析失败的位置；行为不变。
-                // diagnostic: print the site whenever the field type had to be guessed
-                // (receiver shadow and the index used) to locate shape-resolution
-                // failures; behaviour unchanged.
-                if len(ctx.f_code) > 200 {
-                    let mut gf_d = gf_rt
-                    match str_index_of(gf_rt, "\n") {
-                        Some(_) => {
-                            gf_d = "<" + str(str_len(gf_rt)) + ">"
-                        },
-                        None => {},
-                    }
-                    eprintln("X86FIELDI fn=" + ctx.f_name[fh] + " idx=" + str(fidx) + " rec=" + str(is_record_type(gf_rt)) + " rt=" + gf_d)
-                }
                 gf_t = ""
             }
             // gf_t 先算后发：TOS 置换的 kind 随写随落影
@@ -2414,35 +2380,13 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 fidx = find_field_in_enc(record_schema(g_rt0), fname)
             }
             if fidx < 0 {
-                // 诊断：接收者形态没解出字段号时只能落全局首命中，后者可能把别的形
-                // 态的槽号套上来。打印现场（含各形态是否对该名给出不同槽号）以便定
-                // 位；行为不变。
-                // diagnostic: a receiver-shape miss falls back to the global first match,
-                // which may apply another shape's slot number. Print the site (including
-                // whether shapes disagree on the index) to locate it; behaviour unchanged.
-                let gf_schema = record_schema(g_rt0)
-                let mut gf_amb = "none"
                 let mut fi = 0
-                while fi < len(record_encs) {
+                while fi < len(record_encs) && fidx < 0 {
                     let fi2 = find_field_in_enc(record_encs[fi], fname)
                     if fi2 >= 0 {
-                        if fidx < 0 {
-                            fidx = fi2
-                        } else if fi2 != fidx {
-                            gf_amb = "AMBIG"
-                        }
+                        fidx = fi2
                     }
                     fi = fi + 1
-                }
-                if len(ctx.f_code) > 200 {
-                    let mut gf_desc = gf_schema
-                    match str_index_of(gf_schema, "\n") {
-                        Some(_) => {
-                            gf_desc = "<" + str(str_len(gf_schema)) + ">"
-                        },
-                        None => {},
-                    }
-                    eprintln("X86FIELD fn=" + ctx.f_name[fh] + " field=" + fname + " rec=" + str(is_record_type(g_rt0)) + " schema=" + gf_desc + " idx=" + str(fidx) + " " + gf_amb)
                 }
             }
             if fidx >= 0 {
