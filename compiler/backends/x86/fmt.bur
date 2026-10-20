@@ -226,6 +226,20 @@ fn fmt_nested(ctx: X86Ctx, mut g: FmtGen, mut it, boff, load, t) {
     push(it, la_b(vs_pop_n(1)))
 }
 
+// fmt_obj_gate 发射「值必须是对象指针」的闸：任何映射里的对象地址
+// 都不低于 MIN_OBJECT_ADDR，低于该界的值是被当成指针的标量——按运行时
+// 错误报出，并带上源码回溯
+// fmt_obj_gate emits the "the value must be an object pointer" gate: no
+// object's address in any mapping is below MIN_OBJECT_ADDR, so a value under
+// that bound is a scalar taken for a pointer — report it as a runtime error
+// with the source backtrace
+fn fmt_obj_gate(mut it, t, lbl) {
+    push(it, la_b(mov_rm(rax, r15, 0 - 8) + mov_ri32(r11, MIN_OBJECT_ADDR) + cmp_rr(rax, r11)))
+    push(it, la_jcc(CC_GE, lbl))
+    push(it, la_b(x86gen_trap_fmt(mov_rr(rdi, rax), "value is not an object: " + byte_chr(1) + " (type " + t + ")")))
+    push(it, la_l(lbl))
+}
+
 // fmt_enum_eh 从枚举编码取枚举下标 / fmt_enum_eh gets the enum index from an enum encoding
 fn fmt_enum_eh(ctx: X86Ctx, enc) {
     if str_len(enc) > 6 && substr(enc, 0, 6) == "enum:e" {
@@ -346,6 +360,15 @@ fn fmt_body(ctx: X86Ctx, mut g: FmtGen, t, quote, lbl) {
         }
         push(it, fmt_b_lit(0 - 16, " " + chr(125)))
     } else if is_enum_enc(t) {
+        // 影子判成枚举、运行期值却不是对象指针时不得解引用：任何映射
+        // 里的对象地址都不低于 MIN_OBJECT_ADDR，低于该界的值是标量
+        // （整数被当成指针）——按运行时错误报出并带源码回溯。
+        // When the shadow says enum but the runtime value is not an object
+        // pointer, do not dereference it: no object's address in any mapping
+        // is below MIN_OBJECT_ADDR, so a value under that bound is a scalar
+        // (an integer taken for a pointer) — report it as a runtime error with
+        // the source backtrace.
+        fmt_obj_gate(it, t, "e_obj")
         let eh = fmt_enum_eh(ctx, t)
         let nv = if eh >= 0 && eh < len(ctx.en_vnames) {
             len(ctx.en_vnames[eh])
