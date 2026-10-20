@@ -280,7 +280,14 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     // only non-lifted slots (a lifted slot's shadow is the cell's element).
                     if pslot < len(ptshadow_ps) && (pslot == len(ptshadow_ps) - 1 || !(pslot > 0 && pslot < len(plifted) && plifted[pslot])) {
                         let ptop = ptshadow_ps[pslot]
-                        if is_enum_enc(ptop) && ptop != pstype {
+                        // 见发射侧：权威的具体类型不被影子里的枚举编码覆写（权威位只由
+                        // 事实写入，影子可能还停在赋值前的类型）。
+                        // as in the emitter: an authoritative concrete type is not
+                        // overwritten by an enum encoding from the shadow (the authority
+                        // flag is only set by facts, and the shadow may still hold the
+                        // pre-assignment type)
+                        let pslot_pinned = pslot < len(ppos_auth) && ppos_auth[pslot] && !is_enum_enc(pstype)
+                        if is_enum_enc(ptop) && ptop != pstype && !pslot_pinned {
                             pstype = ptop
                             ppos_types[pslot] = ptop
                         } else if is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
@@ -351,6 +358,17 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     }
                 }
                 ppos_auth[pslot] = true
+                // 影子跟上槽里实际放的东西（见发射侧）：SET_LOCAL 把值搬进槽，槽位
+                // 的影子条目却停在赋值前的类型，读该槽时按影子覆写权威类型就会把标
+                // 量当成枚举对象解引用。
+                // The shadow follows what the slot actually holds (see the emitter):
+                // SET_LOCAL moves the value into the slot while the slot's shadow entry
+                // stays at the pre-assignment type — reading the slot then overwrites
+                // the authoritative type with the shadow and dereferences a scalar as an
+                // enum object.
+                if pslot < len(ptshadow_ps) && !(pslot > 0 && pslot < len(plifted) && plifted[pslot]) {
+                    ptshadow_ps[pslot] = ppos_types[pslot]
+                }
                 if p_pending_sub >= 0 {
                     if len(p_local_sub) <= pslot {
                         while len(p_local_sub) <= pslot {

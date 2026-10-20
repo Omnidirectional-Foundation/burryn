@@ -281,7 +281,18 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // its original judgement.
                     if slot < len(type_shadow) && (slot == len(type_shadow) - 1 || !is_lifted(slot)) {
                         let top_t = type_shadow[slot]
-                        if is_enum_enc(top_t) && top_t != stype {
+                        // 权威的具体类型不被影子里的枚举编码覆写：权威位只由事实写入
+                        // （SET_LOCAL、形参签名、push 定下的元素类型），此时影子可能
+                        // 还停在赋值前的类型（常是父枚举），照它把标量当枚举对象解引
+                        // 用即崩溃（value is not an object）。
+                        // An authoritative concrete type is not overwritten by an enum
+                        // encoding from the shadow: the authority flag is only set by
+                        // facts (SET_LOCAL, a param signature, a push-fixed element
+                        // type), and the shadow may still hold the pre-assignment type
+                        // (often the parent enum) — following it dereferences a scalar
+                        // as an enum object ("value is not an object").
+                        let slot_pinned = slot < len(pos_auth) && pos_auth[slot] && !is_enum_enc(stype)
+                        if is_enum_enc(top_t) && top_t != stype && !slot_pinned {
                             stype = top_t
                             pos_types[slot] = top_t
                         } else if is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
@@ -416,6 +427,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     push(cell_auth, false)
                 }
                 cell_auth[slot] = true
+                // 影子跟上槽里实际放的东西：SET_LOCAL 把值搬进槽，槽位的影子条目却
+                // 停在赋值前的类型（常是父枚举），读该槽时按影子覆写权威类型就会把
+                // 标量当成枚举对象解引用（value is not an object）。
+                // The shadow follows what the slot actually holds: SET_LOCAL moves the
+                // value into the slot while the slot's shadow entry stays at the
+                // pre-assignment type (often the parent enum) — reading the slot then
+                // overwrites the authoritative type with the shadow and dereferences a
+                // scalar as an enum object ("value is not an object").
+                if slot < len(type_shadow) && !is_lifted(slot) {
+                    type_shadow[slot] = pos_types[slot]
+                }
             }
             // ref 捕获的局部：声明只在首次建立时落一次种子（循环体的每轮重声明不能把
             // 闭包里 push/put 收敛出来的元素类型打回空列表默认值）；赋值则把所写值的类型
