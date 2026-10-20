@@ -2069,7 +2069,16 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     None => 0,
                 }
                 let ev_key = "v:" + str(ctor_eh) + ":" + str(ctor_vi)
-                put(ctx.enum_variant_types, ev_key, ctor_arg_types)
+                // 合并而非覆盖：同一变体可能在多处构造，其中一处实参来自对该枚举
+                // 自身的 match（类型未知），不得抹掉另一处的已知字段类型
+                // merge instead of overwrite: a variant can be constructed at several
+                // sites, and one site's arguments may come from a match over the enum
+                // itself (unknown types); that must not erase another site's fields
+                let ev_cur = match get(ctx.enum_variant_types, ev_key) {
+                    Some(evp) => evp,
+                    None => [],
+                }
+                put(ctx.enum_variant_types, ev_key, merge_field_types(ev_cur, ctor_arg_types))
                 let mut cann = "enum:e" + str(ctor_eh) + "#" + str(ctor_vi) + ":"
                 let mut caji = 0
                 while caji < len(ctor_arg_types) {
@@ -4252,6 +4261,40 @@ fn merge_type(cur, new) {
     } else {
         new
     }
+}
+
+// merge_field_types 合并同一声明位置的变体字段类型观测：逐字段走 merge_type，
+// 空串与裸容器不覆盖已知字段。构造点可能来自对枚举自身的 match（字段类型尚不
+// 可知），若直接覆盖会把先前构造点建立的字段类型抹成未知，下游 match 绑定随之
+// 退化成 int。
+// merge_field_types merges observations of a variant's field types position by
+// position through merge_type, so an empty string or a bare container never
+// overwrites a known field. A ctor site may read its arguments back from a match over
+// the enum itself (field types not yet known); a plain overwrite would erase what an
+// earlier site established and the downstream match bindings would degrade to int.
+fn merge_field_types(cur, new) {
+    let mut out = []
+    let mut i = 0
+    let n = if len(cur) > len(new) {
+        len(cur)
+    } else {
+        len(new)
+    }
+    while i < n {
+        let a = if i < len(cur) {
+            cur[i]
+        } else {
+            ""
+        }
+        let b = if i < len(new) {
+            new[i]
+        } else {
+            ""
+        }
+        push(out, merge_type(a, b))
+        i = i + 1
+    }
+    out
 }
 
 fn merge_pos(pcur, pnew) {
