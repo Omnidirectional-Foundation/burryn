@@ -1695,27 +1695,18 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     ""
                 }
-                // 键比较策略：键影子明确是 str 时按内容比较；map 已定型为 str 键而
-                // 键影子未知时同样按内容比较（模块加载器把路径串当键，map 的影子常
-                // 停在 "map"/细化后的 str 键，被查键来自模式载荷而影子未收敛）；其余
-                // 组合一律走运行时定形，避免拿单侧假 int 去解引用。
-                // key-compare strategy: content-compare when the key shadow says str,
-                // and also when the map is already str-keyed while the key shadow is
-                // unknown (the module loader keys packages by path strings; its map
-                // shadow stalls at "map" or refines to a str key while the looked-up
-                // key comes from a pattern payload with an unconverged shadow). Every
-                // other combination settles by runtime shape, so a one-sided fake int
-                // never selects a dereferencing path.
+                // 键比较策略：一律运行时定形。影子会把同一张 map 在不同调用点判成不同
+                // 模式——首次 put 时 map 还没细化、之后的 get 已按影子的假 int 键细化——
+                // 于是写入按内容比较、读取按词比较，同一个键读不回来。运行时定形对 str
+                // 键按长度加字节比较、对 int 键按词比较，天然不受影子漂移影响。
+                // key-compare strategy: always settle by runtime shape. Shadows can give
+                // the same map different modes at different call sites — the first put
+                // runs before the map is refined, later gets see a key kind refined from a
+                // fake int shadow — so a key stored by content is looked up by word and
+                // never comes back. The runtime shape compare handles str keys by length
+                // plus bytes and int keys by word, immune to shadow drift.
                 let mk_t = map_key_type(m_t)
-                let kk = if k_t == "str" {
-                    "str"
-                } else if mk_t == "str" && k_t == "" {
-                    "str"
-                } else if k_t == "int" && mk_t == "int" {
-                    "int"
-                } else {
-                    ""
-                }
+                let kk = ""
                 if callee == "get" {
                     w(x86gen_get_map_native(kk))
                     let v_kind = map_val_type(m_t)
@@ -1741,7 +1732,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 let dbg_k = dbg_fn == "is_fresh_source" || dbg_fn == "fresh_pattern_names" || dbg_fn == "fresh_name_copy"
                 let dbg_l = dbg_fn == "load_pkg"
                 if dbg_z || dbg_c || dbg_k || dbg_l {
-                    println("X86MAP fn=" + dbg_fn + " op=" + callee + " msh=" + msh + " mt=" + m_t + " kt=" + k_t + " kk=" + kk)
+                    println("X86MAP fn=" + dbg_fn + " op=" + callee + " msh=" + msh + " mt=" + m_t + " mtk=" + mk_t + " kt=" + k_t + " kk=" + kk)
                 }
                 let refined = if callee == "put" {
                     refine_map_arg(m_t, k_t, v_t)
