@@ -597,15 +597,15 @@ fn x86gen_list_format_at(off, elem_type, elem_code, ff_h) {
 }
 
 // x86gen_map_key_dyn 生成键类型未知时的键相等判据：先按词判等（int 与同一对象都成立）；
-// 词不等时仅当两侧都是字节串对象（x86gen_eq_dyn_seg 的区间判定 + noscan 描述符 + 载荷恰为
+// 词不等时仅当两侧都是字节串对象（x86gen_eq_dyn_seg 的区间判定 + noscan 描述符 + 块容量不小于
 // 8 + 圆整长度）才按内容比较，其余保持不等——与 VM/C 的动态键语义一致（str 按内容、int 按值）。
 // 命中跳 hit_off（自片段末尾算起，即越过调用方 advance 之后的命中块）；未命中落到片段末尾
 // （调用方的 advance）。保存 r8/r9/r11（调用方的表内计数/游标与下标），r10 不动；a_reg 为
 // 表内键、b_reg 为查询键，rdx 携结果标志。
 // x86gen_map_key_dyn emits the key-equality test for an unknown key kind: the words decide
 // first (holds for ints and for the same object); when they differ, only two byte-string
-// objects (x86gen_eq_dyn_seg's range test + noscan desc + payload exactly 8 + the rounded
-// length) compare by content, everything else stays unequal — the VM/C dynamic key
+// objects (x86gen_eq_dyn_seg's range test + noscan desc + block capacity at least 8 + the
+// rounded length) compare by content, everything else stays unequal — the VM/C dynamic key
 // semantics (str by content, int by value). A hit jumps hit_off (measured from the
 // fragment's end, i.e. past the caller's advance to the hit block); a miss falls through to
 // the fragment's end (the caller's advance). r8/r9/r11 (the caller's in-table count/cursors
@@ -625,10 +625,15 @@ fn x86gen_map_key_dyn(a_reg, b_reg, hit_off) {
     seq = lea(rsi, rcx, 8) + lea(rdi, b_reg, 8) + mov_rr(rcx, rdx) + repe_cmpsb() + jne_rel32(str_len(seq) - fail_tail) + seq
     // 长度必须相等：两侧各取自己的长度字 / the lengths must match: each side contributes its length word
     seq = mov_rm(rdx, rcx, 0) + mov_rm(r9, b_reg, 0) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq) - fail_tail) + seq
-    // 两侧载荷都是 8 + 圆整长度、描述符都是 noscan：字节串形状
-    // both payloads are 8 + the rounded length with a noscan desc: the byte-string shape
-    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq) - fail_tail) + seq
-    seq = mov_rm(rdx, b_reg, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, b_reg, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq) - fail_tail) + seq
+    // 两侧描述符都是 noscan、块容量都放得下 8 + 圆整长度：字节串形状。容量判「不小于」而
+    // 不是「等于」——复用块的块头写的是原 cap（分配器按尺寸类回收），严格相等会把复用块里
+    // 的字符串判成非字节串，map 键于是永远按词比较、读不回来。
+    // both payloads are noscan and their block capacity covers 8 + the rounded length: the
+    // byte-string shape. The capacity test is "at least", not "equal" — a reused block keeps
+    // its original cap in the header (the allocator recycles by size class), and strict
+    // equality would rule those strings out, leaving map keys compared by word for good.
+    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jb_rel32(str_len(seq) - fail_tail) + seq
+    seq = mov_rm(rdx, b_reg, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, b_reg, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jb_rel32(str_len(seq) - fail_tail) + seq
     seq = mov_rm(r8, rcx, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq) - fail_tail) + seq
     seq = mov_rm(r8, b_reg, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq) - fail_tail) + seq
     // 两侧都要落在「字节串可寻址区间」内：区间外的值只可能是整数，保持按词比较
@@ -2033,13 +2038,13 @@ fn x86gen_eq_dyn_seg(R) {
 }
 
 // x86gen_eq_dyn 生成类型未知时的相等/不等比较：词相等即按词判（int 与同一对象都成立）；
-// 词不等时，只有两侧都是「字节串」对象（堆内或常量区字节串段 + noscan 描述符 + 载荷恰为
+// 词不等时，只有两侧都是「字节串」对象（堆内或常量区字节串段 + noscan 描述符 + 块容量不小于
 // 8 + 圆整长度）才按内容比较，其余保持按词不等——列表/记录/元组/盒子的载荷形状与字节串
 // 不合，不会误入内容比较。
 // x86gen_eq_dyn emits an equality/inequality compare for operands the model cannot
 // type: equal words decide as words (ints and identical objects both hold); when the
 // words differ, only two byte-string objects (in-heap or in the constant area's
-// byte-string segment, noscan desc, payload exactly 8 + the rounded length) compare by
+// byte-string segment, noscan desc, block capacity at least 8 + the rounded length) compare by
 // content; everything else stays not-equal on the words — lists, records, tuples and
 // boxes fail the byte-string shape test and never take the content path.
 fn x86gen_eq_dyn(neg) {
@@ -2069,13 +2074,16 @@ fn x86gen_eq_dyn(neg) {
     // the lengths must match: each operand contributes its own length word; a mismatch
     // is not the same string
     seq = mov_rm(rdx, rax, 0) + mov_rm(r9, rcx, 0) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
-    // 两侧载荷都是 8 + 圆整长度、描述符都是 noscan：字节串的形状。分配器把载荷圆整到
-    // 8 的倍数（x86gen_alloc/x86gen_alloc_r 的 (n+7)&-8），故载荷恒为 8 + roundup8(len)
-    // both payloads are 8 + the rounded length with a noscan desc: the byte-string shape.
-    // The allocator rounds the payload to a multiple of 8 (x86gen_alloc/x86gen_alloc_r's
-    // (n+7)&-8), so a payload is always 8 + roundup8(len)
-    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
-    seq = mov_rm(rdx, rax, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rax, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jne_rel32(str_len(seq)) + seq
+    // 两侧描述符都是 noscan、块容量都放得下 8 + 圆整长度：字节串形状。分配器把载荷圆整到
+    // 8 的倍数（x86gen_alloc/x86gen_alloc_r 的 (n+7)&-8），新块恒为 8 + roundup8(len)；
+    // 复用块沿用原 cap，容量只会更大，故判「不小于」而不是「等于」。
+    // both payloads are noscan and their block capacity covers 8 + the rounded length: the
+    // byte-string shape. The allocator rounds the payload to a multiple of 8
+    // (x86gen_alloc/x86gen_alloc_r's (n+7)&-8), so a fresh block is always 8 + roundup8(len);
+    // a reused block keeps its original cap, which is only ever larger — hence "at least",
+    // not "equal".
+    seq = mov_rm(rdx, rcx, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rcx, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jb_rel32(str_len(seq)) + seq
+    seq = mov_rm(rdx, rax, 0 - 8) + mov_ri64(r9, GC_SIZE_MASK) + and_rr(rdx, r9) + mov_rm(r9, rax, 0) + add_ri32(r9, 7) + and_ri32(r9, 0 - 8) + add_ri32(r9, 8) + cmp_rr(rdx, r9) + jb_rel32(str_len(seq)) + seq
     seq = mov_rm(r8, rcx, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
     seq = mov_rm(r8, rax, 0 - 8) + shr_ri(r8, 40) + mov_ri64(r9, GC_DESC_MASK) + and_rr(r8, r9) + cmp_ri32(r8, desc_noscan) + jne_rel32(str_len(seq)) + seq
     // 两个操作数都要落在「字节串可寻址区间」内：堆内或常量区字节串段；区间外的值
