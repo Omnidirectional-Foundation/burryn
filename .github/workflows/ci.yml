@@ -375,12 +375,32 @@ jobs:
         if: failure()
         run: |
           set -x
+          ulimit -c unlimited || true
           # gdb 在 ubuntu-latest 上默认缺席，而 readelf 拿不到寄存器；缺了才装。
           # gdb is absent from ubuntu-latest by default and readelf cannot show the
           # registers, so install it only when missing.
           if ! command -v gdb > /dev/null; then
             sudo -n apt-get update -qq || true
             sudo -n apt-get install -y -qq gdb || true
+          fi
+          # 拿刚崩过的 g1x 扫一遍小样例：能在小样例上复现就得到一个可反复调试的最小复现。
+          # 逐例记退出码并继续，不因首个失败中断——失败面是宽是窄本身就是判据；崩掉的
+          # 那一次会在工作目录留下 core，随后由 gdb 读出寄存器。
+          # sweep the small programs with the g1x that just crashed: a crash on a
+          # small program yields a minimal reproducer that can be debugged repeatedly.
+          # Record every exit code and keep going — how wide the failure is, is itself
+          # a verdict; the crashing run leaves a core in the working directory for gdb.
+          first_bad=""
+          if [ -x ./g1x ]; then
+            for f in testdata/basics/*.bur; do
+              [ -f "$f" ] || continue
+              rc=0
+              timeout 30 ./g1x build --backend x86 "$f" -o /tmp/g1x-repro > /dev/null 2>&1 || rc=$?
+              echo "g1x-repro rc=$rc $f"
+              if [ "$rc" -ne 0 ] && [ -z "$first_bad" ]; then
+                first_bad="$f"
+              fi
+            done
           fi
           ls -la core.g1x.* || true
           for c in core.g1x.*; do
@@ -405,18 +425,18 @@ jobs:
               readelf -l "$c" | head -40 || true
             fi
           done
-          # 拿刚崩过的 g1x 扫一遍小样例：能在小样例上复现就得到一个可反复调试的最小复现。
-          # sweep the small programs with the g1x that just crashed: a crash on a
-          # small program yields a minimal reproducer that can be debugged repeatedly
-          if [ -x ./g1x ]; then
-            for f in testdata/basics/*.bur; do
-              [ -f "$f" ] || continue
-              timeout 30 ./g1x build --backend x86 "$f" -o /tmp/g1x-repro > /dev/null 2>&1
-              rc=$?
-              if [ "$rc" -ne 0 ]; then
-                echo "g1x-repro rc=$rc $f"
-              fi
-            done
+          # core 没落盘时的兜底：直接在 gdb 里跑第一个失败的样例，抓现场寄存器。
+          # fallback when no core landed: run the first failing sample under gdb and
+          # capture the registers live
+          if [ -n "$first_bad" ] && command -v gdb > /dev/null; then
+            timeout 300 gdb -batch -nx \
+              -ex 'set pagination off' \
+              -ex 'run' \
+              -ex 'p $_siginfo' \
+              -ex 'info registers rax rbx rcx rdx rsi rdi rip rsp rbp r12 r13 r14 r15' \
+              -ex 'x/24i $rip-40' \
+              -ex 'x/64gx $r14-32' \
+              --args ./g1x build --backend x86 "$first_bad" -o /tmp/g1x-live 2>&1 | head -200 || true
           fi
 
       # 失败也把 g1x 落成 artifact：x86 编译器的运行期 bug 在小机器上复现不了
