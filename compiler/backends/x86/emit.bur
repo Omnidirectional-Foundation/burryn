@@ -3237,6 +3237,54 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     fbytes
 }
 
+// merge_field_str 合并同一变体字段的两次类型观测：空串与裸容器标签（list-、map、
+// chan、enum）都是「无信息」，不得抹掉已知字段；两种互斥的已知类型仍折成未知，
+// 保留对真正多态载荷的安全兜底。聚合按轮推进，首轮拿不到的元素类型若把后续轮次
+// 的已知类型抹平，返回类型里的字段会永久停在空串。
+// merge_field_str merges two type observations of one variant field: an empty
+// string or a bare container tag (list-, map, chan, enum) carries no information
+// and must not erase a known field, while two conflicting known types still fold
+// to unknown, keeping the safe fallback for genuinely polymorphic payloads.
+// Aggregation advances round by round; letting a first-round unknown squash a
+// later round's known type would pin the field to empty for good.
+fn merge_field_str(xa, xb) {
+    if xa == "" {
+        xb
+    } else if xb == "" || xa == xb {
+        xa
+    } else if is_list_type(xa) && is_list_type(xb) {
+        if str_len(xa) <= 5 {
+            xb
+        } else if str_len(xb) <= 5 {
+            xa
+        } else {
+            ""
+        }
+    } else if is_map_type(xa) && is_map_type(xb) {
+        if xa == "map" {
+            xb
+        } else if xb == "map" {
+            xa
+        } else {
+            ""
+        }
+    } else if str_len(xa) >= 4 && substr(xa, 0, 4) == "chan" && str_len(xb) >= 4 && substr(xb, 0, 4) == "chan" {
+        if str_len(xa) <= 5 {
+            xb
+        } else if str_len(xb) <= 5 {
+            xa
+        } else {
+            ""
+        }
+    } else if is_enum_enc(xa) && xb == "enum" {
+        xa
+    } else if xa == "enum" && is_enum_enc(xb) {
+        xb
+    } else {
+        ""
+    }
+}
+
 // merge_field_list 逐字段合并两个逗号分隔的字段类型串：一侧缺失取另一侧，冲突取未知
 // merge_field_list merges two comma-separated field-type lists field by field:
 // a missing side takes the other, a conflict becomes unknown (safe to skip deref)
@@ -3265,13 +3313,7 @@ fn merge_field_list(a, b) {
             } else {
                 ""
             }
-            let xm = if xa == "" {
-                xb
-            } else if xb == "" || xa == xb {
-                xa
-            } else {
-                ""
-            }
+            let xm = merge_field_str(xa, xb)
             if i > 0 {
                 out = out + ","
             }
