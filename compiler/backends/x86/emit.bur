@@ -1695,22 +1695,21 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 } else {
                     ""
                 }
-                // 键比较策略：两侧影子同为 str 才按内容比较、同为 int 才按词比较。
-                // 单侧影子不足以选定解引用路径——map 的键型可能被 put 的假 int 键
-                // （`[]` 起家的表和 upvalue 读出的元素会落到 int）细化成 int，被查
-                // 键的影子也可能是同样的未收敛默认值；两侧不一致时走动态比较（词
-                // 相等或字节串内容相等即命中），对真 int 键同样成立，与 VM/C 的动态
-                // 键语义一致。
-                // key-compare strategy: content-compare only when both shadows say
-                // str, word-compare only when both say int. One side alone cannot
-                // select the dereferencing path — a map's key kind may have been
-                // refined to int by a put's fake int key (tables built from `[]` and
-                // elements read through an upvalue land there), and the looked-up key's
-                // shadow may be the same unconverged default. Disagreement falls back to
-                // the dynamic compare (a word hit or equal byte-string content), which
-                // also holds for real int keys, matching the VM/C dynamic key semantics.
+                // 键比较策略：键影子明确是 str 时按内容比较；map 已定型为 str 键而
+                // 键影子未知时同样按内容比较（模块加载器把路径串当键，map 的影子常
+                // 停在 "map"/细化后的 str 键，被查键来自模式载荷而影子未收敛）；其余
+                // 组合一律走运行时定形，避免拿单侧假 int 去解引用。
+                // key-compare strategy: content-compare when the key shadow says str,
+                // and also when the map is already str-keyed while the key shadow is
+                // unknown (the module loader keys packages by path strings; its map
+                // shadow stalls at "map" or refines to a str key while the looked-up
+                // key comes from a pattern payload with an unconverged shadow). Every
+                // other combination settles by runtime shape, so a one-sided fake int
+                // never selects a dereferencing path.
                 let mk_t = map_key_type(m_t)
-                let kk = if k_t == "str" && mk_t == "str" {
+                let kk = if k_t == "str" {
+                    "str"
+                } else if mk_t == "str" && k_t == "" {
                     "str"
                 } else if k_t == "int" && mk_t == "int" {
                     "int"
@@ -1740,7 +1739,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 let dbg_z = str_len(dbg_fn) >= 4 && substr(dbg_fn, 0, 4) == "zdbg"
                 let dbg_c = len(ctx.f_code) > 200 && (dbg_fn == "convert_type_expr" || dbg_fn == "instantiate_enum" || dbg_fn == "infer_match" || dbg_fn == "collect_annotation_vars")
                 let dbg_k = dbg_fn == "is_fresh_source" || dbg_fn == "fresh_pattern_names" || dbg_fn == "fresh_name_copy"
-                if dbg_z || dbg_c || dbg_k {
+                let dbg_l = dbg_fn == "load_pkg"
+                if dbg_z || dbg_c || dbg_k || dbg_l {
                     println("X86MAP fn=" + dbg_fn + " op=" + callee + " msh=" + msh + " mt=" + m_t + " kt=" + k_t + " kk=" + kk)
                 }
                 let refined = if callee == "put" {
