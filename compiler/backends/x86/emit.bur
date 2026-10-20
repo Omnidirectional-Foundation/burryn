@@ -3424,6 +3424,14 @@ fn merge_enum_ann(a, b) {
             }
             out
         }
+    } else if is_enum_enc(a) && b == "enum" {
+        // 裸 "enum" 不带变体信息，不覆盖富编码 / a bare "enum" carries no variant
+        // information and does not overwrite a rich encoding
+        a
+    } else if (a == "int" || a == "str" || a == "bool" || a == "float" || a == "unit") && (b == "enum" || is_enum_enc(b)) {
+        // 标量观测比枚举标注可靠（与 merge_type 同规）/ a scalar observation is
+        // more reliable than an enum annotation (the same rule as merge_type)
+        a
     } else {
         b
     }
@@ -4294,10 +4302,22 @@ fn merge_type(cur, new) {
         } else {
             new
         }
-    } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && str_len(new) >= 5 && substr(new, 0, 5) == "enum:" {
+    } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && (new == "enum" || is_enum_enc(new)) {
+        // 标量观测比枚举标注可靠：裸 "enum"（如 get 值类型未知时的 Option 影子）
+        // 不得把标量翻成枚举，否则 str/print 按枚举取 tag，整数被当指针解引用
+        // a scalar observation is more reliable than an enum annotation: a bare
+        // "enum" (e.g. the Option shadow when get's value type is unknown) must not
+        // flip a scalar into an enum, or str/print takes the tag path and derefs an
+        // int as a pointer
         cur
-    } else if (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && str_len(cur) >= 5 && substr(cur, 0, 5) == "enum:" {
+    } else if (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && (cur == "enum" || is_enum_enc(cur)) {
         new
+    } else if cur == "enum" && is_enum_enc(new) {
+        // 富编码带变体与载荷信息，裸 "enum" 不覆盖它 / a rich encoding carries
+        // variant and payload information a bare "enum" lacks
+        new
+    } else if is_enum_enc(cur) && new == "enum" {
+        cur
     } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && cur != new {
         cur
     } else {
