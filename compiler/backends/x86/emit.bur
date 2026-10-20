@@ -111,6 +111,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     // w_fmt 把 [r15+off] 的值按类型 t 就地格式化为字符串 / w_fmt formats the value at
     // [r15+off] in place into a string by type t
     fn w_fmt(off, t) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl) {
+        // 诊断：按枚举类型格式化某个值。递归枚举的变体载荷本就是自身编码，所以
+        // 「字段类型等于自身」不是判据；格式化调用点是唯一能点名的位置——影子
+        // 猜错时格式化器会把标量当对象解引用。
+        // diagnostic: a value formatted under an enum type. A recursive enum
+        // legitimately carries its own encoding as a field type, so "the field
+        // type equals the receiver" is no verdict; the format call is the only
+        // place that names the site — when the shadow is wrong the formatter
+        // dereferences a scalar as an object.
+        if is_enum_enc(t) {
+            eprintln("X86ENUMFMT fn=" + ctx.f_name[fh] + " off=" + str(off) + " t=" + t)
+        }
         let lbl = fmt_label(ctx, fmtg, t, false)
         w(fmt_top_pre(off, t) + e1(232))
         push(fmt_call_pos, cur_byte())
@@ -1076,16 +1087,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     gf_t = gf_var[fidx]
                     gf_from_enc = true
                     gf_known = true
-                    // 自指诊断：字段类型与接收者自身编码相同 = 枚举直接含
-                    // 自身，不可能成立。出现即说明类型解析被污染——按枚举
-                    // 解引用标量会野指针。
-                    // self-reference diagnostic: a field type equal to the
-                    // receiver's own encoding means the enum directly contains
-                    // itself, which cannot hold — type resolution got polluted,
-                    // and formatting the value as an enum dereferences a scalar.
-                    if gf_t == gf_rt {
-                        eprintln("X86SELREF fn=" + ctx.f_name[fh] + " idx=" + str(fidx) + " rt=" + gf_rt)
-                    }
                 }
             } else if str_len(gf_rt) >= 4 && substr(gf_rt, 0, 4) == "tup:" {
                 // tuple 载荷的类型就在影子自己的编码里（长度前缀），不必查形态表；
