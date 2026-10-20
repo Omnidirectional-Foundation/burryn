@@ -459,7 +459,15 @@ fn x86gen_start(nfn, n_globals, sched_addr, done_addr, rt_init) {
     } else {
         mov_ri64(rdi, 0) + mov_ri64(rsi, heap_bitmap + heap_reserve) + mov_ri64(rdx, 3) + mov_ri64(r10, X86GC_MMAP_FLAGS) + mov_ri64(r8, 0) + mov_ri64(r9, 0) + sys_mov_rax(9) + syscall()
     }
-    let heap_limit = mov_ri64(r11, rt_slot(rt_heap_limit)) + lea(rcx, rax, heap_bitmap + heap_reserve) + mov_mr(r11, 0, rcx)
+    // 堆上限 = 映射基址 + BITMAP + RESERVE。x86-64 的位移只有 32 位（disp32），
+    // 多 GiB 的偏移放不下：lea 把它静默截断成负数，上限落到堆起点之下，于是
+    // 首次分配即报堆上限。故走 64 位寄存器加法。
+    // The heap cap is the mapping base plus BITMAP plus RESERVE. An x86-64
+    // displacement is only 32 bits (disp32) and cannot hold a multi-GiB offset:
+    // lea would silently truncate it into a negative number, putting the cap
+    // below the heap start and tripping the heap limit on the first allocation.
+    // Use 64-bit register arithmetic instead.
+    let heap_limit = mov_ri64(r11, rt_slot(rt_heap_limit)) + mov_ri64(rcx, heap_bitmap + heap_reserve) + add_rr(rcx, rax) + mov_mr(r11, 0, rcx)
     // P1：bitmap 垫在堆区之前（rt_start_bitmap = 映射基址），用户堆起点随之
     // 后移 BITMAP_SIZE；rt_desc_table 由 rt_init（x86gen_image 生成、_start 开头
     // 执行）以发射期表址写入。
