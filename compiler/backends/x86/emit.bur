@@ -335,6 +335,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                     pos_types[slot] = stype
                 }
+                if is_enum_enc(stype) {
+                    let cs = if is_lifted(slot) {
+                        match get(ctx.global_type, "cell:" + str(fh) + ":" + str(slot)) {
+                            Some(ct) => ct,
+                            None => "",
+                        }
+                    } else {
+                        ""
+                    }
+                    eprintln("X86SLOT fn=" + ctx.f_name[fh] + " ip=" + str(ip) + " slot=" + str(slot) + " t=" + stype + " auth=" + str(slot < len(pos_auth) && pos_auth[slot]) + " lifted=" + str(is_lifted(slot)) + " cell=" + cs)
+                }
                 if is_lifted(slot) {
                     if slot < len(cell_auth) && cell_auth[slot] {
                         // 提升槽：槽存 cell 指针，读须解引用
@@ -431,6 +442,11 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // value (a SEGV into the read-only constant area).
             let is_decl = slot > 0 && len(type_shadow) > 0 && slot == len(type_shadow) - 1
             let was_auth = slot > 0 && slot < len(cell_auth) && cell_auth[slot] && !is_decl
+            let prev_slot_t = if slot < len(pos_types) {
+                pos_types[slot]
+            } else {
+                ""
+            }
             if slot > 0 {
                 while len(pos_types) <= slot {
                     push(pos_types, "")
@@ -461,6 +477,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // scalar as an enum object ("value is not an object").
                 if slot < len(type_shadow) && !is_lifted(slot) {
                     type_shadow[slot] = pos_types[slot]
+                }
+                // 诊断：枚举槽被具体类型的值覆盖时打印现场——槽里换成标量而类型仍
+                // 是父枚举，正是 str 走枚举格式化器解引用标量的入口；定位完即撤
+                // diagnostic: report the site where a concrete value overwrites an
+                // enum-typed slot — the slot then holds a scalar while its type stays
+                // the parent enum, exactly the entry to the enum formatter dereferencing
+                // a scalar; removed once the site is pinned down
+                if is_enum_enc(prev_slot_t) && !is_enum_enc(pos_types[slot]) {
+                    eprintln("X86SETA fn=" + ctx.f_name[fh] + " ip=" + str(ip) + " slot=" + str(slot) + " from=" + prev_slot_t + " to=" + pos_types[slot])
                 }
             }
             // ref 捕获的局部：声明只在首次建立时落一次种子（循环体的每轮重声明不能把
