@@ -115,6 +115,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
     let mut pcur_variant = -1
     let mut pcur_enum_eh = -1
     let pa_ps = ctx.f_arity[ptfh]
+    // 本函数见过的最大槽号（参数占 1..pa_ps）——新局部的判据，与发射侧同一判据。
+    // The highest slot number seen in this function (the params take 1..pa_ps) — the
+    // new-local test, the same criterion the emitter uses.
+    let mut pmax_slot = pa_ps
     let mut pseed = 0
     while pseed < pa_ps + 1 {
         push(pshadow_ps, "")
@@ -363,6 +367,32 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             }
         } else if pop == lib::op_set_local {
             let pslot = read_u16(pcode, pit + 1)
+            // 槽号即栈位（与发射侧同一判据、同一修正）：新局部的声明值落在模型位置
+            // `pslot` 上，模型深度须是 pslot+1；错位时把模型拉回该深度（影子与类型
+            // 一起裁），否则声明被误判成赋值（多一次写穿）且影子整体错格。
+            // Slots are stack positions (the same criterion and the same correction as
+            // the emitter's): a new local's declaration value sits at model position
+            // `pslot`, so the model's depth must be pslot+1; when it is off, pull the
+            // model back to that depth (shadows and types together) — otherwise the
+            // declaration is misread as an assignment (an extra write-through) and
+            // the shadows shift by a slot.
+            let p_is_new = pslot > pmax_slot
+            if p_is_new {
+                pmax_slot = pslot
+            }
+            if p_is_new && len(ptshadow_ps) != pslot + 1 {
+                if len(ctx.f_name) > 500 {
+                    eprintln("X86PDRIFT fn=" + ctx.f_name[ptfh] + " ip=" + str(pit) + " slot=" + str(pslot) + " model=" + str(len(ptshadow_ps)) + " expect=" + str(pslot + 1))
+                }
+                let mut pxd_t = len(ptshadow_ps) - (pslot + 1)
+                if pxd_t > 0 {
+                    shadow_pop(ptshadow_ps, pxd_t)
+                }
+                let mut pxd_s = len(pshadow_ps) - (pslot + 1)
+                if pxd_s > 0 {
+                    shadow_pop(pshadow_ps, pxd_s)
+                }
+            }
             let pis_decl = pslot > 0 && len(ptshadow_ps) > 0 && pslot == len(ptshadow_ps) - 1
             if pslot > 0 && len(ptshadow_ps) > 0 {
                 if len(ppos_types) <= pslot {

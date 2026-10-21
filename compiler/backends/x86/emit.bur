@@ -12,6 +12,12 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     let code = f_code[fh]
     let arity = f_arity[fh]
     let locals = count_locals(ctx, fh)
+    // 本函数见过的最大槽号（参数占 1..arity）——用来认新局部：前端给新局部分配的
+    // 槽号必大于此前任何槽号。
+    // The highest slot number seen in this function (the params take 1..arity) — it
+    // identifies a new local: the frontend hands a new local a slot number above
+    // every slot seen before.
+    let mut max_slot = arity
 
     let mut out = []
     let mut patches = []
@@ -416,6 +422,37 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             }
         } else if op == lib::op_set_local {
             let slot = read_u16(code, ip + 1)
+            // 槽号即栈位：VM 把局部值留在值栈上，前端的槽编号数的就是同一条数位线
+            // （参数在前、局部按声明序、表达式临时量在局部之上）。新局部（槽号大于
+            // 本函数见过的最大槽号）的声明值就落在模型位置 `slot` 上，故模型深度必
+            // 须是 slot+1。模型与运行期一旦错位：局部的值从错位处读出（拿到未写的
+            // 槽 → 悬垂指针），影子字节整体错一格（GC 根表失准 → 悬垂）。
+            // Slots are stack positions: the VM keeps the locals' values on the value
+            // stack and the frontend's numbering counts the same line (params first,
+            // locals in declaration order, expression temporaries above the locals).
+            // A new local (a slot above every slot seen in this function) therefore has
+            // its declaration value at model position `slot`, so the model's depth
+            // must be slot+1. Once the model and the runtime disagree, the local's
+            // value is read from the wrong place (an unwritten slot → a dangling
+            // pointer) and the shadow bytes shift by a slot (the GC root map goes off
+            // → dangling pointers).
+            let is_new_slot = slot > max_slot
+            if is_new_slot {
+                max_slot = slot
+            }
+            if is_new_slot && len(type_shadow) != slot + 1 {
+                if nfn > 500 {
+                    eprintln("X86DRIFT fn=" + f_name[fh] + " ip=" + str(ip) + " slot=" + str(slot) + " model=" + str(len(type_shadow)) + " expect=" + str(slot + 1))
+                }
+                let mut xd_t = len(type_shadow) - (slot + 1)
+                if xd_t > 0 {
+                    shadow_pop(type_shadow, xd_t)
+                }
+                let mut xd_s = len(shadow) - (slot + 1)
+                if xd_s > 0 {
+                    shadow_pop(shadow, xd_s)
+                }
+            }
             // 声明 vs 赋值：声明时被存的值正落在目标槽位（槽位即栈位，表达式的求值
             // 结果留在其起始槽），赋值时值在目标槽之上的栈顶。提升槽的「首次写」必须
             // 分配新 cell（循环体里每轮声明都要一个新 cell，闭包捕获的是那一轮的），
