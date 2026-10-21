@@ -448,19 +448,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     push(pos_auth, false)
                 }
                 pos_auth[slot] = true
-                if ctx.f_name[fh] == "psim" && slot > 18 && slot < 42 {
-                    let st_v = if slot < len(pos_types) {
-                        pos_types[slot]
-                    } else {
-                        "<oob>"
-                    }
-                    let is_decl_v = if is_decl {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    eprintln("X86SET ip=" + str(ip) + " slot=" + str(slot) + " dsh=" + str(len(type_shadow)) + " decl=" + is_decl_v + " t=" + st_v)
-                }
                 while len(cell_auth) <= slot {
                     push(cell_auth, false)
                 }
@@ -3111,14 +3098,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             push(pending_olds, w_old)
                         }
                         pos_types[vds] = w_new
-                        if ctx.f_name[fh] == "psim" && is_enum_enc(w_new) && vds > 18 && vds < 42 {
-                            let src_v = if len(shadow) > 0 {
-                                shadow[len(shadow) - 1]
-                            } else {
-                                ""
-                            }
-                            eprintln("X86STP ip=" + str(ip) + " op=" + str(op) + " vds=" + str(vds) + " old=" + w_old + " new=" + w_new + " src=" + src_v)
-                        }
                     }
                 }
             }
@@ -3206,9 +3185,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // inherits the previous path's enum annotation.
             forget_types_above(pos_types, pos_auth, dmv)
         }
-        if vi == 0 && f_name[fh] == "psim" {
-            eprintln("X86DEP ip=" + str(ip) + " op=" + str(code[ip]) + " d=" + str(len(type_shadow)))
-        }
         if in_dead {
             let sl = len(shadow)
             let tl = len(type_shadow)
@@ -3267,7 +3243,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     eprintln("X86LOOP ip=" + str(ip) + " tgt=" + str(ljt2) + " d=" + str(len(type_shadow)) + " dm=" + str(dv2))
                 }
             }
-            if code[ip] == lib::op_jump || code[ip] == lib::op_select {
+            // 无条件跳转、回边与返回之后，线性路径终止：后续指令属于别的路径，栈深
+            // 只由落点快照恢复。回边若留活，线性模拟会带着回边裁剪后的浅栈继续走，
+            // 深度被永久压低一格，后续声明落在槽号之下（槽位影子与 pos_types 错位）。
+            // after an unconditional jump, a back edge or a return the linear path ends:
+            // the code that follows belongs to another path and only a target snapshot
+            // restores the depth. A live back edge made the linear walk continue on the
+            // shallower post-edge stack, losing one entry for good — later declarations
+            // then landed below their slot number and the shadow drifted from pos_types.
+            if code[ip] == lib::op_jump || code[ip] == lib::op_select || code[ip] == lib::op_loop || code[ip] == lib::op_return {
                 in_dead = true
             }
         }

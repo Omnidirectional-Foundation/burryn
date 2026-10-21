@@ -227,6 +227,8 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             if aggregate {
                 ctx.fn_ret_param[ptfh] = pret_param
             }
+            // 返回同样终止线性路径（见 op_loop 处）/ a return ends the linear path too
+            p_dead = true
         } else if pop == lib::op_const {
             let pval = ctx.f_consts[ptfh][read_u16(pcode, pit + 1)]
             match pval {
@@ -1146,6 +1148,18 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     put(pt_target_shadow, str(ptfh) + ":" + str(ljt), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
                 },
             }
+            // 回边与无条件跳转同样终止线性路径：其后的指令属于别的路径，只有落点快照
+            // 才能给出真实栈深。此前只记目标不置死，线性模拟带着回边裁剪后的浅栈继续
+            // 走，遇到非落点指令时把栈深永久压低一格——后续声明落在槽号之下，槽位影子
+            // 与 pos_types 错位，int 局部读出父枚举，str 便按枚举取 tag 解引用标量。
+            // A back edge ends the linear path just like an unconditional jump: the code
+            // after it belongs to another path and only the target snapshot carries the
+            // real depth. Previously the target was recorded but the path stayed live, so
+            // the simulation walked on with the shallower post-back-edge stack and lost one
+            // entry for good — later declarations then landed below their slot number, the
+            // shadow and pos_types drifted apart, and an int local read back as its parent
+            // enum ("value is not an object" when str takes the tag path on a scalar).
+            p_dead = true
         } else if pop == lib::op_jump_if_false || pop == lib::op_jump_if_true {
             let jjt = pit + 3 + read_u16(pcode, pit + 1)
             match get(p_depth_at, jjt) {
