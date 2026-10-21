@@ -336,6 +336,23 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                     eprintln("X86RD ip=" + str(ip) + " slot=" + str(slot) + " dsh=" + str(len(type_shadow)) + " dpt=" + str(len(pos_types)) + " ts=" + ts_v + " pt=" + pt_v + " auth=" + au_v)
                 }
+                // 槽型与权威型分家即漂移：槽里放的是权威型（pos_types），影子/类型影子
+                // 条目停在别的型上——读该槽会按影子覆写权威型，把标量当枚举对象解引用
+                // （value is not an object），或把指针按标量盖章、收集器不扫它 → 悬垂。
+                // A slot whose shadow type differs from the authoritative type has
+                // drifted: the slot holds the authoritative type (pos_types) while the
+                // shadow/type-shadow entry still carries another type — reading the
+                // slot overwrites the authoritative type with the shadow and
+                // dereferences a scalar as an enum object ("value is not an object"),
+                // or stamps a pointer as a scalar so the collector does not mark it
+                // (dangling).
+                if slot < len(type_shadow) && slot < len(pos_types) && type_shadow[slot] != pos_types[slot] && nfn > 500 {
+                    let mut xd_lifted = "0"
+                    if is_lifted(slot) {
+                        xd_lifted = "1"
+                    }
+                    eprintln("X86TDRIFT fn=" + f_name[fh] + " ip=" + str(ip) + " slot=" + str(slot) + " shadow_type=" + type_shadow[slot] + " auth_type=" + pos_types[slot] + " lifted=" + xd_lifted)
+                }
                 if is_lifted(slot) {
                     if slot < len(cell_auth) && cell_auth[slot] {
                         // 提升槽：槽存 cell 指针，读须解引用
@@ -460,7 +477,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // pre-assignment type (often the parent enum) — reading the slot then
                 // overwrites the authoritative type with the shadow and dereferences a
                 // scalar as an enum object ("value is not an object").
-                if slot < len(type_shadow) && !is_lifted(slot) {
+                //
+                // A lifted (cell) slot needs the same treatment: the slot holds the
+                // cell pointer, but the *type* recorded for it is the type of the
+                // cell's content, and that content changes with every write. Leaving
+                // the type at the declaration's value makes a later read push the
+                // content with a stale kind — a pointer stored as a scalar is not
+                // marked by the collector, so the value is swept and the slot then
+                // reads back a wild pointer.
+                if slot < len(type_shadow) {
                     type_shadow[slot] = pos_types[slot]
                 }
             }
