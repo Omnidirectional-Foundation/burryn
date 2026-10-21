@@ -3260,6 +3260,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // 局部值落在别的帧槽（读到未写的槽 → 野指针），影子字节整体错格
             // （GC 根表失准 → 悬垂）。核对点取在调用之后：调用是唯一会同时消费
             // 被调值与实参的指令，脱节必在此显形。
+            // 比的是地址：lea 取「帧基 + 8×模型深度」这个期望的栈顶地址，与运行期的
+            // 栈顶寄存器 r15 直接比（mov_rm 读的是该槽的内存值，不是地址）。
             // Stack-depth check (diagnostic): the model's depth (len(type_shadow),
             // params included) must equal the runtime's distance from the frame base
             // — both are the same number line. A mismatch means the model and the
@@ -3267,9 +3269,11 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // (an unwritten slot → a wild pointer) and the shadow bytes shift (the GC
             // root map goes off → dangling). The check sits after calls: a call is the
             // one instruction that consumes the callee and the arguments, so a
-            // divergence surfaces there.
+            // divergence surfaces there. It compares addresses: lea forms the expected
+            // stack-top address (frame base + 8 × model depth) and compares it with the
+            // runtime's stack top r15 (mov_rm would load the slot's value instead).
             if code[ip] == lib::op_call && nfn > 500 {
-                w(mov_rm(rax, r14, 8 * len(type_shadow)) + cmp_rr(rax, r15) + x86gen_guard(CC_E, x86gen_trap_exit("x86 depth mismatch")))
+                w(lea(rax, r14, 8 * len(type_shadow)) + cmp_rr(rax, r15) + x86gen_guard(CC_E, x86gen_trap_exit("x86 depth mismatch")))
             }
             if f_name[fh] == "psim" && code[ip] == lib::op_loop {
                 let ljt2 = ip + 3 - read_u16(code, ip + 1)
