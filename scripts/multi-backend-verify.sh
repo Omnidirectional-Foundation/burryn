@@ -8,8 +8,11 @@
 #   PASS = stdout + stderr + exit code agree across all four, including a
 #          unanimous rejection (build-time too; C/x86/LLVM then contribute their
 #          build diagnostics as stderr, compared with the VM's run diagnostics)
-#   SKIP = 任一后端 SIGTRAP(133)，未实现 opcode
-#   FAIL = 其余任一后端行为差异；FAIL > 0 非零退出
+#   FAIL = 任一后端行为差异，含任一后端 SIGTRAP(133)：trap 是后端缺陷（int3 占位
+#          或 op_no_match 落空），不是可豁免的能力缺口；FAIL > 0 非零退出
+#   FAIL = any backend divergence, including a backend SIGTRAP(133): a trap is a
+#          backend defect (int3 placeholder or a match falling through to
+#          op_no_match), not an exemptable capability gap; FAIL > 0 exits nonzero
 # Usage: ./scripts/multi-backend-verify.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -18,9 +21,9 @@ if [ -z "${BUR:-}" ]; then
     echo "BUR is not set; invoke as BUR=<compiler> $0 ..." >&2
     exit 2
 fi
-# clang 缺失属环境错误（非 SKIP）：SKIP 只保留给后端能力缺口。
-# A missing clang is an environment error (not a SKIP): SKIP stays
-# reserved for backend capability gaps.
+# clang 缺失属环境错误：克隆能力缺口不是豁免理由，trap 与缺失依赖都按失败处理。
+# A missing clang is an environment error: neither a capability gap nor a trap
+# is grounds for exemption — both fail.
 if ! command -v clang >/dev/null 2>&1; then
     echo "error: clang not found; the LLVM backend needs clang (install it and rerun)" >&2
     exit 3
@@ -35,7 +38,6 @@ TABLE="$TMP/case-table"
 
 PASS=0
 FAIL=0
-SKIP=0
 PROBE=0
 SEQ=0
 FAILURES=""
@@ -92,13 +94,6 @@ run_quad() {
         l_out=""
         l_rc=$l_brc
         l_err=$(cat "$TMP/l_berr")
-    fi
-
-    if [ "$vm_rc" -eq 133 ] || [ "$c_rc" -eq 133 ] || [ "$x_rc" -eq 133 ] || [ "$l_rc" -eq 133 ]; then
-        echo "  SKIP $label (SIGTRAP unimplemented opcode)"
-        SKIP=$((SKIP + 1))
-        echo "SKIP $label" >>"$TABLE"
-        return
     fi
 
     # §18 v9 探针：x86 clock 站点的 rsp tripwire（exit 40-43）命中时该例不可比，
@@ -174,7 +169,7 @@ for t in std/*/*_test.bur; do
 done
 
 echo
-echo "=== Summary: $PASS pass, $FAIL fail, $SKIP skip, $PROBE probe-hits ==="
+echo "=== Summary: $PASS pass, $FAIL fail, $PROBE probe-hits ==="
 if [ -n "$FAILURES" ]; then
     echo "FAILED:$FAILURES"
 fi
@@ -186,7 +181,7 @@ fi
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
         echo "## multibackend case table"
-        echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP PROBE=$PROBE"
+        echo "PASS=$PASS FAIL=$FAIL PROBE=$PROBE"
         cat "$TABLE"
     } >>"$GITHUB_STEP_SUMMARY"
 fi
