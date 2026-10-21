@@ -3178,35 +3178,26 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             while len(type_shadow) > dmv {
                 shadow_pop(type_shadow, 1)
             }
-            // 落点深度是权威：回边之后的死路径会把线性模拟走浅，缺的位置按落点快照
-            // 补齐；没有快照就留空，读取回退到槽表（槽号即栈位）。
-            // the target depth is authoritative: a dead path after a back edge leaves
-            // the linear walk shallow, so fill the missing positions from the target
-            // snapshot; without one leave them empty and let reads fall back to the slot
-            // table (slot == stack position).
+            // 落点深度是权威：回边之后的死路径会把线性模拟走浅。缺失的位置只能由落点
+            // 快照补上——快照同时带着该深度的栈项标识（slot: 等）与类型；没有足够长
+            // 的快照就保持现状，绝不用空占位伪造栈项。
+            // the target depth is authoritative: a dead path after a back edge leaves the
+            // linear walk shallow. The missing positions can only come from the target
+            // snapshot, which carries both the stack-item identities (slot: ...) and the
+            // types for that depth; without a long enough snapshot leave the model alone
+            // rather than fabricating stack items with empty placeholders.
             if len(type_shadow) < dmv {
                 match get(pt_target_shadow, str(fh) + ":" + str(ip)) {
                     Some(tss) => {
-                        while len(type_shadow) < dmv {
-                            let gi = len(type_shadow)
-                            if gi < len(tss[1]) {
+                        if len(tss[1]) >= dmv && len(tss[0]) >= dmv {
+                            while len(type_shadow) < dmv {
+                                let gi = len(type_shadow)
                                 push(type_shadow, tss[1][gi])
-                            } else {
-                                push(type_shadow, "")
-                            }
-                            if gi < len(tss[0]) {
                                 push(shadow, tss[0][gi])
-                            } else {
-                                push(shadow, "")
                             }
                         }
                     },
-                    None => {
-                        while len(type_shadow) < dmv {
-                            push(type_shadow, "")
-                            push(shadow, "")
-                        }
-                    },
+                    None => {},
                 }
             }
             // 裁掉的位置不再持有值：槽类型与权威一并遗忘，否则同号槽被后来的

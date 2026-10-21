@@ -173,35 +173,26 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             while len(ptshadow_ps) > pal {
                 shadow_pop(ptshadow_ps, 1)
             }
-            // 落点深度是权威：回边之后的死路径会把线性模拟走浅，缺的位置按落点快照
-            // 补齐；没有快照就留空，读取回退到槽表（槽号即栈位）。
-            // the target depth is authoritative: a dead path after a back edge leaves
-            // the linear simulation shallow, so fill the missing positions from the
-            // target snapshot; without one leave them empty and let reads fall back to
-            // the slot table (slot == stack position).
+            // 落点深度是权威：回边之后的死路径会把线性模拟走浅。缺失的位置只能由落点
+            // 快照补上——快照同时带着该深度的栈项标识（slot: 等）与类型；没有足够长
+            // 的快照就保持现状，绝不用空占位伪造栈项。
+            // the target depth is authoritative: a dead path after a back edge leaves the
+            // linear simulation shallow. The missing positions can only come from the
+            // target snapshot, which carries both the stack-item identities (slot: ...)
+            // and the types for that depth; without a long enough snapshot leave the model
+            // alone rather than fabricating stack items with empty placeholders.
             if len(ptshadow_ps) < pal {
                 match get(pt_target_shadow, str(ptfh) + ":" + str(pit)) {
                     Some(tss) => {
-                        while len(ptshadow_ps) < pal {
-                            let gi = len(ptshadow_ps)
-                            if gi < len(tss[1]) {
+                        if len(tss[1]) >= pal && len(tss[0]) >= pal {
+                            while len(ptshadow_ps) < pal {
+                                let gi = len(ptshadow_ps)
                                 push(ptshadow_ps, tss[1][gi])
-                            } else {
-                                push(ptshadow_ps, "")
-                            }
-                            if gi < len(tss[0]) {
                                 push(pshadow_ps, tss[0][gi])
-                            } else {
-                                push(pshadow_ps, "")
                             }
                         }
                     },
-                    None => {
-                        while len(ptshadow_ps) < pal {
-                            push(ptshadow_ps, "")
-                            push(pshadow_ps, "")
-                        }
-                    },
+                    None => {},
                 }
             }
             // 见发射侧：裁掉的位置不再持有值，槽类型与权威一并遗忘。
