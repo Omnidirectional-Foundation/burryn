@@ -299,14 +299,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             stype = top_t
                             pos_types[slot] = top_t
                         }
-                        // 诊断：槽类型与影子都是枚举编码时打印现场，定位被污染的槽；
-                        // 定位完即撤
-                        // diagnostic: print the site when both the slot type and the
-                        // shadow are enum encodings, to name the polluted slot;
-                        // removed once the site is pinned down
-                        if is_enum_enc(stype) && is_enum_enc(top_t) {
-                            eprintln("X86SLOT fn=" + ctx.f_name[fh] + " slot=" + str(slot) + " t=" + stype)
-                        }
                     }
                 } else if slot < len(pos_auth) && pos_auth[slot] {
                     stype = ""
@@ -1154,14 +1146,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // pointer payload from the scan.
             if !gf_known {
                 gf_t = ""
-            }
-            // 诊断：枚举接收者的字段提取打印现场（栈位、接收者类型、字段类型），看
-            // payload 落在哪个栈位；定位完即撤
-            // diagnostic: print the site of a field read off an enum receiver (the
-            // stack slot, the receiver type, the field type), to see which slot the
-            // payload lands on; removed once the site is pinned down
-            if is_enum_enc(gf_rt) {
-                eprintln("X86FLD fn=" + ctx.f_name[fh] + " pos=" + str(len(type_shadow) - 1) + " rec=" + gf_rt + " ft=" + gf_t)
             }
             // gf_t 先算后发：TOS 置换的 kind 随写随落影
             // compute gf_t before emitting: the TOS-replacement kind lands in the
@@ -3134,6 +3118,25 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     shadow = cp_ps(tss[0])
                     type_shadow = cp_ps(tss[1])
                     in_dead = false
+                    // 快照是跳转源的影子，活局部槽的条目可能落后于本路径已经落下
+                    // 的权威具体类型（另一条路径往同一槽写过别的值）：权威槽保留
+                    // 记录类型，否则槽里的标量会被按父枚举编码解引用（value is
+                    // not an object）。恢复只补齐跳转源的临时值位置，不覆盖活槽。
+                    // the snapshot is the jump source's shadow, so its live local slot
+                    // entries may lag the authoritative concrete type this path has
+                    // already recorded (the other path wrote a different value into the
+                    // same slot). An authoritative slot keeps its recorded type, or the
+                    // scalar it holds is dereferenced as the parent enum encoding
+                    // ("value is not an object"). The restore seeds transient positions
+                    // from the jump source and leaves live slots alone.
+                    let mut rs = 0
+                    while rs < len(type_shadow) {
+                        if rs < len(pos_auth) && pos_auth[rs] && !is_enum_enc(pos_types[rs]) {
+                            type_shadow[rs] = pos_types[rs]
+                        }
+                        rs = rs + 1
+                    }
+                    forget_types_above(pos_types, pos_auth, len(type_shadow))
                 },
                 None => {},
             }
@@ -3149,6 +3152,12 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             while len(type_shadow) > dmv {
                 shadow_pop(type_shadow, 1)
             }
+            // 裁掉的位置不再持有值：槽类型与权威一并遗忘，否则同号槽被后来的
+            // 声明复用时还带着上一条路径的枚举标注。
+            // the truncated positions hold no value any more: forget their slot types
+            // and authority as well, or a later declaration reusing the same number
+            // inherits the previous path's enum annotation.
+            forget_types_above(pos_types, pos_auth, dmv)
         }
         if in_dead {
             let sl = len(shadow)

@@ -145,6 +145,19 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     pshadow_ps = cp_ps(pss[0])
                     ptshadow_ps = cp_ps(pss[1])
                     p_dead = false
+                    // 见发射侧：跳转快照不覆盖活槽已记下的权威具体类型，只补齐
+                    // 临时值位置。
+                    // as in the emitter: the jump snapshot does not overwrite the
+                    // authoritative concrete type a live slot has already recorded; it
+                    // only seeds transient positions.
+                    let mut prs = 0
+                    while prs < len(ptshadow_ps) {
+                        if prs < len(ppos_auth) && ppos_auth[prs] && !is_enum_enc(ppos_types[prs]) {
+                            ptshadow_ps[prs] = ppos_types[prs]
+                        }
+                        prs = prs + 1
+                    }
+                    forget_types_above(ppos_types, ppos_auth, len(ptshadow_ps))
                 },
                 None => {},
             }
@@ -160,6 +173,10 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             while len(ptshadow_ps) > pal {
                 shadow_pop(ptshadow_ps, 1)
             }
+            // 见发射侧：裁掉的位置不再持有值，槽类型与权威一并遗忘。
+            // as in the emitter: truncated positions hold no value any more, so their
+            // slot types and authority go with them.
+            forget_types_above(ppos_types, ppos_auth, pal)
         }
         if p_dead {
             pit = pit + inst_len(ctx, ptfh, pcode, pit)
