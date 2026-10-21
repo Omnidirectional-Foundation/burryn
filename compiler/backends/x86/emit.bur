@@ -94,8 +94,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     fn is_lifted(slot) {
         slot > 0 && slot < len(lifted) && lifted[slot]
     }
-    fn w(s) {
+    // 当前位置只随 w 递增：cur_byte 每取一次都拼接整个输出缓冲会让发射一条指令
+    // 付出整段镜像的分配与拷贝（镜像规模下即是 O(n²) 的堆开销）
+    // the current position advances with w alone: letting cur_byte concatenate the
+    // whole output buffer makes emitting one instruction pay an allocation and copy
+    // of the entire image (O(n²) heap cost at image scale)
+    let mut cur_pos = 0
+    fn w(s) capture(ref cur_pos) {
         push(out, s)
+        cur_pos = cur_pos + str_len(s)
     }
     // 格式化子程序池：本函数用到的类型各生成一个子程序，接在函数代码之后
     // formatter pool: one subroutine per type this function formats, appended
@@ -105,8 +112,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     let mut fmt_call_lbl = []
     // cur_byte 取当前字节位置 / cur_byte returns the current byte position
     // Current byte position
-    fn cur_byte() {
-        str_len(join(out, ""))
+    fn cur_byte() capture(ref cur_pos) {
+        cur_pos
     }
     // w_fmt 把 [r15+off] 的值按类型 t 就地格式化为字符串 / w_fmt formats the value at
     // [r15+off] in place into a string by type t
@@ -1712,7 +1719,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // fake int shadow — so a key stored by content is looked up by word and
                 // never comes back. The runtime shape compare handles str keys by length
                 // plus bytes and int keys by word, immune to shadow drift.
-                let mk_t = map_key_type(m_t)
                 let kk = ""
                 if callee == "get" {
                     w(x86gen_get_map_native(kk))
@@ -1730,17 +1736,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     ret_type = "unit"
                 }
                 let msh = shadow[len(shadow) - n]
-                // 临时诊断：zdbg* 与检查器函数里的 map 键判定（定位完即撤）
-                // temp diagnostic: the map key decision inside zdbg* and the checker
-                // functions (remove after localization)
-                let dbg_fn = ctx.f_name[fh]
-                let dbg_z = str_len(dbg_fn) >= 4 && substr(dbg_fn, 0, 4) == "zdbg"
-                let dbg_c = len(ctx.f_code) > 200 && (dbg_fn == "convert_type_expr" || dbg_fn == "instantiate_enum" || dbg_fn == "infer_match" || dbg_fn == "collect_annotation_vars")
-                let dbg_k = dbg_fn == "is_fresh_source" || dbg_fn == "fresh_pattern_names" || dbg_fn == "fresh_name_copy"
-                let dbg_l = dbg_fn == "load_pkg"
-                if dbg_z || dbg_c || dbg_k || dbg_l {
-                    println("X86MAP fn=" + dbg_fn + " op=" + callee + " msh=" + msh + " mt=" + m_t + " mtk=" + mk_t + " kt=" + k_t + " kk=" + kk)
-                }
                 let refined = if callee == "put" {
                     refine_map_arg(m_t, k_t, v_t)
                 } else {
