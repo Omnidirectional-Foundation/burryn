@@ -100,6 +100,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     // whole output buffer makes emitting one instruction pay an allocation and copy
     // of the entire image (O(n²) heap cost at image scale)
     let mut cur_pos = 0
+    // 当前指令下标（w_fmt 的诊断要用，必须在 w_fmt 之前声明）
+    // the current instruction index (used by w_fmt's diagnostic, so declared before it)
+    let mut cur_ip = 0
     fn w(s) capture(ref cur_pos) {
         push(out, s)
         cur_pos = cur_pos + str_len(s)
@@ -118,6 +121,20 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     // w_fmt 把 [r15+off] 的值按类型 t 就地格式化为字符串 / w_fmt formats the value at
     // [r15+off] in place into a string by type t
     fn w_fmt(off, t) capture(ref fmtg, ref fmt_call_pos, ref fmt_call_lbl) {
+        // 值按枚举编码格式化时打印调用点：枚举格式化器对非对象值走 die 路径，
+        // 回溯落在格式化子程序池上只能指到函数首行，这里补出 ip 与栈上标号
+        // print the call site when a value is formatted by an enum encoding: the enum
+        // formatter dies on a non-object, and the backtrace lands in the formatter pool
+        // which only resolves to the function's first line — recover the ip and the
+        // stack label here
+        if is_enum_enc(t) {
+            let fsrc = if len(shadow) > 0 {
+                shadow[len(shadow) - 1]
+            } else {
+                ""
+            }
+            eprintln("X86FMT fn=" + ctx.f_name[fh] + " ip=" + str(cur_ip) + " t=" + t + " src=" + fsrc)
+        }
         let lbl = fmt_label(ctx, fmtg, t, false)
         w(fmt_top_pre(off, t) + e1(232))
         push(fmt_call_pos, cur_byte())
@@ -3097,6 +3114,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     while ip < len(code) {
         top_slot = -1
         sup_stamp = false
+        cur_ip = ip
         // 枚举描述符常量（模板/单例）加载不参与槽类型盖章：它是类型对象
         // 引用而非槽内值，弹栈消费后盖章残留会毒化同号槽
         // enum descriptor consts (templates/singletons) must not take part in
