@@ -3178,6 +3178,37 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             while len(type_shadow) > dmv {
                 shadow_pop(type_shadow, 1)
             }
+            // 落点深度是权威：回边之后的死路径会把线性模拟走浅，缺的位置按落点快照
+            // 补齐；没有快照就留空，读取回退到槽表（槽号即栈位）。
+            // the target depth is authoritative: a dead path after a back edge leaves
+            // the linear walk shallow, so fill the missing positions from the target
+            // snapshot; without one leave them empty and let reads fall back to the slot
+            // table (slot == stack position).
+            if len(type_shadow) < dmv {
+                match get(pt_target_shadow, str(fh) + ":" + str(ip)) {
+                    Some(tss) => {
+                        while len(type_shadow) < dmv {
+                            let gi = len(type_shadow)
+                            if gi < len(tss[1]) {
+                                push(type_shadow, tss[1][gi])
+                            } else {
+                                push(type_shadow, "")
+                            }
+                            if gi < len(tss[0]) {
+                                push(shadow, tss[0][gi])
+                            } else {
+                                push(shadow, "")
+                            }
+                        }
+                    },
+                    None => {
+                        while len(type_shadow) < dmv {
+                            push(type_shadow, "")
+                            push(shadow, "")
+                        }
+                    },
+                }
+            }
             // 裁掉的位置不再持有值：槽类型与权威一并遗忘，否则同号槽被后来的
             // 声明复用时还带着上一条路径的枚举标注。
             // the truncated positions hold no value any more: forget their slot types
@@ -3243,15 +3274,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     eprintln("X86LOOP ip=" + str(ip) + " tgt=" + str(ljt2) + " d=" + str(len(type_shadow)) + " dm=" + str(dv2))
                 }
             }
-            // 无条件跳转、回边与返回之后，线性路径终止：后续指令属于别的路径，栈深
-            // 只由落点快照恢复。回边若留活，线性模拟会带着回边裁剪后的浅栈继续走，
-            // 深度被永久压低一格，后续声明落在槽号之下（槽位影子与 pos_types 错位）。
-            // after an unconditional jump, a back edge or a return the linear path ends:
-            // the code that follows belongs to another path and only a target snapshot
-            // restores the depth. A live back edge made the linear walk continue on the
-            // shallower post-edge stack, losing one entry for good — later declarations
-            // then landed below their slot number and the shadow drifted from pos_types.
-            if code[ip] == lib::op_jump || code[ip] == lib::op_select || code[ip] == lib::op_loop || code[ip] == lib::op_return {
+            if code[ip] == lib::op_jump || code[ip] == lib::op_select {
                 in_dead = true
             }
         }

@@ -173,6 +173,37 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             while len(ptshadow_ps) > pal {
                 shadow_pop(ptshadow_ps, 1)
             }
+            // 落点深度是权威：回边之后的死路径会把线性模拟走浅，缺的位置按落点快照
+            // 补齐；没有快照就留空，读取回退到槽表（槽号即栈位）。
+            // the target depth is authoritative: a dead path after a back edge leaves
+            // the linear simulation shallow, so fill the missing positions from the
+            // target snapshot; without one leave them empty and let reads fall back to
+            // the slot table (slot == stack position).
+            if len(ptshadow_ps) < pal {
+                match get(pt_target_shadow, str(ptfh) + ":" + str(pit)) {
+                    Some(tss) => {
+                        while len(ptshadow_ps) < pal {
+                            let gi = len(ptshadow_ps)
+                            if gi < len(tss[1]) {
+                                push(ptshadow_ps, tss[1][gi])
+                            } else {
+                                push(ptshadow_ps, "")
+                            }
+                            if gi < len(tss[0]) {
+                                push(pshadow_ps, tss[0][gi])
+                            } else {
+                                push(pshadow_ps, "")
+                            }
+                        }
+                    },
+                    None => {
+                        while len(ptshadow_ps) < pal {
+                            push(ptshadow_ps, "")
+                            push(pshadow_ps, "")
+                        }
+                    },
+                }
+            }
             // 见发射侧：裁掉的位置不再持有值，槽类型与权威一并遗忘。
             // as in the emitter: truncated positions hold no value any more, so their
             // slot types and authority go with them.
