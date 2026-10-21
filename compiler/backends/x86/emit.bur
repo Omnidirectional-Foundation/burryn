@@ -281,27 +281,23 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // its original judgement.
                     if slot < len(type_shadow) && (slot == len(type_shadow) - 1 || !is_lifted(slot)) {
                         let top_t = type_shadow[slot]
-                        // 影子里的枚举编码不得覆写具体类型：具体观测比枚举标注可靠，
-                        // 翻成枚举就会把标量当对象解引用（value is not an object）
-                        // an enum encoding from the shadow must not overrule a concrete
-                        // type: a concrete observation is more reliable than an enum
-                        // annotation, and flipping one into an enum makes the formatter
-                        // deref a scalar as an object ("value is not an object")
-                        if is_enum_enc(top_t) && top_t != stype && !is_concrete_type(stype) {
+                        // 权威的具体类型不被影子里的枚举编码覆写：权威位只由事实写入
+                        // （SET_LOCAL、形参签名、push 定下的元素类型），此时影子可能
+                        // 还停在赋值前的类型（常是父枚举），照它把标量当枚举对象解引
+                        // 用即崩溃（value is not an object）。
+                        // An authoritative concrete type is not overwritten by an enum
+                        // encoding from the shadow: the authority flag is only set by
+                        // facts (SET_LOCAL, a param signature, a push-fixed element
+                        // type), and the shadow may still hold the pre-assignment type
+                        // (often the parent enum) — following it dereferences a scalar
+                        // as an enum object ("value is not an object").
+                        let slot_pinned = slot < len(pos_auth) && pos_auth[slot] && !is_enum_enc(stype)
+                        if is_enum_enc(top_t) && top_t != stype && !slot_pinned {
                             stype = top_t
                             pos_types[slot] = top_t
                         } else if is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
                             stype = top_t
                             pos_types[slot] = top_t
-                        }
-                        // 诊断：影子与槽类型不一致时打印现场（函数、槽、槽类型、影子类型、
-                        // 权威位、提升位、判定结果），定位被污染的槽；定位完即撤。
-                        // diagnostic: when the shadow and the slot type disagree, print
-                        // the site (the function, the slot, the slot type, the shadow
-                        // type, the authority flag, the lifted flag, the verdict), to
-                        // name the polluted slot; removed once the site is pinned down.
-                        if top_t != stype {
-                            eprintln("X86SLOT fn=" + ctx.f_name[fh] + " slot=" + str(slot) + " rec=" + stype + " shadow=" + top_t + " auth=" + str(slot < len(pos_auth) && pos_auth[slot]) + " lifted=" + str(is_lifted(slot)))
                         }
                     }
                 } else if slot < len(pos_auth) && pos_auth[slot] {
