@@ -395,10 +395,18 @@ jobs:
             for f in testdata/basics/*.bur; do
               [ -f "$f" ] || continue
               rc=0
-              timeout 30 ./g1x build --backend x86 "$f" -o /tmp/g1x-repro > /dev/null 2>&1 || rc=$?
+              timeout 30 ./g1x build --backend x86 "$f" -o /tmp/g1x-repro > /dev/null 2> /tmp/g1x-err || rc=$?
               echo "g1x-repro rc=$rc $f"
-              if [ "$rc" -ne 0 ] && [ -z "$first_bad" ]; then
-                first_bad="$f"
+              if [ "$rc" -ne 0 ]; then
+                # 运行时错误自带 at fn (file:line) 回溯：非零退出码里既有 SIGSEGV
+                # 也有走 die 路径的运行时错误，后者这条回溯直接给出编译器源码行。
+                # a runtime error carries its own "at fn (file:line)" trace: a
+                # non-zero exit covers both SIGSEGV and the die path, and for the
+                # latter the trace names the compiler source line outright.
+                sed -n '1,6p' /tmp/g1x-err || true
+                if [ -z "$first_bad" ]; then
+                  first_bad="$f"
+                fi
               fi
             done
           fi
