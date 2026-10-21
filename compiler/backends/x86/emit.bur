@@ -8,7 +8,7 @@ import "burryn.dev/compiler/lib"
 
 // emit_one_variant：单函数单变体发射（含嵌套 emit_inst）
 // emit_one_variant: emit one function variant (nested emit_inst included)
-fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, _en_vnames, nfn, _f2s_h, p_depth_maps, mut pt_target_shadow, mut pd_sink, globals_map, n_globals, mut global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, mut record_field_types, mut _enum_field_types, mut _enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, mut ln_sink, mut fmt_diag) {
+fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, _en_vnames, nfn, _f2s_h, p_depth_maps, mut pt_target_shadow, mut pd_sink, globals_map, n_globals, mut global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, mut record_field_types, mut _enum_field_types, mut _enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, mut ln_sink) {
     let code = f_code[fh]
     let arity = f_arity[fh]
     let locals = count_locals(ctx, fh)
@@ -318,6 +318,24 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                     pos_types[slot] = stype
                 }
+                if is_enum_enc(stype) && ctx.f_name[fh] == "psim" {
+                    let ts_v = if slot < len(type_shadow) {
+                        type_shadow[slot]
+                    } else {
+                        "<oob>"
+                    }
+                    let pt_v = if slot < len(pos_types) {
+                        pos_types[slot]
+                    } else {
+                        "<oob>"
+                    }
+                    let au_v = if slot < len(pos_auth) && pos_auth[slot] {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    eprintln("X86RD ip=" + str(ip) + " slot=" + str(slot) + " dsh=" + str(len(type_shadow)) + " dpt=" + str(len(pos_types)) + " ts=" + ts_v + " pt=" + pt_v + " auth=" + au_v)
+                }
                 if is_lifted(slot) {
                     if slot < len(cell_auth) && cell_auth[slot] {
                         // 提升槽：槽存 cell 指针，读须解引用
@@ -430,6 +448,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     push(pos_auth, false)
                 }
                 pos_auth[slot] = true
+                if ctx.f_name[fh] == "psim" && slot > 18 && slot < 42 {
+                    let st_v = if slot < len(pos_types) {
+                        pos_types[slot]
+                    } else {
+                        "<oob>"
+                    }
+                    let is_decl_v = if is_decl {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    eprintln("X86SET ip=" + str(ip) + " slot=" + str(slot) + " dsh=" + str(len(type_shadow)) + " decl=" + is_decl_v + " t=" + st_v)
+                }
                 while len(cell_auth) <= slot {
                     push(cell_auth, false)
                 }
@@ -1467,10 +1498,6 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     ""
                 }
                 if str_arg_t != "str" {
-                    if is_enum_enc(str_arg_t) {
-                        push(fmt_diag, ip)
-                        eprintln("X86STRSITE fn=" + ctx.f_name[fh] + " ip=" + str(ip) + " t=" + str_arg_t + " dsh=" + str(len(shadow)) + " dty=" + str(len(type_shadow)))
-                    }
                     w_fmt(0 - 8, str_arg_t)
                 }
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r15, 0 - 16, rax) + vs_pop_n(1) + shadow_set(1, GC_SHADOW_PTR))
@@ -3084,6 +3111,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             push(pending_olds, w_old)
                         }
                         pos_types[vds] = w_new
+                        if ctx.f_name[fh] == "psim" && is_enum_enc(w_new) && vds > 18 && vds < 42 {
+                            let src_v = if len(shadow) > 0 {
+                                shadow[len(shadow) - 1]
+                            } else {
+                                ""
+                            }
+                            eprintln("X86STP ip=" + str(ip) + " op=" + str(op) + " vds=" + str(vds) + " old=" + w_old + " new=" + w_new + " src=" + src_v)
+                        }
                     }
                 }
             }
@@ -3170,6 +3205,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // and authority as well, or a later declaration reusing the same number
             // inherits the previous path's enum annotation.
             forget_types_above(pos_types, pos_auth, dmv)
+        }
+        if vi == 0 && f_name[fh] == "psim" {
+            eprintln("X86DEP ip=" + str(ip) + " op=" + str(code[ip]) + " d=" + str(len(type_shadow)))
         }
         if in_dead {
             let sl = len(shadow)
