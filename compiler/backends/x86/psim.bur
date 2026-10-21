@@ -1211,7 +1211,8 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                 },
             }
         } else if pop == lib::op_chan_next {
-            put(p_depth_at, pit + 3 + read_u16(pcode, pit + 1), len(pshadow_ps) - 1)
+            let pcn_t = pit + 3 + read_u16(pcode, pit + 1)
+            put(p_depth_at, pcn_t, len(pshadow_ps) - 1)
             // 结果类型 = ch 槽的元素类型（chan:X → X；未知 → 空）
             // result type = the channel slot's element type (chan:X -> X; unknown -> empty)
             let mut pcn_elem = ""
@@ -1223,6 +1224,20 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
             }
             shadow_pop(pshadow_ps, 1)
             shadow_pop(ptshadow_ps, 1)
+            // 关闭分支的落点也要有快照：落点快照是死路径跳过的唯一恢复点，缺了它
+            // 回边之后的跳过永远醒不过来，chan 的 for-in 之后整段函数失去类型推断
+            // （recv 的 Option 退化成标量，match 落到 op_no_match 触发 int3）。
+            // the closed branch's target needs a snapshot too: a target snapshot is the
+            // only resume point for a dead-path skip, and without it the skip after a
+            // back edge never wakes up — the whole function after a channel for-in drops
+            // out of type inference (recv's Option degenerates to a scalar and the match
+            // falls through to op_no_match, which traps).
+            match get(pt_target_shadow, str(ptfh) + ":" + str(pcn_t)) {
+                Some(_) => {},
+                None => {
+                    put(pt_target_shadow, str(ptfh) + ":" + str(pcn_t), [cp_ps(pshadow_ps), cp_ps(ptshadow_ps)])
+                },
+            }
             push(pshadow_ps, "")
             push(ptshadow_ps, pcn_elem)
         } else if pop == lib::op_neg {
