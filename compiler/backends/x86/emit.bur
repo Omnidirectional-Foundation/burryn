@@ -3272,8 +3272,16 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // divergence surfaces there. It compares addresses: lea forms the expected
             // stack-top address (frame base + 8 × model depth) and compares it with the
             // runtime's stack top r15 (mov_rm would load the slot's value instead).
+            // 报错自带现场：函数名、字节码 ip、模型深度与运行期深度（%1 由 setup 装
+            // rdi）——回溯未必取得到（die 的回溯打印另受调用点寄存器影响），故把
+            // 定位信息放进消息本身。
+            // The report carries the scene: function name, bytecode ip, model depth and
+            // runtime depth (%1 comes from rdi via setup) — the backtrace is not
+            // dependable (the die's frame printing also depends on the call site's
+            // registers), so the locating facts ride in the message itself.
             if code[ip] == lib::op_call && nfn > 500 {
-                w(lea(rax, r14, 8 * len(type_shadow)) + cmp_rr(rax, r15) + x86gen_guard(CC_E, x86gen_trap_exit("x86 depth mismatch")))
+                let xd_d = len(type_shadow)
+                w(lea(rcx, r14, 8 * xd_d) + cmp_rr(rcx, r15) + x86gen_guard(CC_E, x86gen_trap_fmt(mov_rr(rdi, r15) + sub_rr(rdi, r14) + shr_ri(rdi, 3), "x86 depth mismatch fn=" + f_name[fh] + " ip=" + str(ip) + " model=" + str(xd_d) + " runtime=" + byte_chr(1))))
             }
             if f_name[fh] == "psim" && code[ip] == lib::op_loop {
                 let ljt2 = ip + 3 - read_u16(code, ip + 1)
