@@ -281,23 +281,28 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // its original judgement.
                     if slot < len(type_shadow) && (slot == len(type_shadow) - 1 || !is_lifted(slot)) {
                         let top_t = type_shadow[slot]
-                        // 权威的具体类型不被影子里的枚举编码覆写：权威位只由事实写入
-                        // （SET_LOCAL、形参签名、push 定下的元素类型），此时影子可能
-                        // 还停在赋值前的类型（常是父枚举），照它把标量当枚举对象解引
-                        // 用即崩溃（value is not an object）。
-                        // An authoritative concrete type is not overwritten by an enum
-                        // encoding from the shadow: the authority flag is only set by
-                        // facts (SET_LOCAL, a param signature, a push-fixed element
-                        // type), and the shadow may still hold the pre-assignment type
-                        // (often the parent enum) — following it dereferences a scalar
-                        // as an enum object ("value is not an object").
-                        let slot_pinned = slot < len(pos_auth) && pos_auth[slot] && !is_enum_enc(stype)
-                        if is_enum_enc(top_t) && top_t != stype && !slot_pinned {
+                        // 影子里的枚举编码不得覆写具体类型：具体观测比枚举标注可靠，
+                        // 翻成枚举就会把标量当对象解引用（value is not an object）
+                        // an enum encoding from the shadow must not overrule a concrete
+                        // type: a concrete observation is more reliable than an enum
+                        // annotation, and flipping one into an enum makes the formatter
+                        // deref a scalar as an object ("value is not an object")
+                        if is_enum_enc(top_t) && top_t != stype && !is_concrete_type(stype) {
                             stype = top_t
                             pos_types[slot] = top_t
                         } else if is_enum_enc(stype) && !is_enum_enc(top_t) && str_len(top_t) > 0 {
                             stype = top_t
                             pos_types[slot] = top_t
+                        } else if str_len(top_t) == 0 && !(slot < len(pos_auth) && pos_auth[slot]) {
+                            // 影子判不出时非权威的槽类型也是旧的回写，一并作废：留
+                            // 着上一个同号局部的枚举标注，读该槽就会把标量当枚举对象
+                            // when the shadow cannot decide, a non-authoritative slot
+                            // type is a stale write-back as well and is dropped too:
+                            // keeping the previous same-numbered local's enum
+                            // annotation makes a later read treat a scalar as an enum
+                            // object
+                            stype = ""
+                            pos_types[slot] = ""
                         }
                     }
                 } else if slot < len(pos_auth) && pos_auth[slot] {
@@ -3413,7 +3418,7 @@ fn merge_enum_ann(a, b) {
         // 裸 "enum" 不带变体信息，不覆盖富编码 / a bare "enum" carries no variant
         // information and does not overwrite a rich encoding
         a
-    } else if (a == "int" || a == "str" || a == "bool" || a == "float" || a == "unit") && (b == "enum" || is_enum_enc(b)) {
+    } else if is_concrete_type(a) && (b == "enum" || is_enum_enc(b)) {
         // 标量观测比枚举标注可靠（与 merge_type 同规）/ a scalar observation is
         // more reliable than an enum annotation (the same rule as merge_type)
         a
@@ -4232,6 +4237,15 @@ fn is_map_type(t) {
     str_len(t) >= 3 && substr(t, 0, 3) == "map"
 }
 
+// is_concrete_type 判断是否为具体类型词（标量族）：具体观测比枚举标注可靠，
+// 翻成枚举就会把标量当指针解引用
+// is_concrete_type tells whether t is a concrete type word (the scalar family): a
+// concrete observation is more reliable than an enum annotation, and flipping one
+// into an enum makes the formatter deref a scalar as a pointer
+fn is_concrete_type(t) {
+    t == "int" || t == "str" || t == "bool" || t == "float" || t == "unit"
+}
+
 // merge_type 合并类型跟踪 / merge_type merges type tracking
 fn merge_type(cur, new) {
     if cur == "" {
@@ -4286,7 +4300,7 @@ fn merge_type(cur, new) {
         } else {
             new
         }
-    } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && (new == "enum" || is_enum_enc(new)) {
+    } else if is_concrete_type(cur) && (new == "enum" || is_enum_enc(new)) {
         // 标量观测比枚举标注可靠：裸 "enum"（如 get 值类型未知时的 Option 影子）
         // 不得把标量翻成枚举，否则 str/print 按枚举取 tag，整数被当指针解引用
         // a scalar observation is more reliable than an enum annotation: a bare
@@ -4294,7 +4308,7 @@ fn merge_type(cur, new) {
         // flip a scalar into an enum, or str/print takes the tag path and derefs an
         // int as a pointer
         cur
-    } else if (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && (cur == "enum" || is_enum_enc(cur)) {
+    } else if is_concrete_type(new) && (cur == "enum" || is_enum_enc(cur)) {
         new
     } else if cur == "enum" && is_enum_enc(new) {
         // 富编码带变体与载荷信息，裸 "enum" 不覆盖它 / a rich encoding carries
@@ -4302,7 +4316,7 @@ fn merge_type(cur, new) {
         new
     } else if is_enum_enc(cur) && new == "enum" {
         cur
-    } else if (cur == "int" || cur == "str" || cur == "bool" || cur == "float" || cur == "unit") && (new == "int" || new == "str" || new == "bool" || new == "float" || new == "unit") && cur != new {
+    } else if is_concrete_type(cur) && is_concrete_type(new) && cur != new {
         cur
     } else {
         new

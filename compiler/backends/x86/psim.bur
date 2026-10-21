@@ -280,19 +280,21 @@ fn psim(ctx: X86Ctx, ptfh, param_types, aggregate, mut pt_target_shadow, mut p_d
                     // only non-lifted slots (a lifted slot's shadow is the cell's element).
                     if pslot < len(ptshadow_ps) && (pslot == len(ptshadow_ps) - 1 || !(pslot > 0 && pslot < len(plifted) && plifted[pslot])) {
                         let ptop = ptshadow_ps[pslot]
-                        // 见发射侧：权威的具体类型不被影子里的枚举编码覆写（权威位只由
-                        // 事实写入，影子可能还停在赋值前的类型）。
-                        // as in the emitter: an authoritative concrete type is not
-                        // overwritten by an enum encoding from the shadow (the authority
-                        // flag is only set by facts, and the shadow may still hold the
-                        // pre-assignment type)
-                        let pslot_pinned = pslot < len(ppos_auth) && ppos_auth[pslot] && !is_enum_enc(pstype)
-                        if is_enum_enc(ptop) && ptop != pstype && !pslot_pinned {
+                        // 见发射侧：影子里的枚举编码不得覆写具体类型
+                        // as in the emitter: an enum encoding from the shadow must not
+                        // overrule a concrete type
+                        if is_enum_enc(ptop) && ptop != pstype && !is_concrete_type(pstype) {
                             pstype = ptop
                             ppos_types[pslot] = ptop
                         } else if is_enum_enc(pstype) && !is_enum_enc(ptop) && str_len(ptop) > 0 {
                             pstype = ptop
                             ppos_types[pslot] = ptop
+                        } else if str_len(ptop) == 0 && !(pslot < len(ppos_auth) && ppos_auth[pslot]) {
+                            // 见发射侧：影子判不出时非权威的槽类型一并作废
+                            // as in the emitter: when the shadow cannot decide, a
+                            // non-authoritative slot type is dropped as well
+                            pstype = ""
+                            ppos_types[pslot] = ""
                         }
                     }
                 } else if pslot < len(ppos_auth) && ppos_auth[pslot] {
