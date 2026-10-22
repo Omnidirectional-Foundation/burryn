@@ -16,6 +16,22 @@ pub let mut xd_drift_budget = 20
 
 // emit_one_variant：单函数单变体发射（含嵌套 emit_inst）
 // emit_one_variant: emit one function variant (nested emit_inst included)
+// shadow_stamp_slot 给槽位盖影子 kind：槽在帧里的位置是 slot，影子游标在栈顶，
+// 故位移为「当前深度 − 槽号」。槽号超出模型深度时不盖（负位移会写到游标之上，踩到
+// 别的槽的字节）。
+// shadow_stamp_slot stamps a slot's shadow kind: the slot sits at frame position
+// `slot` and the shadow cursor is at the stack top, so the displacement is
+// "current depth - slot". A slot above the model's depth is not stamped (a
+// negative displacement would write above the cursor and hit another slot's
+// byte).
+fn shadow_stamp_slot(type_shadow, slot, k) {
+    if slot > 0 && len(type_shadow) > slot {
+        shadow_set(len(type_shadow) - slot, k)
+    } else {
+        ""
+    }
+}
+
 fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_consts, en_qual, _en_vnames, nfn, _f2s_h, p_depth_maps, mut pt_target_shadow, mut pd_sink, globals_map, n_globals, mut global_type, method_full_map, fn_ret_type, fn_ret_param, fn_param_types, fn_extra_base, record_encs, record_offs, mut record_field_types, mut _enum_field_types, mut _enum_variant_types, out_enc, res_out_enc, res_int_enc, opt_res_enc, yield_addr, sched_addr, timer_add_addr, done_addr, chan_sched_addr, chan_wake_addr, chan_push_sendq_addr, chan_push_recvq_addr, chan_push_waiters_addr, chan_remove_waiter_addr, waitset_add_addr, mut ln_sink, f_spans) {
     let code = f_code[fh]
     let arity = f_arity[fh]
@@ -2277,7 +2293,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // the raw value was pushed (an int stamps SCALAR), the cell is
                         // then not scanned, its contents are swept, and the slot
                         // reads back a wild pointer.
-                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10) + shadow_set(len(type_shadow) - uidx, GC_SHADOW_PTR))
+                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10) + shadow_stamp_slot(type_shadow, uidx, GC_SHADOW_PTR))
                         while len(pos_auth) <= uidx {
                             push(pos_auth, false)
                         }
@@ -2309,7 +2325,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // the raw value was pushed (an int stamps SCALAR), the cell is
                         // then not scanned, its contents are swept, and the slot
                         // reads back a wild pointer.
-                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + shadow_set(len(type_shadow) - uidx, GC_SHADOW_PTR))
+                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + shadow_stamp_slot(type_shadow, uidx, GC_SHADOW_PTR))
                         while len(pos_auth) <= uidx {
                             push(pos_auth, false)
                         }
@@ -3225,7 +3241,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                             // stamped as a scalar is not scanned, so the value is
                             // swept and the slot reads back a wild pointer (enum and
                             // record payloads come out as raw pointers).
-                            w(shadow_set(len(type_shadow) - rs, gc_kind_of(pos_types[rs])))
+                            w(shadow_stamp_slot(type_shadow, rs, gc_kind_of(pos_types[rs])))
                         }
                         rs = rs + 1
                     }
