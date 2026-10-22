@@ -12,6 +12,14 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     let code = f_code[fh]
     let arity = f_arity[fh]
     let locals = count_locals(ctx, fh)
+    // 本函数见过的最大槽号（参数占 1..arity）：前端给新局部分配的槽号必大于此前
+    // 任何槽号，据此认出「声明」并核对该声明在模型里的位置是否就是槽号本身。
+    // The highest slot number seen in this function (the params take 1..arity): the
+    // frontend hands a new local a slot above every slot seen before, which
+    // identifies the declaration and checks that the declaration's position in the
+    // model is the slot number itself.
+    let mut max_slot = arity
+    let mut xd_drift_reported = 0
 
     let mut out = []
     let mut patches = []
@@ -346,7 +354,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // dereferences a scalar as an enum object ("value is not an object"),
                 // or stamps a pointer as a scalar so the collector does not mark it
                 // (dangling).
-                if slot < len(type_shadow) && slot < len(pos_types) && !is_lifted(slot) && type_shadow[slot] != pos_types[slot] && nfn > 500 {
+                if slot < len(type_shadow) && slot < len(pos_types) && !is_lifted(slot) && type_shadow[slot] != pos_types[slot] && nfn > 500 && xd_drift_reported < 20 {
+                    xd_drift_reported = xd_drift_reported + 1
                     let mut xd_lifted = "0"
                     if is_lifted(slot) {
                         xd_lifted = "1"
@@ -448,6 +457,21 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // this round's slot already holds a cell; trusting it writes through a raw
             // value (a SEGV into the read-only constant area).
             let is_decl = slot > 0 && len(type_shadow) > 0 && slot == len(type_shadow) - 1
+            // 新槽（前端给新局部发的槽号必大于此前任何槽号）若不在模型栈顶，说明前端
+            // 的槽号与运行期栈位错开：局部值落在别的位置，按槽号读回的是别人的值
+            // → 野指针。报出第一处即可定位。
+            // A new slot (the frontend hands a new local a number above every slot
+            // seen before) that is not the model's stack top means the frontend's
+            // numbering and the runtime's stack positions differ: the local's value
+            // sits elsewhere and reading it by slot yields a foreign value — the
+            // source of the wild pointers. The first such site locates it.
+            if slot > max_slot {
+                max_slot = slot
+                if !is_decl && xd_drift_reported < 20 && nfn > 500 {
+                    xd_drift_reported = xd_drift_reported + 1
+                    eprintln("X86SLOTDRIFT fn=" + f_name[fh] + " ip=" + str(ip) + " slot=" + str(slot) + " model_depth=" + str(len(type_shadow)) + " expected_depth=" + str(slot + 1))
+                }
+            }
             let was_auth = slot > 0 && slot < len(cell_auth) && cell_auth[slot] && !is_decl
             if slot > 0 {
                 while len(pos_types) <= slot {
