@@ -359,8 +359,18 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           chmod +x gen1
-          ./gen1 build --backend x86 compiler -o g1x
-          ./g1x build --backend x86 compiler -o g2x
+          # 内存曲线：两份同工量的构建各采一条 RSS 曲线——gen1（C 宿主）与 g1x
+          # （x86 宿主）。x86 堆是 MAP_NORESERVE 的保留区，RSS 逼近实际触页量；
+          # 曲线的形状（单调爬升 / 锯齿 / 平顶）直接分辨「活集真这么大」与
+          # 「回收没生效」，配合 OOM 报错里的堆账目三数互为印证。
+          # memory curves: sample the RSS of both builds of the same workload —
+          # gen1 (C-hosted) and g1x (x86-hosted). The x86 heap is a MAP_NORESERVE
+          # reservation, so RSS tracks the pages actually touched; the curve's
+          # shape (monotonic ramp / sawtooth / plateau) tells "the live set really
+          # is that large" apart from "the collector stopped reclaiming", and the
+          # three heap-accounting numbers in the OOM report corroborate it.
+          ./scripts/rss-curve.sh gen1x ./gen1 build --backend x86 compiler -o g1x
+          ./scripts/rss-curve.sh g2x ./g1x build --backend x86 compiler -o g2x
           sha256sum g1x g2x
           cmp g1x g2x
 

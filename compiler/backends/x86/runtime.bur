@@ -207,10 +207,24 @@ pub let mut oom_die_g = 0
 // x86gen_alloc / x86gen_alloc_r, whose sequences inline the bound check (see
 // gc.bur).
 
-// x86gen_oom_die_stub 生成 OOM die stub 本体：全保存现场后经 die 报错退出
-// x86gen_oom_die_stub emits the OOM die stub: save everything, report through die
+// x86gen_oom_die_stub 生成 OOM die stub 本体：全保存现场后经 die 报错退出。
+// 报错带三个堆账目数：已用字节（堆顶 r12 - 堆基）、堆上限、上轮 collect 释放的字节。
+// 原先只有一句「x86 heap limit」，读者无从分辨是「活集真那么大」还是「回收没生效 /
+// 碎片化把堆顶顶上去」——三个数把两者分开：上轮释放量接近零 ⇒ 活集确实到了上限；
+// 释放量可观而堆顶仍越限 ⇒ 复用没生效（堆顶只涨不复）。
+// x86gen_oom_die_stub emits the OOM die stub: save everything, report through die.
+// The report carries three heap-accounting numbers: bytes used (heap top r12
+// minus the heap base), the heap limit, and the bytes the last collect freed.
+// The old bare "x86 heap limit" said nothing about whether the live set really
+// is that large or the collector stopped reclaiming — the three numbers tell
+// the two apart: a near-zero freed means the live set really hit the limit; a
+// large freed with the top still over the limit means reuse stopped working.
 fn x86gen_oom_die_stub() {
-    push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rsi) + push_r(rdi) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + x86gen_trap_exit("out of memory: x86 heap limit")
+    let used = mov_ri64(rax, rt_slot(rt_heap_start)) + mov_rm(rax, rax, 0) + mov_rr(rcx, r12) + sub_rr(rcx, rax) + mov_rr(rdi, rcx)
+    let lim = mov_ri64(rax, rt_slot(rt_heap_limit)) + mov_rm(rax, rax, 0) + mov_rr(rsi, rax)
+    let freed = mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_rm(rax, rax, 0) + mov_rr(rdx, rax)
+    let msg = "out of memory: x86 heap limit (used " + byte_chr(1) + " of " + byte_chr(2) + " bytes, last collect freed " + byte_chr(3) + ")"
+    push_r(rax) + push_r(rcx) + push_r(rdx) + push_r(rsi) + push_r(rdi) + push_r(r8) + push_r(r9) + push_r(r10) + push_r(r11) + x86gen_trap_fmt(used + lim + freed, msg)
 }
 
 // x86gen_sched_block 生成调度器主循环：pop ready → 恢复 ctx → ret；主 fiber 完成退出；
