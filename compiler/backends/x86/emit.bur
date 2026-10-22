@@ -2269,7 +2269,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // (r11 holds the closure base here, so the cell goes in r10)
                         // P3 批 3：cell 挂 allptr（见 GET 侧注释）/ allptr cell (see
                         // the GET-side note)
-                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10))
+                        // 槽里改放 cell 指针后，该槽的收集器影子字节必须重盖成 PTR：
+                        // 字节是落针时按裸值的型盖的（int → SCALAR），cell 不被扫 →
+                        // cell 里的值被回收 → 槽读回野指针。
+                        // The slot now holds a cell pointer, so its collector shadow
+                        // byte must be re-stamped to PTR: the byte was written when
+                        // the raw value was pushed (an int stamps SCALAR), the cell is
+                        // then not scanned, its contents are swept, and the slot
+                        // reads back a wild pointer.
+                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10) + shadow_set(len(type_shadow) - uidx, GC_SHADOW_PTR))
                         while len(pos_auth) <= uidx {
                             push(pos_auth, false)
                         }
@@ -2293,7 +2301,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         // 槽尚未 cell 化：先存值，再把槽提升为 cell（保持提升槽不变式）
                         // slot not yet lifted: store the value, then lift the slot into a
                         // cell (keeps the lifted-slot invariant)
-                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10))
+                        // 槽里改放 cell 指针后，该槽的收集器影子字节必须重盖成 PTR：
+                        // 字节是落针时按裸值的型盖的（int → SCALAR），cell 不被扫 →
+                        // cell 里的值被回收 → 槽读回野指针。
+                        // The slot now holds a cell pointer, so its collector shadow
+                        // byte must be re-stamped to PTR: the byte was written when
+                        // the raw value was pushed (an int stamps SCALAR), the cell is
+                        // then not scanned, its contents are swept, and the slot
+                        // reads back a wild pointer.
+                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + shadow_set(len(type_shadow) - uidx, GC_SHADOW_PTR))
                         while len(pos_auth) <= uidx {
                             push(pos_auth, false)
                         }
