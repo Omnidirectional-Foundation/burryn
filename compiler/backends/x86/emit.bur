@@ -485,22 +485,49 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 while len(pos_types) <= slot {
                     push(pos_types, "")
                 }
-                if len(type_shadow) > 0 {
+                if is_decl {
+                    // 声明：值此刻**就在**槽里（槽即栈位），SET_LOCAL 只是把「这个槽
+                    // 落在栈的哪一格、型是什么」告诉后端。值不能搬、型不能取栈顶
+                    // （声明的栈顶是别的表达式留下的），cell 权也不能给——声明时槽里
+                    // 是裸值不是 cell 指针。
+                    // A declaration: the value is *already* in the slot (a slot is a
+                    // stack position), so SET_LOCAL only tells the backend which
+                    // stack cell the slot lives in and what its type is. Nothing is
+                    // moved, the type is not taken from the stack top (that is some
+                    // other expression's leftover), and the slot is not given cell
+                    // authority — at a declaration the slot holds a raw value, not a
+                    // cell pointer.
+                    if slot < len(type_shadow) {
+                        pos_types[slot] = type_shadow[slot]
+                    }
+                    if slot < len(pos_auth) {
+                        while len(pos_auth) <= slot {
+                            push(pos_auth, false)
+                        }
+                    }
+                    pos_auth[slot] = true
+                    if slot < len(cell_auth) {
+                        while len(cell_auth) <= slot {
+                            push(cell_auth, false)
+                        }
+                    }
+                    cell_auth[slot] = false
+                } else if len(type_shadow) > 0 {
                     pos_types[slot] = type_shadow[len(type_shadow) - 1]
                 } else {
                     // select recv 臂体的 set_local：栈顶类型已被 select 弹掉，默认 int
                     // select recv arm body set_local: select popped the stack-top type,
                     // default to int instead of leaving the slot untyped
                     pos_types[slot] = "int"
+                    while len(pos_auth) <= slot {
+                        push(pos_auth, false)
+                    }
+                    pos_auth[slot] = true
+                    while len(cell_auth) <= slot {
+                        push(cell_auth, false)
+                    }
+                    cell_auth[slot] = true
                 }
-                while len(pos_auth) <= slot {
-                    push(pos_auth, false)
-                }
-                pos_auth[slot] = true
-                while len(cell_auth) <= slot {
-                    push(cell_auth, false)
-                }
-                cell_auth[slot] = true
                 // 影子跟上槽里实际放的东西：SET_LOCAL 把值搬进槽，槽位的影子条目却
                 // 停在赋值前的类型（常是父枚举），读该槽时按影子覆写权威类型就会把
                 // 标量当成枚举对象解引用（value is not an object）。
@@ -514,7 +541,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 // the element type pushed into the cell, not the slot's own value
                 // type (the value's type is the authoritative pos_types entry, which
                 // the write updates).
-                if slot < len(type_shadow) && !is_lifted(slot) {
+                if slot < len(type_shadow) && !is_lifted(slot) && !is_decl {
                     type_shadow[slot] = pos_types[slot]
                 }
             }
@@ -533,7 +560,18 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // dispatches to the placeholder's variant (returns 0, no side effects).
             // merge_type keeps a container's element-bearing side, so a bare `list-` cannot
             // reset it.
-            if slot > 0 && is_lifted(slot) {
+            // 声明不落 cell 的型：声明值此刻只是占位（嵌套 fn 声明压的是 op_unit），
+            // 把它当 cell 的元素型定下，cell 的型就永远停在这个占位上——之后真写进去
+            // 的值（闭包句柄 / 列表）只被并进去而不替换，读出来仍按占位型分派，
+            // 枚举/记录的载荷于是按裸指针出面（打成数字、当整数相乘）。
+            // A declaration does not settle the cell's type: the declared value is
+            // only a placeholder (a nested fn declaration pushes op_unit), and
+            // settling the cell's type on it pins the cell to that placeholder — the
+            // value written later (a closure handle, a list) is only merged in, not
+            // substituted, so reads still dispatch by the placeholder's type and the
+            // enum/record payloads come out as raw pointers (printed as numbers,
+            // multiplied as integers).
+            if slot > 0 && is_lifted(slot) && !is_decl {
                 let ck = "cell:" + str(fh) + ":" + str(slot)
                 if was_auth {
                     let ccur = match get(global_type, ck) {
@@ -548,7 +586,15 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     }
                 }
             }
-            if is_lifted(slot) {
+            if is_decl {
+                // 声明不搬值：值此刻就在槽（槽即栈位），搬一次等于把栈顶的**别的**值
+                // 写进槽、把槽里自己的值留在原地——于是槽与值错位、读回别人的值。
+                // A declaration does not move anything: the value is in the slot
+                // already (a slot is a stack position), so moving copies some other
+                // stack-top value into the slot and leaves the slot's own value
+                // behind — the slot and its value then disagree, and reads return
+                // someone else's value.
+            } else if is_lifted(slot) {
                 if was_auth {
                     // 后续写：写 cell 内容
                     // subsequent writes: write through the cell
@@ -578,8 +624,18 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // Assignments pass here too: the declaration-time byte may already be wrong.
             // A lifted slot holds a cell pointer and is always PTR.
             if slot > 0 && len(type_shadow) > slot {
-                let sk = if is_lifted(slot) {
+                // 声明时槽里是裸值（还没 cell 化），字节按**值**的型盖；提升槽的
+                // PTR 是 cell 化之后才有的事——提前盖 PTR 会让收集器去扫一个裸标量
+                // （当指针解引用），提前盖 SCALAR 又会让 cell 化后的指针不被扫。
+                // At a declaration the slot holds the raw value (not yet cell-ified),
+                // so the byte follows the *value's* kind; a lifted slot's PTR only
+                // becomes true once the cell exists — stamping PTR early makes the
+                // collector scan a bare scalar as a pointer, stamping SCALAR early
+                // leaves the cell pointer unscanned.
+                let sk = if is_lifted(slot) && !is_decl {
                     GC_SHADOW_PTR
+                } else if is_decl {
+                    gc_kind_of(type_shadow[slot])
                 } else {
                     gc_kind_of(type_shadow[len(type_shadow) - 1])
                 }
