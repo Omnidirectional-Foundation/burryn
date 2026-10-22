@@ -3229,23 +3229,23 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     while rs < len(type_shadow) {
                         if rs < len(pos_auth) && pos_auth[rs] && !is_enum_enc(pos_types[rs]) {
                             type_shadow[rs] = pos_types[rs]
-                            // 权威型落回模型后，必须把该位置的收集器影子字节一并重盖：
-                            // 字节是落针时按当时的型盖的，恢复改的是模型里的型，字节还
-                            // 停在旧型上——指针按标量盖住时收集器不扫它 → 值被回收 →
-                            // 槽里读回野指针（枚举/记录载荷直接变成裸指针）。
-                            // The authoritative type goes back into the model, so the
-                            // collector's shadow byte for that position has to be
-                            // re-stamped: the byte was written when the value was
-                            // pushed, with the type of that moment, and the restore
-                            // changes the model without touching the byte — a pointer
-                            // stamped as a scalar is not scanned, so the value is
-                            // swept and the slot reads back a wild pointer (enum and
-                            // record payloads come out as raw pointers).
-                            let mut xds_k = gc_kind_of(pos_types[rs])
-                            if is_lifted(rs) {
-                                xds_k = GC_SHADOW_PTR
-                            }
-                            w(shadow_stamp_slot(type_shadow, rs, xds_k))
+                            // 只改模型，不改字节。合并点处槽里的运行期内容并没有变，
+                            // 变的是发射器对它的认知；字节由真正写入该槽的那条路径盖上，
+                            // 描述的正是运行期内容。在这里按模型重盖会用「模型以为的
+                            // 种类」覆盖「运行期真实的种类」——两条路径给同一槽写过
+                            // 不同类型时，哪条路径跑到合并点就会踩到不匹配的字节，反而
+                            // 把指针盖成标量（收集器不扫 → 值被回收 → 槽读回野指针）。
+                            // Only the model changes here, not the byte. At a merge the
+                            // slot's run-time content does not change — the emitter's
+                            // belief about it does; the byte was stamped by the path
+                            // that actually wrote the slot and describes the live
+                            // content. Re-stamping it from the model would overwrite
+                            // the run-time truth with the model's guess — when two
+                            // paths wrote different types into the same slot, whichever
+                            // path reaches the merge would land on a mismatched byte
+                            // and could stamp a pointer as a scalar (the collector then
+                            // does not scan it, the value is swept, and the slot reads
+                            // back a wild pointer).
                         }
                         rs = rs + 1
                     }
