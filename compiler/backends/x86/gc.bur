@@ -188,14 +188,16 @@ pub fn desc_list(k) {
 }
 
 // bitmap_desc 按形态注册 BITMAP desc（key 去重，两遍发射同序注册 pic_data 必等）：
-// 前 skip 词标量不扫，其后每词静态类型折出非 SCALAR 即置位（未知词落 PTR 位，
-// 宁多勿漏）。P3 批 3 修 record/enum 实例挂 GC_DESC_ALL（=noscan）载荷从未被扫的洞。
+// 前 skip 词不扫，其后每词一律置位——位由静态类型折 SCALAR 收缩会在模型漂移时
+// 漏扫指针载荷（与根扫描同因，见 gc_vs 注释）：mark 的三重过滤使多扫一个标量
+// 无害，漏扫一个指针即悬垂，故载荷区宁全扫。types 只定宽度。
 // bitmap_desc registers a per-shape BITMAP desc (deduped by key; both emission
 // passes register in the same order so pic_data matches byte for byte): the
-// leading `skip` words are scalars and stay unscanned, every later word sets its
-// bit unless its static type folds to SCALAR (unknown words land PTR — prefer
-// over-scan). P3 batch 2 fixes record/enum instances hanging off GC_DESC_ALL
-// (= noscan) whose payloads were never scanned.
+// leading `skip` words stay unscanned and every later word gets its bit — no
+// SCALAR fold, which under a drifting type model drops pointer payloads from
+// the scan (same cause as the root scan, see the gc_vs note): mark's three
+// gates make over-scanning a scalar harmless while missing one pointer
+// dangles, so the payload area is scanned whole. `types` only fixes the width.
 pub fn bitmap_desc(key, skip, types) {
     let words = skip + len(types)
     let mut bits = []
@@ -209,9 +211,7 @@ pub fn bitmap_desc(key, skip, types) {
     let mut mask = 1
     while bi < words {
         if bi >= skip {
-            if gc_kind_of(types[bi - skip]) != GC_SHADOW_SCALAR {
-                bits[byte_i] = bits[byte_i] + mask
-            }
+            bits[byte_i] = bits[byte_i] + mask
         }
         mask = mask + mask
         if mask == 256 {
@@ -655,25 +655,29 @@ fn x86gen_gc_mark_block() {
 }
 
 // x86gen_gc_collect_block：完整回收一轮。fixpoint 线性趟——每趟扫根（①保存区
-// 9 个 caller GPR 词 MAYBE（callee 槽持非堆地址，扫描可证明空操作）、②全局
-// kind 表非 SCALAR 槽、③各 fiber 值栈影子（当前 fiber 用
-// 保存区里的活 r15）、④fb 结构自身、⑤exec 排水自由链 rt_gray）再沿 hdr 链扫
-// 全部 MARK 块 payload 按 desc 试 mark；cnt 相邻两趟不变即收敛。sweep：MARK 清
-// 位保活，否则置 FREE 并（poison 开时）payload 填 0xAB；rt_gc_cycles++、
-// rt_gc_last_freed=死块字节和。栈布局：入口 sub rsp,16 后 [rsp+112]=cnt 快照、
-// [rsp+120]=cur_fiber，再 push 14 个 GPR。毁 FLAGS，其余全保。
+// 9 个 caller GPR 词（callee 槽持非堆地址，扫描可证明空操作）、②全局 kind 表非
+// SCALAR 槽、③各 fiber 值栈全槽（当前 fiber 用保存区里的活 r15）、④fb 结构自身、
+// ⑤exec 排水自由链 rt_gray）再沿 hdr 链扫全部 MARK 块 payload 按 desc 试 mark；
+// cnt 相邻两趟不变即收敛。③不看影子字节：那份判定由逐指令静态类型折出，模型漂移
+// 即漏扫活指针（详见 gc_vs 处注释）；全局 kind 表取声明类型，无此漂移，仍按表筛。
+// sweep：MARK 清位保活，否则置 FREE 并（poison 开时）payload 填 0xAB；
+// rt_gc_cycles++、rt_gc_last_freed=死块字节和。栈布局：入口 sub rsp,16 后
+// [rsp+112]=cnt 快照、[rsp+120]=cur_fiber，再 push 14 个 GPR。毁 FLAGS，其余全保。
 // x86gen_gc_collect_block: one full collection round. Fixpoint linear passes —
-// each pass scans the roots (1. the save area's 9 caller-GPR words as MAYBE —
-// the callee slots hold non-heap addresses, a provable no-op — 2. non-SCALAR
-// global-kind slots, 3. every fiber's value-stack shadow, the current fiber
-// using the live r15 from the save area, 4. the fb structs themselves, 5.
-// exec's drain free chain at rt_gray), then walks the hdr chain marking every
-// MARKed block's payload per its desc; convergence when cnt stops changing
-// between passes. Sweep: MARKed blocks get the bit cleared (kept), the rest
-// get FREE set plus a 0xAB payload fill when poison is on; rt_gc_cycles++
-// and rt_gc_last_freed = the dead byte total. Stack layout: entry sub rsp,16
-// puts [rsp+112]=cnt snapshot and [rsp+120]=cur_fiber, then the 14 pushes.
-// Clobbers FLAGS, preserves everything else.
+// each pass scans the roots (1. the save area's 9 caller-GPR words — the callee
+// slots hold non-heap addresses, a provable no-op — 2. non-SCALAR global-kind
+// slots, 3. every slot of every fiber's value stack, the current fiber using the
+// live r15 from the save area, 4. the fb structs themselves, 5. exec's drain
+// free chain at rt_gray), then walks the hdr chain marking every MARKed block's
+// payload per its desc; convergence when cnt stops changing between passes. 3
+// ignores the shadow byte: that verdict is folded from per-instruction static
+// types, and model drift drops live pointers from the scan (see the gc_vs
+// note); the global kind table comes from declared types, has no such drift,
+// and still filters by its table. Sweep: MARKed blocks get the bit cleared
+// (kept), the rest get FREE set plus a 0xAB payload fill when poison is on;
+// rt_gc_cycles++ and rt_gc_last_freed = the dead byte total. Stack layout:
+// entry sub rsp,16 puts [rsp+112]=cnt snapshot and [rsp+120]=cur_fiber, then
+// the 14 pushes. Clobbers FLAGS, preserves everything else.
 fn x86gen_gc_collect_block(n_globals) {
     let mark_call = mov_ri64(rax, gc_mark_g) + call_r(rax)
     let mut it = []
@@ -743,15 +747,27 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_l("gc_fb_cur"))
     push(it, la_b(mov_rm(rdx, rsp, 0)))
     push(it, la_l("gc_fb_r15"))
-    push(it, la_b(mov_rm(r10, r9, FB_STACK_LO) + mov_rm(r11, r9, FB_SHADOW) + sub_rr(rdx, r10) + shr_ri(rdx, 3) + xor_rr(rcx, rcx)))
+    // 活槽一律试 mark，不读影子字节：影子 kind 由静态类型模型折出，模型一漂
+    // （X86TDRIFT）就把指针载荷判成 SCALAR，该槽当轮不扫、对象被 sweep 成死
+    // 块——下一次读到的 [payload+0] 已是自由链 next（指针），编译期的字符串
+    // 常量首字即地址，拼接按它当长度申请 127TiB 假 OOM。mark 的三重过滤（对
+    // 齐/堆界/起点位）对真标量恒拒绝，多扫一个标量无害，漏扫一个指针即悬垂。
+    // 原生栈 [LIMIT, RSP+16] 与保存区本就无影子全扫，值栈与之一致。
+    // every live slot is offered to mark without reading the shadow byte: the
+    // shadow kind is folded from the static type model, and once that model
+    // drifts (X86TDRIFT) a pointer payload reads as SCALAR, the slot is skipped
+    // for the round and the object is swept — the next read of [payload+0] is a
+    // free-list next (a pointer), so a compile-time string constant starts with
+    // an address and concatenation allocates 127TiB on it (false OOM). mark's
+    // three gates (alignment / heap range / start bit) reject real scalars
+    // unconditionally: over-scanning a scalar is harmless, under-scanning a
+    // pointer dangles. The native stack [LIMIT, RSP+16] and the save area are
+    // already scanned shadow-free; the value stack now matches them.
+    push(it, la_b(mov_rm(r10, r9, FB_STACK_LO) + sub_rr(rdx, r10) + shr_ri(rdx, 3) + xor_rr(rcx, rcx)))
     push(it, la_l("gc_vs"))
     push(it, la_b(cmp_rr(rcx, rdx)))
     push(it, la_jcc(CC_AE, "gc_vs_done"))
-    push(it, la_b(mov_rr(rax, r11) + add_rr(rax, rcx) + movzx_rm8(rdi, rax, 0) + test_rr(rdi, rdi)))
-    push(it, la_jcc(CC_E, "gc_vs_next"))
-    push(it, la_b(mov_rr(r8, rcx) + shl_ri(r8, 3) + add_rr(r8, r10) + mov_rm(rdi, r8, 0) + mark_call))
-    push(it, la_l("gc_vs_next"))
-    push(it, la_b(add_ri32(rcx, 1)))
+    push(it, la_b(mov_rr(r8, rcx) + shl_ri(r8, 3) + add_rr(r8, r10) + mov_rm(rdi, r8, 0) + mark_call + add_ri32(rcx, 1)))
     push(it, la_jmp("gc_vs"))
     push(it, la_l("gc_vs_done"))
     push(it, la_b(mov_rm(r10, r9, FB_LIMIT) + mov_rm(r11, r9, FB_RSP) + add_ri32(r11, 16)))
