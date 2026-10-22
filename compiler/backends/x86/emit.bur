@@ -53,16 +53,17 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
     let mut cur_enum_eh = -1
     let mut pos_types = []
     let mut pos_auth = []
-    // cell 权威表：仅 lift 分支读，记录「该槽此刻确实持有 cell 指针」。pos_auth
-    // 兼作类型盖章权威，是流不敏感静态标志——提升槽被裸值重填（声明压栈）后它
-    // 不失效，SET_LOCAL 于是误走「写穿 cell」，把裸值当 cell 指针写；裸值若是
-    // 只读常量即 SIGSEGV。cell_auth 随栈深回落复位。
-    // cell authority (lift branches only): whether the slot currently holds a
-    // cell pointer. pos_auth doubles as the stamping authority and is a
-    // flow-insensitive static flag — after a lifted slot is refilled with a raw
-    // value (a declaration push) it stays set, so SET_LOCAL wrongly takes the
-    // write-through path and writes through a raw value; a read-only constant
-    // then faults. cell_auth is reset as the stack depth falls back.
+    // cell 类型提示表：只决定提升槽的 pos_auth/global_type 记账（首次读是否落
+    // 权威、赋值是 merge 还是 seed）。运行期「槽里是不是 cell」由影子字节的
+    // GC_SHADOW_CELL 判定——线性发射期的这张表会被循环第二圈推翻（声明压栈把
+    // 裸值写回槽里，表却仍是 true），拿它选机器码就会把裸值当 cell 写穿。
+    // cell type-hint table: used only for lifted-slot pos_auth/global_type
+    // bookkeeping (whether the first read lands authority, and whether an
+    // assignment merges or seeds). Whether the slot actually holds a cell at
+    // run time is decided by the GC_SHADOW_CELL shadow byte; this linear table
+    // is stale on a loop's second round (a declaration push refills the slot
+    // with a raw value while the table still says true), so it must not select
+    // machine code.
     let mut cell_auth = []
     let mut top_slot = -1
     // 前两条指令的 ip：左操作数常量的启发式读取要回溯到「左」产出链末条
@@ -370,44 +371,41 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     eprintln("X86TDRIFT fn=" + f_name[fh] + " ip=" + str(ip) + " slot=" + str(slot) + " shadow_type=" + type_shadow[slot] + " auth_type=" + pos_types[slot] + " lifted=" + xd_lifted)
                 }
                 if is_lifted(slot) {
-                    if slot < len(cell_auth) && cell_auth[slot] {
-                        // 提升槽：槽存 cell 指针，读须解引用
-                        // lifted slot: the slot holds a cell pointer, dereference on read
-                        w(mov_rm(rax, r14, 8 * slot) + mov_rm(rax, rax, 0) + vs_push(rax, gc_kind_of(stype)))
+                    let was_cell_auth = slot < len(cell_auth) && cell_auth[slot]
+                    // 提升槽的运行时判据是槽的影子字节：CELL = 槽里是 cell 指针，
+                    // 其余 = 裸值。line 78 的循环第二圈时槽里已是第一圈包出的
+                    // cell，而发射期按线性流仍为第一圈生成「再包一层」；push 收到
+                    // 旧 cell，按其 [0]（list 指针）当 len、[16] 当 data，
+                    // data + len*8 回绕到 0 → si_addr=0 的写 SEGV。机器码必须每次
+                    // 读槽影子再决定，cell_auth 只留作类型记账。
+                    // The lifted slot's runtime discriminator is its shadow byte:
+                    // CELL means the slot holds a cell pointer, anything else a raw
+                    // value. On the second round of the line-78 loop the slot already
+                    // holds the cell made on the first round, while the linear emitter
+                    // still emitted the first-round "wrap again" code; push then
+                    // received the old cell, read its [0] (the list pointer) as len
+                    // and [16] as data, and data + len*8 wrapped to 0 — the si_addr=0
+                    // write SEGV. The machine code must consult the shadow byte on
+                    // every read; cell_auth stays type bookkeeping only.
+                    let lift_disp = len(type_shadow) - slot
+                    if lift_disp > 0 {
+                        let lift_check = shadow_kind_load(lift_disp, rcx) + cmp_ri32(rcx, GC_SHADOW_CELL)
+                        let lift_have = mov_rm(rax, rax, 0)
+                        let lift_wrap = x86gen_alloc(r11, 8, desc_allptr) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11) + shadow_set(lift_disp, GC_SHADOW_CELL) + mov_rm(rax, r11, 0)
+                        w(mov_rm(rax, r14, 8 * slot) + lift_check + je_rel32(str_len(lift_wrap) + 5) + lift_wrap + jmp_rel32(str_len(lift_have)) + lift_have + vs_push(rax, gc_kind_of(stype)))
                     } else {
-                        // 兜底：let 初始化无 SET_LOCAL（CONST 落槽），槽里是裸值——
-                        // 分配 cell 装入并回写，后续读写走 cell
-                        // fallback: let init has no SET_LOCAL (const lands in the slot),
-                        // the slot holds a raw value; allocate a cell, move the value in,
-                        // and write the cell pointer back
-                        // P3 批 3：cell 挂 allptr——8B 槽值可以是任意指针，noscan
-                        // （GC_DESC_ALL=id 0）让 cell 内容从未被扫，提升槽唯一持有时
-                        // 值即悬垂；标量值由 mark 三重过滤安全拒绝。
-                        // 槽里换成 cell 指针后影子字节也要跟着盖章（与 SET_LOCAL 侧同理），
-                        // 否则槽里是 PTR 而影子说 SCALAR，cell 自身无根。
-                        // P3 batch 3: cells hang off allptr — the 8B slot value can be
-                        // any pointer; noscan (GC_DESC_ALL = id 0) meant the cell
-                        // content was never scanned, so a lifted slot as the sole
-                        // holder dangled; scalars are safely rejected by mark's gates.
-                        // Once the slot holds the cell pointer its byte must be stamped
-                        // too (as on the SET_LOCAL side) or the slot's byte says SCALAR
-                        // while the slot holds a pointer and the cell itself is unrooted.
-                        let cbox = mov_rm(rax, r14, 8 * slot) + x86gen_alloc(r11, 8, desc_allptr) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11)
-                        let cstamp = if len(type_shadow) > slot {
-                            shadow_set(len(type_shadow) - slot, GC_SHADOW_PTR)
-                        } else {
-                            ""
-                        }
-                        w(cbox + cstamp + mov_rm(rax, r11, 0) + vs_push(rax, gc_kind_of(stype)))
+                        w(mov_rm(rax, r14, 8 * slot) + vs_push(rax, gc_kind_of(stype)))
+                    }
+                    if !was_cell_auth {
                         while len(pos_auth) <= slot {
                             push(pos_auth, false)
                         }
                         pos_auth[slot] = true
-                        while len(cell_auth) <= slot {
-                            push(cell_auth, false)
-                        }
-                        cell_auth[slot] = true
                     }
+                    while len(cell_auth) <= slot {
+                        push(cell_auth, false)
+                    }
+                    cell_auth[slot] = true
                 } else {
                     w(mov_rm(rax, r14, 8 * slot) + vs_push(rax, gc_kind_of(stype)))
                 }
@@ -453,7 +451,8 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // 结果留在其起始槽），赋值时值在目标槽之上的栈顶。提升槽的「首次写」必须
             // 分配新 cell（循环体里每轮声明都要一个新 cell，闭包捕获的是那一轮的），
             // 故此时不采信可能过期的 cell_auth——它只说明该槽号此前是提升变量，不说明
-            // 这一轮的槽里已经是 cell；采信它就会写穿一个裸值（SEGV 写只读常量区）。
+            // 这一轮的槽里已经是 cell；运行期改用槽影子字节判定（声明一律换新 cell，
+            // 赋值先看 CELL 再写穿或包 cell）。
             // declaration vs assignment: in a declaration the stored value lands exactly
             // on the target slot (a slot is a stack position and an expression's result
             // stays in its starting slot), while an assignment's value sits on the stack
@@ -461,8 +460,9 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // fresh cell (a declaration in a loop body needs one per iteration, and a
             // closure captures that iteration's), so do not trust the possibly stale
             // cell_auth here — it only says the slot number was lifted earlier, not that
-            // this round's slot already holds a cell; trusting it writes through a raw
-            // value (a SEGV into the read-only constant area).
+            // this round's slot already holds a cell. The runtime shadow byte makes the
+            // call instead: a declaration always gets a fresh cell; an assignment
+            // writes through a CELL slot or lifts a raw value first.
             let is_decl = slot > 0 && len(type_shadow) > 0 && slot == len(type_shadow) - 1
             // 新槽（前端给新局部发的槽号必大于此前任何槽号）若不在模型栈顶，说明前端
             // 的槽号与运行期栈位错开：局部值落在别的位置，按槽号读回的是别人的值
@@ -549,17 +549,28 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                 }
             }
             if is_lifted(slot) {
-                if was_auth {
-                    // 后续写：写 cell 内容
-                    // subsequent writes: write through the cell
-                    w(mov_rm(rcx, r14, 8 * slot) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 0, rax))
-                } else {
-                    // 首次写：分配 cell，槽存指针（P1 前经 gc_rec 在 r11 跨调用登记存活）
-                    // first write: allocate the cell, the slot holds the pointer
-                    // (pre-P1, gc_rec kept r11 alive across the call)
-                    // P3 批 3：cell 挂 allptr（见 GET 侧注释）/ allptr cell (see the
-                    // GET-side note)
+                if is_decl {
+                    // 声明：每轮执行都换新 cell，闭包捕获的是本轮那个
+                    // declaration: a fresh cell per execution; a closure captures
+                    // this round's cell
                     w(x86gen_alloc(r11, 8, desc_allptr) + mov_rm(rax, r15, 0 - 8) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11))
+                } else {
+                    // 赋值：槽影子是 CELL 就写穿，否则先把裸值包成 cell。
+                    // cell_auth 是线性流提示，循环第二圈可能已过期，不能用来
+                    // 选机器码。
+                    // assignment: write through when the slot's shadow byte is CELL,
+                    // otherwise lift the raw value first. cell_auth is a
+                    // linear-flow hint and may be stale on a loop's second round,
+                    // so it must not select the machine code.
+                    let set_disp = len(type_shadow) - slot
+                    if set_disp > 0 {
+                        let set_check = shadow_kind_load(set_disp, rcx) + cmp_ri32(rcx, GC_SHADOW_CELL)
+                        let set_through = mov_rm(rcx, r14, 8 * slot) + mov_rm(rax, r15, 0 - 8) + mov_mr(rcx, 0, rax)
+                        let set_alloc = x86gen_alloc(r11, 8, desc_allptr) + mov_rm(rax, r15, 0 - 8) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11)
+                        w(set_check + jne_rel32(str_len(set_through) + 5) + set_through + jmp_rel32(str_len(set_alloc)) + set_alloc)
+                    } else {
+                        w(x86gen_alloc(r11, 8, desc_allptr) + mov_rm(rax, r15, 0 - 8) + mov_mr(r11, 0, rax) + mov_mr(r14, 8 * slot, r11))
+                    }
                 }
             } else {
                 w(mov_rm(rax, r15, 0 - 8) + mov_mr(r14, 8 * slot, rax))
@@ -568,7 +579,7 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // 声明先压 op_unit 占住槽位（declare_local 取的是该 unit 的栈位），闭包再压其
             // 上，SET_LOCAL 只搬值、不盖章，槽的影子便停在 unit 的 SCALAR 上；槽里的闭包
             // 从此对收集器不可见，扫掉后调用点读回垃圾——flush_tries 一类野跳如此。赋值也
-            // 走这里：声明期的字节可能本来就不对。提升槽里放的是 cell 指针，恒为 PTR。
+            // 走这里：声明期的字节可能本来就不对。提升槽里放的是 cell 指针，恒为 CELL。
             // the slot's shadow byte follows what the slot actually holds: the stored value
             // is not always the one just pushed — a nested fn declaration pushes op_unit to
             // reserve the slot (declare_local takes that unit's stack position) and pushes
@@ -576,10 +587,10 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
             // slot's byte stays the unit's SCALAR; the closure then turns invisible to the
             // collector and the call reads back garbage — the wild dispatch on flush_tries.
             // Assignments pass here too: the declaration-time byte may already be wrong.
-            // A lifted slot holds a cell pointer and is always PTR.
+            // A lifted slot holds a cell pointer and is always CELL.
             if slot > 0 && len(type_shadow) > slot {
                 let sk = if is_lifted(slot) {
-                    GC_SHADOW_PTR
+                    GC_SHADOW_CELL
                 } else {
                     gc_kind_of(type_shadow[len(type_shadow) - 1])
                 }
@@ -2278,26 +2289,30 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     // ref 捕获：闭包槽存 cell 指针（读侧解引用，见 GET 侧）
                     // ref capture: the closure slot holds the cell pointer (the read
                     // side dereferences it, see the GET side)
-                    if is_lifted(uidx) && !(uidx < len(cell_auth) && cell_auth[uidx]) {
-                        // 兜底：let 初始化无 SET_LOCAL，槽里是裸值——cell 化后闭包槽存指针
-                        // fallback: no SET_LOCAL for the let init; lift the raw value
-                        // into a cell so the closure slot holds the cell pointer
-                        // (r11 holds the closure base here, so the cell goes in r10)
-                        // P3 批 3：cell 挂 allptr（见 GET 侧注释）/ allptr cell (see
-                        // the GET-side note)
-                        // 槽里改放 cell 指针后，该槽的收集器影子字节必须重盖成 PTR：
-                        // 字节是落针时按裸值的型盖的（int → SCALAR），cell 不被扫 →
-                        // cell 里的值被回收 → 槽读回野指针。
-                        // The slot now holds a cell pointer, so its collector shadow
-                        // byte must be re-stamped to PTR: the byte was written when
-                        // the raw value was pushed (an int stamps SCALAR), the cell is
-                        // then not scanned, its contents are swept, and the slot
-                        // reads back a wild pointer.
-                        w(mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10) + shadow_stamp_slot(type_shadow, uidx, GC_SHADOW_PTR))
-                        while len(pos_auth) <= uidx {
-                            push(pos_auth, false)
+                    if is_lifted(uidx) {
+                        let was_cell_auth = uidx < len(cell_auth) && cell_auth[uidx]
+                        // 与 GET 同因：槽影子是 CELL 就复用已有 cell，否则把裸值
+                        // 包成 cell 后写回槽并盖 CELL。闭包创建在循环里也只有一份
+                        // 机器码，运行期状态必须自描述。
+                        // same cause as GET: a CELL slot reuses its cell; otherwise
+                        // wrap the raw value, write the cell back, and stamp CELL.
+                        // Closure creation in a loop is also one machine-code copy,
+                        // so the runtime state must be self-describing.
+                        let cap_disp = len(type_shadow) - uidx
+                        let cap_cell = mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax)
+                        let cap_raw = mov_rm(rax, r14, 8 * uidx) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + mov_mr(r11, 8 + 8 * ui, r10) + shadow_stamp_slot(type_shadow, uidx, GC_SHADOW_CELL)
+                        if cap_disp > 0 {
+                            let cap_check = shadow_kind_load(cap_disp, rcx) + cmp_ri32(rcx, GC_SHADOW_CELL)
+                            w(cap_check + je_rel32(str_len(cap_raw) + 5) + cap_raw + jmp_rel32(str_len(cap_cell)) + cap_cell)
+                        } else {
+                            w(cap_raw)
                         }
-                        pos_auth[uidx] = true
+                        if !was_cell_auth {
+                            while len(pos_auth) <= uidx {
+                                push(pos_auth, false)
+                            }
+                            pos_auth[uidx] = true
+                        }
                         while len(cell_auth) <= uidx {
                             push(cell_auth, false)
                         }
@@ -2306,36 +2321,37 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                         w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
                     }
                 } else if flag % 2 == 1 {
-                    // 值捕获：闭包槽存**值**快照（与 VM 一致）。提升槽里放的是 cell，
-                    // 故解引用取值；槽未提升则原样搬。读侧按非 ref 两段取，存 cell 会取到
-                    // 邻接对象的头字。
-                    // by-value capture: the closure slot holds the value snapshot (as the
-                    // VM does). A lifted slot holds a cell, so dereference it; an unlifted
-                    // slot is copied as-is. The read side uses the non-ref two-load form,
-                    // so storing a cell would fetch the neighbouring object's header.
-                    if is_lifted(uidx) && !(uidx < len(cell_auth) && cell_auth[uidx]) {
-                        // 槽尚未 cell 化：先存值，再把槽提升为 cell（保持提升槽不变式）
-                        // slot not yet lifted: store the value, then lift the slot into a
-                        // cell (keeps the lifted-slot invariant)
-                        // 槽里改放 cell 指针后，该槽的收集器影子字节必须重盖成 PTR：
-                        // 字节是落针时按裸值的型盖的（int → SCALAR），cell 不被扫 →
-                        // cell 里的值被回收 → 槽读回野指针。
-                        // The slot now holds a cell pointer, so its collector shadow
-                        // byte must be re-stamped to PTR: the byte was written when
-                        // the raw value was pushed (an int stamps SCALAR), the cell is
-                        // then not scanned, its contents are swept, and the slot
-                        // reads back a wild pointer.
-                        w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + shadow_stamp_slot(type_shadow, uidx, GC_SHADOW_PTR))
-                        while len(pos_auth) <= uidx {
-                            push(pos_auth, false)
+                    // 值捕获：闭包槽存**值**快照（与 VM 一致）。槽影子是 CELL
+                    // 就解引用取值；裸值直接搬，随后把槽提升为 cell（保持提升槽
+                    // 不变式）。读侧按非 ref 两段取，存 cell 会取到邻接对象的
+                    // 头字。
+                    // by-value capture: the closure slot holds the value snapshot
+                    // (as the VM does). A CELL slot is dereferenced; a raw value is
+                    // copied as-is and the slot is then lifted into a cell (keeps
+                    // the lifted-slot invariant). The read side uses the non-ref
+                    // two-load form, so storing a cell would fetch the neighbouring
+                    // object's header.
+                    if is_lifted(uidx) {
+                        let was_cell_auth = uidx < len(cell_auth) && cell_auth[uidx]
+                        let cap_disp = len(type_shadow) - uidx
+                        let value_cell = mov_rm(rax, r14, 8 * uidx) + mov_rm(rax, rax, 0) + mov_mr(r11, 8 + 8 * ui, rax)
+                        let value_raw = mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax) + x86gen_alloc(r10, 8, desc_allptr) + mov_mr(r10, 0, rax) + mov_mr(r14, 8 * uidx, r10) + shadow_stamp_slot(type_shadow, uidx, GC_SHADOW_CELL)
+                        if cap_disp > 0 {
+                            let cap_check = shadow_kind_load(cap_disp, rcx) + cmp_ri32(rcx, GC_SHADOW_CELL)
+                            w(cap_check + je_rel32(str_len(value_raw) + 5) + value_raw + jmp_rel32(str_len(value_cell)) + value_cell)
+                        } else {
+                            w(value_raw)
                         }
-                        pos_auth[uidx] = true
+                        if !was_cell_auth {
+                            while len(pos_auth) <= uidx {
+                                push(pos_auth, false)
+                            }
+                            pos_auth[uidx] = true
+                        }
                         while len(cell_auth) <= uidx {
                             push(cell_auth, false)
                         }
                         cell_auth[uidx] = true
-                    } else if is_lifted(uidx) {
-                        w(mov_rm(rax, r14, 8 * uidx) + mov_rm(rax, rax, 0) + mov_mr(r11, 8 + 8 * ui, rax))
                     } else {
                         w(mov_rm(rax, r14, 8 * uidx) + mov_mr(r11, 8 + 8 * ui, rax))
                     }

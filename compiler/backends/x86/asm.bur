@@ -498,12 +498,20 @@ pub fn jt_load(dst, disp) {
     mov_rm(dst, r13, disp) + add_rr(dst, r13)
 }
 
-// P2 影子 kind 编码（影子区每 8B 槽一字节；与 desc 的 MAYBE 语义一致）
+// P2 影子 kind 编码（影子区每 8B 槽一字节；与 desc 的 MAYBE 语义一致）。
+// CELL 是提升槽自己的 tag：槽里放的是 lift cell 指针，不是裸值；读取该槽时
+// 必须先看这个字节再决定解引用，不能只看发射期的 cell_auth（循环第二圈时
+// 槽已在第一圈变成 cell，而线性发射仍按裸值生成了再包一层的代码）。
 // P2 shadow kind encoding (one byte per 8B slot in the shadow region; MAYBE
-// semantics match the desc kinds)
+// semantics match the desc kinds). CELL is the lifted slot's own tag: the slot
+// holds a lift-cell pointer, not a raw value. A reader must consult this byte
+// before dereferencing; the emission-time cell_auth alone is insufficient
+// (on a loop's second round the slot is already a cell while the linear
+// emitter still emitted the first-round "wrap the raw value" code).
 pub let GC_SHADOW_SCALAR = 0
 pub let GC_SHADOW_PTR = 1
 pub let GC_SHADOW_MAYBE = 2
+pub let GC_SHADOW_CELL = 3
 
 // 影子游标：rt_shadow_top 槽持有「影子基址 + (r15-stack_lo)/8」的字节地址，与 r15
 // 同步推进；任意槽的影子字节 = 游标 - 静态位移（帧高发射期全静态，无运行期索引
@@ -536,6 +544,14 @@ fn shadow_set(disp, k) {
     } else {
         shadow_cursor_load() + e1(198) + modrm(1, 0, rax) + sb(d) + sb(k) + pop_r(rax)
     }
+}
+
+// shadow_kind_load(disp, dst)：读「游标 - disp」槽的 kind 字节到 dst，rax 保护。
+// shadow_kind_load(disp, dst): load the kind byte at "cursor - disp" into dst,
+// preserving rax.
+fn shadow_kind_load(disp, dst) {
+    let d = 0 - disp
+    shadow_cursor_load() + movzx_rm8(dst, rax, d) + pop_r(rax)
 }
 
 // shadow_bump(n)：游标槽 += n（n 槽，正进负退）。rt 槽在 data 段镜像，无「绝对
