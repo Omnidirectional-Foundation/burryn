@@ -3197,6 +3197,19 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
                     while rs < len(type_shadow) {
                         if rs < len(pos_auth) && pos_auth[rs] && !is_enum_enc(pos_types[rs]) {
                             type_shadow[rs] = pos_types[rs]
+                            // 权威型落回模型后，必须把该位置的收集器影子字节一并重盖：
+                            // 字节是落针时按当时的型盖的，恢复改的是模型里的型，字节还
+                            // 停在旧型上——指针按标量盖住时收集器不扫它 → 值被回收 →
+                            // 槽里读回野指针（枚举/记录载荷直接变成裸指针）。
+                            // The authoritative type goes back into the model, so the
+                            // collector's shadow byte for that position has to be
+                            // re-stamped: the byte was written when the value was
+                            // pushed, with the type of that moment, and the restore
+                            // changes the model without touching the byte — a pointer
+                            // stamped as a scalar is not scanned, so the value is
+                            // swept and the slot reads back a wild pointer (enum and
+                            // record payloads come out as raw pointers).
+                            w(shadow_set(len(type_shadow) - rs, gc_kind_of(pos_types[rs])))
                         }
                         rs = rs + 1
                     }
