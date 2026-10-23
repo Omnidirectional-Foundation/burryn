@@ -2005,32 +2005,39 @@ fn x86gen_eq_str() {
 }
 
 // x86gen_eq_dyn_seg 生成「操作数可作字节串」的区间判定，0/1 落 r9：堆内
-// （[heap_start, r12)）或常量区字节串段（[img_base()+8, img_base()+x86_const_str_len)）。
+// （[heap_start+8, r12)）或常量区字节串段（[img_base()+8, img_base()+x86_const_str_len)）。
+// 堆下界的 +8 与常量区同义：首个块的 hdr 压在 heap_start，payload 从 +8 起；
+// 把 hdr 本身放进字节串门会让 [R-8] 读到堆外。
 // 常量区操作数此前一律落在门外——常量串无块头，形态门必败，字符串字面量与堆串只能
 // 退化成按词比较。段首 +8 跳过首个对象的块头，段内每个操作数的 [p-8] 都落在镜像内
 // （段内只有字节串，块头由常量环逐个写出，见 x86.bur）；常量区无字节串时不生成段判定，
 // 免得空段上界（len-8 的补码）被下溢出的巨大差值当成命中。
 // 需 r8 已载入 heap_start；只动 rdi/rsi/r9/r11。
 // x86gen_eq_dyn_seg emits the "operand can be a byte string" range test, leaving 0/1
-// in r9: in-heap ([heap_start, r12)) or in the constant area's byte-string segment
-// ([img_base()+8, img_base()+x86_const_str_len)). A constant-area operand used to
-// always fall outside — constant strings carried no block header, so the shape test
-// could never accept them, and a string literal degraded to a word compare against a
-// heap string. The +8 skips the first object's block header, so an admitted operand's
-// [p-8] always lands inside the image (the segment holds byte strings only, each with a
-// header written by the const loop, see x86.bur). When the constant area has no byte
-// strings the segment test is not emitted at all — with an empty segment the bound
-// (len-8 in two's complement) would let a wrapped large difference read as a hit.
-// r8 must already hold heap_start; clobbers rdi/rsi/r9/r11.
+// in r9: in-heap ([heap_start+8, r12)) or in the constant area's byte-string segment
+// ([img_base()+8, img_base()+x86_const_str_len)). The +8 has the same meaning as in
+// the constant area: the first block's hdr sits at heap_start, its payload starts at
+// +8; admitting the hdr itself would read [R-8] outside the heap. A constant-area
+// operand used to always fall outside — constant strings carried no block header, so
+// the shape test could never accept them, and a string literal degraded to a word
+// compare against a heap string. The +8 skips the first object's block header, so an
+// admitted operand's [p-8] always lands inside the image (the segment holds byte
+// strings only, each with a header written by the const loop, see x86.bur). When the
+// constant area has no byte strings the segment test is not emitted at all — with an
+// empty segment the bound (len-8 in two's complement) would let a wrapped large
+// difference read as a hit. r8 must already hold heap_start; clobbers rdi/rsi/r9/r11.
 fn x86gen_eq_dyn_seg(R) {
-    // 堆内：R - heap_start < r12 - heap_start（无符号）
-    // in-heap: R - heap_start < r12 - heap_start (unsigned)
+    // 堆内：8 <= R - heap_start < r12 - heap_start（无符号）。下界单独比，
+    // 空堆时 n = 0，任何候选都落在 n 之外（不能把两边同减 8 让上界下溢）。
+    // in-heap: 8 <= R - heap_start < r12 - heap_start (unsigned). Keep the
+    // lower bound separate: an empty heap has n = 0, so every candidate falls
+    // outside it (subtracting 8 on both sides would underflow the upper bound).
     // setcc 只写低字节，rex 又只按寄存器号补前缀——低寄存器（dl 之外）会落到 bh 那类
     // 同名槽位，置位寄存器一律取 r9/r11（≥8，前缀必到）。命中标志最终落在 r9。
     // setcc writes the low byte only and rex() adds a prefix by register number, so a low
     // register (anything but dl) lands on a same-numbered byte slot like bh; the flag
     // registers are therefore r9/r11 (>= 8, prefix always emitted). The hit flag ends in r9.
-    let in_heap = xor_rr(r9, r9) + mov_rr(rsi, R) + sub_rr(rsi, r8) + mov_rr(r11, r12) + sub_rr(r11, r8) + cmp_rr(rsi, r11) + setb(r9)
+    let in_heap = xor_rr(r9, r9) + xor_rr(r11, r11) + mov_rr(rsi, R) + sub_rr(rsi, r8) + cmp_ri32(rsi, 8) + setae(r9) + mov_rr(rdi, r12) + sub_rr(rdi, r8) + cmp_rr(rsi, rdi) + setb(r11) + and_rr(r9, r11)
     if x86_const_str_len <= 8 {
         return in_heap
     }

@@ -608,20 +608,27 @@ pub let GC_MARK_BIT = 4611686018427387904
 pub let GC_FREE_BIT = 0 - 9223372036854775807 - 1
 pub let GC_SIZE_MASK = 1099511627775
 
-// x86gen_gc_mark_block：mark(rdi) 子程序——对齐过滤 + [heap_start, r12) 界内 +
+// x86gen_gc_mark_block：mark(rdi) 子程序——对齐过滤 + [heap_start+8, r12) 界内 +
 // start-bit 命中三者全过才认指针：置 hdr 位 62、rt_gc_cnt++。已 MARK 直退。
+// 候选是 payload 指针：首个块的 hdr 就压在 heap_start，payload 最早在
+// heap_start+8，故 rdi <= heap_start 一律拒——相等时 (rdi-8-heap)>>3 下溢，
+// 起点位图会按 0x1fff... 的索引越界读。
 // start-bit 按候选的块头粒度查（(rdi-8-heap)>>3，与分配站点/verify 同口径）：
 // 位只落在 hdr 粒度上，按 rdi 本身粒度查恒差一格——真指针全被拒收，而值恰为
 // 某块 hdr 地址的值反会过检，把 MARK 写进 [hdr-8] = 前一块 payload 尾字。
 // start-bit 是唯一把「值」变「块」的闸门，粒度错位即收集器整体失效。
 // x86gen_gc_mark_block: the mark(rdi) subroutine — an aligned candidate inside
-// [heap_start, r12) whose start-bit is set counts as a pointer: set hdr bit 62
-// and rt_gc_cnt++. Already-MARKed exits early. The start-bit is checked at the
-// candidate's BLOCK-HEADER granule ((rdi-8-heap)>>3, same convention as the
-// alloc sites and verify): bits only ever land on hdr granules, so checking at
-// rdi's own granule is always one granule off — every real pointer gets
-// rejected, while any value that happens to equal some block's hdr address
-// passes and MARK lands at [hdr-8], the previous block's last payload word.
+// [heap_start+8, r12) whose start-bit is set counts as a pointer: set hdr bit 62
+// and rt_gc_cnt++. Already-MARKed exits early. The candidate is a payload
+// pointer: the first block's hdr sits at heap_start, so the earliest payload is
+// heap_start+8 and rdi <= heap_start must be rejected — equality would
+// underflow (rdi-8-heap)>>3 into a 0x1fff... bitmap index. The start-bit is
+// checked at the candidate's BLOCK-HEADER granule ((rdi-8-heap)>>3, same
+// convention as the alloc sites and verify): bits only ever land on hdr
+// granules, so checking at rdi's own granule is always one granule off — every
+// real pointer gets rejected, while any value that happens to equal some
+// block's hdr address passes and MARK lands at [hdr-8], the previous block's
+// last payload word.
 // Saves rax/rcx/rdx/rsi (push/pop), touches nothing else; clobbers FLAGS.
 fn x86gen_gc_mark_block() {
     let mut it = []
@@ -633,7 +640,7 @@ fn x86gen_gc_mark_block() {
     push(it, la_jcc(CC_NE, "gm_done"))
     push(it, la_b(mov_ri64(rsi, rt_slot(rt_heap_start)) + mov_rm(rsi, rsi, 0)))
     push(it, la_b(cmp_rr(rdi, rsi)))
-    push(it, la_jcc(CC_B, "gm_done"))
+    push(it, la_jcc(CC_BE, "gm_done"))
     push(it, la_b(cmp_rr(rdi, r12)))
     push(it, la_jcc(CC_AE, "gm_done"))
     push(it, la_b(mov_rr(rax, rdi) + sub_ri32(rax, 8) + sub_rr(rax, rsi) + shr_ri(rax, 3)))
