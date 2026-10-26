@@ -1,5 +1,13 @@
 // net_nb.bur — 非阻塞 accept/read/write 与 __eagain
 // net_nb: non-blocking accept/read/write with __eagain
+// 客户端在首次读到数据前不能抢跑：服务端先观察到一次 __eagain 并打印后，
+// 客户端才写入。否则两个 fiber 的调度顺序决定「首读是否 already readable」，
+// C 与 x86 宿主的调度差异会让输出多一行/少一行（CI 已实测两边都出现过）。
+// The client must not race the first read: it waits until the server has seen
+// one __eagain and printed, then writes. Otherwise the fiber scheduling order
+// decides whether the first read is already readable, and the C/x86 hosts'
+// differing schedules flip one output line (both directions seen in CI).
+let mut server_saw_eagain = false
 fn server(lh) {
     // accept 也要让出重试：macOS 回环的握手落地可能晚于 connect 返回，accept
     // 会拿到 __eagain，放弃就会让客户端永远阻塞在 net_read 上（§16 darwin
@@ -52,6 +60,7 @@ fn server(lh) {
                                 println("server read: would block")
                                 said_block = true
                             }
+                            server_saw_eagain = true
                         } else {
                             println("server read: " + e)
                             return
@@ -79,7 +88,11 @@ fn main_loop() {
 
     match tcp_dial("127.0.0.1", port) {
         Ok(conn) => {
-            yield()
+            let mut spins = 0
+            while !server_saw_eagain && spins < 10000 {
+                yield()
+                spins = spins + 1
+            }
             match net_write(conn, "hello") {
                 Ok(_) => {},
                 Err(e) => println("client write: " + e),
