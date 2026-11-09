@@ -319,18 +319,16 @@ jobs:
           sha256sum g1llvm g2llvm
           cmp g1llvm g2llvm
 
-  x86-fixpoint:
+  x86-selfbuild:
     needs: gen1
     if: always() && needs.gen1.result == 'success'
     runs-on: ubuntu-latest
-    # 该 job 连着跑两次完整编译器构建（gen1 编出 g1x，再用 g1x 把编译器编一遍）：
-    # 第一次由 gen1 宿主承担，约 55 分钟；第二次由更慢的 x86 宿主 g1x 承担，
-    # 预算给两段逐步慢下来的构建留量 ⇒ 240 分钟，仍在 Actions 单 job 360 上限内。
-    # the job runs two full compiler builds back to back (gen1 produces g1x, then g1x
-    # builds the compiler again): the first build is hosted by gen1 at about 55
-    # minutes and the second by the slower x86-built g1x — budget 240 minutes
-    # for the two step-slower builds, inside Actions' 360-minute per-job cap.
-    timeout-minutes: 240
+    # 腿 1：gen1（C 宿主）经 x86 后端编出编译器 g1x，实测约 42 分钟（RSS 峰值
+    # 7.5GiB），90 分钟预算覆盖 runner 波动；产物经 artifact 交给腿 2。
+    # leg 1: gen1 (C-hosted) compiles the compiler through the x86 backend into
+    # g1x. It takes about 42 minutes (RSS peak 7.5GiB), so the 90-minute budget
+    # absorbs runner variance; the artifact carries g1x to leg 2.
+    timeout-minutes: 90
     env:
       MALLOC_ARENA_MAX: "2"
     steps:
@@ -342,36 +340,73 @@ jobs:
         with:
           name: gen1
 
+      # 腿 1：gen1 经 x86 后端自编。RSS 曲线区分「活集真这么大」与「回收没生效」，
+      # 其形状与腿 2 的曲线对照。
+      # leg 1: gen1 self-compiles through the x86 backend. The RSS curve separates
+      # "the live set really is that large" from "the collector stopped reclaiming",
+      # and its shape is compared against leg 2's curve.
+      - name: x86 self-build (gen1 -> g1x)
+        run: |
+          set -euo pipefail
+          chmod +x gen1
+          ./scripts/rss-curve.sh gen1x ./gen1 build --backend x86 compiler -o g1x
+
+      # 失败也把 g1x 落成 artifact：x86 编译器的运行期 bug 在小机器上复现不了
+      # （本机 gen OOM），拉回 quicksrv 本地调试；成功时它是腿 2 的输入。
+      # upload g1x even on failure: the x86-compiled compiler's runtime bugs
+      # cannot be reproduced on the 8GB box (the gen OOMs there), so pull it
+      # back for local debugging; on success it is leg 2's input.
+      - name: Upload g1x
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-g1x
+          path: g1x
+          if-no-files-found: ignore
+          retention-days: 7
+
+  x86-fixpoint:
+    needs: x86-selfbuild
+    if: always() && needs.x86-selfbuild.result == 'success'
+    runs-on: ubuntu-latest
+    # 腿 2：x86 宿主 g1x 再把编译器编一遍，两次产物逐字节相同。同一活集在 x86
+    # 运行时下慢得多（最近一轮 3h18m 未完成、RSS 单调爬升仍在健康区间），单列
+    # 一个 job 用满 Actions 单 job 360 分钟上限。
+    # leg 2: the x86-hosted g1x builds the compiler once more and the artifact
+    # must be byte-identical to g1x. The same live set is far slower under the
+    # x86 runtime (the latest attempt was still healthy but unfinished at 3h18m,
+    # RSS climbing monotonically), so it gets its own job at Actions' 360-minute
+    # per-job cap.
+    timeout-minutes: 360
+    env:
+      MALLOC_ARENA_MAX: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download g1x
+        uses: actions/download-artifact@v4
+        with:
+          name: x86-g1x
+
       # 崩溃取证：默认 core_pattern 是管道，跑完一个 core 文件都不留；改成落盘到
       # 工作目录，失败步骤才能读它的寄存器（临时步骤，定位完即撤）。
       # crash forensics: the default core_pattern pipes cores away and leaves no file;
       # point it at the working directory so the failure step can read the registers
       # (temporary step, dropped once the crash site is pinned down).
       - name: Enable core dumps
-        run: sudo -n sysctl -w kernel.core_pattern=core.g1x.%p || true
+        run: sudo -n sysctl -w kernel.core_pattern=core.g2x.%p || true
 
-      # x86 后端自举链——gen1（C 自举）经 x86 后端编出编译器，再用它把编译器
-      # 再编一遍，两次产物逐字节相同。多遍暖机 + 三段 list 化之后首次可行。
-      # the x86 backend self-chain — gen1 (C-built) compiles the compiler
-      # through the x86 backend, then that compiler compiles the compiler
-      # again; both artifacts must be byte-identical. First feasible after the
-      # multi-pass warmup and the list-based segment assembly.
+      # 腿 2：g1x 经 x86 后端再编一遍编译器，两次产物逐字节相同。多遍暖机 +
+      # 三段 list 化之后首次可行。
+      # leg 2: g1x compiles the compiler through the x86 backend once more; the
+      # two artifacts must be byte-identical. First feasible after the multi-pass
+      # warmup and the list-based segment assembly.
       - name: x86 three-generation fixpoint
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
-          chmod +x gen1
-          # 内存曲线：两份同工量的构建各采一条 RSS 曲线——gen1（C 宿主）与 g1x
-          # （x86 宿主）。x86 堆是 MAP_NORESERVE 的保留区，RSS 逼近实际触页量；
-          # 曲线的形状（单调爬升 / 锯齿 / 平顶）直接分辨「活集真这么大」与
-          # 「回收没生效」，配合 OOM 报错里的堆账目三数互为印证。
-          # memory curves: sample the RSS of both builds of the same workload —
-          # gen1 (C-hosted) and g1x (x86-hosted). The x86 heap is a MAP_NORESERVE
-          # reservation, so RSS tracks the pages actually touched; the curve's
-          # shape (monotonic ramp / sawtooth / plateau) tells "the live set really
-          # is that large" apart from "the collector stopped reclaiming", and the
-          # three heap-accounting numbers in the OOM report corroborate it.
-          ./scripts/rss-curve.sh gen1x ./gen1 build --backend x86 compiler -o g1x
+          chmod +x g1x
           ./scripts/rss-curve.sh g2x ./g1x build --backend x86 compiler -o g2x
           sha256sum g1x g2x
           cmp g1x g2x
@@ -422,8 +457,8 @@ jobs:
               fi
             done
           fi
-          ls -la core.g1x.* || true
-          for c in core.g1x.*; do
+          ls -la core.g2x.* || true
+          for c in core.g2x.*; do
             [ -f "$c" ] || continue
             readelf -n "$c" | head -60 || true
             if command -v gdb > /dev/null; then
@@ -458,20 +493,6 @@ jobs:
               -ex 'x/64gx $r14-32' \
               --args ./g1x build --backend x86 "$first_bad" -o /tmp/g1x-live 2>&1 | head -200 || true
           fi
-
-      # 失败也把 g1x 落成 artifact：x86 编译器的运行期 bug 在小机器上复现不了
-      # （本机 gen OOM），拉回 quicksrv 本地调试
-      # upload g1x even on failure: the x86-compiled compiler's runtime bugs
-      # cannot be reproduced on the 8GB box (the gen OOMs there), so pull it
-      # back for local debugging
-      - name: Upload g1x for post-mortem
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-g1x
-          path: g1x
-          if-no-files-found: ignore
-          retention-days: 7
 
   testdata:
     needs: gen1
@@ -1686,7 +1707,7 @@ jobs:
   gate:
     needs:
       [gohost, seed, bur-base, gen1, check, fixpoint, llvm-fixpoint,
-       x86-fixpoint, testdata, examples, std, lsp, multibackend, x86-repro,
+       x86-selfbuild, x86-fixpoint, testdata, examples, std, lsp, multibackend, x86-repro,
        llvm, sdk-pack, llvm-pe-build, llvm-pe-run, llvm-macho-build,
        llvm-macho-run, c-pe-build, c-pe-run, c-macho-build, c-macho-run,
        x86-pe-build, x86-pe-run, x86-macho-build,
