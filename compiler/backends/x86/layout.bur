@@ -143,25 +143,30 @@ pub let GC_INIT_THRESHOLD = 256
 // a scalar taken for one.
 pub let MIN_OBJECT_ADDR = 65536
 // P0：x86 堆预留（任务书 §3.6）与 PE 提交粒度；Linux 的 mmap flags 加 MAP_NORESERVE。
-// 编译器规模自举（3413 个函数）的活跃集已越过旧的 1GiB 预留，POSIX 预留放宽到
-// 6GiB——MAP_NORESERVE 下只占地址空间；PE 的 VirtualAlloc 一次提交，保留原上限。
+// 编译器规模自举的活集在 x86 运行时下越过 6GiB（RSS 曲线单调爬升到 6.2GiB 仍未见
+// 顶），POSIX 预留放宽到 12GiB——MAP_NORESERVE 下只占地址空间；PE 的 VirtualAlloc
+// 一次提交，且其语料只有小程序，保留 1GiB 上限。
 // P0: the x86 heap reserve (task brief §3.6) and the PE commit granularity; Linux's mmap
-// flags add MAP_NORESERVE. Compiler-scale self-compile (3413 functions) exceeds the old
-// 1GiB reserve, so the POSIX reserve grows to 6GiB — under MAP_NORESERVE that is address
-// space only; PE's VirtualAlloc commits eagerly, so it keeps the old cap.
-pub let X86GC_RESERVE = 6442450944
+// flags add MAP_NORESERVE. The compiler-scale self-compile's live set exceeds 6GiB under
+// the x86 runtime (the RSS curve climbed monotonically to 6.2GiB without plateauing), so
+// the POSIX reserve grows to 12GiB — under MAP_NORESERVE that is address space only; PE's
+// VirtualAlloc commits eagerly and its corpus is small programs only, so it keeps the
+// 1GiB cap.
+pub let X86GC_RESERVE = 12884901888
 pub let X86GC_RESERVE_PE = 1073741824
-// P1：start bitmap 每 8B granule 一**字节**（bit0 = 块起点），垫在堆区之前。
+// P1：start bitmap 每 8B granule 一**字节**（bit0 = 块起点），垫在堆区之前；长度
+// = 预留/8，必须随 X86GC_RESERVE 同步缩放（位图越过预留一半即踩进堆区）。
 // 对任务书「每 8B 一位」的空间换指令偏离：1B/granule 让站点置位只发一条
 // or byte [base+idx]（1-bit 要拆位多两条且挤第三个寄存器），与堆同尺度的
 // NORESERVE 映射不值钱，P3 sweep 还能按字节快跳零段。
 // P1: the start bitmap keeps one BYTE per 8-byte granule (bit0 = block start)
-// and pads in front of the heap. Space-for-instructions deviation from the
-// brief's one-bit-per-8B: 1B/granule turns the per-site set into a single
-// "or byte [base+idx]" (1-bit needs two extra split instructions and a third
-// register), a NORESERVE mapping of the heap's own scale is cheap, and P3's
-// sweep can skip zero runs byte-wise.
-pub let X86GC_BITMAP_SIZE = 805306368
+// and pads in front of the heap; its length is RESERVE/8 and must scale with
+// X86GC_RESERVE (a bitmap past half the reserve walks into the heap).
+// Space-for-instructions deviation from the brief's one-bit-per-8B: 1B/granule
+// turns the per-site set into a single "or byte [base+idx]" (1-bit needs two
+// extra split instructions and a third register), a NORESERVE mapping of the
+// heap's own scale is cheap, and P3's sweep can skip zero runs byte-wise.
+pub let X86GC_BITMAP_SIZE = 1610612736
 pub let X86GC_BITMAP_SIZE_PE = 134217728
 pub let X86GC_MMAP_FLAGS = 16418
 
