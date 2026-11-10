@@ -356,14 +356,14 @@ fn x86gen_alloc(dst, size, desc) {
     let bits = mov_rr(s2, dst) + sub_ri32(s2, 8) + mov_ri64(s1, rt_slot(rt_heap_start)) + mov_rm(s1, s1, 0) + sub_rr(s2, s1) + shr_ri(s2, 3) + mov_ri64(s1, rt_slot(rt_start_bitmap)) + mov_rm(s1, s1, 0) + gc_bitmap_set(s1, s2)
     // --gc-stress：切块前先同步 collect（收集器全寄存器自保，rax 再 push/pop 双保
     // 险）；非 stress 换成阈值钩子——r12 ≥ rt_gc_threshold 即同步 collect，同样挂
-    // 在切块前（新块尚不存在，无 born-unmarked 窗口），collect 尾把阈值抬到
-    // r12 + GC_THRESH_SLACK。stress 下每次 alloc 都 collect，阈值钩子被吸收不发。
+    // 在切块前（新块尚不存在，无 born-unmarked 窗口），collect 尾按堆跨度几何式
+    // 抬升阈值。stress 下每次 alloc 都 collect，阈值钩子被吸收不发。
     // --gc-stress: collect right before every bump (the collector saves all
     // registers itself; the rax push/pop is belt and suspenders). Non-stress
     // swaps in the threshold hook — collect synchronously once r12 reaches
     // rt_gc_threshold, also before the block exists (no born-unmarked window);
-    // the collect tail raises the threshold to r12 + GC_THRESH_SLACK. Under
-    // stress every alloc collects anyway, so the threshold hook would be absorbed.
+    // the collect tail raises the threshold geometrically with the heap span.
+    // Under stress every alloc collects anyway, so the threshold hook is absorbed.
     let hook = if gc_stress_g {
         push_r(rax) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     } else {
@@ -1021,12 +1021,18 @@ fn x86gen_gc_collect_block(n_globals) {
     push(it, la_l("gc_sw_done"))
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_cycles)) + mov_rm(rcx, rax, 0) + add_ri32(rcx, 1) + mov_mr(rax, 0, rcx)))
     push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_last_freed)) + mov_mr(rax, 0, r10)))
-    // P3 阈值步进：下一轮回收点 = 当前堆顶 + GC_THRESH_SLACK（复用生效时 r12 几
-    // 乎不动，回收频率随之稳定）
+    // P3 阈值步进：下一轮回收点 = 当前堆顶 + clamp(堆跨度/4, MIN, MAX)。固定
+    // 16MiB 步进下 collect 次数随堆线性增长，而每次 sweep 重走整堆 ⇒ O(堆²)；
+    // 几何步进在 12GiB 跨度下只回收几十次。跨度与界都是非负小数，有符号条件
+    // 跳转与无符号等价。
     // P3 threshold step: the next collection point = the current heap top +
-    // GC_THRESH_SLACK (with reuse working, r12 barely moves and the collection
-    // cadence settles)
-    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_threshold)) + mov_ri64(rcx, GC_THRESH_SLACK) + add_rr(rcx, r12) + mov_mr(rax, 0, rcx)))
+    // clamp(heap span / 4, MIN, MAX). With a fixed 16MiB step the collect count
+    // grows linearly with the heap while every sweep re-walks the whole heap
+    // (O(heap²)); the geometric step collects a few dozen times at a 12GiB span.
+    // The span and bounds are non-negative small values, so signed conditionals
+    // match the unsigned ones.
+    let span_slack = mov_ri64(rcx, rt_slot(rt_heap_start)) + mov_rm(rcx, rcx, 0) + mov_rr(rdx, r12) + sub_rr(rdx, rcx) + shr_ri(rdx, 2) + mov_ri64(rcx, GC_THRESH_MAX) + cmp_rr(rdx, rcx) + jle_rel32(str_len(mov_rr(rdx, rcx))) + mov_rr(rdx, rcx) + mov_ri64(rcx, GC_THRESH_MIN) + cmp_rr(rdx, rcx) + jge_rel32(str_len(mov_rr(rdx, rcx))) + mov_rr(rdx, rcx)
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_threshold)) + span_slack + add_rr(rdx, r12) + mov_mr(rax, 0, rdx)))
     // 出口：逆序弹 14 个 GPR，还快照区，ret
     push(it, la_b(pop_r(r15) + pop_r(r14) + pop_r(r13) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rdi) + pop_r(rsi) + pop_r(rbp) + pop_r(rbx) + pop_r(rdx) + pop_r(rcx) + pop_r(rax) + add_ri32(rsp, 16) + ret()))
     la_link(it)

@@ -121,12 +121,21 @@ pub let POLLFD_BASE = 2224
 // (above). The thunk slot and the fd/WSA areas shift along symbolically,
 // nothing hardcodes them.
 pub let RUNTIME_SIZE = 2808
-// P3：阈值回收的步进——collect 尾把 rt_gc_threshold 抬到 r12 + GC_THRESH_SLACK，
-// _start 以同值初始化（r12 起点太小会一开场就连环回收）。
+// P3：阈值回收的步进——collect 尾按「自堆起点以来的跨度」几何式抬升
+// rt_gc_threshold：slack = clamp(span/4, GC_THRESH_MIN, GC_THRESH_MAX)，
+// _start 以最小值初始化（r12 起点太小会一开场就连环回收）。固定步进让 collect
+// 次数随堆线性增长，而每次 sweep 都重走整堆 ⇒ O(堆²)；几何步进把总扫描量压到
+// O(堆)，上限 256MiB 卡住两次回收之间 bump 的增量，避免自由链断供时堆顶失控。
 // P3: the threshold-collection step — the collect tail raises rt_gc_threshold
-// to r12 + GC_THRESH_SLACK, and _start initializes it with the same value (a
-// too-small start would collect in a loop right off the bat).
-pub let GC_THRESH_SLACK = 16777216
+// geometrically with the span since heap_start:
+// slack = clamp(span/4, GC_THRESH_MIN, GC_THRESH_MAX); _start initializes it
+// with the floor (a too-small start would collect in a loop right off the bat).
+// A fixed step makes the collect count grow linearly with the heap while every
+// sweep re-walks the whole heap, i.e. O(heap²); the geometric step keeps total
+// scanning at O(heap) and the 256MiB cap bounds how far the bump may run
+// between collections when the free lists run dry.
+pub let GC_THRESH_MIN = 16777216
+pub let GC_THRESH_MAX = 268435456
 // P1：rec 表与 gray 栈的容量常量（rec 项 24B）随 rec 表删除退役，仅留字面量占位。
 // P1: the rec table's/gray stack's capacity constants (24B per rec entry) are
 // retired along with the rec table; kept as literals only.
