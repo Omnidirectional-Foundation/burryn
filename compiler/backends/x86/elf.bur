@@ -196,7 +196,9 @@ fn elf_section_header(name, typ, addr, off, size) {
 
 // emit_elf 是 ELF 装配入口。代码域（常量 + 函数 + 跳转表 + _start）与 .eh_frame
 // 组成 R-X 的第一条 PT_LOAD；可写 runtime 区独立成 R-W 的第二条 PT_LOAD，落在
-// base_addr + DATA_VA_OFF 的固定高 VA，文件内页对齐紧跟 .eh_frame 之后。节头表
+// base_addr + data_va_off 的高 VA——data_va_off 由 x86gen_image 每遍按上一遍
+// 量得的代码域终点页对齐抬升，数据段 VA 恰为代码域末页之后的第一个页界，文件内
+// 页对齐紧跟 .eh_frame 之后。节头表
 // 与 .shstrtab 落在两条 PT_LOAD 之外（纯尾部调试数据，execve 从不读取它们，已用
 // 手工构造的最小 ELF 在 gdb 下实测验证——见 architecture.md §5.19）。
 // pdata_offsets/pdata_lens 是 x86.bur codegen 循环已经无条件收集的每函数偏移/
@@ -206,8 +208,11 @@ fn elf_section_header(name, typ, addr, off, size) {
 // 函数 FDE 后面，同一份共享 CIE。
 // emit_elf is the ELF assembly entry. The code domain (constants + functions +
 // jump table + _start) plus .eh_frame forms the first, R-X PT_LOAD; the
-// writable runtime area becomes its own R-W PT_LOAD at the fixed high VA of
-// base_addr + DATA_VA_OFF, page-aligned right after .eh_frame in the file. The
+// writable runtime area becomes its own R-W PT_LOAD at the high VA of
+// base_addr + data_va_off — data_va_off is lifted by x86gen_image at each
+// pass's head, page-aligned past the previous pass's measured code-domain end,
+// so the data segment's VA is the first page boundary past the code domain's
+// last page, page-aligned right after .eh_frame in the file. The
 // section header table and .shstrtab sit outside both PT_LOADs (pure trailing
 // debug data — execve never reads them, verified against a hand-built minimal
 // ELF under real gdb, see architecture.md §5.19). pdata_offsets/pdata_lens are
@@ -227,6 +232,22 @@ pub fn emit_elf(code, entry_off, data_content, pdata_offsets, pdata_lens, code_b
     let eh_frame = user_eh + internal_eh
     let text_total = eh_frame_off + str_len(eh_frame)
     let data_foff = pe_align(text_total, 4096)
+    // 布局硬校验（仅真实遍——暖机/探针产物即弃，不落盘）：数据段 VA 必须页对齐
+    // 且不小于代码域终点（.eh_frame 计入），重叠即内部错误，绝不静默写出互相
+    // 覆盖的段。真实遍的 data_va_off 由 lift_data_va_off 抬到 text_total 之后的
+    // 第一个页界，恰好等于 data_foff，校验恒过；触发即长度跨遍发散的前兆。
+    // Layout hard check (real pass only — warmup/probe images are discarded,
+    // never written): the data segment's VA must be page-aligned and no smaller
+    // than the code domain's end (.eh_frame included); overlap is an internal
+    // error, never a silently written overlapping pair of segments. In the real
+    // pass lift_data_va_off has raised data_va_off to the first page boundary
+    // past text_total — exactly data_foff — so the check always holds; a trip
+    // signals cross-pass length divergence.
+    if !pic_probe_pass() && (data_va_off < text_total || data_va_off % 4096 != 0) {
+        eprintln("internal error: x86 ELF layout: data VA " + str(data_va_off) + " collides with the code domain ending at " + str(text_total))
+        exit(1)
+    }
+    set_text_extent(text_total)
     let mut text_pad = ""
     let mut tpi = text_total
     while tpi < data_foff {
@@ -239,7 +260,7 @@ pub fn emit_elf(code, entry_off, data_content, pdata_offsets, pdata_lens, code_b
     let null_sh = elf_section_header(0, 0, 0, 0, 0)
     let eh_sh = elf_section_header(1, 1, base_addr + eh_frame_off, eh_frame_off, str_len(eh_frame))
     let shstr_sh = elf_section_header(11, 3, 0, data_foff + data_len, str_len(shstrtab))
-    join([elf_header_with_sh(entry, 2, sh_off, 3, 2), phdr_load(0, base_addr, text_total, text_total, pf_r + pf_x), phdr_load(data_foff, base_addr + DATA_VA_OFF, data_len, data_len, pf_r + pf_w), code, eh_frame, text_pad, data_content, shstrtab, null_sh, eh_sh, shstr_sh], "")
+    join([elf_header_with_sh(entry, 2, sh_off, 3, 2), phdr_load(0, base_addr, text_total, text_total, pf_r + pf_x), phdr_load(data_foff, base_addr + data_va_off, data_len, data_len, pf_r + pf_w), code, eh_frame, text_pad, data_content, shstrtab, null_sh, eh_sh, shstr_sh], "")
 }
 
 // syscall 只在 linux 发裸 syscall 指令；其余目标没有稳定的裸 syscall 契约

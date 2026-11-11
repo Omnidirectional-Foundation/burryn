@@ -187,11 +187,13 @@ fn macho_chained_fixups(dataoff, datasize) {
     u32(2147483700) + u32(16) + u32(dataoff) + u32(datasize)
 }
 
-// macho_data_segment 生成 __DATA：固定高 VA 槽，文件紧随 __TEXT 页界之后，R-W
-// macho_data_segment builds __DATA: the fixed high VA slot, file body right
-// after the __TEXT page boundary, R-W
+// macho_data_segment 生成 __DATA：紧贴 __TEXT 对齐末尾页界的高 VA 槽（随
+// data_va_off 动态抬升），文件紧随 __TEXT 页界之后，R-W
+// macho_data_segment builds __DATA: the high-VA slot right at the page boundary
+// past __TEXT's aligned end (lifted dynamically with data_va_off), file body
+// right after the __TEXT page boundary, R-W
 fn macho_data_segment(data_fileoff, data_len) {
-    u32(25) + u32(72) + macho_seg_name("__DATA") + u64(macho_base + DATA_VA_OFF) + u64(pe_align(data_len, 4096)) + u64(data_fileoff) + u64(data_len) + u32(3) + u32(3) + u32(0) + u32(0)
+    u32(25) + u32(72) + macho_seg_name("__DATA") + u64(macho_base + data_va_off) + u64(pe_align(data_len, 4096)) + u64(data_fileoff) + u64(data_len) + u32(3) + u32(3) + u32(0) + u32(0)
 }
 
 // macho_dylinker 生成 LC_DYLINKER 指向 /usr/lib/dyld
@@ -260,6 +262,22 @@ pub fn emit_macho(text_content, entry_in_text, data_content, pdata_offsets, pdat
     let fstarts_payload = macho_function_starts_payload(pdata_offsets, code_base)
     let text_end = MACHO_TEXT_OFF + str_len(text_content) + unwind_len
     let data_fileoff = pe_align(text_end, 4096)
+    // 布局硬校验（仅真实遍——暖机/探针产物即弃，不落盘）：__DATA 的 VA 必须页
+    // 对齐且不小于 __TEXT 终点（__unwind_info 计入），重叠即内部错误，绝不静默
+    // 写出互相覆盖的段。真实遍的 data_va_off 由 lift_data_va_off 抬到 text_end
+    // 之后的第一个页界，恰等于 data_fileoff，校验恒过；触发即长度跨遍发散的前兆。
+    // Layout hard check (real pass only — warmup/probe images are discarded,
+    // never written): __DATA's VA must be page-aligned and no smaller than
+    // __TEXT's end (__unwind_info included); overlap is an internal error, never
+    // a silently written overlapping pair of segments. In the real pass
+    // lift_data_va_off has raised data_va_off to the first page boundary past
+    // text_end — exactly data_fileoff — so the check always holds; a trip
+    // signals cross-pass length divergence.
+    if !pic_probe_pass() && (data_va_off < text_end || data_va_off % 4096 != 0) {
+        eprintln("internal error: x86 Mach-O layout: __DATA VA offset " + str(data_va_off) + " collides with __TEXT ending at " + str(text_end))
+        exit(1)
+    }
+    set_text_extent(text_end)
     let linkedit_off = pe_align(data_fileoff + str_len(data_content), 4096)
     let chained_payload = macho_linkedit_payload()
     let fstarts_dataoff = linkedit_off + str_len(chained_payload)
@@ -575,7 +593,7 @@ fn macho_linkedit_payload() {
     let starts_in_image = u32(4) + u32(0) + u32(0) + u32(20) + u32(0)
     // PageSize 4096 与 PointerFormat 6（PTR_64_OFFSET）合入一个 u32；
     // PageCount 1 与页起点 NONE（0xFFFF）合入末尾 u32
-    let starts_in_segment = u32(24) + u32(397312) + u64(DATA_VA_OFF) + u32(0) + u32(4294901761)
+    let starts_in_segment = u32(24) + u32(397312) + u64(data_va_off) + u32(0) + u32(4294901761)
     let mut out = payload + starts_in_image + starts_in_segment
     while str_len(out) % 16 != 0 {
         out = out + byte_chr(0)

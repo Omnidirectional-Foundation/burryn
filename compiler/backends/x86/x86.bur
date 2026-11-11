@@ -797,6 +797,19 @@ pub fn x86gen_program_to_buf(f_name, f_file, f_arity, f_nupvals, f_code, f_spans
 // addresses funnel through layout.bur's img_base/data_origin, so it can be
 // replayed at the probe base
 fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, mut pt_target_shadow, mut pd_sink, fn_extra_base, mut global_type: map(str, str), mut record_field_types: map(str, [str]), mut enum_field_types: map(str, [[str]]), mut enum_variant_types: map(str, [str]), f_file, f_spans, ls_files, ls_names, ls_tables, ls_bases) {
+    // 每遍开头按上一遍量得的代码域终点页对齐抬升数据段 VA：imm64 定长使代码域
+    // 长度跨遍不变，前一遍的量值即终值；首遍尚未量得，维持 16MiB 初值（暖机
+    // 产物即弃）。抬升在探针遍前生效，使探针与真实遍共享同一 data_va_off——
+    // PIC 站点差恰为 PIC_PROBE_SHIFT，数据段 RVA 亦两遍逐字节相同。
+    // Each pass opens by lifting the data segment's VA to a page boundary past
+    // the previous pass's measured code-domain end: imm64s are fixed-width, the
+    // code length is pass-invariant, the previous measurement is final; the
+    // first pass has no measurement yet and keeps the 16MiB initial (its warmup
+    // image is discarded). The lift takes effect before the probe pass, so the
+    // probe and real passes share one data_va_off — the PIC site delta is then
+    // exactly PIC_PROBE_SHIFT, and the data segment's RVAs match byte for byte
+    // across the two passes.
+    lift_data_va_off()
     let f_name = ctx.f_name
     let f_arity = ctx.f_arity
     let f_nupvals = ctx.f_nupvals
@@ -1164,14 +1177,14 @@ fn x86gen_image(ctx: X86Ctx, const_data, n_globals, globals_map, p_depth_maps, m
         }
         let runtime_with_fd = runtime_with_thunk + fd_fill + wsa_fill
         // 导入 blob 落在 .data 内 runtime 区之后；描述符与 IAT 预填里写的是
-        // RVA（基底 DATA_VA_OFF），代码侧引用 IAT 槽用的是绝对 VA（经
+        // RVA（基底 data_va_off），代码侧引用 IAT 槽用的是绝对 VA（经
         // data_origin 收口），两套量纲不能混。
         // The import blob sits in .data after the runtime area; descriptors
-        // and the IAT prefill carry RVAs (based at DATA_VA_OFF) while code
+        // and the IAT prefill carry RVAs (based at data_va_off) while code
         // references to the IAT slots use absolute VAs (funneled through
         // data_origin) — the two scales must not be mixed.
         let idata_data_off = str_len(runtime_with_fd)
-        let idata_rva = DATA_VA_OFF + idata_data_off
+        let idata_rva = data_va_off + idata_data_off
         let iat_abs0 = data_origin() + idata_data_off + pe_import_desc_size(len(import_dlls)) + pe_ilt_size(len(import_names), len(import_dlls))
         // IAT 逐 DLL 独立以零项收尾（同 pe_build_imports 的间隙说明），故各 DLL
         // 的绝对地址列表要跳过每组之间的空槽，不能按扁平 n*8 连续算

@@ -63,23 +63,24 @@ fn test_pe_build_section_entry_text_and_data() {
     let text = pe_build_section_entry(".text", 100, 4096, 512, 1024, 1610612768)
     let want_text = ".text" + byte_chr(0) + byte_chr(0) + byte_chr(0) + e4(100) + e4(4096) + e4(512) + e4(1024) + e4(0) + e4(0) + e2(0) + e2(0) + e4(1610612768)
     assert(text == want_text, ".text entry: CODE|EXECUTE|READ (0x60000020), code domain at RVA 4096")
-    let data = pe_build_section_entry(".data", 5168, DATA_VA_OFF, 5632, 1536, 3221225536)
-    let want_data = ".data" + byte_chr(0) + byte_chr(0) + byte_chr(0) + e4(5168) + e4(DATA_VA_OFF) + e4(5632) + e4(1536) + e4(0) + e4(0) + e2(0) + e2(0) + e4(3221225536)
-    assert(data == want_data, ".data entry: INITIALIZED_DATA|READ|WRITE (0xC0000040) at the fixed high RVA, no execute bit")
+    let data = pe_build_section_entry(".data", 5168, 16777216, 5632, 1536, 3221225536)
+    let want_data = ".data" + byte_chr(0) + byte_chr(0) + byte_chr(0) + e4(5168) + e4(16777216) + e4(5632) + e4(1536) + e4(0) + e4(0) + e2(0) + e2(0) + e4(3221225536)
+    assert(data == want_data, ".data entry: INITIALIZED_DATA|READ|WRITE (0xC0000040) at the high RVA, no execute bit")
 }
 
-fn test_pe_emit_headers_sections_adjacent_across_data_hole() {
-    let hdr = pe_emit_headers(0, 100000, DATA_VA_OFF, 16, 0, 0, 99988, 5000)
-    assert(substr(hdr, 70, 2) == e2(3), "three sections: .text, the .bss gap filler and .data")
-    let gap_va = 4096 + pe_align(100000, 4096)
+fn test_pe_emit_headers_sections_adjacent() {
+    let dva = 4096 + pe_align(100000, 4096)
+    data_va_off = dva
+    let hdr = pe_emit_headers(0, 100000, dva, 16, 0, 0, 99988, 5000)
+    assert(substr(hdr, 70, 2) == e2(2), "two sections: .text and .data, VAs ascending and adjacent")
     let want_text = pe_build_section_entry(".text", 100000, 4096, pe_align(100000, 512), 1024, 1610612768)
-    let want_gap = pe_build_section_entry(".bss", DATA_VA_OFF - gap_va, gap_va, 0, 0, 1073741952)
-    let want_data = pe_build_section_entry(".data", 5000, DATA_VA_OFF, pe_align(5000, 512), 1024 + pe_align(100000, 512), 3221225536)
-    assert(substr(hdr, 328, 120) == want_text + want_gap + want_data, "section VAs ascend and are adjacent: the filler spans .text's aligned end up to DATA_VA_OFF")
+    let want_data = pe_build_section_entry(".data", 5000, dva, pe_align(5000, 512), 1024 + pe_align(100000, 512), 3221225536)
+    assert(substr(hdr, 328, 80) == want_text + want_data, "section VAs ascend and are adjacent: .data sits exactly at .text's aligned end")
 }
 
 fn test_pe_emit_headers_dynamic_base_with_reloc_dir() {
-    let hdr = pe_emit_headers(0, 100000, DATA_VA_OFF, 16, 0, 0, 99988, 5000)
+    data_va_off = 4096 + pe_align(100000, 4096)
+    let hdr = pe_emit_headers(0, 100000, data_va_off, 16, 0, 0, 99988, 5000)
     assert(substr(hdr, 158, 2) == e2(352), "DllCharacteristics = HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT")
     assert(substr(hdr, 200 + 5 * 8, 8) == e4(pe_content_rva(99988)) + e4(12), "data directory 5 points at the 12-byte base relocation block")
     assert(pe_build_reloc() == e4(4096) + e4(12) + e2(0) + e2(0), "one block, page RVA 4096, two IMAGE_REL_BASED_ABSOLUTE skip entries")

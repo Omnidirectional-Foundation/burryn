@@ -263,13 +263,43 @@ pub fn rt_slot(off) {
     data_origin() + off
 }
 
-// DATA_VA_OFF 是三目标统一的可写数据段固定偏移：与代码尺寸解耦，使 rt_slot 等
-// 地址公式在代码长度确定前即可求值；代码段与数据段之间留未映射 VA 空洞。
-// DATA_VA_OFF is the three targets' shared writable-data segment's fixed offset
-// from the image base, decoupled from the code size so address formulas like
-// rt_slot resolve before the code length is known; an unmapped VA hole sits
-// between the code and data segments.
-pub let DATA_VA_OFF = 16777216
+// data_va_off 是三目标统一的可写数据段 VA 偏移：rt_slot 等地址公式要在代码长度
+// 确定前的发射期求值，故 x86gen_image 每遍开头 lift_data_va_off 按上一遍量得的
+// 代码域终点页对齐抬升——imm64 定长使代码域长度跨遍不变，前一遍的量值即终值，
+// 数据段 VA 恒为代码域末页之后的第一个页界，代码段与数据段永不重叠。16MiB 初值
+// 只服务首遍暖机（产物即弃）。
+// data_va_off is the three targets' shared writable-data segment's VA offset:
+// address formulas like rt_slot must resolve at emission time, before the code
+// length is known, so x86gen_image lifts it at each pass's head via
+// lift_data_va_off from the previous pass's measured code-domain end, aligned
+// to a page — imm64s are fixed-width, the code length is pass-invariant, the
+// previous measurement is final, and the data segment's VA is always the first
+// page boundary past the code domain's last page, so the code and data
+// segments never overlap. The 16MiB initial value only serves the first
+// throwaway warmup pass.
+pub let mut data_va_off = 16777216
+
+// text_extent 记录上一遍装配量得的代码域 VA 终点（含各目标自己的头区基准），
+// set_text_extent 由三目标发射器在装配尾调用，lift_data_va_off 据此抬升。
+// text_extent records the previous pass's measured code-domain VA end (each
+// target's own header base included); the three emitters call set_text_extent
+// at their assembly tail, and lift_data_va_off lifts from it.
+let mut text_extent = 0
+
+pub fn set_text_extent(n: int) {
+    text_extent = n
+}
+
+// lift_data_va_off 把 data_va_off 抬到 text_extent 之后的第一个页界；幂等——
+// 代码域长度跨遍不变，量值已定后每遍算出同一结果。
+// lift_data_va_off raises data_va_off to the first page boundary past
+// text_extent; idempotent — the code length is pass-invariant, so once
+// measured every pass derives the same value.
+pub fn lift_data_va_off() {
+    if text_extent > 0 {
+        data_va_off = (text_extent + 4095) / 4096 * 4096
+    }
+}
 
 // code_origin 返回代码/常量内容的绝对起点：三目标的 runtime 区都已迁出代码域，
 // 常量紧跟各自的头区。
@@ -292,15 +322,15 @@ pub fn code_origin() {
 pub let mut x86_const_str_len = 0
 
 // data_origin 返回可写 runtime 区的绝对基址：三目标一致落在镜像基址加
-// DATA_VA_OFF 的独立可写段（ELF 第二条 PT_LOAD、PE .data、Mach-O __DATA）。
+// data_va_off 的独立可写段（ELF 第二条 PT_LOAD、PE .data、Mach-O __DATA）。
 // data_origin returns the writable runtime area's absolute base: all three
 // targets place it in the standalone writable segment at the image base plus
-// DATA_VA_OFF (ELF's second PT_LOAD, PE's .data, Mach-O's __DATA).
+// data_va_off (ELF's second PT_LOAD, PE's .data, Mach-O's __DATA).
 pub fn data_origin() {
     if target_os == "darwin" {
-        macho_base + DATA_VA_OFF + addr_shift
+        macho_base + data_va_off + addr_shift
     } else {
-        base_addr + DATA_VA_OFF + addr_shift
+        base_addr + data_va_off + addr_shift
     }
 }
 

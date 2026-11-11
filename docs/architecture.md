@@ -1,6 +1,6 @@
 # Architecture — Burryn 实现架构
 
-> v0.7 · active · 2026-09-24
+> v0.7 · active · 2026-11-11
 > 状态：实现权威 · 编号 `S<n>[.<m>]`（阶段表见 [`GOALS.md`](GOALS.md)）
 > 相关文档：[`GOALS.md`](GOALS.md) 路线与完成线 · [`grammar.md`](grammar.md) 表层语法 · [`NUMBERING.md`](NUMBERING.md) 旧编号 · [`../README.md`](../README.md)
 
@@ -250,10 +250,12 @@ Raw int64，8 字节/槽，**无 tag**。
 代码域（R-X）: headers | consts | funcs | jump_table | _start | .eh_frame
                 ^img_base = ELF base+176 / PE base+4096 / Mach-O base+0x1000
 数据域（R-W）: runtime slots [+ windows: thunk 槽 | fd 表 | WSA 区]
-                ^data_origin = 镜像基址 + DATA_VA_OFF (16MB)
+                ^data_origin = 镜像基址 + data_va_off（页对齐贴住代码域终点，动态抬升）
 ```
 
-- 可写 runtime 区独立成 R-W 段，与代码域之间留 VA 空洞（ELF/Mach-O 不映射，PE 由只占 VA 的 `.bss` 填洞节补齐），定案见 §5.21
+- 可写 runtime 区独立成 R-W 段，VA 恰为代码域末页之后的第一个页界，代码与数据
+  永不重叠；`data_va_off` 由每遍发射按上一遍量得的代码域终点页对齐抬升，定案见
+  §5.21（拆分）与 §5.26（动态抬升）
 - 三目标均为 PIE：上图基址是链接基址，实际装载基址由内核/加载器随机选定，代码全程 RIP 相对，定案见 §5.22
 - 堆：16MB via mmap(MAP_ANONYMOUS)，零填充，bump-allocated via r12
 - 值栈：1MB below rsp，向上增长
@@ -563,7 +565,9 @@ PE/Mach-O 初版时同一验证力度，如实记录，不假装有更高确信�
 
 完成线「节/段拆分（R-X 代码与 R-W 数据分开）」的落地定案：三目标一致把可写
 runtime 区（GC/调度器槽；Windows 另含分派器 thunk 槽、fd 表与 WSA 区）从代码域
-迁出，代码域收成 R-X。本节落地时仍是固定基址，PIE 随后另行落地，见 §5.22。
+迁出，代码域收成 R-X。本节落地时仍是固定基址，PIE 随后另行落地，见 §5.22；
+其后的固定 16MB 偏移在自举规模下与代码域碰撞，数据段 VA 改为动态抬升、`.bss`
+填洞节随之删除，见 §5.26。
 
 - **布局**：可写区落在镜像基址 + 16MB 的固定高 VA（`DATA_VA_OFF`，`layout.bur`
   单一定义，取代原 Mach-O 专属的 `MACHO_DATA_VA_OFF`），与代码域之间留未映射
@@ -755,6 +759,34 @@ print/println/eprintln 与 `str()` 对非字符串值统一走 `compiler/backend
   record/枚举、bool/unit payload，三方一致；multi-backend 124/0/0。
 - **已知边界**：格式化只能用到后端跟踪到的静态类型——map 值类型只跟踪 int/str/float，
   其余（如 map 的值是 list）仍按整数印；函数值尚未印成 `<fn name>`。
+
+### 5.26 数据段 VA 动态抬升：页对齐贴住代码域终点（定案，2026-11-11）
+
+取代 §5.21 的固定 16MB `DATA_VA_OFF`：自举产物（g1x）代码域总长 166.8MB 已远超
+16MB，第二条 PT_LOAD 按固定偏移映射数据段时直接覆盖代码页，热路径指令落在被
+R-W 零页重映射的 VA 上即 SIGSEGV_ACCERR（§5.21 的「与代码尺寸解耦」前提在
+编译器自举规模下失效）。
+
+- **机制**：`DATA_VA_OFF` 常量改为 `layout.bur` 的 `data_va_off` 可变量；三目标
+  发射器（`emit_elf` / `pe_emit_headers` / `emit_macho`）在装配尾把各自量得的
+  代码域 VA 终点记入 `text_extent`（`set_text_extent`），`x86gen_image` 每遍开头
+  `lift_data_va_off` 将 `data_va_off` 抬到 `text_extent` 之后的第一个页界。两遍
+  收敛成立依赖 imm64 定长（mov r64,imm64 恒 10B，PIC 改写后 lea+nop 等长）：代码
+  域长度跨遍不变，前一遍的量值即终值，第二遍起抬升幂等。
+- **遍编排**：抬升在探针遍前生效，探针与真实遍共享同一 `data_va_off`——PIC 站点
+  差恰为 `PIC_PROBE_SHIFT`，`pic_data` 的数据段逐字节相等约束不受影响（IAT 预填
+  写的是 RVA，与 `data_va_off` 数值无关）。首遍暖机无量值可依，维持 16MiB 初值，
+  产物即弃。
+- **PE 节表收成两节**：`.data` 的 VA 恰为 `.text` 对齐末尾（`gap_va`），§5.21 的
+  `.bss` 填洞节失去存在场景，删除；真 Windows 加载器要求的「节 VA 升序且相邻」
+  由布局构造直接满足。
+- **三目标硬校验**（仅真实遍生效，`pic_probe_pass` 门控；暖机/探针产物即弃）：
+  ELF 数据段 VA 页对齐且 ≥ 代码域终点、PE `data_va_off == gap_va`、Mach-O
+  `__DATA` VA 页对齐且 ≥ `__TEXT` 终点；违反即 `eprintln` + `exit(1)`，绝不静默
+  写出重叠段。PE `SizeOfImage` 另加 32 位 RVA 域上界校验（`e4` 对越界值静默截
+  断）。校验恒过；触发即长度跨遍发散的前兆。
+- **Mach-O 连带改善**：`__DATA` VA（= `data_fileoff`）不再高于 `__LINKEDIT` VA，
+  段 VA 恢复升序。
 
 ## 6. LSP 与编辑器生态
 
