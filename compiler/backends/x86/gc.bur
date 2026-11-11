@@ -1081,8 +1081,25 @@ fn x86gen_gc_collect_block(n_globals) {
     // (O(heap²)); the geometric step collects a few dozen times at a 12GiB span.
     // The span and bounds are non-negative small values, so signed conditionals
     // match the unsigned ones.
+    // 钳制与下限：threshold 钳到 limit − GC_THRESH_MIN。fire 条件是 threshold ≤ r12
+    // 而 r12 < limit 恒成立，钳到 limit 本身则 fire 点与 die 点重合，临终区一轮
+    // GC 都不会跑；带 16MiB 余量才保证 bump 撞限之前先 fire。collect 不缩 r12，
+    // 钳制一旦生效 threshold ≤ r12，每个分配点（含 reuse 命中）都会连环 fire；
+    // 再抬下限到 r12 + 8，只有 bump 真正推高堆顶后的下一个分配点才 fire——
+    // 复用为主的推进零轮 collect。
+    // Clamp and floor: the threshold is clamped to limit - GC_THRESH_MIN. The
+    // hook fires when threshold <= r12 while r12 < limit always holds, so
+    // clamping to the bare limit makes the fire point coincide with the die
+    // point and the endgame runs no GC at all; only a positive margin
+    // guarantees a collect before a bump hits the limit. A collect never
+    // shrinks r12, so once the clamp binds, threshold <= r12 would chain-fire
+    // at every alloc site (reuse hits included); raising the floor to r12 + 8
+    // fires only at the site after a bump actually advances the top —
+    // reuse-driven progress then pays zero collects.
     let span_slack = mov_ri64(rcx, rt_slot(rt_heap_start)) + mov_rm(rcx, rcx, 0) + mov_rr(rdx, r12) + sub_rr(rdx, rcx) + shr_ri(rdx, 2) + mov_ri64(rcx, GC_THRESH_MAX) + cmp_rr(rdx, rcx) + jle_rel32(str_len(mov_rr(rdx, rcx))) + mov_rr(rdx, rcx) + mov_ri64(rcx, GC_THRESH_MIN) + cmp_rr(rdx, rcx) + jge_rel32(str_len(mov_rr(rdx, rcx))) + mov_rr(rdx, rcx)
-    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_threshold)) + span_slack + add_rr(rdx, r12) + mov_mr(rax, 0, rdx)))
+    let clamp_top = mov_ri64(rcx, rt_slot(rt_heap_limit)) + mov_rm(rcx, rcx, 0) + sub_ri32(rcx, GC_THRESH_MIN) + cmp_rr(rdx, rcx) + jle_rel32(str_len(mov_rr(rdx, rcx))) + mov_rr(rdx, rcx)
+    let floor_top = lea(rcx, r12, 8) + cmp_rr(rdx, rcx) + jge_rel32(str_len(mov_rr(rdx, rcx))) + mov_rr(rdx, rcx)
+    push(it, la_b(mov_ri64(rax, rt_slot(rt_gc_threshold)) + span_slack + add_rr(rdx, r12) + clamp_top + floor_top + mov_mr(rax, 0, rdx)))
     // 出口：逆序弹 14 个 GPR，还快照区，ret
     push(it, la_b(pop_r(r15) + pop_r(r14) + pop_r(r13) + pop_r(r11) + pop_r(r10) + pop_r(r9) + pop_r(r8) + pop_r(rdi) + pop_r(rsi) + pop_r(rbp) + pop_r(rbx) + pop_r(rdx) + pop_r(rcx) + pop_r(rax) + add_ri32(rsp, 16) + ret()))
     la_link(it)

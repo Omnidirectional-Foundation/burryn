@@ -3395,33 +3395,61 @@ fn emit_one_variant(ctx, fh, vi, vsigs, f_name, f_arity, f_nupvals, f_code, f_co
         prev_ip = ip
         ip = ip + inst_len(ctx, fh, code, ip)
     }
-    // 跳转补丁：回填 rel32 偏移（字节位置差）
-    // Patch jumps: fill in rel32 offsets (byte-position deltas)
+    // 跳转补丁与格式化 call rel32 单遍回填：两组补丁位置都随发射游标严格递增
+    //（push 都紧跟着 w() 之后取 cur_byte()），且互不重叠——每个字节偏移只属于
+    // 一条指令的一个操作数。按偏移归并后一次切片收集再 join，每字节只经过一次；
+    // 旧实现对每条补丁整串重建（substr×2 + concat），大函数 × 千级补丁是
+    // O(P·L) 大块 churn，正是 fixpoint 的 OOM 热源。并列时跳转补丁在前（与旧
+    // 实现的先后一致；两组位置按构造不相等）。
+    // Jump patches and formatter call rel32s backpatch in one linear pass: both
+    // position lists are strictly increasing in the emission cursor (each push
+    // reads cur_byte() right after its w()) and never overlap — every byte
+    // offset belongs to exactly one instruction operand. Merge by offset, slice
+    // once into a list and join, so every byte passes through once; the old loop
+    // rebuilt the whole string per patch (substr x2 + concat) — O(P*L) big-block
+    // churn on large functions with thousands of patches, the fixpoint's OOM hot
+    // spot. Ties keep the jump patch first (matching the old application order;
+    // the two sets are disjoint by construction).
     let mut fbytes = join(out, "")
+    let body_len = str_len(fbytes)
+    let mut mixed = []
     let mut pi = 0
-    while pi < len(patches) {
-        let p = patches[pi]
-        let rel32_pos = p[0]
-        let target_ip = p[1]
-        let target_byte = match get(ip_to_byte, target_ip) {
-            Some(v) => v,
-            None => 0,
-        }
-        let rel32 = target_byte - (rel32_pos + 4)
-        fbytes = substr(fbytes, 0, rel32_pos) + e4s(rel32) + substr(fbytes, rel32_pos + 4, str_len(fbytes) - rel32_pos - 4)
-        pi = pi + 1
-    }
-    // 格式化子程序池接在末尾，回填各 call rel32 / append the formatter pool and
-    // fill in each call rel32
-    if len(fmt_call_pos) > 0 {
-        let tail_start = str_len(fbytes)
-        let mut fk = 0
-        while fk < len(fmt_call_pos) {
+    let mut fk = 0
+    while pi < len(patches) || fk < len(fmt_call_pos) {
+        if fk >= len(fmt_call_pos) || pi < len(patches) && patches[pi][0] <= fmt_call_pos[fk] {
+            let p = patches[pi]
+            let rel32_pos = p[0]
+            let target_byte = match get(ip_to_byte, p[1]) {
+                Some(v) => v,
+                None => 0,
+            }
+            push(mixed, [rel32_pos, target_byte - (rel32_pos + 4)])
+            pi = pi + 1
+        } else {
             let cpos = fmt_call_pos[fk]
-            let target = tail_start + la_pos(fmtg.items, fmt_call_lbl[fk])
-            fbytes = substr(fbytes, 0, cpos) + e4s(target - (cpos + 4)) + substr(fbytes, cpos + 4, str_len(fbytes) - cpos - 4)
+            let target = body_len + la_pos(fmtg.items, fmt_call_lbl[fk])
+            push(mixed, [cpos, target - (cpos + 4)])
             fk = fk + 1
         }
+    }
+    let mut parts = []
+    let mut off = 0
+    let mut k = 0
+    while k < len(mixed) {
+        let m = mixed[k]
+        if m[0] < off || m[0] + 4 > body_len {
+            eprintln("internal error: x86 rel32 patch out of range at " + str(m[0]))
+            exit(1)
+        }
+        push(parts, substr(fbytes, off, m[0] - off))
+        push(parts, e4s(m[1]))
+        off = m[0] + 4
+        k = k + 1
+    }
+    push(parts, substr(fbytes, off, body_len - off))
+    fbytes = join(parts, "")
+    // 格式化子程序池接在末尾 / the formatter pool rides at the tail
+    if len(fmt_call_pos) > 0 {
         fbytes = fbytes + la_link(fmtg.items)
     }
     fbytes
