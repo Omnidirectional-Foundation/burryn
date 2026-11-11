@@ -322,26 +322,76 @@ fn gc_bitmap_set(s1, s2) {
     e1(128) + e1(12) + e1(s2 * 8 + s1) + sb(1)
 }
 
-// x86gen_alloc 立即数尺寸分配（size = payload 字节数，发射期圆整到 8）：
-// dst = r12+8（payload 起点）→ r12 += size+8 → 限界检查（r12 越界进 oom_die）
-// → [dst-8] = payload|desc<<40 → bitmap 置 start 位。
+// gc_cap_round 把请求尺寸（8 倍数）取成块 cap：≤64 精确，>64 取 2 的幂。幂档
+// 让 sweep 链入的块与之后同档请求一一对上（见 layout.bur 的类头注释）。
+// gc_cap_round turns the requested size (a multiple of 8) into the block cap:
+// exact up to 64, a power of two above. The power rung makes every swept block
+// line up with the later requests of the same rung (see the class-head comment
+// in layout.bur).
+fn gc_cap_round(sz) {
+    if sz <= 8 {
+        8
+    } else if sz <= 16 {
+        16
+    } else if sz <= 32 {
+        32
+    } else if sz <= 64 {
+        64
+    } else {
+        let mut cap = 128
+        while cap < sz {
+            cap = cap * 2
+        }
+        cap
+    }
+}
+
+// gc_class_slot 按 cap 给出类头槽偏移（rt_slot 的入参）：≤64 用精确类，>64 用
+// 幂档数组。cap 必须已过 gc_cap_round。
+// gc_class_slot returns the class-head slot offset (the rt_slot argument): the
+// exact classes up to 64, the power-of-two array above. cap must have gone
+// through gc_cap_round.
+fn gc_class_slot(cap) {
+    if cap <= 8 {
+        rt_free8
+    } else if cap <= 16 {
+        rt_free16
+    } else if cap <= 32 {
+        rt_free32
+    } else if cap <= 64 {
+        rt_free64
+    } else {
+        let mut e = 7
+        let mut c = 128
+        while c < cap {
+            c = c * 2
+            e = e + 1
+        }
+        rt_free_class_base + (e - 7) * 8
+    }
+}
+
+// x86gen_alloc 立即数尺寸分配（size = payload 字节数，发射期圆整到 8、再按
+// gc_cap_round 取块 cap）：dst = r12+8（payload 起点）→ r12 += cap+8 → 限界检查
+//（r12 越界进 oom_die）→ [dst-8] = cap|desc<<40 → bitmap 置 start 位。
 // 寄存器代价：毁 s1/s2（push/pop 保护）与 r12；写 dst；rax 仅 die 路径触碰
 //（亦保护）。FLAGS 被破坏——与旧内联 bump（add 亦毁 FLAGS）同级，站点内
 // test→je 相邻对不受影响（分配序列插在原 bump 位置）。
-// x86gen_alloc immediate-size allocation (size = payload bytes, rounded to 8
-// at emission): dst = r12+8 (payload start) -> r12 += size+8 -> bound check
-// (r12 past the limit enters oom_die) -> [dst-8] = payload|desc<<40 -> set the
-// start bit. Register cost: clobbers s1/s2 (push/pop saved) and r12; writes
-// dst; rax only touched on the die path (also saved). FLAGS are clobbered —
-// same class as the old inline bump (add clobbers FLAGS too); adjacent
-// test->je pairs inside sites are unaffected (the sequence goes where the
-// bump was).
+// x86gen_alloc immediate-size allocation (size = payload bytes, rounded to 8 at
+// emission and then to the block cap by gc_cap_round): dst = r12+8 (payload
+// start) -> r12 += cap+8 -> bound check (r12 past the limit enters oom_die) ->
+// [dst-8] = cap|desc<<40 -> set the start bit. Register cost: clobbers s1/s2
+// (push/pop saved) and r12; writes dst; rax only touched on the die path (also
+// saved). FLAGS are clobbered — same class as the old inline bump (add clobbers
+// FLAGS too); adjacent test->je pairs inside sites are unaffected (the sequence
+// goes where the bump was).
 fn x86gen_alloc(dst, size, desc) {
     let sz = (size + 7) / 8 * 8
+    let cap = gc_cap_round(sz)
     let s1 = gc_scratch1(dst)
     let s2 = gc_scratch2(dst)
     let die = gc_oom_die()
-    let hdr_bump = mov_ri64(s1, sz + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1)
+    let hdr_bump = mov_ri64(s1, cap + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1)
     // 复用路径 hdr = 原块 cap（非请求尺寸）：hdr 链下一块 = hdr + 8 + size，写小
     // 了走查会切进本块内部。cap 由 sweep 写在节点 [payload+8]。
     // the reuse path's hdr = the block's original cap (not the requested size):
@@ -369,47 +419,36 @@ fn x86gen_alloc(dst, size, desc) {
     } else {
         push_r(rax) + mov_ri64(rax, rt_slot(rt_gc_threshold)) + mov_rm(rax, rax, 0) + cmp_rr(rax, r12) + ja_rel32(str_len(mov_ri64(rax, gc_collect_g)) + str_len(call_r(rax))) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     }
-    // P3 尺寸类自由链复用：sweep 把死块按 cap 链入 8/16/32/64/big 五个类头；
-    // 分配端按请求尺寸选类（立即数版发射期即常量）后查该类链头，cap ≥ sz 即摘
-    // 头复用，否则照旧 bump。单链头版本对混合尺寸 churn 的命中率只有 ~25%（每
-    // 轮 4-5 种尺寸轮转、链头只伺候一种），r12 仍线性增长直至 OOM——分类后
-    // churn 类负载基本全命中。8B 类的节点只放 [next] 一个字（cap 由类隐含为
-    // 8），是唯一不需要 cap 比较的一档。
-    // P3 size-class free-list reuse: the sweep chains dead blocks into five
-    // class heads (8/16/32/64/big) by cap; the alloc side picks the class by
-    // request size (an emission-time constant for immediate-size sites) and
-    // checks that class's head, popping when cap >= sz, else bumping as before.
-    // The single-head version matched only ~25% on mixed-size churn (4-5
-    // rotating sizes vs one head), so r12 still grew linearly to OOM — with the
-    // classes the churn workload nearly always hits. The 8B class stores just
-    // the [next] word (the class implies cap 8), the only rung without a cap
-    // compare.
-    let cls = if sz == 8 {
-        rt_free8
-    } else if sz <= 16 {
-        rt_free16
-    } else if sz <= 32 {
-        rt_free32
-    } else if sz <= 64 {
-        rt_free64
-    } else {
-        rt_free_big
-    }
+    // P3 尺寸类自由链复用：sweep 把死块按 cap 链入 8/16/32/64 精确类与 >64 的
+    // 2 的幂档；分配端按请求 cap 选类（立即数版发射期即常量）后查该类链头，
+    // cap ≥ sz 即摘头复用，否则照旧 bump。幂档内块 cap 恒等于档值，链头必命中：
+    // `substr`/拼接 churn 的尺寸逐次微增也不会像旧 big 单链那样整窗落空。8B 类
+    // 的节点只放 [next] 一个字（cap 由类隐含为 8），是唯一不需要 cap 比较的一档。
+    // P3 size-class free-list reuse: the sweep chains dead blocks into the exact
+    // 8/16/32/64 classes and the power-of-two rungs above 64; the alloc side
+    // picks the class by the request cap (an emission-time constant for
+    // immediate-size sites) and checks that class's head, popping when cap >= sz,
+    // else bumping as before. Within a rung every block's cap equals the rung, so
+    // the head always hits: the substr/concat churn's slowly growing sizes no
+    // longer miss a whole window as they did with the old single big head. The
+    // 8B class stores just the [next] word (the class implies cap 8), the only
+    // rung without a cap compare.
+    let cls = gc_class_slot(cap)
     let next_ld = mov_rm(dst, s1, 0)
     // head_pop 的槽址走 s2（头加载前装入、贯穿复用段不毁）：旧版把槽址装 rax
     // 再写 [rax]=dst——dst==rax 的站点（str 系，实测）mov_ri64(rax,&slot) 先毁
-    // 掉 rax 里的 next，[rax]=rax 把槽址自己写进链头=链头自指，后续 big 分配
-    // 把槽当块、cap 读到 .eh_frame 文本、hdr 写穿 rt_free64/rt_free_big。
+    // 掉 rax 里的 next，[rax]=rax 把槽址自己写进链头=链头自指，后续分配
+    // 把槽当块、cap 读到 .eh_frame 文本、hdr 写穿类头槽。
     // head_pop keeps the slot address in s2 (loaded before the head load, alive
     // across the reuse stretch): the old cut parked it in rax and stored
     // [rax]=dst — at dst==rax sites (the str family, observed) mov_ri64(rax,&slot)
     // destroyed the next sitting in rax, so [rax]=rax wrote the slot's own
-    // address into the head: the next big alloc took the slot for a block, read
-    // .eh_frame text as its cap and wrote hdrs through rt_free64/rt_free_big.
+    // address into the head: the next allocation took the slot for a block, read
+    // .eh_frame text as its cap and wrote hdrs through the class heads.
     let head_pop = mov_mr(s2, 0, dst)
     let dst_set = mov_rr(dst, s1)
     let cap_ld = mov_rm(s2, dst, 8)
-    let bump = lea(dst, r12, 8) + add_ri32(r12, sz + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die
+    let bump = lea(dst, r12, 8) + add_ri32(r12, cap + 8) + mov_ri64(s1, rt_slot(rt_heap_limit)) + mov_rm(s1, s1, 0) + cmp_rr(s1, r12) + ja_rel32(str_len(die)) + die
     let jmp_bits = jmp_rel32(str_len(bump) + str_len(hdr_bump))
     let reuse_tail = cap_ld + hdr_reuse + jmp_bits
     let cap_chk = mov_rm(dst, s1, 8) + cmp_ri32(dst, sz) + jb_rel32(str_len(next_ld) + str_len(head_pop) + str_len(dst_set) + str_len(reuse_tail))
@@ -427,9 +466,9 @@ fn x86gen_alloc(dst, size, desc) {
     let next8 = mov_rm(dst, s1, 0)
     let head_pop8 = mov_mr(s2, 0, dst)
     let dst_set8 = mov_rr(dst, s1)
-    let hdr_reuse8 = mov_ri64(s1, sz + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1) + jmp_bits
+    let hdr_reuse8 = mov_ri64(s1, cap + desc * GC_DESC_SHIFT) + mov_mr(dst, 0 - 8, s1) + jmp_bits
     let reuse8 = mov_ri64(s2, rt_slot(rt_free8)) + mov_rm(s1, s2, 0) + test_rr(s1, s1) + je_rel32(str_len(next8) + str_len(head_pop8) + str_len(dst_set8) + str_len(hdr_reuse8)) + next8 + head_pop8 + dst_set8 + hdr_reuse8
-    let reuse = if sz == 8 {
+    let reuse = if sz <= 8 {
         reuse8
     } else {
         reuse_general
@@ -438,25 +477,28 @@ fn x86gen_alloc(dst, size, desc) {
 }
 
 // x86gen_alloc_r 寄存器尺寸分配（size_reg 承载 payload 字节数，运行期圆整）：
-// sz = (size_reg+7) & -8 先算进 s1，bump 与 hdr 共用它；desc≠0 时对 hdr 补
-// OR（P1 desc 恒 0，该分支零字节）。size_reg 自身不被改写；size_reg 不得等
-// 于 dst（dst 在读 size 前被覆写——站点审计保证）。
+// sz = (size_reg+7) & -8 先算进 s1；>64 的请求再抬到 2 的幂档（cap），s1 随档
+// 更新，bump 推进与 hdr 都按 cap。desc≠0 时对 hdr 补 OR（P1 desc 恒 0，该分支
+// 零字节）。size_reg 的调用方原值由入口 push/pop 复原；size_reg 不得等于 dst
+//（dst 在读 size 前被覆写——站点审计保证）。
 // x86gen_alloc_r register-size allocation (size_reg carries the payload byte
-// count, rounded at run time): sz = (size_reg+7) & -8 lands in s1 first and is
-// shared by the bump and the hdr; desc != 0 ORs the hdr (P1's desc is always
-// 0, so that branch emits no bytes). size_reg itself is not written; size_reg
-// must not equal dst (dst is overwritten before the size is read — audited per
-// site).
+// count, rounded at run time): sz = (size_reg+7) & -8 lands in s1 first; a
+// request above 64 is then raised to its power-of-two rung (cap) and s1 follows
+// the rung, so the bump advance and the hdr both use cap. desc != 0 ORs the hdr
+// (P1's desc is always 0, so that branch emits no bytes). The caller's
+// size_reg is restored by the entry push/pop; size_reg must not equal dst (dst
+// is overwritten before the size is read — audited per site).
 fn x86gen_alloc_r(dst, size_reg, desc) {
     let s1 = gc_scratch1(dst)
     let s2 = gc_scratch2(dst)
     let die = gc_oom_die()
-    // 圆整提前到分支前：s1 承载圆整尺寸贯穿 bump（add_rr r12）与 hdr_or；复用路
-    // 径不用圆整尺寸（hdr 写原 cap），s1 在复用尾重载为 cap，两路共用 hdr_or。
-    // the rounding hoists above the branch: s1 carries the rounded size through
-    // the bump (add_rr r12) and hdr_or; the reuse path ignores it (its hdr takes
-    // the original cap), reloading s1 with cap at its tail — both paths share
-    // the same hdr_or/hdr_write.
+    // 圆整提前到分支前：s1 承载圆整尺寸（>64 再抬成幂档 cap）贯穿 bump
+    //（add_rr r12）与 hdr_or；复用路径的 hdr 取块内原 cap，s1 在复用尾重载，
+    // 两路共用 hdr_or。
+    // the rounding hoists above the branch: s1 carries the rounded size (raised
+    // to the power rung above 64) through the bump (add_rr r12) and hdr_or; the
+    // reuse path's hdr takes the block's stored cap, reloading s1 at its tail —
+    // both paths share the same hdr_or/hdr_write.
     let round = mov_rr(s1, size_reg) + add_ri32(s1, 7) + and_ri32(s1, 0 - 8)
     let hdr_or = if desc != 0 {
         mov_ri64(s2, desc * GC_DESC_SHIFT) + or_rr(s1, s2)
@@ -471,20 +513,28 @@ fn x86gen_alloc_r(dst, size_reg, desc) {
     } else {
         push_r(rax) + mov_ri64(rax, rt_slot(rt_gc_threshold)) + mov_rm(rax, rax, 0) + cmp_rr(rax, r12) + ja_rel32(str_len(mov_ri64(rax, gc_collect_g)) + str_len(call_r(rax))) + mov_ri64(rax, gc_collect_g) + call_r(rax) + pop_r(rax)
     }
-    // P3 尺寸类链头（alloc_r 运行期选类）：比较链选类头槽址进 s2，槽址存 rax
-    // 跨过头加载（rax 已 push 保护），弹头写回用 rax 指向的选中槽；cap ≥ sz 由
-    // 分配端再校验兜底，两条退出路径（je/jb）都先经 bail 还原 rax。类界用 jb
-    // 严格小于形式（24/40/72）：尺寸恒 8 倍数，cap ≤ 16 ⟺ cap < 24 等。
-    // P3 size-class heads (alloc_r picks at run time): the compare chain
-    // selects the class head slot into s2, the slot address parks in rax
-    // (push-protected) across the head load, the pop writes back through rax,
-    // cap >= sz is re-checked as a backstop, and both bail-outs (je/jb) restore
-    // rax via the bail stub first. The bounds use strict jb form (24/40/72):
-    // sizes are always 8-multiples, so cap <= 16 iff cap < 24, etc.
-    let sel3 = mov_ri64(s2, rt_slot(rt_free_big))
-    let sel2 = mov_ri64(s2, rt_slot(rt_free64)) + cmp_ri32(s1, 72) + jb_rel32(str_len(sel3))
-    let sel1 = mov_ri64(s2, rt_slot(rt_free32)) + cmp_ri32(s1, 40) + jb_rel32(str_len(sel2) + str_len(sel3))
-    let sel0 = mov_ri64(s2, rt_slot(rt_free16)) + cmp_ri32(s1, 24) + jb_rel32(str_len(sel1) + str_len(sel2) + str_len(sel3))
+    // P3 尺寸类链头（alloc_r 运行期选类）：≤64 走精确类的比较链（jb 严格小于
+    // 24/40/72——尺寸恒 8 倍数，cap ≤ 16 ⟺ cap < 24）；>64 走 2 的幂档，cap 从
+    // 128 起倍增到 ≥ sz、槽址同步 +8（循环不碰 cl，size_reg 可能正是 rcx/rdx），
+    // 出口把 cap 写回 s1，使 bump 推进、hdr 与请求尺寸都按档值。档内 cap 恒等于
+    // 档值，链头必命中；两条 miss 路径（je/jb）都先经 bail 还原停靠寄存器。
+    // P3 size-class heads (alloc_r picks at run time): up to 64 uses the exact
+    // classes' compare chain (strict jb bounds 24/40/72 — sizes are always
+    // 8-multiples, so cap <= 16 iff cap < 24); above 64 uses the power-of-two
+    // rungs, doubling cap from 128 until >= sz and stepping the slot +8 in
+    // tandem (the loop never touches cl: size_reg may be rcx/rdx). The exit
+    // copies cap back into s1 so the bump advance, the hdr and the request size
+    // all use the rung. Within a rung every block's cap equals the rung, so the
+    // head always hits; both miss paths (je/jb) restore the parked register via
+    // bail first.
+    let big_step = add_rr(dst, dst) + add_ri32(s2, 8)
+    let big_cmp = cmp_rr(dst, s1)
+    let big_back = jmp_rel32(0 - (str_len(big_cmp) + 6 + str_len(big_step) + 5))
+    let big_skip = jae_rel32(str_len(big_step) + str_len(big_back))
+    let sel_big = mov_ri64(dst, 128) + mov_ri64(s2, rt_slot(rt_free_class_base)) + big_cmp + big_skip + big_step + big_back + mov_rr(s1, dst)
+    let sel2 = mov_ri64(s2, rt_slot(rt_free64)) + cmp_ri32(s1, 72) + jb_rel32(str_len(sel_big))
+    let sel1 = mov_ri64(s2, rt_slot(rt_free32)) + cmp_ri32(s1, 40) + jb_rel32(str_len(sel2) + str_len(sel_big))
+    let sel0 = mov_ri64(s2, rt_slot(rt_free16)) + cmp_ri32(s1, 24) + jb_rel32(str_len(sel1) + str_len(sel2) + str_len(sel_big))
     let bump = lea(dst, r12, 8) + add_rr(r12, s1) + add_ri32(r12, 8) + mov_ri64(s2, rt_slot(rt_heap_limit)) + mov_rm(s2, s2, 0) + cmp_rr(s2, r12) + ja_rel32(str_len(die)) + die
     // bail 只还原停靠寄存器；miss 路随后经 jmp_over_free8 跳过 8B 段落到 bump。
     // 旧版在 bail 后加了 jmp_rel32(len(bump))，把「跳过 bump」的位移用在了 bump
@@ -542,7 +592,7 @@ fn x86gen_alloc_r(dst, size_reg, desc) {
     let jmp_hdr = jmp_rel32(str_len(bail) + str_len(jmp_over_free8) + str_len(free8) + str_len(bump))
     let reuse_mid = mov_rm(dst, s2, 0) + mov_mr(slot_reg, 0, dst) + park_pop + dst_set + cap_re + jmp_hdr
     let cap_chk = mov_rm(dst, s2, 8) + cmp_rr(dst, s1) + jb_rel32(str_len(reuse_mid))
-    let reuse_general = sel0 + sel1 + sel2 + sel3 + park + mov_rm(s2, s2, 0) + test_rr(s2, s2) + je_rel32(str_len(cap_chk) + str_len(reuse_mid)) + cap_chk + reuse_mid + bail
+    let reuse_general = sel0 + sel1 + sel2 + sel_big + park + mov_rm(s2, s2, 0) + test_rr(s2, s2) + je_rel32(str_len(cap_chk) + str_len(reuse_mid)) + cap_chk + reuse_mid + bail
     let reuse = cmp_ri32(s1, 16) + jb_rel32(str_len(reuse_general) + str_len(jmp_over_free8)) + reuse_general + jmp_over_free8 + free8
     hook + push_r(s1) + push_r(s2) + round + reuse + bump + hdr_or + hdr_write + bits + pop_r(s2) + pop_r(s1)
 }
@@ -972,25 +1022,25 @@ fn x86gen_gc_collect_block(n_globals) {
         push(it, la_b(mov_rr(rdi, r9) + add_ri32(rdi, 8) + mov_rr(rcx, rdx) + mov_ri64(rax, 171) + e1(243) + e1(170)))
     }
     // 链入尺寸类自由链：8B 载荷走隐式 cap 类，节点只有 [next] 一个字
-    //（payload+0），cap 由类隐含；≥16B 按 cap 选类头槽址（比较链，jb 严格小于
-    // 界 24/40/72，与分配端的 ≤16/≤32/≤64 对 8 倍数等价）进 rdi，节点
-    // = [next:8][cap:8]（payload+0/+8）。8B 块的 +8 槽已是下一块 hdr，放不下
-    // 第二字——类表因此多出 8 这一档。
+    //（payload+0），cap 由类隐含；≥16B 按 cap 选类头槽址进 rdi：≤64 走精确类
+    //（比较链，jb 严格小于 24/40/72），>64 走幂档——类号 = bsr(cap-1)+1，
+    // 槽 = base + (类号-7)*8。节点 = [next:8][cap:8]（payload+0/+8）。8B 块的
+    // +8 槽已是下一块 hdr，放不下第二字——类表因此多出 8 这一档。
     // chain into the size-class free list: 8B payloads take the implicit-cap
     // class whose node is the single [next] word (payload+0), cap implied by the
-    // class; >= 16B picks the class head slot by cap (compare chain, strict jb
-    // bounds 24/40/72, equivalent to the alloc side's <=16/<=32/<=64 for
-    // 8-multiples) into rdi, node = [next:8][cap:8] (payload+0/+8). An 8B
-    // block's +8 slot is already the next block's hdr, so a second node word
-    // does not fit — hence the extra 8 rung.
+    // class; >= 16B picks the class head slot by cap into rdi: up to 64 the
+    // exact classes (compare chain, strict jb bounds 24/40/72), above 64 the
+    // power rungs — class = bsr(cap-1)+1, slot = base + (class-7)*8. Node =
+    // [next:8][cap:8] (payload+0/+8). An 8B block's +8 slot is already the next
+    // block's hdr, so a second node word does not fit — hence the extra 8 rung.
     push(it, la_b(cmp_ri32(rdx, 8)))
     push(it, la_jcc(CC_B, "gc_sw_nolink"))
     push(it, la_jcc(CC_E, "gc_sw_link8"))
-    let sel3 = mov_ri64(rdi, rt_slot(rt_free_big))
-    let sel2 = mov_ri64(rdi, rt_slot(rt_free64)) + cmp_ri32(rdx, 72) + jb_rel32(str_len(sel3))
-    let sel1 = mov_ri64(rdi, rt_slot(rt_free32)) + cmp_ri32(rdx, 40) + jb_rel32(str_len(sel2) + str_len(sel3))
-    let sel0 = mov_ri64(rdi, rt_slot(rt_free16)) + cmp_ri32(rdx, 24) + jb_rel32(str_len(sel1) + str_len(sel2) + str_len(sel3))
-    push(it, la_b(sel0 + sel1 + sel2 + sel3 + mov_rm(rcx, rdi, 0) + mov_mr(r9, 8, rcx) + mov_mr(r9, 16, rdx) + lea(rcx, r9, 8) + mov_mr(rdi, 0, rcx)))
+    let sel_big = mov_rr(rdi, rdx) + sub_ri32(rdi, 1) + bsr_rr(rdi, rdi) + sub_ri32(rdi, 6) + shl_ri(rdi, 3) + mov_ri64(rcx, rt_slot(rt_free_class_base)) + add_rr(rdi, rcx)
+    let sel2 = mov_ri64(rdi, rt_slot(rt_free64)) + cmp_ri32(rdx, 72) + jb_rel32(str_len(sel_big))
+    let sel1 = mov_ri64(rdi, rt_slot(rt_free32)) + cmp_ri32(rdx, 40) + jb_rel32(str_len(sel2) + str_len(sel_big))
+    let sel0 = mov_ri64(rdi, rt_slot(rt_free16)) + cmp_ri32(rdx, 24) + jb_rel32(str_len(sel1) + str_len(sel2) + str_len(sel_big))
+    push(it, la_b(sel0 + sel1 + sel2 + sel_big + mov_rm(rcx, rdi, 0) + mov_mr(r9, 8, rcx) + mov_mr(r9, 16, rdx) + lea(rcx, r9, 8) + mov_mr(rdi, 0, rcx)))
     let link8 = mov_ri64(rdi, rt_slot(rt_free8)) + mov_rm(rcx, rdi, 0) + mov_mr(r9, 8, rcx) + lea(rcx, r9, 8) + mov_mr(rdi, 0, rcx)
     push(it, la_b(jmp_rel32(str_len(link8))))
     push(it, la_l("gc_sw_link8"))
